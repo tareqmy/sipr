@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="brand/logo/lockup-1600.png" alt="sipr" width="360">
+</p>
+
 # sipr
 
 A SIPp-like SIP testing tool and traffic generator, written in Rust.
@@ -71,6 +75,13 @@ Everything is built on the Rust standard library only — no external crates.
 TCP/TLS transports, `-inf` injection files (and the `lookup`/`insert`/`replace`
 actions that depend on them), 3PCC (`sendCmd`/`recvCmd`), RTP/pcap media, IPv6,
 and an HTTP control API.
+
+## Brand
+
+sipr's visual identity is "Ferrous" — an oxidized-orange industrial slab that
+wears the Rust heritage openly. Logos, the color palette, fonts, and a terminal
+color mapping live in [`brand/`](brand/); the live dashboard uses those colors
+(rust title, sage for successful calls), honoring `NO_COLOR`.
 
 ## License
 

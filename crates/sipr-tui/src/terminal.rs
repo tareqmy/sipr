@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use sipr_stats::Snapshot;
 
-use crate::render::{Screen, render};
+use crate::render::{Screen, render_with};
+use crate::style::Palette;
 
 const ENTER_ALT: &str = "\x1b[?1049h\x1b[?25l";
 const LEAVE_ALT: &str = "\x1b[?1049l\x1b[?25h";
@@ -114,6 +115,12 @@ pub fn run(snapshots: &Receiver<Snapshot>, keys_out: &Sender<char>) {
                 }
             }
         });
+    // Ferrous colors, unless the user set NO_COLOR (https://no-color.org).
+    let pal = if std::env::var_os("NO_COLOR").is_some() {
+        Palette::PLAIN
+    } else {
+        Palette::COLOR
+    };
     let mut screen = Screen::Main;
     let mut last: Option<Snapshot> = None;
     loop {
@@ -122,7 +129,7 @@ pub fn run(snapshots: &Receiver<Snapshot>, keys_out: &Sender<char>) {
             if key == 's' {
                 screen = screen.next();
                 if let Some(snap) = &last {
-                    draw(&render(snap, screen));
+                    draw(&render_with(snap, screen, &pal));
                 }
             } else if keys_out.send(key).is_err() {
                 return;
@@ -131,7 +138,7 @@ pub fn run(snapshots: &Receiver<Snapshot>, keys_out: &Sender<char>) {
         // Wait briefly for the next snapshot; redraw when one arrives.
         match snapshots.recv_timeout(Duration::from_millis(100)) {
             Ok(snap) => {
-                draw(&render(&snap, screen));
+                draw(&render_with(&snap, screen, &pal));
                 last = Some(snap);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}

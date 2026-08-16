@@ -9,7 +9,9 @@
 //! hook so no exit path wrecks the shell.
 
 pub mod render;
+pub mod style;
 pub mod terminal;
 
-pub use render::{Screen, render as render_screen};
+pub use render::{Screen, render as render_screen, render_with};
+pub use style::Palette;
 pub use terminal::run;

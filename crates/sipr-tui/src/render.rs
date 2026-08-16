@@ -4,6 +4,8 @@
 
 use sipr_stats::Snapshot;
 
+use crate::style::Palette;
+
 /// Which screen is showing ('s' cycles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -34,36 +36,70 @@ fn hms(d: std::time::Duration) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-fn title_line(snap: &Snapshot, screen_name: &str) -> String {
+fn title_line(snap: &Snapshot, screen_name: &str, pal: &Palette) -> String {
+    // The wordmark "sipr" wears the rust title color; the version and the rest
+    // of the head stay default so the role tag / clock keep their exact text.
+    let name = pal.paint(pal.title, "sipr");
     let head = format!(
-        "sipr {} | {} [{}] | {screen_name} ",
+        "{name} {} | {} [{}] | {screen_name} ",
         env!("CARGO_PKG_VERSION"),
         snap.scenario,
         if snap.uas { "UAS" } else { "UAC" },
     );
+    // Dash count is computed from the VISIBLE width (escape codes are zero-
+    // width), so the rule reaches the same column with or without color.
+    let visible = head.len() - (name.len() - "sipr".len());
     let clock = hms(snap.elapsed);
-    let dashes = WIDTH.saturating_sub(head.len() + clock.len() + 1);
-    format!("{head}{} {clock}", "-".repeat(dashes))
+    let dashes = WIDTH.saturating_sub(visible + clock.len() + 1);
+    let rule = pal.paint(pal.label, &"-".repeat(dashes));
+    format!("{head}{rule} {clock}")
 }
 
 const FOOTER: &str =
     "  [s] next screen   [+/-] rate ±1  [*//] ±10   [p] pause   [q] quit  [Q] abort";
 
+fn footer(pal: &Palette) -> String {
+    if pal.is_plain() {
+        return FOOTER.to_owned();
+    }
+    // Tint the bracketed keys without disturbing the layout.
+    let mut out = String::with_capacity(FOOTER.len() + 64);
+    let mut rest = FOOTER;
+    while let Some(open) = rest.find('[') {
+        let Some(close) = rest[open..].find(']') else {
+            break;
+        };
+        out.push_str(&rest[..open + 1]);
+        out.push_str(&pal.paint(pal.key, &rest[open + 1..open + close]));
+        out.push(']');
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Render the selected screen as plain lines (no ANSI codes).
 #[must_use]
 pub fn render(snap: &Snapshot, screen: Screen) -> Vec<String> {
+    render_with(snap, screen, &Palette::PLAIN)
+}
+
+/// Render the selected screen, styling with `pal` (use [`Palette::COLOR`] for
+/// the Ferrous look, [`Palette::PLAIN`] for no escapes).
+#[must_use]
+pub fn render_with(snap: &Snapshot, screen: Screen, pal: &Palette) -> Vec<String> {
     let mut lines = match screen {
-        Screen::Main => render_main(snap),
-        Screen::Scenario => render_scenario(snap),
-        Screen::Repartition => render_repartition(snap),
+        Screen::Main => render_main(snap, pal),
+        Screen::Scenario => render_scenario(snap, pal),
+        Screen::Repartition => render_repartition(snap, pal),
     };
     lines.push(String::new());
-    lines.push(FOOTER.to_owned());
+    lines.push(footer(pal));
     lines
 }
 
-fn render_main(snap: &Snapshot) -> Vec<String> {
-    let mut out = vec![title_line(snap, "main"), String::new()];
+fn render_main(snap: &Snapshot, pal: &Palette) -> Vec<String> {
+    let mut out = vec![title_line(snap, "main", pal), String::new()];
     let paused = if snap.paused { "  ** PAUSED **" } else { "" };
     if snap.uas {
         out.push(format!(
@@ -77,9 +113,15 @@ fn render_main(snap: &Snapshot) -> Vec<String> {
         ));
     }
     out.push(String::new());
+    let ok = pal.paint(pal.ok, &format!("{:>8}", snap.successful));
+    let failed = if snap.failed > 0 {
+        pal.paint(pal.bad, &format!("{:>7}", snap.failed))
+    } else {
+        format!("{:>7}", snap.failed)
+    };
     out.push(format!(
-        "  Calls:    {:>8} created   {:>7} live   {:>8} ok   {:>7} failed",
-        snap.created, snap.live, snap.successful, snap.failed
+        "  Calls:    {:>8} created   {:>7} live   {ok} ok   {failed} failed",
+        snap.created, snap.live
     ));
     out.push(format!(
         "  Messages: {:>8} sent   {:>8} matched   {:>5}/{:<5} retrans out/in",
@@ -97,9 +139,10 @@ fn render_main(snap: &Snapshot) -> Vec<String> {
     }
     out.push(String::new());
     for r in &snap.rtds {
+        let tag = pal.paint(pal.label, &format!("RTD {:<4}", r.name));
         out.push(format!(
-            "  RTD {:<4} n={:<8} avg {:>8.1}ms   sd {:>7.1}ms   p99 {:>6}ms   max {:>6}ms",
-            r.name, r.count, r.mean_ms, r.stddev_ms, r.p99_ms, r.max_ms
+            "  {tag} n={:<8} avg {:>8.1}ms   sd {:>7.1}ms   p99 {:>6}ms   max {:>6}ms",
+            r.count, r.mean_ms, r.stddev_ms, r.p99_ms, r.max_ms
         ));
     }
     let (n, mean, max) = snap.call_length;
@@ -111,13 +154,16 @@ fn render_main(snap: &Snapshot) -> Vec<String> {
     out
 }
 
-fn render_scenario(snap: &Snapshot) -> Vec<String> {
-    let mut out = vec![title_line(snap, "scenario"), String::new()];
-    out.push(format!(
-        "  {:>3}  {:<22} {:>9} {:>9} {:>8} {:>8} {:>8}",
-        "#", "step", "sent", "recv", "retrans", "timeout", "unexp"
+fn render_scenario(snap: &Snapshot, pal: &Palette) -> Vec<String> {
+    let mut out = vec![title_line(snap, "scenario", pal), String::new()];
+    out.push(pal.paint(
+        pal.label,
+        &format!(
+            "  {:>3}  {:<22} {:>9} {:>9} {:>8} {:>8} {:>8}",
+            "#", "step", "sent", "recv", "retrans", "timeout", "unexp"
+        ),
     ));
-    out.push(format!("  {}", "-".repeat(WIDTH - 4)));
+    out.push(pal.paint(pal.label, &format!("  {}", "-".repeat(WIDTH - 4))));
     for (i, row) in snap.steps.iter().enumerate() {
         let s = &row.stats;
         out.push(format!(
@@ -133,10 +179,10 @@ fn render_scenario(snap: &Snapshot) -> Vec<String> {
     out
 }
 
-fn render_repartition(snap: &Snapshot) -> Vec<String> {
-    let mut out = vec![title_line(snap, "repartitions"), String::new()];
+fn render_repartition(snap: &Snapshot, pal: &Palette) -> Vec<String> {
+    let mut out = vec![title_line(snap, "repartitions", pal), String::new()];
     let table = |title: &str, rows: &[(String, u64)], out: &mut Vec<String>| {
-        out.push(format!("  {title}"));
+        out.push(pal.paint(pal.label, &format!("  {title}")));
         if rows.is_empty() {
             out.push("    (not configured in this scenario)".to_owned());
         } else {
@@ -280,5 +326,44 @@ mod tests {
         let all = render(&s, Screen::Main).join("\n");
         assert!(all.contains("Incoming traffic"), "{all}");
         assert!(all.contains("[UAS]"), "{all}");
+    }
+
+    #[test]
+    fn color_palette_wraps_the_brand_accents() {
+        let color = render_with(&snap(), Screen::Main, &Palette::COLOR).join("\n");
+        // Rust title on the wordmark, sage on the ok count, a reset somewhere.
+        assert!(
+            color.contains("\x1b[1;38;5;208msipr"),
+            "title color: {color:?}"
+        );
+        assert!(color.contains("\x1b[38;5;65m"), "sage ok count missing");
+        assert!(color.contains("\x1b[0m"), "reset missing");
+        // The plain path stays escape-free.
+        let plain = render(&snap(), Screen::Main).join("\n");
+        assert!(!plain.contains('\x1b'), "plain must have no escapes");
+    }
+
+    #[test]
+    fn colored_title_rule_reaches_the_same_width_as_plain() {
+        // Escape codes are zero-width; the visible clock must still align.
+        let plain = title_line(&snap(), "main", &Palette::PLAIN);
+        let color = title_line(&snap(), "main", &Palette::COLOR);
+        let strip = |s: &str| {
+            let mut out = String::new();
+            let mut in_esc = false;
+            for c in s.chars() {
+                if c == '\x1b' {
+                    in_esc = true;
+                } else if in_esc {
+                    if c == 'm' {
+                        in_esc = false;
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        assert_eq!(strip(&color), plain, "visible text must match plain");
     }
 }

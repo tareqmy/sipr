@@ -1,0 +1,20 @@
+/* sipr brand tokens — Ferrous */
+:root{
+  --sipr-rust:#B7410E;        /* primary accent (light grounds) */
+  --sipr-rust-bright:#E05A1E; /* accent on dark grounds */
+  --sipr-ink:#221C18;         /* text / near-black */
+  --sipr-paper:#F3ECDF;       /* warm paper ground */
+  --sipr-paper-edge:#DDD2BD;  /* borders on paper */
+  --sipr-taupe:#7A6F60;       /* secondary text */
+  --sipr-sage:#5E7A52;        /* success / OK */
+  --sipr-char:#1C1613;        /* dark ground */
+  --sipr-font-display:'Alfa Slab One',serif;
+  --sipr-font-body:'Archivo',sans-serif;
+  --sipr-font-mono:'IBM Plex Mono',monospace;
+}
+@font-face{font-family:'Alfa Slab One';font-weight:400;src:url('fonts/AlfaSlabOne-Regular.woff2') format('woff2')}
+@font-face{font-family:'Archivo';font-weight:400;src:url('fonts/Archivo-Regular.woff2') format('woff2')}
+@font-face{font-family:'Archivo';font-weight:600;src:url('fonts/Archivo-SemiBold.woff2') format('woff2')}
+@font-face{font-family:'Archivo';font-weight:800;src:url('fonts/Archivo-ExtraBold.woff2') format('woff2')}
+@font-face{font-family:'IBM Plex Mono';font-weight:400;src:url('fonts/IBMPlexMono-Regular.woff2') format('woff2')}
+@font-face{font-family:'IBM Plex Mono';font-weight:500;src:url('fonts/IBMPlexMono-Medium.woff2') format('woff2')}
