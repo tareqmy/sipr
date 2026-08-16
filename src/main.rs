@@ -89,22 +89,75 @@ fn run(cli: &Cli) -> ExitCode {
         return fatal(&format!("scenario '{scenario_name}' failed to compile"));
     };
 
-    // A UAC needs somewhere to send calls; a UAS does not.
-    if scenario.role == Role::Uac && cli.target.is_none() {
+    // UAS mode lands at M4; until then only UAC scenarios run.
+    if scenario.role == Role::Uas {
+        eprintln!(
+            "sipr {}: scenario '{scenario_name}' accepted ({} steps, Uas) — UAS \
+             mode is not implemented yet (M4; see docs/MILESTONES.md). Exiting.",
+            env!("CARGO_PKG_VERSION"),
+            scenario.steps.len(),
+        );
+        return ExitCode::from(EXIT_NO_CALLS);
+    }
+
+    // A UAC needs somewhere to send calls.
+    let Some(target_raw) = cli.target.as_deref() else {
         return fatal(&format!(
             "remote target required: scenario '{scenario_name}' is a UAC — \
              pass REMOTE_HOST[:PORT]"
         ));
-    }
+    };
+    let target = match resolve_target(target_raw) {
+        Ok(t) => t,
+        Err(e) => return fatal(&e),
+    };
 
-    eprintln!(
-        "sipr {}: scenario '{scenario_name}' accepted ({} steps, {:?}) — the \
-         traffic engine is not implemented yet (M1; see docs/MILESTONES.md). Exiting.",
-        env!("CARGO_PKG_VERSION"),
-        scenario.steps.len(),
-        scenario.role,
-    );
-    ExitCode::from(EXIT_NO_CALLS)
+    let config = sipr_engine::EngineConfig {
+        target,
+        local_ip: cli.local_ip,
+        port: cli.port,
+        service: cli.service.clone(),
+        rate: cli.rate,
+        rate_period: std::time::Duration::from_millis(cli.rate_period_ms),
+        limit: cli.limit,
+        max_calls: cli.max_calls,
+        pause_default: std::time::Duration::from_millis(cli.pause_ms),
+        max_retrans: cli.max_retrans,
+        no_retrans: cli.no_retrans,
+        timeout: cli.timeout_s.map(std::time::Duration::from_secs),
+        base_cseq: cli.base_cseq.unwrap_or(1),
+        call_id_format: cli.call_id_format.clone(),
+        seed: 0,
+        periodic_stats: cli.background,
+    };
+    match sipr_engine::run(&scenario, &config) {
+        Ok(report) => {
+            eprintln!("sipr: run complete: {}", report.summary());
+            ExitCode::from(report.exit_code())
+        }
+        Err(e) => fatal(&e.to_string()),
+    }
+}
+
+/// Resolve `host[:port]` (port defaults to 5060). Bare IPv6 literals are a
+/// post-v1 concern (docs/SIPP_COMPAT.md roadmap).
+fn resolve_target(raw: &str) -> Result<std::net::SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    let candidate = if raw
+        .rsplit(':')
+        .next()
+        .is_some_and(|p| p.parse::<u16>().is_ok())
+        && raw.matches(':').count() == 1
+    {
+        raw.to_owned()
+    } else {
+        format!("{raw}:5060")
+    };
+    candidate
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve target '{raw}': {e}"))?
+        .next()
+        .ok_or_else(|| format!("target '{raw}' resolved to no addresses"))
 }
 
 fn unknown_embedded(name: &str) -> String {

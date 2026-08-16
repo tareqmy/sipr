@@ -40,6 +40,10 @@ repository.workspace = true
 
 [dependencies]
 sipr-scenario = { workspace = true }
+sipr-engine = { workspace = true }
+
+[dev-dependencies]
+sipr-net = { workspace = true }
 
 [lints]
 workspace = true

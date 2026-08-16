@@ -1,0 +1,1200 @@
+//! The M3 UAC engine: one event-loop thread owning every call.
+//!
+//! Runtime shape (docs/ARCHITECTURE.md §2, as-built note): the UDP recv
+//! loop, the timer service, the pacer, and the stdin watcher all send into
+//! ONE mpsc channel; this loop drains it and advances call state machines.
+//! Single ownership of the call map means no locks anywhere on the hot path.
+//!
+//! Recv matching implements the semantics verified against SIPp's
+//! `call.cpp` (docs/SIPP_COMPAT.md §6): forward scan skipping unmatched
+//! optionals until the first mandatory step, backward contiguous-optional
+//! scan for late/repeated matches, CSeq-method guard on responses, and
+//! retransmission cancel on any matched recv.
+
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
+
+use sipr_net::timer::TimerId;
+use sipr_net::{Inbound, NetEvent, RetransSchedule, TimerService, TransportConfig, UdpTransport};
+use sipr_scenario::model::{Expect, PauseSpec, RecvStep, Role, Scenario, Step, StepCommon};
+use sipr_scenario::template::{Keyword, MsgTemplate, Span};
+
+use crate::render::{RenderCtx, render};
+
+/// Engine configuration, distilled from the CLI.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    /// Remote target for outbound calls.
+    pub target: SocketAddr,
+    /// Local IP to bind (`-i`).
+    pub local_ip: Option<IpAddr>,
+    /// Local port to bind (`-p`).
+    pub port: Option<u16>,
+    /// `[service]` value (`-s`).
+    pub service: String,
+    /// New calls per rate period (`-r`).
+    pub rate: f64,
+    /// Rate period (`-rp`).
+    pub rate_period: Duration,
+    /// Concurrent-call cap (`-l`); excess calls are not started, not queued.
+    pub limit: Option<u64>,
+    /// Total calls to start (`-m`).
+    pub max_calls: Option<u64>,
+    /// `<pause/>` default duration (`-d`).
+    pub pause_default: Duration,
+    /// Global retransmission attempt cap (`-max_retrans`).
+    pub max_retrans: Option<u32>,
+    /// Disable retransmissions (`-nr`).
+    pub no_retrans: bool,
+    /// Global test timeout (`-timeout`).
+    pub timeout: Option<Duration>,
+    /// Initial `[cseq]` value (`-base_cseq`).
+    pub base_cseq: u32,
+    /// `[call_id]` format (`-cid_str`): `%u` call number, `%p` pid, `%s` ip.
+    pub call_id_format: Option<String>,
+    /// Seed for pause distributions / chance / loss.
+    pub seed: u64,
+    /// Print periodic stat lines (headless mode).
+    pub periodic_stats: bool,
+}
+
+/// Final counters of a run.
+#[derive(Debug, Default, Clone)]
+pub struct RunReport {
+    /// Calls started.
+    pub created: u64,
+    /// Calls that completed their scenario.
+    pub successful: u64,
+    /// Calls that failed (unexpected message, timeout, retrans exhausted...).
+    pub failed: u64,
+    /// Messages sent (first transmissions).
+    pub messages_sent: u64,
+    /// Messages received and matched.
+    pub messages_matched: u64,
+    /// Retransmissions sent.
+    pub retrans_sent: u64,
+    /// Inbound retransmissions detected (deduped).
+    pub retrans_recv: u64,
+    /// Messages that matched no step of any live call.
+    pub unexpected: u64,
+    /// Datagrams that were not SIP at all.
+    pub garbage: u64,
+    /// Wall-clock duration of the run.
+    pub elapsed: Duration,
+}
+
+impl RunReport {
+    /// SIPp-compatible exit code (docs/SIPP_COMPAT.md §5).
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        if self.failed > 0 {
+            1
+        } else if self.successful > 0 {
+            0
+        } else {
+            99 // aborted, no calls processed
+        }
+    }
+
+    /// One-line summary for logs.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "created {} successful {} failed {} | sent {} matched {} \
+             retrans-sent {} retrans-recv {} unexpected {} garbage {} | {:.1?}",
+            self.created,
+            self.successful,
+            self.failed,
+            self.messages_sent,
+            self.messages_matched,
+            self.retrans_sent,
+            self.retrans_recv,
+            self.unexpected,
+            self.garbage,
+            self.elapsed
+        )
+    }
+}
+
+/// Handle for runtime control (rate changes from the future TUI; tests).
+#[derive(Clone)]
+pub struct EngineControl {
+    /// Rate in milli-calls-per-period, adjustable while running.
+    rate_millis: Arc<AtomicU64>,
+    stop_pacer: Arc<AtomicBool>,
+}
+
+impl EngineControl {
+    /// Replace the call rate (calls per rate period).
+    pub fn set_rate(&self, rate: f64) {
+        let clamped = rate.clamp(0.0, 1_000_000.0);
+        // Millis precision is plenty for a call rate.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        self.rate_millis
+            .store((clamped * 1000.0) as u64, Ordering::Relaxed);
+    }
+
+    /// Current rate.
+    #[must_use]
+    pub fn rate(&self) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let r = self.rate_millis.load(Ordering::Relaxed) as f64;
+        r / 1000.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerKind {
+    Retrans,
+    RecvTimeout,
+    Pause,
+    Timewait,
+}
+
+enum Event {
+    Net(NetEvent),
+    CallTimer {
+        call_id: String,
+        generation: u64,
+        kind: TimerKind,
+    },
+    PacerTick,
+    GlobalTimeout,
+    Stdin(char),
+}
+
+struct RetransCtx {
+    buf: Vec<u8>,
+    lost_pct: Option<f64>,
+    attempt: u32,
+    schedule: RetransSchedule,
+    timer: TimerId,
+}
+
+struct CallState {
+    number: u64,
+    /// Next step to execute; when `waiting`, start of the recv window.
+    index: usize,
+    waiting: bool,
+    cseq: u32,
+    peer_tag: Option<String>,
+    routes: Vec<String>,
+    last_recv: Option<Inbound>,
+    /// (branch, cseq-line, start-line-ish) key for inbound retrans dedupe.
+    last_recv_key: Option<(String, String, String)>,
+    retrans: Option<RetransCtx>,
+    timer: Option<(TimerId, TimerKind)>,
+    /// Bumped whenever timers are (re)armed; stale fires are ignored.
+    generation: u64,
+}
+
+/// Why the engine refused to run a scenario.
+#[derive(Debug)]
+pub struct EngineError(pub String);
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Run a UAC scenario to completion. Blocks until done.
+///
+/// # Errors
+///
+/// [`EngineError`] when the scenario needs features beyond M3 (actions,
+/// variables, auth, UAS role) or the transport cannot bind.
+pub fn run(scenario: &Scenario, config: &EngineConfig) -> Result<RunReport, EngineError> {
+    let (report, _control) = run_with_control(scenario, config)?;
+    Ok(report)
+}
+
+/// [`run`], also exposing the runtime control handle to the caller thread
+/// via a callback-free pattern: control is returned only after completion in
+/// M3 (the TUI consumes it live at M5).
+///
+/// # Errors
+///
+/// See [`run`].
+pub fn run_with_control(
+    scenario: &Scenario,
+    config: &EngineConfig,
+) -> Result<(RunReport, EngineControl), EngineError> {
+    validate_for_engine(scenario)?;
+    let mut engine = Engine::new(scenario, config)?;
+    let control = engine.control.clone();
+    let report = engine.run_loop();
+    Ok((report, control))
+}
+
+struct Engine<'s> {
+    scenario: &'s Scenario,
+    config: EngineConfig,
+    transport: UdpTransport,
+    timers: TimerService<Event>,
+    rx: Receiver<Event>,
+    calls: HashMap<String, CallState>,
+    stats: RunReport,
+    rng: sipr_net::rng::Rng,
+    /// Per-step: CSeq method a response recv must carry (SIPp guard).
+    expected_cseq_method: Vec<Option<String>>,
+    control: EngineControl,
+    pacer_carry: f64,
+    /// Fraction of the rate period each pacer tick represents.
+    tick_ratio: f64,
+    soft_stopping: bool,
+    hard_stop: bool,
+    local_ip_str: String,
+    pid: u32,
+}
+
+impl<'s> Engine<'s> {
+    fn new(scenario: &'s Scenario, config: &EngineConfig) -> Result<Self, EngineError> {
+        let (tx, rx) = channel::<Event>();
+        // Bridge net events into the engine channel.
+        let (net_tx, net_rx) = channel::<NetEvent>();
+        let bridge_tx = tx.clone();
+        let _bridge = std::thread::Builder::new()
+            .name("sipr-net-bridge".into())
+            .spawn(move || {
+                while let Ok(ev) = net_rx.recv() {
+                    if bridge_tx.send(Event::Net(ev)).is_err() {
+                        return;
+                    }
+                }
+            });
+        let transport = UdpTransport::bind(
+            &TransportConfig {
+                local_ip: config.local_ip,
+                port: config.port,
+                send_loss_pct: 0.0,
+                recv_loss_pct: 0.0,
+                loss_seed: config.seed,
+            },
+            net_tx,
+        )
+        .map_err(|e| EngineError(format!("cannot bind UDP socket: {e}")))?;
+        let timers = TimerService::start(tx.clone());
+        let control = EngineControl {
+            rate_millis: Arc::new(AtomicU64::new(0)),
+            stop_pacer: Arc::new(AtomicBool::new(false)),
+        };
+        control.set_rate(config.rate);
+        // Pacer: tick faster than the rate period and start fractional
+        // batches, so a `-r 500 -rp 1000` run smooths into ~20ms bursts of
+        // ~10 instead of one burst of 500 (SIPp smooths within the period).
+        let tick = config.rate_period.min(Duration::from_millis(20));
+        let pacer_tx = tx.clone();
+        let pacer_stop = Arc::clone(&control.stop_pacer);
+        let _pacer = std::thread::Builder::new()
+            .name("sipr-pacer".into())
+            .spawn(move || {
+                while !pacer_stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(tick);
+                    if pacer_tx.send(Event::PacerTick).is_err() {
+                        return;
+                    }
+                }
+            });
+        // Stdin watcher: 'q' = soft quit, 'Q' = hard quit.
+        let stdin_tx = tx.clone();
+        let _stdin = std::thread::Builder::new()
+            .name("sipr-stdin".into())
+            .spawn(move || {
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match std::io::stdin().read_line(&mut line) {
+                        Ok(0) | Err(_) => return, // EOF: no interactive control
+                        Ok(_) => {
+                            if let Some(c) = line.trim().chars().next() {
+                                if stdin_tx.send(Event::Stdin(c)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        if let Some(t) = config.timeout {
+            timers.arm(t, Event::GlobalTimeout);
+        }
+        let local_addr = transport.local_addr();
+        Ok(Self {
+            scenario,
+            config: config.clone(),
+            transport,
+            timers,
+            rx,
+            calls: HashMap::new(),
+            stats: RunReport::default(),
+            rng: sipr_net::rng::Rng::new(config.seed ^ 0x51B8_0003),
+            expected_cseq_method: precompute_cseq_methods(scenario),
+            control,
+            pacer_carry: 0.0,
+            tick_ratio: tick.as_secs_f64() / config.rate_period.as_secs_f64(),
+            soft_stopping: false,
+            hard_stop: false,
+            local_ip_str: local_addr.ip().to_string(),
+            pid: std::process::id(),
+        })
+    }
+
+    fn run_loop(&mut self) -> RunReport {
+        let started = Instant::now();
+        let mut last_line = Instant::now();
+        // First tick immediately: SIPp starts placing calls right away.
+        self.on_pacer_tick();
+        loop {
+            if self.hard_stop || (self.done_creating() && self.calls.is_empty()) {
+                break;
+            }
+            match self.rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Event::Net(NetEvent::Packet(p))) => self.on_packet(&p.message),
+                Ok(Event::Net(NetEvent::Garbage { .. })) => self.stats.garbage += 1,
+                Ok(Event::Net(NetEvent::SocketError(kind))) => {
+                    eprintln!("sipr: socket error: {kind:?}; stopping");
+                    self.fail_all("socket error");
+                    break;
+                }
+                Ok(Event::CallTimer {
+                    call_id,
+                    generation,
+                    kind,
+                }) => self.on_call_timer(&call_id, generation, kind),
+                Ok(Event::PacerTick) => self.on_pacer_tick(),
+                Ok(Event::GlobalTimeout) => {
+                    eprintln!("sipr: global timeout reached; failing active calls");
+                    self.fail_all("global timeout");
+                    self.soft_stopping = true;
+                    self.control.stop_pacer.store(true, Ordering::Relaxed);
+                }
+                Ok(Event::Stdin(c)) => match c {
+                    'q' => {
+                        self.soft_stopping = true;
+                        self.control.stop_pacer.store(true, Ordering::Relaxed);
+                    }
+                    'Q' => {
+                        self.fail_all("hard quit");
+                        self.hard_stop = true;
+                    }
+                    _ => {}
+                },
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if self.config.periodic_stats && last_line.elapsed() >= Duration::from_secs(1) {
+                last_line = Instant::now();
+                eprintln!("sipr: live {} | {}", self.calls.len(), self.stats.summary());
+            }
+        }
+        self.control.stop_pacer.store(true, Ordering::Relaxed);
+        self.stats.elapsed = started.elapsed();
+        self.stats.clone()
+    }
+
+    fn done_creating(&self) -> bool {
+        self.soft_stopping
+            || self
+                .config
+                .max_calls
+                .is_some_and(|m| self.stats.created >= m)
+    }
+
+    // ---- pacing --------------------------------------------------------
+
+    fn on_pacer_tick(&mut self) {
+        if self.done_creating() {
+            return;
+        }
+        self.pacer_carry += self.control.rate() * self.tick_ratio;
+        // Non-queuing cap: what cannot start this period is forgotten, not
+        // deferred (SIPp -l semantics; SIPP_COMPAT §6).
+        let mut budget = self.pacer_carry.floor();
+        self.pacer_carry -= budget;
+        while budget >= 1.0 {
+            budget -= 1.0;
+            if self.done_creating() {
+                return;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let live = self.calls.len() as u64;
+            if self.config.limit.is_some_and(|l| live >= l) {
+                self.pacer_carry = 0.0;
+                return;
+            }
+            self.start_call();
+        }
+    }
+
+    fn start_call(&mut self) {
+        self.stats.created += 1;
+        let number = self.stats.created;
+        let call_id = self.make_call_id(number);
+        let call = CallState {
+            number,
+            index: 0,
+            waiting: false,
+            cseq: self.config.base_cseq,
+            peer_tag: None,
+            routes: Vec::new(),
+            last_recv: None,
+            last_recv_key: None,
+            retrans: None,
+            timer: None,
+            generation: 0,
+        };
+        self.calls.insert(call_id.clone(), call);
+        self.advance(&call_id);
+    }
+
+    fn make_call_id(&self, number: u64) -> String {
+        match &self.config.call_id_format {
+            Some(fmt) => fmt
+                .replace("%u", &number.to_string())
+                .replace("%p", &self.pid.to_string())
+                .replace("%s", &self.local_ip_str),
+            None => format!("{number}-{}@{}", self.pid, self.local_ip_str),
+        }
+    }
+
+    // ---- step execution ------------------------------------------------
+
+    #[allow(clippy::too_many_lines)]
+    fn advance(&mut self, call_id: &str) {
+        loop {
+            let Some(call) = self.calls.get(call_id) else {
+                return;
+            };
+            let index = call.index;
+            let Some(step) = self.scenario.steps.get(index) else {
+                self.complete_call(call_id);
+                return;
+            };
+            match step {
+                Step::Send(send) => {
+                    let (buf, is_request, method_is_new_txn) = {
+                        let Some(call) = self.calls.get(call_id) else {
+                            return;
+                        };
+                        let ctx = RenderCtx {
+                            service: &self.config.service,
+                            remote_ip: &self.config.target.ip().to_string(),
+                            remote_port: self.config.target.port(),
+                            local_ip: &self.local_ip_str,
+                            local_port: self.transport.local_addr().port(),
+                            transport: "UDP",
+                            call_id,
+                            call_number: call.number,
+                            pid: self.pid,
+                            cseq: call.cseq,
+                            msg_index: index,
+                            peer_tag: call.peer_tag.as_deref(),
+                            routes: &call.routes,
+                            last: call.last_recv.as_ref(),
+                        };
+                        match render(&send.template, &ctx) {
+                            Ok(buf) => {
+                                let first = template_first_word(&send.template).unwrap_or_default();
+                                let is_req = first != "SIP/2.0";
+                                let new_txn = is_req && first != "ACK" && first != "CANCEL";
+                                (buf, is_req, new_txn)
+                            }
+                            Err(e) => {
+                                self.fail_call(call_id, &format!("render failed: {e}"));
+                                return;
+                            }
+                        }
+                    };
+                    let sent = self
+                        .transport
+                        .send_to(&buf, self.config.target, send.lost_pct)
+                        .unwrap_or(false);
+                    let _ = sent; // simulated drops still count as "sent"
+                    self.stats.messages_sent += 1;
+                    let retrans_ms = send.retrans_ms;
+                    let lost_pct = send.lost_pct;
+                    let jump = self.jump_target(&send.common, index);
+                    let Some(call) = self.calls.get_mut(call_id) else {
+                        return;
+                    };
+                    if is_request && method_is_new_txn {
+                        call.cseq = call.cseq.wrapping_add(1);
+                    }
+                    // Replace any pending retransmission with this send's.
+                    if let Some(old) = call.retrans.take() {
+                        self.timers.cancel(old.timer);
+                    }
+                    if let Some(base) = retrans_ms {
+                        let schedule = RetransSchedule::new(
+                            Some(base),
+                            self.config.max_retrans,
+                            self.config.no_retrans,
+                        );
+                        if let Some(interval) = schedule.interval(1) {
+                            call.generation += 1;
+                            let timer = self.timers.arm(
+                                interval,
+                                Event::CallTimer {
+                                    call_id: call_id.to_owned(),
+                                    generation: call.generation,
+                                    kind: TimerKind::Retrans,
+                                },
+                            );
+                            call.retrans = Some(RetransCtx {
+                                buf,
+                                lost_pct,
+                                attempt: 1,
+                                schedule,
+                                timer,
+                            });
+                        }
+                    }
+                    call.index = jump;
+                }
+                Step::Recv(_) => {
+                    let mandatory = self.window_mandatory(index);
+                    let Some(call) = self.calls.get_mut(call_id) else {
+                        return;
+                    };
+                    call.waiting = true;
+                    if let Some((mi, timeout)) = mandatory {
+                        let _ = mi;
+                        if let Some(ms) = timeout {
+                            call.generation += 1;
+                            let timer = self.timers.arm(
+                                Duration::from_millis(ms),
+                                Event::CallTimer {
+                                    call_id: call_id.to_owned(),
+                                    generation: call.generation,
+                                    kind: TimerKind::RecvTimeout,
+                                },
+                            );
+                            call.timer = Some((timer, TimerKind::RecvTimeout));
+                        }
+                    }
+                    return;
+                }
+                Step::Pause { spec, common } => {
+                    let dur = self.sample_pause(spec);
+                    let jump = self.jump_target(common, index);
+                    let Some(call) = self.calls.get_mut(call_id) else {
+                        return;
+                    };
+                    call.generation += 1;
+                    call.index = jump; // applied when the timer fires
+                    let timer = self.timers.arm(
+                        dur,
+                        Event::CallTimer {
+                            call_id: call_id.to_owned(),
+                            generation: call.generation,
+                            kind: TimerKind::Pause,
+                        },
+                    );
+                    call.timer = Some((timer, TimerKind::Pause));
+                    return;
+                }
+                Step::Nop { common, .. } => {
+                    let jump = self.jump_target(common, index);
+                    if let Some(call) = self.calls.get_mut(call_id) {
+                        call.index = jump;
+                    }
+                }
+                Step::Label { .. } => {
+                    if let Some(call) = self.calls.get_mut(call_id) {
+                        call.index = index + 1;
+                    }
+                }
+                Step::Timewait { ms, .. } => {
+                    let Some(call) = self.calls.get_mut(call_id) else {
+                        return;
+                    };
+                    call.generation += 1;
+                    call.index = index + 1;
+                    let timer = self.timers.arm(
+                        Duration::from_millis(*ms),
+                        Event::CallTimer {
+                            call_id: call_id.to_owned(),
+                            generation: call.generation,
+                            kind: TimerKind::Timewait,
+                        },
+                    );
+                    call.timer = Some((timer, TimerKind::Timewait));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Where execution goes after `index` finishes: `next` (with `chance`),
+    /// else the following step.
+    fn jump_target(&mut self, common: &StepCommon, index: usize) -> usize {
+        if let Some(dest) = common.next {
+            let take = common.chance.is_none_or(|c| self.rng.next_f64() < c);
+            if take {
+                return dest;
+            }
+        }
+        index + 1
+    }
+
+    /// The window's mandatory recv step (index, timeout), scanning from
+    /// `start` over optional recvs and labels.
+    fn window_mandatory(&self, start: usize) -> Option<(usize, Option<u64>)> {
+        let mut i = start;
+        while let Some(step) = self.scenario.steps.get(i) {
+            match step {
+                Step::Recv(r) if r.optional => i += 1,
+                Step::Recv(r) => return Some((i, r.timeout_ms)),
+                Step::Label { .. } => i += 1,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn sample_pause(&mut self, spec: &PauseSpec) -> Duration {
+        match spec {
+            PauseSpec::Default => self.config.pause_default,
+            PauseSpec::Fixed(ms) => Duration::from_millis(*ms),
+            PauseSpec::Variable(_) => self.config.pause_default, // pre-validated out
+            PauseSpec::Distribution { kind, params } => {
+                let u = self.rng.next_f64();
+                let ms = match (kind.as_str(), params.as_slice()) {
+                    ("uniform", [a, b]) => u.mul_add(b - a, *a),
+                    ("fixed", [v]) => *v,
+                    ("exponential", [mean]) => -mean * (1.0 - u).ln(),
+                    ("normal", [mean, stddev]) => {
+                        // Box-Muller (one sample is fine here).
+                        let v = self.rng.next_f64().max(f64::MIN_POSITIVE);
+                        let z = (-2.0 * v.ln()).sqrt() * (2.0 * std::f64::consts::PI * u).cos();
+                        z.mul_add(*stddev, *mean)
+                    }
+                    _ => 0.0, // pre-validated out
+                };
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Duration::from_millis(ms.max(0.0) as u64)
+            }
+        }
+    }
+
+    // ---- inbound -------------------------------------------------------
+
+    fn on_packet(&mut self, msg: &Inbound) {
+        let Some(call_id) = msg.call_id().map(ToOwned::to_owned) else {
+            self.stats.unexpected += 1;
+            return;
+        };
+        if !self.calls.contains_key(&call_id) {
+            self.stats.unexpected += 1;
+            return;
+        }
+        // Inbound retransmission dedupe (branch + CSeq + start line).
+        let key = (
+            msg.top_via_branch().unwrap_or_default().to_owned(),
+            msg.header("CSeq").unwrap_or_default().to_owned(),
+            msg.status_code().map_or_else(
+                || msg.method().unwrap_or_default().to_owned(),
+                |c| c.to_string(),
+            ),
+        );
+        if self
+            .calls
+            .get(&call_id)
+            .is_some_and(|c| c.last_recv_key.as_ref() == Some(&key))
+        {
+            self.stats.retrans_recv += 1;
+            return;
+        }
+        let (window_start, waiting) = match self.calls.get(&call_id) {
+            Some(c) => (c.index, c.waiting),
+            None => return,
+        };
+        let scan = scan_for_match(
+            self.scenario,
+            &self.expected_cseq_method,
+            window_start,
+            waiting,
+            msg,
+        );
+        match scan {
+            Scan::Forward(si) => {
+                self.stats.messages_matched += 1;
+                let rrs = matches!(&self.scenario.steps[si], Step::Recv(r) if r.record_route_set);
+                let Some(call) = self.calls.get_mut(&call_id) else {
+                    return;
+                };
+                // A matched recv cancels the pending retransmission
+                // (call.cpp: next_retrans = 0) and the window timeout.
+                if let Some(r) = call.retrans.take() {
+                    self.timers.cancel(r.timer);
+                }
+                if let Some((t, _)) = call.timer.take() {
+                    self.timers.cancel(t);
+                }
+                call.generation += 1;
+                if let Some(tag) = if msg.status_code().is_some() {
+                    msg.to_tag()
+                } else {
+                    msg.from_tag()
+                } {
+                    call.peer_tag = Some(tag.to_owned());
+                }
+                if rrs {
+                    call.routes = msg
+                        .header_values("Record-Route")
+                        .into_iter()
+                        .map(ToOwned::to_owned)
+                        .collect();
+                }
+                call.last_recv_key = Some(key);
+                call.last_recv = Some(msg.clone());
+                call.waiting = false;
+                call.index = si + 1;
+                self.advance(&call_id);
+            }
+            Scan::Old => {
+                // Late/repeated optional (e.g. another 180): absorbed.
+                self.stats.messages_matched += 1;
+                if let Some(call) = self.calls.get_mut(&call_id) {
+                    call.last_recv_key = Some(key);
+                }
+            }
+            Scan::NoMatch => {
+                self.stats.unexpected += 1;
+                self.fail_call(&call_id, "unexpected message");
+            }
+        }
+    }
+
+    // ---- timers --------------------------------------------------------
+
+    fn on_call_timer(&mut self, call_id: &str, generation: u64, kind: TimerKind) {
+        if kind == TimerKind::Retrans {
+            self.on_retrans_timer(call_id, generation);
+            return;
+        }
+        let index = match self.calls.get_mut(call_id) {
+            Some(call) if call.generation == generation => {
+                call.timer = None;
+                call.index
+            }
+            _ => return, // gone or stale
+        };
+        match kind {
+            TimerKind::RecvTimeout => {
+                let ontimeout = self.window_mandatory(index).and_then(|(mi, _)| {
+                    match &self.scenario.steps[mi] {
+                        Step::Recv(RecvStep { ontimeout, .. }) => *ontimeout,
+                        _ => None,
+                    }
+                });
+                match ontimeout {
+                    Some(dest) => {
+                        if let Some(call) = self.calls.get_mut(call_id) {
+                            call.waiting = false;
+                            call.index = dest;
+                        }
+                        self.advance(call_id);
+                    }
+                    None => self.fail_call(call_id, "recv timeout"),
+                }
+            }
+            TimerKind::Pause => self.advance(call_id),
+            TimerKind::Timewait => self.complete_call(call_id),
+            TimerKind::Retrans => unreachable!("handled above"),
+        }
+    }
+
+    fn on_retrans_timer(&mut self, call_id: &str, generation: u64) {
+        let Some((buf, lost, next)) = self.calls.get_mut(call_id).and_then(|call| {
+            let r = call.retrans.as_mut()?;
+            r.attempt += 1;
+            Some((r.buf.clone(), r.lost_pct, r.schedule.interval(r.attempt)))
+        }) else {
+            return; // call gone or retransmission already cancelled
+        };
+        let _ = self.transport.send_to(&buf, self.config.target, lost);
+        self.stats.retrans_sent += 1;
+        match next {
+            Some(interval) => {
+                let timer = self.timers.arm(
+                    interval,
+                    Event::CallTimer {
+                        call_id: call_id.to_owned(),
+                        generation,
+                        kind: TimerKind::Retrans,
+                    },
+                );
+                if let Some(r) = self.calls.get_mut(call_id).and_then(|c| c.retrans.as_mut()) {
+                    r.timer = timer;
+                }
+            }
+            None => self.fail_call(call_id, "retransmissions exhausted"),
+        }
+    }
+
+    // ---- lifecycle -----------------------------------------------------
+
+    fn cancel_call_timers(&mut self, call: &mut CallState) {
+        if let Some(r) = call.retrans.take() {
+            self.timers.cancel(r.timer);
+        }
+        if let Some((t, _)) = call.timer.take() {
+            self.timers.cancel(t);
+        }
+        call.generation += 1;
+    }
+
+    fn complete_call(&mut self, call_id: &str) {
+        if let Some(mut call) = self.calls.remove(call_id) {
+            self.cancel_call_timers(&mut call);
+            self.stats.successful += 1;
+        }
+    }
+
+    fn fail_call(&mut self, call_id: &str, _reason: &str) {
+        if let Some(mut call) = self.calls.remove(call_id) {
+            self.cancel_call_timers(&mut call);
+            self.stats.failed += 1;
+        }
+    }
+
+    fn fail_all(&mut self, reason: &str) {
+        let ids: Vec<String> = self.calls.keys().cloned().collect();
+        for id in ids {
+            self.fail_call(&id, reason);
+        }
+    }
+}
+
+enum Scan {
+    /// Matched at this forward step index.
+    Forward(usize),
+    /// Matched an already-passed optional (contiguous block behind us).
+    Old,
+    NoMatch,
+}
+
+/// SIPp's recv window scan, as verified in call.cpp (SIPP_COMPAT §6).
+fn scan_for_match(
+    scenario: &Scenario,
+    expected_cseq_method: &[Option<String>],
+    window_start: usize,
+    waiting: bool,
+    msg: &Inbound,
+) -> Scan {
+    // Forward: optionals may be skipped; stop at first mandatory recv
+    // (inclusive) or any non-recv step.
+    if waiting {
+        let mut i = window_start;
+        while let Some(step) = scenario.steps.get(i) {
+            match step {
+                Step::Label { .. } => {
+                    i += 1;
+                }
+                Step::Recv(r) => {
+                    if recv_matches(r, expected_cseq_method.get(i), i, msg) {
+                        return Scan::Forward(i);
+                    }
+                    if r.optional {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    // Backward: contiguous optional block behind the window may re-match
+    // (late 180 after the 200 advanced us, a repeated provisional...).
+    let mut i = window_start;
+    let mut contig = true;
+    while i > 0 {
+        i -= 1;
+        match scenario.steps.get(i) {
+            Some(Step::Label { .. }) => {}
+            Some(Step::Recv(r)) => {
+                if !r.optional {
+                    contig = false;
+                }
+                if contig && recv_matches(r, expected_cseq_method.get(i), i, msg) {
+                    return Scan::Old;
+                }
+            }
+            _ => contig = false,
+        }
+        if !contig {
+            break;
+        }
+    }
+    Scan::NoMatch
+}
+
+fn recv_matches(
+    step: &RecvStep,
+    expected_method: Option<&Option<String>>,
+    index: usize,
+    msg: &Inbound,
+) -> bool {
+    match &step.expect {
+        Expect::Request(m) => msg.method() == Some(m.as_str()),
+        Expect::Response(code) => {
+            let Some(actual) = msg.status_code() else {
+                return false;
+            };
+            if code.parse::<u16>() != Ok(actual) {
+                return false;
+            }
+            // SIPp guard: beyond index 0, the response's CSeq method must
+            // match the nearest preceding request (call.cpp
+            // recv_response_for_cseq_method_list).
+            if index == 0 {
+                return true;
+            }
+            match expected_method.and_then(Option::as_deref) {
+                Some(expected) => msg.cseq().is_some_and(|(_, m)| m == expected),
+                None => true,
+            }
+        }
+    }
+}
+
+/// For every step, the method of the nearest preceding request `<send>`.
+fn precompute_cseq_methods(scenario: &Scenario) -> Vec<Option<String>> {
+    let mut out = Vec::with_capacity(scenario.steps.len());
+    let mut last: Option<String> = None;
+    for step in &scenario.steps {
+        if let Step::Send(s) = step {
+            if let Some(word) = template_first_word(&s.template) {
+                if word != "SIP/2.0" {
+                    last = Some(word);
+                }
+            }
+        }
+        out.push(last.clone());
+    }
+    out
+}
+
+/// First whitespace-delimited token of a template (the method or SIP/2.0).
+fn template_first_word(t: &MsgTemplate) -> Option<String> {
+    match t.spans.first()? {
+        Span::Lit(l) => l.split_whitespace().next().map(ToOwned::to_owned),
+        Span::Kw(Keyword::Last(_) | Keyword::Var(_)) | Span::Kw(_) => None,
+    }
+}
+
+/// Reject scenarios that need features beyond M3, loudly and up front.
+fn validate_for_engine(scenario: &Scenario) -> Result<(), EngineError> {
+    let err = |msg: String| Err(EngineError(msg));
+    if scenario.role == Role::Uas {
+        return err("UAS mode is not implemented yet (M4) — this scenario answers calls".into());
+    }
+    for (i, step) in scenario.steps.iter().enumerate() {
+        let (actions, common, template) = match step {
+            Step::Send(s) => (&s.actions, &s.common, Some(&s.template)),
+            Step::Recv(r) => {
+                if r.regexp_match {
+                    return err(format!(
+                        "step {i}: regexp_match needs the regex engine (M6)"
+                    ));
+                }
+                if let Expect::Response(code) = &r.expect {
+                    if code.parse::<u16>().is_err() {
+                        return err(format!(
+                            "step {i}: response '{code}' is not a status code \
+                             (regex responses land at M6)"
+                        ));
+                    }
+                }
+                (&r.actions, &r.common, None)
+            }
+            Step::Nop { actions, common } => (actions, common, None),
+            Step::Pause { spec, common } => {
+                if matches!(spec, PauseSpec::Variable(_)) {
+                    return err(format!("step {i}: pause variable= needs variables (M6)"));
+                }
+                if let PauseSpec::Distribution { kind, .. } = spec {
+                    if !matches!(
+                        kind.as_str(),
+                        "uniform" | "fixed" | "exponential" | "normal"
+                    ) {
+                        return err(format!(
+                            "step {i}: pause distribution '{kind}' is not implemented yet"
+                        ));
+                    }
+                }
+                if common.test.is_some() || common.condexec.is_some() {
+                    return err(format!("step {i}: test/condexec need variables (M6)"));
+                }
+                continue;
+            }
+            Step::Label { .. } | Step::Timewait { .. } => continue,
+        };
+        if !actions.is_empty() {
+            return err(format!("step {i}: <action> blocks execute at M6"));
+        }
+        if common.test.is_some() || common.condexec.is_some() {
+            return err(format!("step {i}: test/condexec need variables (M6)"));
+        }
+        if let Some(t) = template {
+            for kw in t.keywords() {
+                match kw {
+                    Keyword::Var(v) => {
+                        return err(format!("step {i}: [${v}] executes at M6"));
+                    }
+                    Keyword::Authentication(_) => {
+                        return err(format!("step {i}: [authentication] lands at M6"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uac() -> Scenario {
+        sipr_scenario::compile("uac", sipr_scenario::embedded("uac").unwrap())
+            .scenario
+            .unwrap()
+    }
+
+    fn response(code: u16, cseq_method: &str, to_tag: bool) -> Inbound {
+        let tag = if to_tag { ";tag=remote1" } else { "" };
+        let raw = format!(
+            "SIP/2.0 {code} X\r\nVia: SIP/2.0/UDP h;branch=z9hG4bK-1\r\n\
+             From: <sip:a>;tag=t1\r\nTo: <sip:b>{tag}\r\nCall-ID: c1\r\n\
+             CSeq: 1 {cseq_method}\r\n\r\n"
+        );
+        Inbound::parse(raw.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn forward_scan_skips_unmatched_optionals() {
+        let sc = uac();
+        let methods = precompute_cseq_methods(&sc);
+        // Window starts at step 1 (recv 100 opt). A 200 must land on step 4.
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 1, true, &response(200, "INVITE", true)),
+            Scan::Forward(4)
+        ));
+        // A 183 lands on its own optional step 3.
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 1, true, &response(183, "INVITE", false)),
+            Scan::Forward(3)
+        ));
+    }
+
+    #[test]
+    fn cseq_method_guard_blocks_stale_finals() {
+        let sc = uac();
+        let methods = precompute_cseq_methods(&sc);
+        // Window at step 8 (recv 200 after BYE): a late 200 for the INVITE
+        // must NOT match forward; it is absorbed... by nothing behind (the
+        // steps behind 8 are send/pause), so it is unexpected.
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 8, true, &response(200, "INVITE", true)),
+            Scan::NoMatch
+        ));
+        // The right 200 (CSeq BYE) matches.
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 8, true, &response(200, "BYE", true)),
+            Scan::Forward(8)
+        ));
+    }
+
+    #[test]
+    fn backward_scan_absorbs_out_of_order_provisionals() {
+        let sc = uac();
+        let methods = precompute_cseq_methods(&sc);
+        // A 183 matched at step 3, so the call is parked at the mandatory
+        // 200 (step 4). A distinct out-of-order 180 hits the contiguous
+        // optional block behind the window.
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 4, true, &response(180, "INVITE", false)),
+            Scan::Old
+        ));
+        // Once past the mandatory 200 (ACK sent, window start 5), contig is
+        // broken by the mandatory step: a late 180 is unexpected — verified
+        // against call.cpp's backward loop (contig dies at OPTIONAL_FALSE).
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 5, false, &response(180, "INVITE", false)),
+            Scan::NoMatch
+        ));
+        // And a random 486 never matches backward.
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 4, true, &response(486, "INVITE", false)),
+            Scan::NoMatch
+        ));
+    }
+
+    #[test]
+    fn unexpected_request_is_no_match() {
+        let sc = uac();
+        let methods = precompute_cseq_methods(&sc);
+        let bye = Inbound::parse(
+            b"BYE sip:x SIP/2.0\r\nCall-ID: c1\r\nCSeq: 2 BYE\r\nFrom: <a>;tag=z\r\n\r\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 1, true, &bye),
+            Scan::NoMatch
+        ));
+    }
+
+    #[test]
+    fn precomputed_methods_follow_sends() {
+        let sc = uac();
+        let m = precompute_cseq_methods(&sc);
+        assert_eq!(m[1].as_deref(), Some("INVITE")); // recv 100
+        assert_eq!(m[4].as_deref(), Some("INVITE")); // recv 200
+        assert_eq!(m[8].as_deref(), Some("BYE")); // final recv 200
+    }
+
+    #[test]
+    fn validation_rejects_m6_features_and_uas() {
+        let uas = sipr_scenario::compile("uas", sipr_scenario::embedded("uas").unwrap())
+            .scenario
+            .unwrap();
+        assert!(validate_for_engine(&uas).is_err());
+        let with_actions = sipr_scenario::compile(
+            "t",
+            r#"<scenario name="t">
+                 <send><![CDATA[
+                   OPTIONS sip:[service]@[remote_ip] SIP/2.0
+                   Call-ID: [call_id]
+
+                 ]]></send>
+                 <recv response="200">
+                   <action><log message="hi"/></action>
+                 </recv>
+               </scenario>"#,
+        )
+        .scenario
+        .unwrap();
+        let e = validate_for_engine(&with_actions).unwrap_err();
+        assert!(e.0.contains("M6"), "{e}");
+        assert!(validate_for_engine(&uac()).is_ok());
+    }
+
+    #[test]
+    fn exit_codes_follow_sipp() {
+        let mut r = RunReport::default();
+        assert_eq!(r.exit_code(), 99);
+        r.successful = 5;
+        assert_eq!(r.exit_code(), 0);
+        r.failed = 1;
+        assert_eq!(r.exit_code(), 1);
+    }
+}

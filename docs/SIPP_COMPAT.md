@@ -98,10 +98,32 @@ Verify exact SIPp table before closing M3 and update this line.
 
 ## 6. Behavior notes (folklore learned from docs/C++ — append as discovered)
 
-- `optional="true"` recv steps: an inbound message is tried against the current
-  pending non-optional recv AND any optional recvs in the window before it;
-  optional steps may arrive out of order / not at all. (Verify exact matching
-  order in `call.cpp` before implementing M3.)
+- Recv matching — VERIFIED in `call.cpp` (`process_incoming`, the two scan
+  loops around line 5360, and `matches_scenario`); implemented in
+  `sipr-engine/src/engine.rs::scan_for_match`:
+  - *Forward scan* from the current index: unmatched optional recvs are
+    skipped; the scan stops at the first mandatory recv (inclusive) or any
+    non-recv step. A match may land on any step in that window; execution
+    resumes after the matched step (skipped optionals are passed for good).
+  - *Backward scan* when forward fails: only the contiguous optional block
+    immediately behind the window may re-match (out-of-order provisionals);
+    `contig` is broken by ANY non-optional message including sends — a late
+    180 arriving after the ACK is *unexpected* and kills the call, exactly
+    as in SIPp. (`optional="global"` would bypass contig; sipr rejects that
+    value until implemented.)
+  - *CSeq-method guard*: beyond index 0, a response only matches a recv if
+    its CSeq method equals the nearest preceding request send's method
+    (`recv_response_for_cseq_method_list`) — a late 200/INVITE cannot match
+    the BYE's 200.
+- A matched recv cancels the pending retransmission of the last send
+  (`next_retrans = 0`) — including a matched *provisional*. SIPp's own code
+  carries a TODO admitting this can erroneously stop retransmission (e.g.
+  180 received, 200 lost → the call stalls until a timeout). sipr reproduces
+  the behavior faithfully; scenarios can mitigate with `timeout`/`ontimeout`
+  on the mandatory recv.
+- Pacing: SIPp smooths call starts within the rate period rather than
+  bursting `-r` calls at once; sipr ticks every ≤20 ms and accumulates
+  fractional starts.
 - `-l` cap: calls above the concurrent cap are not queued — the pacer simply
   does not start them; effective rate drops.
 - `[branch]` must be unique per transaction and RFC 3261 magic-cookie prefixed

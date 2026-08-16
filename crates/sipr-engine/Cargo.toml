@@ -8,6 +8,8 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+sipr-scenario = { workspace = true }
+sipr-net = { workspace = true }
 
 [lints]
 workspace = true

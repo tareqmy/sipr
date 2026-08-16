@@ -1,4 +1,13 @@
-//! `sipr-engine` will hold the per-call state machine, call table, pacer, and dialog bookkeeping.
+//! `sipr-engine`: the traffic engine — per-call state machines, the pacer,
+//! and dialog bookkeeping, driven by one event-loop thread (M3: UAC mode).
 //!
-//! Intentionally empty until milestone M3 — see `docs/MILESTONES.md` and
-//! `docs/ARCHITECTURE.md` before adding code here.
+//! Entry point: [`run`] with a compiled [`sipr_scenario::model::Scenario`]
+//! and an [`EngineConfig`]. The engine pre-validates that the scenario only
+//! uses M3-supported features and refuses loudly otherwise (actions,
+//! variables, and auth execute at M6; UAS mode lands at M4).
+
+mod engine;
+mod render;
+
+pub use engine::{EngineConfig, EngineControl, EngineError, RunReport, run, run_with_control};
+pub use render::{RenderCtx, RenderError, render};

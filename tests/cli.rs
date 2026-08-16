@@ -73,17 +73,21 @@ fn default_scenario_is_uac_and_needs_target() {
 }
 
 #[test]
-fn uas_without_target_reaches_engine_stub() {
-    let o = sipr(&["-sn", "uas", "-p", "5060"]);
+fn uas_without_target_reaches_m4_stub() {
+    let o = sipr(&["-sn", "uas", "-p", "15060"]);
     assert_code(&o, 99);
-    assert!(stderr(&o).contains("not implemented yet"));
+    assert!(stderr(&o).contains("UAS mode is not implemented yet"));
 }
 
 #[test]
-fn uac_with_target_reaches_engine_stub() {
-    let o = sipr(&["-sn", "uac", "-r", "50", "127.0.0.1:5060"]);
-    assert_code(&o, 99);
-    assert!(stderr(&o).contains("scenario 'uac' accepted"));
+fn unresolvable_target_is_fatal() {
+    let o = sipr(&["-sn", "uac", "definitely-not-a-real-host.invalid."]);
+    assert_code(&o, 255);
+    assert!(
+        stderr(&o).contains("cannot resolve target"),
+        "{}",
+        stderr(&o)
+    );
 }
 
 #[test]

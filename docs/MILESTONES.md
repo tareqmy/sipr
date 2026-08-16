@@ -62,17 +62,28 @@ unchecked *required* items (unchecked stretch items are fine, move them down).
       unavailable in this build env; the seeded equivalent is reproducible
       by construction.
 
-## M3 — UAC end to end  ← first interop milestone
+## M3 — UAC end to end  ← first interop milestone (one gate pending)
 
-- [ ] Embedded uac scenario completes INVITE–(100/180)–200–ACK–pause–BYE–200
-      against real `sipp -sn uas`; 0 failed at `-r 10 -m 1000`
-- [ ] Pacer: `-r`, `-rp`, `-l` (non-queuing cap), `-m`; runtime rate change API
-      (consumed by TUI later)
-- [ ] optional-recv window semantics verified against C++ (record in
-      SIPP_COMPAT §6)
-- [ ] Soft/hard shutdown; SIPp-compatible exit codes (verify table, update
-      SIPP_COMPAT §5)
-- [ ] Interop harness in CI (TESTING §4); loopback cps baseline recorded
+- [ ] Embedded uac scenario completes against real `sipp -sn uas`; 0 failed.
+      STATUS: the harness exists (`tests/interop.rs`, resolves `$SIPP_BIN` /
+      PATH, visible skip otherwise) but no sipp binary exists in the build
+      sandbox — run `SIPP_BIN=~/development/cprojects/sipp/sipp cargo test
+      --test interop` on the dev machine to close this box. The equivalent
+      flow IS verified end-to-end in-container against a scripted UAS
+      (`tests/e2e.rs`): INVITE–180–200–ACK–pause–BYE–200, 20 000 calls at
+      2000 cps, 0 failed, plus lost-first-INVITE retransmission recovery.
+- [x] Pacer: `-r`, `-rp`, `-l` (non-queuing cap), `-m`; smoothing within the
+      rate period (≤20 ms sub-ticks); runtime rate change API
+      (`EngineControl::set_rate`, consumed by the TUI at M5)
+- [x] optional-recv window semantics verified against `call.cpp` and
+      recorded in SIPP_COMPAT §6 (forward scan, backward contiguous scan,
+      CSeq-method guard, retrans cancel — incl. SIPp's own stall wart)
+- [x] Soft quit (`q`+Enter / `-m` drain) and hard quit (`Q`); exit codes
+      0/1/99 per SIPp's documented table (+2 usage, 255 fatal; 97 lands
+      with `exec int_cmd` at M6); global `-timeout` fails active calls
+- [x] Interop job added to CI (installs sip-tester on the runner); loopback
+      cps baseline recorded in `benches/BASELINES.md` (~2000 cps sustained,
+      far-end-bound)
 
 ## M4 — UAS mode + stats
 

@@ -6,6 +6,8 @@ version = 4
 name = "sipr"
 version = "0.1.0"
 dependencies = [
+ "sipr-engine",
+ "sipr-net",
  "sipr-scenario",
 ]
 
@@ -16,6 +18,10 @@ version = "0.1.0"
 [[package]]
 name = "sipr-engine"
 version = "0.1.0"
+dependencies = [
+ "sipr-net",
+ "sipr-scenario",
+]
 
 [[package]]
 name = "sipr-net"

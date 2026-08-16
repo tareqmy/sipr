@@ -1,0 +1,226 @@
+//! End-to-end: the sipr binary places real calls over loopback UDP against a
+//! scripted UAS implementing the classic uas flow (INVITE → 180 → 200,
+//! ACK, BYE → 200). This is the always-on complement to the real-SIPp
+//! interop suite in `tests/interop.rs`.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::collections::HashMap;
+use std::net::{SocketAddr, UdpSocket};
+use std::process::Command;
+use std::time::Duration;
+
+use sipr_net::Inbound;
+
+/// Minimal scripted UAS. Answers until the socket is idle for `idle`.
+fn spawn_uas(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<UasStats>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(idle)).expect("timeout");
+    let handle = std::thread::spawn(move || run_uas(&sock));
+    (addr, handle)
+}
+
+#[derive(Default, Debug)]
+struct UasStats {
+    invites: u64,
+    byes: u64,
+    retrans_invites: u64,
+}
+
+fn run_uas(sock: &UdpSocket) -> UasStats {
+    let mut stats = UasStats::default();
+    let mut answered: HashMap<String, Vec<u8>> = HashMap::new(); // branch → 200
+    let mut buf = [0u8; 65_535];
+    while let Ok((n, from)) = sock.recv_from(&mut buf) {
+        let Ok(msg) = Inbound::parse(&buf[..n]) else {
+            continue;
+        };
+        match msg.method() {
+            Some("INVITE") => {
+                let branch = msg.top_via_branch().unwrap_or_default().to_owned();
+                if let Some(ok) = answered.get(&branch) {
+                    stats.retrans_invites += 1;
+                    let _ = sock.send_to(ok, from); // retransmitted INVITE: resend 200
+                    continue;
+                }
+                stats.invites += 1;
+                let ringing = mirror_response(&msg, "180 Ringing", true);
+                let ok = mirror_response(&msg, "200 OK", true);
+                let _ = sock.send_to(&ringing, from);
+                let _ = sock.send_to(&ok, from);
+                answered.insert(branch, ok);
+            }
+            Some("ACK") => {}
+            Some("BYE") => {
+                stats.byes += 1;
+                let ok = mirror_response(&msg, "200 OK", false);
+                let _ = sock.send_to(&ok, from);
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
+/// Build a response by mirroring Via/From/To/Call-ID/CSeq, adding a To tag
+/// for dialog-establishing responses.
+fn mirror_response(msg: &Inbound, status: &str, add_to_tag: bool) -> Vec<u8> {
+    let mut out = format!("SIP/2.0 {status}\r\n");
+    for via in msg.header_lines("Via") {
+        out.push_str(via);
+        out.push_str("\r\n");
+    }
+    for from in msg.header_lines("From") {
+        out.push_str(from);
+        out.push_str("\r\n");
+    }
+    let to = msg.header("To").unwrap_or_default();
+    let has_tag = to.contains(";tag=");
+    if add_to_tag && !has_tag {
+        out.push_str(&format!("To: {to};tag=uas-e2e-1\r\n"));
+    } else {
+        out.push_str(&format!("To: {to}\r\n"));
+    }
+    out.push_str(&format!(
+        "Call-ID: {}\r\n",
+        msg.call_id().unwrap_or_default()
+    ));
+    out.push_str(&format!(
+        "CSeq: {}\r\n",
+        msg.header("CSeq").unwrap_or_default()
+    ));
+    out.push_str("Contact: <sip:uas@127.0.0.1>\r\nContent-Length: 0\r\n\r\n");
+    out.into_bytes()
+}
+
+fn run_sipr(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .args(args)
+        .output()
+        .expect("spawn sipr")
+}
+
+#[test]
+fn embedded_uac_flow_completes_against_scripted_uas() {
+    let (addr, uas) = spawn_uas(Duration::from_secs(3));
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-r",
+        "10",
+        "-m",
+        "5",
+        "-d",
+        "50",
+        "-timeout",
+        "20",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "expected success; stderr:\n{err}"
+    );
+    assert!(
+        err.contains("created 5 successful 5 failed 0"),
+        "summary mismatch:\n{err}"
+    );
+    let uas_stats = uas.join().expect("uas thread");
+    assert_eq!(uas_stats.invites, 5, "{uas_stats:?}");
+    assert_eq!(uas_stats.byes, 5, "{uas_stats:?}");
+}
+
+#[test]
+fn rate_and_limit_are_respected() {
+    // -l 1 with a slow pause means calls serialize; -m 3 still completes.
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-r",
+        "50",
+        "-l",
+        "1",
+        "-m",
+        "3",
+        "-d",
+        "30",
+        "-timeout",
+        "20",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 3 failed 0"), "{err}");
+}
+
+#[test]
+fn silence_leads_to_failed_calls_and_exit_1() {
+    // Nothing listens on this socket (we bind it and never read).
+    let dead = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = dead.local_addr().expect("addr");
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-m",
+        "1",
+        "-nr",
+        "-timeout",
+        "1",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{err}");
+    assert!(err.contains("failed 1"), "{err}");
+}
+
+#[test]
+fn retransmissions_fire_when_first_invite_is_lost() {
+    // A UAS that ignores the first INVITE per branch: the call only
+    // completes because the retransmission arrives.
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut seen: HashMap<String, u32> = HashMap::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let branch = msg.top_via_branch().unwrap_or_default().to_owned();
+                    let count = seen.entry(branch).or_insert(0);
+                    *count += 1;
+                    if *count >= 2 {
+                        let _ = sock.send_to(&mirror_response(&msg, "200 OK", true), from);
+                    } // first INVITE: deliberately ignored
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+    });
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-m",
+        "1",
+        "-d",
+        "30",
+        "-timeout",
+        "20",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(err.contains("retrans-sent"), "{err}");
+    drop(uas);
+}
