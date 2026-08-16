@@ -27,7 +27,18 @@ APIs; scenario IR types must not leak rsip types (templates are raw bytes + slot
 
 ## 2. Runtime model
 
-Tokio multi-threaded runtime. The moving parts:
+> **As built (M2): std-only, no tokio.** The build environment cannot reach
+> crates.io, and SIPp's own architecture is a single event loop — so the
+> runtime is dedicated std threads (UDP recv loop, timer thread, later the
+> pacer) all sending into ONE `mpsc` channel drained by the engine's event
+> loop thread. The diagram below still describes the moving parts accurately;
+> read "task" as "thread". The pure logic (TimerQueue, RetransSchedule,
+> Inbound parsing, call state machines) is driver-agnostic: if tokio joins
+> the workspace later, only the thin thread drivers in `sipr-net` change.
+> Multi-core scaling comes from sharding engine loops (N loops × 1 socket
+> each with `SO_REUSEPORT`), not from a work-stealing runtime.
+
+The moving parts:
 
 ```
                     ┌────────────┐   rate ticks    ┌──────────────┐

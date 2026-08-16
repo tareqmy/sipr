@@ -39,14 +39,28 @@ unchecked *required* items (unchecked stretch items are fine, move them down).
       negative goldens for media/3PCC/unknown-element scenarios with expected
       error markers
 
-## M2 — Net + message layer
+## M2 — Net + message layer ✅
 
-- [ ] UDP transport: bind `-i`/`-p`, send/recv loops, rsip inbound parse,
-      Call-ID router, call table
-- [ ] Timer service: arm/cancel, pause timers, retransmission schedule
-      (T1→T2 doubling, `retrans` override, max-retrans cap), recv timeouts
-- [ ] `lost` simulation on send/recv paths
-- [ ] proptest: no panic on arbitrary inbound datagrams
+- [x] UDP transport: bind `-i`/`-p`, recv loop, inbound parse, Call-ID
+      routing fields, sharded call table. NOTES: (a) inbound parsing is an
+      in-tree lazy parser (`sipr-net/src/message.rs`) instead of rsip —
+      start-line classification, compact forms, folding, Call-ID/CSeq/
+      branch/tags — panic-free on arbitrary bytes; (b) runtime is std-only
+      threads feeding one mpsc event channel (SIPp's single-event-loop
+      shape) instead of tokio — see the note in ARCHITECTURE §2; pure logic
+      (TimerQueue, RetransSchedule, Inbound) is driver-agnostic if tokio
+      lands later.
+- [x] Timer service: pure `TimerQueue` (arm/cancel/pop_due, unit-tested
+      without sleeping) + condvar thread driver; retransmission schedule
+      with T1→T2 doubling, `retrans` override (incl. `retrans="0"` = off,
+      base > T2 respected), max-retrans cap, `-nr` kill switch
+- [x] `lost` simulation on send and recv paths (deterministic seeded
+      xorshift; per-send override beats transport default)
+- [x] No panic on arbitrary inbound datagrams: deterministic fuzz-style
+      suite (`tests/no_panic.rs`) — random bytes, random ASCII, all
+      truncations, single-byte mutations, pathological shapes. proptest is
+      unavailable in this build env; the seeded equivalent is reproducible
+      by construction.
 
 ## M3 — UAC end to end  ← first interop milestone
 
