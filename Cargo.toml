@@ -8,18 +8,21 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["tareqmy"]
 repository = "https://github.com/tareqmy/sipr"
+homepage = "https://github.com/tareqmy/sipr"
 license = "MIT"
+keywords = ["sip", "sipp", "voip", "load-testing", "telephony"]
+categories = ["network-programming", "command-line-utilities", "development-tools::testing"]
 
 [workspace.dependencies]
-# Internal crates. External crates from the sanctioned set
-# (docs/CONVENTIONS.md §Dependencies) are added here when a milestone first
-# needs them.
-sipr-scenario = { path = "crates/sipr-scenario" }
-sipr-net = { path = "crates/sipr-net" }
-sipr-engine = { path = "crates/sipr-engine" }
-sipr-auth = { path = "crates/sipr-auth" }
-sipr-stats = { path = "crates/sipr-stats" }
-sipr-tui = { path = "crates/sipr-tui" }
+# Internal crates (path + version so each is publishable to crates.io).
+# External crates from the sanctioned set (docs/CONVENTIONS.md §Dependencies)
+# are added here when a milestone first needs them.
+sipr-scenario = { path = "crates/sipr-scenario", version = "0.1.0" }
+sipr-net = { path = "crates/sipr-net", version = "0.1.0" }
+sipr-engine = { path = "crates/sipr-engine", version = "0.1.0" }
+sipr-auth = { path = "crates/sipr-auth", version = "0.1.0" }
+sipr-stats = { path = "crates/sipr-stats", version = "0.1.0" }
+sipr-tui = { path = "crates/sipr-tui", version = "0.1.0" }
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -38,7 +41,11 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
 
 [dependencies]
 sipr-scenario = { workspace = true }

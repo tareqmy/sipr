@@ -2,6 +2,13 @@
   <img src="brand/logo/lockup-1600.png" alt="sipr" width="360">
 </p>
 
+<p align="center">
+  <a href="https://github.com/tareqmy/sipr/actions/workflows/ci.yml"><img src="https://github.com/tareqmy/sipr/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-B7410E" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/rust-1.85%2B-B7410E" alt="Rust 1.85+">
+  <img src="https://img.shields.io/badge/dependencies-std--only-5E7A52" alt="std-only">
+</p>
+
 # sipr
 
 A SIPp-like SIP testing tool and traffic generator, written in Rust.
@@ -13,6 +20,17 @@ dashboard. Think `sipp -sn uac -r 50`, rebuilt in safe, dependency-free Rust.
 **Status: v1 feature-complete for signaling over UDP.** In loopback benchmarks
 it sustains tens of thousands of calls per second with zero failures — see
 `benches/BASELINES.md`.
+
+## Install
+
+sipr builds from source with a stock Rust toolchain (1.85+), no external
+crates or system libraries required:
+
+```sh
+git clone https://github.com/tareqmy/sipr && cd sipr
+cargo build --release        # binary at target/release/sipr
+cargo install --path .       # or install it onto your PATH
+```
 
 ## Quick start
 
