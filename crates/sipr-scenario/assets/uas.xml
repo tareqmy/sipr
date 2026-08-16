@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- sipr embedded 'uas' scenario: the classic UAS responder flow, kept      -->
+<!-- functionally identical to SIPp's default uas scenario so sipr and sipp  -->
+<!-- interoperate out of the box:                                            -->
+<!--                                                                         -->
+<!--   INVITE -> 180 -> 200 -> [ACK] -> BYE -> 200 -> timewait               -->
+<!--                                                                         -->
+<!-- [last_X:] copies header X verbatim from the last received message; the  -->
+<!-- UAS side mirrors Via/From/To/Call-ID/CSeq that way and adds its To tag. -->
+
+<scenario name="Basic UAS responder">
+  <recv request="INVITE" crlf="true"/>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 180 Ringing
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPrTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_Record-Route:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPrTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0
+      a=rtpmap:0 PCMU/8000
+
+    ]]>
+  </send>
+
+  <recv request="ACK" optional="true" rtd="true" crlf="true"/>
+
+  <recv request="BYE"/>
+
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- linger so a lost 200-to-BYE can be answered again on retransmission -->
+  <timewait milliseconds="4000"/>
+
+  <!-- response time and call length histogram buckets, in milliseconds -->
+  <ResponseTimeRepartition value="10, 20, 30, 40, 50, 100, 150, 200"/>
+  <CallLengthRepartition value="10, 50, 100, 500, 1000, 5000, 10000"/>
+
+</scenario>

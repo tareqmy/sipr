@@ -1,0 +1,13 @@
+[package]
+name = "sipr-auth"
+description = "sipr: digest authentication (RFC 2617/7616) backing the [authentication] keyword"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

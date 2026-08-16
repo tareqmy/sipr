@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- sipr embedded 'uac' scenario: the classic Sipstone UAC flow, kept       -->
+<!-- functionally identical to SIPp's default uac scenario (same steps,      -->
+<!-- attributes, and keywords) so sipr and sipp interoperate out of the box: -->
+<!--                                                                         -->
+<!--   INVITE -> [100] [180] [183] -> 200 -> ACK -> pause -> BYE -> 200      -->
+<!--                                                                         -->
+<!-- The <pause/> duration comes from the -d option (default 3000 ms).      -->
+
+<scenario name="Basic Sipstone UAC">
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPrTag00[call_number]
+      To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: sip:sipr@[local_ip]:[local_port]
+      Max-Forwards: 70
+      Subject: Performance Test
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0
+      a=rtpmap:0 PCMU/8000
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+
+  <recv response="180" optional="true"/>
+
+  <recv response="183" optional="true"/>
+
+  <recv response="200" rtd="true"/>
+
+  <send>
+    <![CDATA[
+
+      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPrTag00[call_number]
+      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: sip:sipr@[local_ip]:[local_port]
+      Max-Forwards: 70
+      Subject: Performance Test
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <pause/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPrTag00[call_number]
+      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Contact: sip:sipr@[local_ip]:[local_port]
+      Max-Forwards: 70
+      Subject: Performance Test
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true"/>
+
+  <!-- response time and call length histogram buckets, in milliseconds -->
+  <ResponseTimeRepartition value="10, 20, 30, 40, 50, 100, 150, 200"/>
+  <CallLengthRepartition value="10, 50, 100, 500, 1000, 5000, 10000"/>
+
+</scenario>

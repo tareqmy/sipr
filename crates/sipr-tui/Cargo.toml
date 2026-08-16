@@ -1,0 +1,13 @@
+[package]
+name = "sipr-tui"
+description = "sipr: the ratatui live dashboard and key handling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

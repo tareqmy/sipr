@@ -79,6 +79,46 @@ acceptance tests.
   `docs/CONVENTIONS.md` §Dependencies. Adding a new crate requires a stated reason
   in the PR/commit description.
 
+## Engineering principles
+
+- **Prioritize readability over cleverness.** Write code that clearly
+  communicates intent. Code is read far more often than it is written: use
+  descriptive names, keep functions small and single-purposed, and follow the
+  project's style conventions instead of writing dense one-liners.
+- **Write automated tests early.** Cover core logic and edge cases with unit
+  and integration tests as the code lands, not after. Tests reduce regressions,
+  act as living documentation, and buy the confidence to refactor aggressively
+  (see `docs/TESTING.md` for the required layers per crate).
+- **Practice strict version-control hygiene.** Small, atomic commits with
+  clear, imperative messages explaining the *why*, not just the *what*
+  (Conventional Commits, per `docs/CONVENTIONS.md`). Keep branches short-lived
+  and review changes thoroughly before they reach `main`.
+- **Avoid premature optimization (YAGNI).** Build what is needed for the
+  current milestone rather than engineering for hypothetical futures. Implement
+  the simplest solution that works, profile actual bottlenecks with data
+  (criterion benches, M3+), and optimize only when necessary. The documented
+  hot-path rules in `docs/ARCHITECTURE.md` §3 are the *measured-by-design*
+  exception, not a license to micro-optimize elsewhere.
+- **Design defensively and fail gracefully.** Never trust external input —
+  inbound datagrams, scenario files, injection CSVs, CLI values. Validate at
+  the boundaries, use structured error handling (typed errors, no swallowed
+  failures), log actionable context, and fail without leaking internals.
+  Remember the test-tool nuance: *outbound* scenario traffic may deliberately
+  violate the SIP RFCs; defensiveness applies to what we *accept*, not what
+  scenarios choose to send.
+
+Core refactoring strategies:
+
+- **Extract method.** If a block inside a function needs a comment to explain
+  *what* it does, extract it into a helper named after that intent.
+- **Use guard clauses.** Return early on invalid input and edge cases instead
+  of nesting the happy path inside `if` pyramids.
+- **Favor composition over inheritance.** In Rust terms: no god-objects or
+  deep trait hierarchies — inject small, focused types (services, strategies)
+  to handle specific behaviors, and keep trait bounds narrow. `call.cpp` in
+  SIPp grew to 300KB by absorbing every concern; the crate boundaries exist so
+  that never happens here.
+
 ## Workflow
 
 - Work in small, compilable increments; keep `main` green.

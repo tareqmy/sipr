@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["tareqmy"]
+repository = "https://github.com/tareqmy/sipr"
+
+[workspace.dependencies]
+# Internal crates. External crates from the sanctioned set
+# (docs/CONVENTIONS.md §Dependencies) are added here when a milestone first
+# needs them.
+sipr-scenario = { path = "crates/sipr-scenario" }
+sipr-net = { path = "crates/sipr-net" }
+sipr-engine = { path = "crates/sipr-engine" }
+sipr-auth = { path = "crates/sipr-auth" }
+sipr-stats = { path = "crates/sipr-stats" }
+sipr-tui = { path = "crates/sipr-tui" }
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+print_stdout = "allow"
+
+[package]
+name = "sipr"
+description = "A SIPp-like SIP testing tool and traffic generator, written in Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+sipr-scenario = { workspace = true }
+
+[lints]
+workspace = true

@@ -58,6 +58,11 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 with injection files) `[date]` `[timestamp]` `[cseq+n]`-style arithmetic if
 present in corpus scenarios (verify against C++).
 
+Media placeholders `[media_ip]` `[media_port]` `[media_ip_type]` appear in the
+default uac/uas scenarios' SDP bodies, so the keyword engine must substitute
+them in v1 even though no media flows: SIPp sources them from `-mi`/`-mp`
+(defaulting media_ip to the local IP). Pin exact defaults at M3.
+
 Keyword parameters use SIPp syntax `[keyword param=value]`. Unknown keywords:
 loud warning + left verbatim in the message (match SIPp behavior — verify in
 C++ and record below).

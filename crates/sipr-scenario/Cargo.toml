@@ -1,0 +1,13 @@
+[package]
+name = "sipr-scenario"
+description = "sipr: scenario model — SIPp-compatible XML parsing, keywords, actions, embedded default scenarios"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

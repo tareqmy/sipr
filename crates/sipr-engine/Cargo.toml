@@ -1,0 +1,13 @@
+[package]
+name = "sipr-engine"
+description = "sipr: the per-call state machine, call table, pacer, and dialog bookkeeping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

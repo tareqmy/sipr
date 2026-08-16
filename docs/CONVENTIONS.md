@@ -2,8 +2,9 @@
 
 ## Rust
 
-- Edition 2021+, MSRV = latest stable minus 2 (record actual MSRV in root
-  Cargo.toml once M0 lands). `#![forbid(unsafe_code)]` in every crate.
+- Edition 2024, MSRV = 1.85 (`rust-version` in the root Cargo.toml). Unsafe
+  code is forbidden workspace-wide (`[workspace.lints.rust] unsafe_code =
+  "forbid"`; every crate sets `[lints] workspace = true`).
 - `rustfmt` with default settings — no local style debates. `cargo clippy
   --workspace --all-targets -- -D warnings` must pass; `#[allow]` requires an
   adjacent comment justifying it.
@@ -41,10 +42,14 @@
 
 ## Dependencies
 
-Sanctioned: `tokio`, `tokio-util`, `rsip`, `quick-xml`, `clap`, `ratatui`,
+Sanctioned: `tokio`, `tokio-util`, `rsip`, `quick-xml`, `ratatui`,
 `crossterm`, `regex`, `hdrhistogram`, `thiserror`, `anyhow`, `tracing`,
 `tracing-subscriber`, `rand`, `md-5`, `sha2`, `dashmap`, `arc-swap`, `bytes`,
-and for tests `proptest`, `criterion`, `assert_cmd`, `tempfile`.
+and for tests `proptest`, `criterion`, `assert_cmd`, `tempfile`. Add them to
+`[workspace.dependencies]` when a milestone first needs them. The CLI is a
+deliberate exception: `src/cli.rs` is a bespoke table-driven parser (not clap)
+because SIPp's single-dash multi-char flags don't fit clap's model — extend
+the `FLAGS` table there rather than introducing clap.
 Anything else: state the reason in the commit/PR description. Prefer std over a
 crate for trivial needs. No crates with native/C dependencies without discussion
 (portability is a selling point vs SIPp's build).

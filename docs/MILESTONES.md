@@ -4,15 +4,20 @@ Live tracking document. Check items in the same commit that completes them.
 Rationale and detail: `PLAN.md` §4. Do not start milestone N+1 while N has
 unchecked *required* items (unchecked stretch items are fine, move them down).
 
-## M0 — Scaffolding
+## M0 — Scaffolding ✅
 
-- [ ] Workspace + six crates compile empty; `#![forbid(unsafe_code)]` everywhere
-- [ ] clap CLI accepts the v1 flag set (SIPP_COMPAT §3) with help text; unknown
-      flags error out with suggestion
-- [ ] `-sn uac|uas` selects embedded default scenarios (ported from SIPp `-sd`
-      output; stored as assets); `-sd` prints them
-- [ ] CI: fmt + clippy(-D warnings) + test on push
-- [ ] `rust-toolchain.toml`, MSRV recorded in CONVENTIONS.md
+- [x] Workspace + six crates compile empty; `#![forbid(unsafe_code)]` everywhere
+      (workspace lint, `unsafe_code = "forbid"`)
+- [x] CLI accepts the v1 flag set (SIPP_COMPAT §3) with help text; unknown
+      flags error out with a did-you-mean suggestion. NOTE: implemented as a
+      bespoke table-driven parser in `src/cli.rs`, not clap — SIPp's
+      single-dash multi-char flags (`-sf`, `-trace_msg`) can't be expressed in
+      clap without an argv-rewriting shim, and zero deps keeps M0 buildable
+      anywhere. Revisit only if flag complexity outgrows the table.
+- [x] `-sn uac|uas` selects embedded default scenarios (clean-room ports of
+      SIPp's defaults, `crates/sipr-scenario/assets/`); `-sd` prints them
+- [x] CI: fmt + clippy(-D warnings) + test on push
+- [x] `rust-toolchain.toml`, MSRV (1.85) recorded in CONVENTIONS.md
 
 ## M1 — Scenario front end
 
