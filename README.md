@@ -71,3 +71,12 @@ Everything is built on the Rust standard library only — no external crates.
 TCP/TLS transports, `-inf` injection files (and the `lookup`/`insert`/`replace`
 actions that depend on them), 3PCC (`sendCmd`/`recvCmd`), RTP/pcap media, IPv6,
 and an HTTP control API.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
+
+Note: sipr is an independent clean-room reimplementation. The original SIPp is
+GPL-licensed; no SIPp source is copied into this project — only its scenario
+format and observable behavior are reproduced, which are not themselves subject
+to copyright.

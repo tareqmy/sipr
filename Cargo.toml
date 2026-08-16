@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["tareqmy"]
 repository = "https://github.com/tareqmy/sipr"
+license = "MIT"
 
 [workspace.dependencies]
 # Internal crates. External crates from the sanctioned set
@@ -37,6 +38,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 sipr-scenario = { workspace = true }
