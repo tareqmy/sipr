@@ -308,6 +308,41 @@ fn run_one(
             sipr_scenario::model::IntCmd::StopGracefully => ActionOutcome::StopGracefully,
             sipr_scenario::model::IntCmd::StopNow => ActionOutcome::StopNow,
         },
+        Action::Lookup {
+            file,
+            key,
+            assign_to,
+        } => {
+            let file = render_with_store(file, store, base_ctx);
+            let key = render_with_store(key, store, base_ctx);
+            match base_ctx.fields.lookup_line(&file, &key) {
+                Ok(line) => {
+                    store.set(*assign_to, Value::Num(line));
+                    ActionOutcome::Continue
+                }
+                Err(e) => ActionOutcome::FailCall(e),
+            }
+        }
+        Action::Insert { file, value } => {
+            let file = render_with_store(file, store, base_ctx);
+            let value = render_with_store(value, store, base_ctx);
+            match base_ctx.fields.insert_line(&file, &value) {
+                Ok(()) => ActionOutcome::Continue,
+                Err(e) => ActionOutcome::FailCall(e),
+            }
+        }
+        Action::Replace { file, line, value } => {
+            let file = render_with_store(file, store, base_ctx);
+            let line_s = render_with_store(line, store, base_ctx);
+            let value = render_with_store(value, store, base_ctx);
+            let Ok(line_n) = line_s.trim().parse::<usize>() else {
+                return ActionOutcome::FailCall(format!("replace: invalid line number '{line_s}'"));
+            };
+            match base_ctx.fields.replace_line(&file, line_n, &value) {
+                Ok(()) => ActionOutcome::Continue,
+                Err(e) => ActionOutcome::FailCall(e),
+            }
+        }
     }
 }
 

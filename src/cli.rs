@@ -80,6 +80,8 @@ pub struct Cli {
     pub max_retrans: Option<u32>,
     /// `-inf`: injection files (CSV) for `[fieldN]`; repeatable, in order.
     pub inf: Vec<std::path::PathBuf>,
+    /// `-infindex FILE FIELD`: build a `<lookup>` index; repeatable.
+    pub inf_index: Vec<(String, usize)>,
 }
 
 impl Default for Cli {
@@ -115,6 +117,7 @@ impl Default for Cli {
             call_id_format: None,
             max_retrans: None,
             inf: Vec::new(),
+            inf_index: Vec::new(),
         }
     }
 }
@@ -241,6 +244,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "FILE",
         "Injection file (CSV) for [fieldN]; repeatable",
     ),
+    (
+        "infindex",
+        true,
+        "FILE FIELD",
+        "Index an -inf file on FIELD for <lookup>; repeatable",
+    ),
     ("h", false, "", "Print help"),
     ("help", false, "", "Print help"),
     ("v", false, "", "Print version"),
@@ -282,6 +291,20 @@ where
             "h" | "help" => return Ok(Invocation::Help),
             "v" | "version" => return Ok(Invocation::Version),
             _ => {}
+        }
+        // -infindex is the one two-argument flag: FILE then FIELD.
+        if name == "infindex" {
+            let file = inline_value
+                .or_else(|| args.next())
+                .ok_or_else(|| "option '-infindex' requires FILE and FIELD".to_owned())?;
+            let field_s = args
+                .next()
+                .ok_or_else(|| "option '-infindex' requires a FIELD after FILE".to_owned())?;
+            let field = field_s.parse::<usize>().map_err(|_| {
+                format!("option '-infindex' FIELD must be a number, got '{field_s}'")
+            })?;
+            cli.inf_index.push((file, field));
+            continue;
         }
         let Some((flag, takes_value, ..)) = flag_spec(name) else {
             let mut msg = format!("unknown option '-{name}'");

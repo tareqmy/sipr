@@ -175,8 +175,25 @@ on a machine with sipp to close them.
 - [x] SIPP_COMPAT §6 documents the injection semantics and the deferral of
       `lookup`/`insert`/`replace` (indexed-file mutation needs the file store).
 
+## M8 — Indexed injection: lookup / insert / replace ✅
+
+- [x] `-infindex FILE FIELD` builds a key→line index over one field of an
+      `-inf` file (matched by basename, SIPp-style); duplicate keys resolve to
+      the last line. Index/lookup/insert/replace live in
+      `sipr-scenario/src/inject.rs` (pure) with `RefCell`-wrapped files in the
+      engine so `[fieldN]` reads and `insert`/`replace` mutations share them on
+      the one event-loop thread.
+- [x] `<lookup assign_to=… file=… key=…/>` stores the matched line (or -1),
+      `<insert file=… value=…/>` appends, `<replace file=… line=… value=…/>`
+      swaps — all with rendered-template arguments (`compile.rs`, executed in
+      `sipr-engine/src/actions.rs`).
+- [x] `[fieldN]` gained SIPp-faithful selectors: `file=NAME` (basename key, or
+      a numeric `-inf` index as a sipr extension) and `line=EXPR` rendered at
+      send time — `line=[$var]` is what makes `lookup` usable. The tokenizer
+      now balances nested brackets to parse `line=[$1]`. Verified end-to-end
+      (`tests/e2e.rs::lookup_reads_indexed_field_by_key`). SIPP_COMPAT §6.
+
 ## Post-v1 backlog (ordered)
 
-`lookup`/`insert`/`replace` (indexed injection) → TCP → TLS → 3PCC
-(`sendCmd`/`recvCmd`) → `-users` closed loop → pcap/RTP media (study gossipper
-first) → AKA auth → IPv6 → HTTP control API.
+TCP → TLS → 3PCC (`sendCmd`/`recvCmd`) → `-users` closed loop → pcap/RTP media
+(study gossipper first) → AKA auth → IPv6 → HTTP control API.

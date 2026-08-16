@@ -22,10 +22,22 @@ pub enum InjectMode {
 pub struct InjectionFile {
     /// Selection mode from the header line.
     pub mode: InjectMode,
-    /// Display name (the path as given on the CLI).
+    /// Display name (the CLI basename SIPp keys `inFiles` by).
     pub name: String,
     /// Rows, each already split into fields on `;`.
     rows: Vec<Vec<String>>,
+    /// Optional `-infindex` index (field number + key→line map). SIPp keeps the
+    /// last line for each duplicate key; we do too (`HashMap::insert`).
+    index: Option<InjectIndex>,
+}
+
+/// A `-infindex` index over one field of an injection file.
+#[derive(Debug, Clone)]
+struct InjectIndex {
+    /// The 0-based field the key is drawn from.
+    field: usize,
+    /// key → line number (last writer wins, matching SIPp's `reIndex`).
+    map: std::collections::HashMap<String, usize>,
 }
 
 impl InjectionFile {
@@ -76,6 +88,7 @@ impl InjectionFile {
             mode,
             name: name.to_owned(),
             rows,
+            index: None,
         })
     }
 
@@ -96,6 +109,93 @@ impl InjectionFile {
     #[must_use]
     pub fn field(&self, line: usize, field: usize) -> Option<&str> {
         self.rows.get(line)?.get(field).map(String::as_str)
+    }
+
+    /// The index key for `line` — its `field`-th value, or `""` when the field
+    /// is missing (SIPp's `getField` yields an empty string, which is indexed).
+    fn key_at(&self, line: usize, field: usize) -> String {
+        self.rows
+            .get(line)
+            .and_then(|r| r.get(field))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Build an index on `field` (SIPp `-infindex FILE FIELD`). Rebuildable;
+    /// duplicate keys resolve to the last line, matching SIPp.
+    pub fn build_index(&mut self, field: usize) {
+        let mut map = std::collections::HashMap::with_capacity(self.rows.len());
+        for line in 0..self.rows.len() {
+            map.insert(self.key_at(line, field), line);
+        }
+        self.index = Some(InjectIndex { field, map });
+    }
+
+    /// Whether `-infindex` has been applied to this file.
+    #[must_use]
+    pub fn is_indexed(&self) -> bool {
+        self.index.is_some()
+    }
+
+    /// Look up the line number whose indexed field equals `key`. `None` on a
+    /// miss (SIPp's `lookup` returns -1). Callers must check [`Self::is_indexed`]
+    /// first — SIPp errors when looking up an unindexed file.
+    #[must_use]
+    pub fn lookup(&self, key: &str) -> Option<usize> {
+        self.index.as_ref()?.map.get(key).copied()
+    }
+
+    /// Append a data row from a raw `;`-separated line (SIPp `insert`). Splits
+    /// like [`Self::parse`] and reindexes the new line when indexed.
+    pub fn insert(&mut self, value: &str) {
+        self.rows
+            .push(value.split(';').map(str::to_owned).collect());
+        self.reindex(self.rows.len() - 1);
+    }
+
+    /// Replace line `line` (0-based) with a raw `;`-separated `value` (SIPp
+    /// `replace`). Re-indexes around the change.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `line` is past the end of the file.
+    pub fn replace(&mut self, line: usize, value: &str) -> Result<(), String> {
+        if line >= self.rows.len() {
+            return Err(format!(
+                "injection file {}: replace line {line} out of range ({} lines)",
+                self.name,
+                self.rows.len()
+            ));
+        }
+        self.deindex(line);
+        self.rows[line] = value.split(';').map(str::to_owned).collect();
+        self.reindex(line);
+        Ok(())
+    }
+
+    /// (Re)point the index entry for `line` at `line`. No-op when unindexed.
+    fn reindex(&mut self, line: usize) {
+        let Some(field) = self.index.as_ref().map(|i| i.field) else {
+            return;
+        };
+        let key = self.key_at(line, field);
+        if let Some(idx) = self.index.as_mut() {
+            idx.map.insert(key, line);
+        }
+    }
+
+    /// Drop `line`'s index entry, but only if it still maps to `line` (SIPp's
+    /// `deIndex` guards against clobbering a duplicate key's later winner).
+    fn deindex(&mut self, line: usize) {
+        let Some(field) = self.index.as_ref().map(|i| i.field) else {
+            return;
+        };
+        let key = self.key_at(line, field);
+        if let Some(idx) = self.index.as_mut()
+            && idx.map.get(&key) == Some(&line)
+        {
+            idx.map.remove(&key);
+        }
     }
 }
 
@@ -147,5 +247,54 @@ mod tests {
         assert!(InjectionFile::parse("x", "NONSENSE\na\n").is_err());
         assert!(InjectionFile::parse("x", "SEQUENTIAL\n").is_err()); // no rows
         assert!(InjectionFile::parse("x", "SEQUENTIAL PRINTF=5\na\n").is_err());
+    }
+
+    #[test]
+    fn index_and_lookup_last_key_wins() {
+        let mut f = InjectionFile::parse("u.csv", SAMPLE).unwrap();
+        assert!(!f.is_indexed());
+        assert_eq!(f.lookup("alice"), None, "no index yet");
+        f.build_index(0);
+        assert!(f.is_indexed());
+        assert_eq!(f.lookup("alice"), Some(0));
+        assert_eq!(f.lookup("carol"), Some(2));
+        assert_eq!(f.lookup("nobody"), None, "miss");
+
+        // Duplicate keys: the later line wins, matching SIPp's reIndex.
+        let mut d = InjectionFile::parse("d", "SEQUENTIAL\nk;v1\nk;v2\n").unwrap();
+        d.build_index(0);
+        assert_eq!(d.lookup("k"), Some(1));
+    }
+
+    #[test]
+    fn insert_appends_and_reindexes() {
+        let mut f = InjectionFile::parse("u", "SEQUENTIAL\na;1\n").unwrap();
+        f.build_index(0);
+        f.insert("b;2");
+        assert_eq!(f.len(), 2);
+        assert_eq!(f.field(1, 1), Some("2"));
+        assert_eq!(f.lookup("b"), Some(1), "new row is indexed");
+    }
+
+    #[test]
+    fn replace_swaps_row_and_moves_index() {
+        let mut f = InjectionFile::parse("u", "SEQUENTIAL\na;1\nb;2\n").unwrap();
+        f.build_index(0);
+        f.replace(0, "c;9").unwrap();
+        assert_eq!(f.field(0, 0), Some("c"));
+        assert_eq!(f.lookup("c"), Some(0), "new key indexed");
+        assert_eq!(f.lookup("a"), None, "old key dropped");
+        assert_eq!(f.lookup("b"), Some(1), "untouched key intact");
+        assert!(f.replace(9, "z").is_err(), "out of range");
+    }
+
+    #[test]
+    fn mutation_without_index_is_inert() {
+        let mut f = InjectionFile::parse("u", "SEQUENTIAL\na;1\n").unwrap();
+        f.insert("b;2");
+        f.replace(0, "c;3").unwrap();
+        assert_eq!(f.field(0, 0), Some("c"));
+        assert_eq!(f.field(1, 0), Some("b"));
+        assert_eq!(f.lookup("c"), None, "unindexed lookups always miss");
     }
 }

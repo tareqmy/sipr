@@ -349,6 +349,32 @@ pub enum Action {
     },
     /// Internal command.
     ExecInt(IntCmd),
+    /// Look up a key in an indexed injection file; store the matched line
+    /// number (or -1 on a miss) into a variable.
+    Lookup {
+        /// Injection file, by name (rendered).
+        file: MsgTemplate,
+        /// Key to look up (rendered).
+        key: MsgTemplate,
+        /// Destination variable for the line number.
+        assign_to: VarId,
+    },
+    /// Append a rendered `;`-separated line to an injection file.
+    Insert {
+        /// Injection file, by name (rendered).
+        file: MsgTemplate,
+        /// The new line (rendered).
+        value: MsgTemplate,
+    },
+    /// Replace a line of an injection file with a rendered value.
+    Replace {
+        /// Injection file, by name (rendered).
+        file: MsgTemplate,
+        /// Line number to replace (rendered, then parsed).
+        line: MsgTemplate,
+        /// Replacement line (rendered).
+        value: MsgTemplate,
+    },
 }
 
 /// A compiled scenario.
@@ -485,7 +511,12 @@ fn keyword_name(k: &Keyword) -> String {
         Keyword::Last(h) => return format!("[last_{h}:]"),
         Keyword::Var(v) => return format!("[${v}]"),
         Keyword::Unknown(u) => return format!("[{u}]"),
-        Keyword::Field { index, file, .. } => return format!("[field{index} file={file}]"),
+        Keyword::Field { index, file, .. } => {
+            return match file {
+                Some(f) => format!("[field{index} file={f}]"),
+                None => format!("[field{index}]"),
+            };
+        }
         Keyword::Authentication(_) => "authentication",
         Keyword::Service => "service",
         Keyword::RemoteIp => "remote_ip",

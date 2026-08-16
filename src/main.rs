@@ -143,6 +143,7 @@ fn run(cli: &Cli) -> ExitCode {
         }),
         stat_interval: std::time::Duration::from_secs(cli.stat_interval_s.unwrap_or(1)),
         inf_files: cli.inf.clone(),
+        inf_index: cli.inf_index.clone(),
     };
     // Live TUI when attached to a terminal (and not headless/lint mode).
     let use_tui = {

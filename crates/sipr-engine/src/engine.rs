@@ -77,6 +77,9 @@ pub struct EngineConfig {
     pub stat_interval: Duration,
     /// `-inf`: injection-file paths (CSV) for `[fieldN]`, in order.
     pub inf_files: Vec<std::path::PathBuf>,
+    /// `-infindex FILE FIELD`: build a lookup index on `FIELD` of the injection
+    /// file named `FILE` (matched by basename), enabling `<lookup>`.
+    pub inf_index: Vec<(String, usize)>,
 }
 
 /// Final counters of a run.
@@ -285,29 +288,6 @@ pub fn run_with_ui(
     ui: Option<UiChannels>,
 ) -> Result<(RunReport, EngineControl), EngineError> {
     validate_for_engine(scenario)?;
-    // A scenario using [fieldN file=K] needs at least K+1 `-inf` files.
-    let max_file = scenario
-        .steps
-        .iter()
-        .filter_map(|s| match s {
-            Step::Send(send) => Some(&send.template),
-            _ => None,
-        })
-        .flat_map(sipr_scenario::template::MsgTemplate::keywords)
-        .filter_map(|k| match k {
-            Keyword::Field { file, .. } => Some(*file),
-            _ => None,
-        })
-        .max();
-    if let Some(max_file) = max_file {
-        if max_file >= config.inf_files.len() {
-            return Err(EngineError(format!(
-                "scenario uses [field... file={max_file}] but only {} injection \
-                 file(s) were given with -inf",
-                config.inf_files.len()
-            )));
-        }
-    }
     if scenario.role == Role::Uac && config.target.is_none() {
         return Err(EngineError(
             "this scenario places calls (UAC): a remote target is required".into(),
@@ -330,7 +310,7 @@ struct Engine<'s> {
     trace_msg: Option<sipr_stats::TraceFile>,
     trace_err: Option<sipr_stats::TraceFile>,
     trace_stat: Option<sipr_stats::TraceFile>,
-    inf_files: Vec<InjectionFile>,
+    inf_files: Vec<std::cell::RefCell<InjectionFile>>,
     inf_seq: Vec<usize>,
     rng: sipr_net::rng::Rng,
     /// Per-step: CSeq method a response recv must carry (SIPp guard).
@@ -467,7 +447,8 @@ impl<'s> Engine<'s> {
             &scenario.call_length_repartition,
         );
         stat_set.init_steps(scenario.steps.iter().map(step_label).collect());
-        // Load -inf injection files up front (fail fast on bad files).
+        // Load -inf injection files up front (fail fast on bad files). SIPp
+        // keys files by basename; keyword `file=` and `-infindex` match that.
         let mut inf_files = Vec::with_capacity(config.inf_files.len());
         for path in &config.inf_files {
             let text = std::fs::read_to_string(path).map_err(|e| {
@@ -476,17 +457,31 @@ impl<'s> Engine<'s> {
                     path.display()
                 ))
             })?;
-            let file =
-                InjectionFile::parse(&path.display().to_string(), &text).map_err(EngineError)?;
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let file = InjectionFile::parse(&name, &text).map_err(EngineError)?;
             if file.mode == InjectMode::User {
                 eprintln!(
-                    "sipr: warning: injection file {} uses USER mode, which needs \
-                     -users (unsupported); its [fieldN] will render empty",
-                    path.display()
+                    "sipr: warning: injection file {name} uses USER mode, which needs \
+                     -users (unsupported); its [fieldN] will render empty"
                 );
             }
-            inf_files.push(file);
+            inf_files.push(std::cell::RefCell::new(file));
         }
+        // Apply -infindex: build the lookup index on the named file's field.
+        for (file_name, field) in &config.inf_index {
+            let cell = inf_files
+                .iter()
+                .find(|c| c.borrow().name == *file_name)
+                .ok_or_else(|| {
+                    EngineError(format!("-infindex: no injection file named '{file_name}'"))
+                })?;
+            cell.borrow_mut().build_index(*field);
+        }
+        // Reject scenarios whose [fieldN file=…] names a file we did not load.
+        validate_field_files(scenario, &inf_files)?;
         let inf_len = inf_files.len();
         Ok(Self {
             scenario,
@@ -707,7 +702,8 @@ impl<'s> Engine<'s> {
     /// Choose this call's line in each injection file, per its mode.
     fn assign_field_lines(&mut self) -> Vec<Option<usize>> {
         let mut out = Vec::with_capacity(self.inf_files.len());
-        for (i, file) in self.inf_files.iter().enumerate() {
+        for (i, cell) in self.inf_files.iter().enumerate() {
+            let file = cell.borrow();
             let n = file.len();
             let line = match file.mode {
                 _ if n == 0 => None,
@@ -1755,6 +1751,41 @@ fn validate_for_engine(scenario: &Scenario) -> Result<(), EngineError> {
                 return Err(EngineError(format!(
                     "step {i}: pause distribution '{kind}' is not implemented yet"
                 )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a scenario whose `[fieldN file=…]` names an injection file that was
+/// not loaded (SIPp errors at parse time). A bare name or a numeric index both
+/// count; `None` (default file) needs at least one `-inf`.
+fn validate_field_files(
+    scenario: &Scenario,
+    files: &[std::cell::RefCell<InjectionFile>],
+) -> Result<(), EngineError> {
+    let resolves = |spec: Option<&str>| -> bool {
+        match spec {
+            None => !files.is_empty(),
+            Some(s) => {
+                files.iter().any(|c| c.borrow().name == s)
+                    || s.parse::<usize>().is_ok_and(|i| i < files.len())
+            }
+        }
+    };
+    for step in &scenario.steps {
+        let Step::Send(send) = step else { continue };
+        for kw in send.template.keywords() {
+            if let Keyword::Field { file, .. } = kw
+                && !resolves(file.as_deref())
+            {
+                return Err(EngineError(match file {
+                    Some(f) => format!(
+                        "scenario uses [field... file={f}] but no injection file \
+                         named '{f}' was given with -inf"
+                    ),
+                    None => "scenario uses [fieldN] but no -inf file was given".to_owned(),
+                }));
             }
         }
     }

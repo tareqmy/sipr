@@ -318,12 +318,12 @@ fn dump_is_stable_and_informative() {
 
 #[test]
 fn field_keyword_tokenizes_with_file_and_line() {
-    use sipr_scenario::template::Keyword;
+    use sipr_scenario::template::{Keyword, LineExpr};
     let xml = wrap(&format!(
         r#"{invite}
            <send><![CDATA[
              ACK sip:[field0]@[remote_ip] SIP/2.0
-             X-Two: [field2 file=1]
+             X-Two: [field2 file=users.csv]
              X-Line: [field0 line=3]
              Call-ID: [call_id]
 
@@ -340,9 +340,38 @@ fn field_keyword_tokenizes_with_file_and_line() {
         .template
         .keywords()
         .filter_map(|k| match k {
-            Keyword::Field { index, file, line } => Some((*index, *file, *line)),
+            Keyword::Field { index, file, line } => Some((*index, file.clone(), line.clone())),
             _ => None,
         })
         .collect();
-    assert_eq!(fields, vec![(0, 0, None), (2, 1, None), (0, 0, Some(3))]);
+    assert_eq!(
+        fields,
+        vec![
+            (0, None, None),
+            (2, Some("users.csv".to_owned()), None),
+            (0, None, Some(LineExpr::Literal(3))),
+        ]
+    );
+}
+
+#[test]
+fn field_line_var_reads_the_selector_variable() {
+    // `[fieldN line=[$v]]` must (a) tokenize the nested variable selector and
+    // (b) count as a read of `v`, so the ereg that writes it is not flagged
+    // unused and `v` is not "read but never set".
+    let xml = wrap(&format!(
+        r#"{invite}
+           <recv response="200">
+             <action><ereg regexp="([0-9]+)" search_in="hdr" header="X:" assign_to="idx"/></action>
+           </recv>
+           <send><![CDATA[
+             ACK sip:x SIP/2.0
+             X-Var: [field0 line=[$idx]]
+             Call-ID: [call_id]
+
+           ]]></send>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
 }

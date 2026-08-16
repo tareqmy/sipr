@@ -12,10 +12,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   files: a `SEQUENTIAL`/`RANDOM`/`USER` mode header, `;`-separated fields,
   `#` comments, blank-line terminator. One line is drawn per call per file
   (SEQUENTIAL cycles, RANDOM picks uniformly, USER defers to `-users`). The
-  `[fieldN]` keyword substitutes field N of the drawn line, with sipr
-  extensions `[fieldN file=K]` (select the K-th `-inf`, 0-based) and
-  `[fieldN line=M]` (pin a literal line). Unknown field/file indices are
-  rejected at load. See `docs/SIPP_COMPAT.md` §6.
+  `[fieldN]` keyword substitutes field N of the drawn line. `file=NAME`
+  selects another file by its basename (SIPp's key), or by a 0-based `-inf`
+  index (sipr extension); `line=` overrides the per-call line and is rendered
+  at send time, so `line=[$var]` works. Unknown field/file names are rejected
+  at load. See `docs/SIPP_COMPAT.md` §6.
+- **Indexed injection** — `-infindex FILE FIELD` builds a key→line index over
+  one field of an `-inf` file (matched by basename; last line wins on
+  duplicate keys). Actions `<lookup assign_to=… file=… key=…/>` (stores the
+  matched line or -1), `<insert file=… value=…/>` (appends a row), and
+  `<replace file=… line=… value=…/>` (swaps a row) operate on that data at
+  runtime. The canonical use is `lookup → [fieldN line=[$var]]`.
 
 ## [0.1.0] — 2026-08-16
 

@@ -106,10 +106,15 @@ impl Compiler {
     /// Tokenize template text and record `[$var]` reads.
     fn templ(&mut self, text: &str, line: u32) -> MsgTemplate {
         let t = template::tokenize(text, line, &mut self.diags);
+        // `[$v]` reads, and `[fieldN line=[$v]]` reads its selector variable.
         let vars: Vec<String> = t
             .keywords()
             .filter_map(|k| match k {
                 Keyword::Var(v) => Some(v.clone()),
+                Keyword::Field {
+                    line: Some(template::LineExpr::Var(v)),
+                    ..
+                } => Some(v.clone()),
                 _ => None,
             })
             .collect();
@@ -873,7 +878,38 @@ impl Compiler {
                 };
                 Some(Action::ExecInt(cmd))
             }
-            "lookup" | "insert" | "replace" | "sample" | "setdest" | "index" => {
+            "lookup" => {
+                self.warn_unknown_attrs(el, &["assign_to", "file", "key"]);
+                let to = self.require_attr(el, "assign_to")?;
+                let file = self.require_attr(el, "file")?;
+                let key = self.require_attr(el, "key")?;
+                Some(Action::Lookup {
+                    file: self.templ(&file, line),
+                    key: self.templ(&key, line),
+                    assign_to: self.var_writes(&to),
+                })
+            }
+            "insert" => {
+                self.warn_unknown_attrs(el, &["file", "value"]);
+                let file = self.require_attr(el, "file")?;
+                let value = self.require_attr(el, "value")?;
+                Some(Action::Insert {
+                    file: self.templ(&file, line),
+                    value: self.templ(&value, line),
+                })
+            }
+            "replace" => {
+                self.warn_unknown_attrs(el, &["file", "line", "value"]);
+                let file = self.require_attr(el, "file")?;
+                let line_attr = self.require_attr(el, "line")?;
+                let value = self.require_attr(el, "value")?;
+                Some(Action::Replace {
+                    file: self.templ(&file, line),
+                    line: self.templ(&line_attr, line),
+                    value: self.templ(&value, line),
+                })
+            }
+            "sample" | "setdest" | "index" => {
                 self.diags.error(
                     Some(line),
                     format!(

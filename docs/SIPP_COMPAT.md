@@ -38,10 +38,13 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 
 ### v1.x tier (fast follow)
 
-`sendCmd`/`recvCmd` + `dest`/`src` (3PCC), `lookup`/`insert`/`replace`/`index`
-(they operate on `-inf` injection-file rows, so they land with injection
-files) + `[fieldN]`, `sample`, `setdest`, `exec command=` (external process),
-`start_txn`/`ack_txn`/`response_txn` (manual transaction naming).
+`sendCmd`/`recvCmd` + `dest`/`src` (3PCC), `sample`, `setdest`,
+`exec command=` (external process), `start_txn`/`ack_txn`/`response_txn`
+(manual transaction naming). `index` as a standalone action stays out — sipr
+builds the index from `-infindex` at load, not from a scenario action.
+
+`-inf` injection + `[fieldN]` and `lookup`/`insert`/`replace` shipped in M7
+(see §6).
 
 ### Later / with media & transports
 
@@ -195,8 +198,25 @@ Verify exact SIPp table before closing M3 and update this line.
   assigned ONE line per file at creation (`nextLine`): SEQUENTIAL = a shared
   per-file counter mod line-count, RANDOM = uniform pick, USER = userId-1
   (needs `-users`; without it the fields render empty — sipr warns at load).
-  `[fieldN]` uses the default (first) file; sipr adds `[fieldN file=K]`
-  (0-based `-inf` index) and `[fieldN line=M]` (literal line override).
-  `lookup`/`insert`/`replace` (indexed-file mutation) are NOT in this pass.
+  `[fieldN]` uses the default (first) file. `file=` selects another file by
+  its SIPp key — the BASENAME of the `-inf` path (`sipp.cpp`
+  `SIPP_OPTION_INPUT_FILE` strips the directory); sipr also accepts a 0-based
+  `-inf` index there as an extension. `line=` overrides the per-call line and,
+  per SIPp (`message.cpp` builds it as a `SendingMessage`, resolved in
+  `getFieldFromInputFile`), is rendered at send time — so `line=[$var]` works
+  and a value past the end / negative renders empty (SIPp sets line = -1).
+- Indexed injection, `lookup`/`insert`/`replace` (M7, verified in `infile.cpp`
+  `index`/`lookup`/`insert`/`replace`/`reIndex`/`deIndex` and `call.cpp`
+  action execution): `-infindex FILE FIELD` builds a key→line map over one
+  field; on duplicate keys the LAST line wins (`reIndex` erases then inserts).
+  `<lookup assign_to="v" file="F" key="K"/>` stores the matched line number in
+  `v`, or -1 on a miss (looking up a file with no `-infindex` is an error).
+  `<insert file="F" value="…"/>` appends a `;`-split row; `<replace file="F"
+  line="N" value="…"/>` swaps a row; both re-index around the change. `file`,
+  `key`, `value`, `line` are all rendered templates. The typical chain is
+  `lookup → [fieldN line=[$v]]`. Files are wrapped so reads (`[fieldN]`) and
+  mutations (`insert`/`replace`) share them on the single engine thread. The
+  standalone `<index>` action is not supported — use `-infindex`. `PRINTF=`
+  virtual-line files remain out.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

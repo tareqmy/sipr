@@ -72,18 +72,30 @@ pub enum Keyword {
     Var(String),
     /// `[authentication ...]` with its `key=value` parameters.
     Authentication(Vec<(String, String)>),
-    /// `[fieldN]` — a value from an `-inf` injection file. `file` selects the
-    /// 0-based `-inf` file (default 0); `line` overrides the per-call line.
+    /// `[fieldN]` — a value from an `-inf` injection file. `file` names the
+    /// file (SIPp's basename key) or gives its 0-based `-inf` index; `None`
+    /// means the first file. `line` overrides the per-call line.
     Field {
         /// 0-based field index within the row.
         index: usize,
-        /// 0-based `-inf` file index.
-        file: usize,
-        /// Explicit line override (`line=M`), else the call's assigned line.
-        line: Option<usize>,
+        /// `file=` spec: a basename or a numeric `-inf` index. `None` = first.
+        file: Option<String>,
+        /// `line=` override (`line=M` or `line=[$var]`), else the call's line.
+        line: Option<LineExpr>,
     },
     /// Unrecognized keyword: emitted verbatim (including brackets).
     Unknown(String),
+}
+
+/// The `line=` selector of a `[fieldN]` keyword. SIPp renders this as a
+/// sub-message; we support the two forms that actually occur: a literal line
+/// number and a single variable reference (the shape `lookup` produces).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineExpr {
+    /// `line=M` — a fixed 0-based line.
+    Literal(usize),
+    /// `line=[$var]` / `line=$var` — resolved from a call variable at send time.
+    Var(String),
 }
 
 /// A tokenized message template.
@@ -130,22 +142,14 @@ pub fn tokenize(text: &str, line: u32, diags: &mut Diagnostics) -> MsgTemplate {
     let mut rest = text;
     while let Some(open) = rest.find('[') {
         let after = &rest[open + 1..];
-        // A keyword never spans a line and must close before the next '['.
-        let close = after.find(']');
-        let next_open = after.find('[');
-        let newline = after.find('\n');
-        let closes_here = match (close, next_open, newline) {
-            (Some(c), no, nl) => no.is_none_or(|n| c < n) && nl.is_none_or(|n| c < n),
-            (None, _, _) => false,
-        };
-        if !closes_here {
+        // Find the matching ']' at bracket depth 0, allowing balanced nested
+        // brackets (SIPp permits `[field0 line=[$1]]`). A keyword never spans a
+        // line, so a newline before the close means this '[' is just a literal
+        // (IPv6 literals and stray brackets rely on this).
+        let Some(close) = matching_close(after) else {
             lit.push_str(&rest[..=open]);
             rest = after;
             continue;
-        }
-        let close = match close {
-            Some(c) => c,
-            None => unreachable!("closes_here guarantees a ']'"),
         };
         lit.push_str(&rest[..open]);
         let body = &after[..close];
@@ -173,6 +177,27 @@ pub fn tokenize(text: &str, line: u32, diags: &mut Diagnostics) -> MsgTemplate {
         spans.push(Span::Lit(lit));
     }
     MsgTemplate { spans }
+}
+
+/// Offset of the `]` that closes the keyword opened just before `after`,
+/// scanning at bracket depth 0. `None` if a newline arrives first (keywords
+/// never span lines) or the brackets never balance.
+fn matching_close(after: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    for (i, c) in after.char_indices() {
+        match c {
+            '\n' => return None,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 enum Classified {
@@ -233,7 +258,8 @@ fn classify(body: &str) -> Classified {
     }
 }
 
-/// `[fieldN]`, `[fieldN file=K]`, `[fieldN line=M]` — an injection-file value.
+/// `[fieldN]`, `[fieldN file=NAME]`, `[fieldN line=M|[$var]]` — an
+/// injection-file value.
 fn classify_field(name: &str, params: &str) -> Classified {
     let Some(idx) = name.strip_prefix("field") else {
         return Classified::Unknown;
@@ -241,22 +267,36 @@ fn classify_field(name: &str, params: &str) -> Classified {
     let Ok(index) = idx.parse::<usize>() else {
         return Classified::Unknown;
     };
-    let mut file = 0usize;
+    let mut file = None;
     let mut line = None;
     for (k, v) in parse_params(params) {
         match k.as_str() {
-            "file" => match v.parse() {
-                Ok(f) => file = f,
-                Err(_) => return Classified::Unknown,
-            },
-            "line" => match v.parse() {
-                Ok(l) => line = Some(l),
-                Err(_) => return Classified::Unknown,
+            "file" => file = Some(v),
+            "line" => match parse_line_expr(&v) {
+                Some(e) => line = Some(e),
+                None => return Classified::Unknown,
             },
             _ => return Classified::Unknown,
         }
     }
     Classified::Keyword(Keyword::Field { index, file, line })
+}
+
+/// Parse a `line=` value: a literal number, or a `[$var]` / `$var` reference.
+fn parse_line_expr(v: &str) -> Option<LineExpr> {
+    if let Ok(n) = v.parse::<usize>() {
+        return Some(LineExpr::Literal(n));
+    }
+    let inner = v
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(v);
+    let name = inner.strip_prefix('$')?;
+    if !name.is_empty() && name.chars().all(is_var_char) {
+        Some(LineExpr::Var(name.to_owned()))
+    } else {
+        None
+    }
 }
 
 fn is_var_char(c: char) -> bool {

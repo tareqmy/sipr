@@ -6,11 +6,13 @@
 //! `[last_X:]`/`[routes]` with nothing to substitute delete their whole line,
 //! and `[len]` becomes the body length computed after all substitution.
 
+use std::cell::RefCell;
 use std::fmt::Write as _;
 
 use sipr_net::Inbound;
+use sipr_scenario::inject::InjectionFile;
 use sipr_scenario::model::VarTable;
-use sipr_scenario::template::{Keyword, MsgTemplate, Span};
+use sipr_scenario::template::{Keyword, LineExpr, MsgTemplate, Span};
 
 use crate::actions::VarStore;
 
@@ -78,10 +80,14 @@ pub struct RenderCtx<'a> {
 
 /// `-inf` files plus the current call's assigned line in each (parallel to
 /// `files`). An out-of-range file/line/field renders empty, per SIPp.
+///
+/// Files sit behind `RefCell` because `insert`/`replace` actions mutate them
+/// mid-run while `[fieldN]` reads them — all on the single engine thread, so
+/// the borrows never overlap in time.
 #[derive(Clone, Copy)]
 pub struct FieldSource<'a> {
     /// Loaded injection files, in `-inf` order.
-    pub files: &'a [sipr_scenario::inject::InjectionFile],
+    pub files: &'a [RefCell<InjectionFile>],
     /// The call's chosen line per file (`None` = no line, e.g. USER mode).
     pub lines: &'a [Option<usize>],
 }
@@ -93,13 +99,74 @@ impl FieldSource<'_> {
         lines: &[],
     };
 
-    /// Resolve `[fieldN file=F line=?]` to its value, or `""`.
-    fn value(&self, index: usize, file: usize, line: Option<usize>) -> &str {
-        let Some(f) = self.files.get(file) else {
-            return "";
-        };
-        let ln = line.or_else(|| self.lines.get(file).copied().flatten());
-        ln.and_then(|l| f.field(l, index)).unwrap_or("")
+    /// Resolve a `file=` spec (a basename, or a numeric `-inf` index; `None`
+    /// selects the first file) to an index into `files`.
+    fn resolve_file(&self, spec: Option<&str>) -> Option<usize> {
+        match spec {
+            None => (!self.files.is_empty()).then_some(0),
+            Some(s) => {
+                if let Some(i) = self.files.iter().position(|c| c.borrow().name == s) {
+                    return Some(i);
+                }
+                s.parse::<usize>().ok().filter(|&i| i < self.files.len())
+            }
+        }
+    }
+
+    /// The call's assigned line for file `fi`.
+    fn default_line(&self, fi: usize) -> Option<usize> {
+        self.lines.get(fi).copied().flatten()
+    }
+
+    /// Append field `index` of `line` in file `fi` to `out` (empty if absent).
+    fn read(&self, fi: usize, line: usize, index: usize, out: &mut String) {
+        if let Some(cell) = self.files.get(fi)
+            && let Some(v) = cell.borrow().field(line, index)
+        {
+            out.push_str(v);
+        }
+    }
+
+    /// `lookup`: matched line number for `key` in `file`, or `-1.0` on a miss.
+    ///
+    /// # Errors
+    ///
+    /// The file is unknown, or has no `-infindex`.
+    pub fn lookup_line(&self, file: &str, key: &str) -> Result<f64, String> {
+        let fi = self
+            .resolve_file(Some(file))
+            .ok_or_else(|| format!("lookup: unknown injection file '{file}'"))?;
+        let cell = self.files[fi].borrow();
+        if !cell.is_indexed() {
+            return Err(format!("lookup: injection file '{file}' has no -infindex"));
+        }
+        #[allow(clippy::cast_precision_loss)]
+        Ok(cell.lookup(key).map_or(-1.0, |l| l as f64))
+    }
+
+    /// `insert`: append a `;`-separated `value` line to `file`.
+    ///
+    /// # Errors
+    ///
+    /// The file is unknown.
+    pub fn insert_line(&self, file: &str, value: &str) -> Result<(), String> {
+        let fi = self
+            .resolve_file(Some(file))
+            .ok_or_else(|| format!("insert: unknown injection file '{file}'"))?;
+        self.files[fi].borrow_mut().insert(value);
+        Ok(())
+    }
+
+    /// `replace`: swap line `line` of `file` for a `;`-separated `value`.
+    ///
+    /// # Errors
+    ///
+    /// The file is unknown, or `line` is out of range.
+    pub fn replace_line(&self, file: &str, line: usize, value: &str) -> Result<(), String> {
+        let fi = self
+            .resolve_file(Some(file))
+            .ok_or_else(|| format!("replace: unknown injection file '{file}'"))?;
+        self.files[fi].borrow_mut().replace(line, value)
     }
 }
 
@@ -243,7 +310,17 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
         Keyword::MediaPort => out.push_str("6000"),
         Keyword::MediaIpType => out.push_str(ip_type(ctx.local_ip)),
         Keyword::Field { index, file, line } => {
-            out.push_str(ctx.fields.value(*index, *file, *line));
+            if let Some(fi) = ctx.fields.resolve_file(file.as_deref()) {
+                // No `line=` → the call's assigned line. With `line=`, an
+                // invalid/negative value renders empty (SIPp sets line -1).
+                let chosen = match line {
+                    None => ctx.fields.default_line(fi),
+                    Some(expr) => resolve_line_expr(expr, ctx),
+                };
+                if let Some(l) = chosen {
+                    ctx.fields.read(fi, l, *index, out);
+                }
+            }
         }
         Keyword::Last(name) => {
             let lines = ctx.last.map(|m| m.header_lines(name)).unwrap_or_default();
@@ -293,6 +370,26 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
 
 fn table_lookup(vars: &VarTable, name: &str) -> Option<usize> {
     (0..vars.len()).find(|&i| vars.name(i) == name)
+}
+
+/// Resolve a `[fieldN line=...]` selector to a concrete line. A `line=[$var]`
+/// that is unset, non-numeric, or negative yields `None` (empty field), which
+/// is how a `lookup` miss (variable = -1) collapses to no output.
+fn resolve_line_expr(expr: &LineExpr, ctx: &RenderCtx<'_>) -> Option<usize> {
+    match expr {
+        LineExpr::Literal(n) => Some(*n),
+        LineExpr::Var(name) => {
+            let vc = ctx.var_ctx.as_ref()?;
+            let id = table_lookup(vc.vars, name)?;
+            let n = vc.store.get(id).as_num();
+            if n < 0.0 {
+                None
+            } else {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Some(n as usize)
+            }
+        }
+    }
 }
 
 fn param_or<'a>(params: &'a [(String, String)], key: &str, default: &'a str) -> &'a str {
@@ -427,6 +524,55 @@ mod tests {
             !text.contains("Record-Route"),
             "absent header must delete its line:\n{text}"
         );
+    }
+
+    #[test]
+    fn field_source_resolve_lookup_insert_replace() {
+        use sipr_scenario::inject::InjectionFile;
+        let mut f =
+            InjectionFile::parse("users.csv", "SEQUENTIAL\nalice;1001\nbob;1002\n").unwrap();
+        f.build_index(0);
+        let files = vec![RefCell::new(f)];
+        let fs = FieldSource {
+            files: &files,
+            lines: &[Some(0)],
+        };
+
+        // Resolve by name, by numeric index, and default; unknown -> None.
+        assert_eq!(fs.resolve_file(Some("users.csv")), Some(0));
+        assert_eq!(fs.resolve_file(Some("0")), Some(0));
+        assert_eq!(fs.resolve_file(None), Some(0));
+        assert_eq!(fs.resolve_file(Some("nope")), None);
+
+        // lookup: hit, miss (-1), unknown-file error.
+        assert_eq!(fs.lookup_line("users.csv", "bob").unwrap(), 1.0);
+        assert_eq!(fs.lookup_line("users.csv", "ghost").unwrap(), -1.0);
+        assert!(fs.lookup_line("missing", "x").is_err());
+
+        // insert then look up the new row.
+        fs.insert_line("users.csv", "carol;1003").unwrap();
+        assert_eq!(fs.lookup_line("users.csv", "carol").unwrap(), 2.0);
+
+        // replace row 0: old key drops, new key indexes, read reflects it.
+        fs.replace_line("users.csv", 0, "amir;1000").unwrap();
+        assert_eq!(fs.lookup_line("users.csv", "alice").unwrap(), -1.0);
+        assert_eq!(fs.lookup_line("users.csv", "amir").unwrap(), 0.0);
+        let mut out = String::new();
+        fs.read(0, 0, 0, &mut out);
+        assert_eq!(out, "amir");
+        assert!(
+            fs.replace_line("users.csv", 99, "z").is_err(),
+            "out of range"
+        );
+
+        // lookup on an unindexed file errors (SIPp: "Invalid Index File").
+        let g = InjectionFile::parse("plain.csv", "SEQUENTIAL\nx;y\n").unwrap();
+        let files2 = vec![RefCell::new(g)];
+        let fs2 = FieldSource {
+            files: &files2,
+            lines: &[Some(0)],
+        };
+        assert!(fs2.lookup_line("plain.csv", "x").is_err());
     }
 
     #[test]

@@ -794,3 +794,130 @@ fn injection_file_fields_land_in_sent_messages() {
         "sequential fields per call"
     );
 }
+
+#[test]
+fn lookup_reads_indexed_field_by_key() {
+    // Prove the -infindex/lookup/[field line=[$var]] chain end to end: every
+    // call looks up the fixed key "carol" in an indexed file and stamps her
+    // number (1003) into a header — regardless of the call's own cycling line.
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut looked: Vec<String> = Vec::new();
+        let mut answered: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let branch = msg.top_via_branch().unwrap_or_default().to_owned();
+                    if let Some(ok) = answered.get(&branch) {
+                        let _ = sock.send_to(ok, from);
+                        continue;
+                    }
+                    if let Some(h) = msg.header("X-Looked") {
+                        looked.push(h.trim().to_owned());
+                    }
+                    let ok = mirror_response(&msg, "200 OK", true);
+                    answered.insert(branch, ok.clone());
+                    let _ = sock.send_to(&ok, from);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        looked
+    });
+
+    let inf = "SEQUENTIAL\nalice;1001\nbob;1002\ncarol;1003\n";
+    // SIPp keys files by basename, so the file must literally be users.csv;
+    // give it a unique parent directory to avoid clashes between test runs.
+    let inf_dir = std::env::temp_dir().join(format!("sipr-lk-{}", std::process::id()));
+    std::fs::create_dir_all(&inf_dir).expect("mkdir");
+    let inf_path = inf_dir.join("users.csv");
+    std::fs::write(&inf_path, inf).expect("write inf");
+
+    // A <nop> looks up "carol" -> her line; the INVITE reads field 1 of that
+    // line via line=[$ln]. [field0] (the From user) still cycles per call.
+    let scenario = r#"<scenario name="lookup-uac">
+  <nop>
+    <action>
+      <lookup assign_to="ln" file="users.csv" key="carol"/>
+    </action>
+  </nop>
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:[field0]@[local_ip]:[local_port]>
+    X-Looked: [field1 line=[$ln]]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Content-Length: 0
+
+  ]]></send>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+    let sc_path = std::env::temp_dir().join(format!("sipr-lk-sc-{}.xml", std::process::id()));
+    std::fs::write(&sc_path, scenario).expect("write scenario");
+
+    let out = run_sipr(&[
+        "-sf",
+        sc_path.to_str().expect("utf8"),
+        "-inf",
+        inf_path.to_str().expect("utf8"),
+        "-infindex",
+        "users.csv",
+        "0",
+        "-m",
+        "3",
+        "-d",
+        "30",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&sc_path);
+    let _ = std::fs::remove_file(&inf_path);
+    let _ = std::fs::remove_dir(&inf_dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 3 failed 0"), "{err}");
+
+    let looked = uas.join().expect("uas thread");
+    assert_eq!(
+        looked,
+        vec!["1003", "1003", "1003"],
+        "every call looked up carol -> 1003"
+    );
+}
