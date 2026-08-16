@@ -162,5 +162,29 @@ Verify exact SIPp table before closing M3 and update this line.
   and ignores it (comment in `compile_pause`).
 - The DTD spells the recv SDP attribute `ignosesdp` (sic); SIPp docs use
   `ignoresdp`. sipr recognizes both spellings (and rejects them until media).
+- Regex engine (M6, `sipr-scenario/src/regex.rs`): `ereg` and
+  `regexp_match` recv patterns use an in-tree POSIX-ERE matcher — literals,
+  `.` (not newline), classes incl. `[[:alpha:]]`-style POSIX classes,
+  anchors, alternation, `* + ? {m,n}`, and capture groups. DIVERGENCE: it is
+  a leftmost-first greedy backtracker (PCRE-style), NOT POSIX
+  leftmost-longest. Identical on the patterns SIPp scenarios use (the SIPp
+  default regexp scenario's IP/SDP-origin captures are covered by tests); a
+  pattern that relies on POSIX longest-match semantics could differ. A
+  backtracking step budget bounds pathological patterns — an over-budget
+  match fails rather than hanging. `ereg assign_to="1,2,3"`: index 0 (first
+  listed var) gets the whole match, the rest get capture groups in order.
+- Digest auth (M6, `sipr-auth`): MD5 and SHA-256, `qop=auth` with
+  cnonce/nc, opaque echo, 401 (`Authorization`) and 407
+  (`Proxy-Authorization`). The `[authentication]` keyword computes the value
+  from the last `recv auth="true"` challenge, using `-au`/`-ap` or the
+  keyword's own `username=`/`password=` params. The digest URI is currently
+  the `sip:[service]@remote` shape; a proxy keying strictly on the
+  request-URI may need that widened (tracked for post-v1). Stale-nonce: the
+  challenge exposes `stale`; scenarios re-auth by looping back to the send.
+- Action executor (M6): variables are loosely typed (string/num/bool) with
+  SIPp-style coercion; `strcmp` yields 0 on equality (C semantics);
+  `test`/`condexec` truthiness = set and not zero/false/empty; `divide` by
+  zero leaves the value unchanged. `exec int_cmd` maps to fail-call /
+  graceful-stop / immediate-stop.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

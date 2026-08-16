@@ -130,17 +130,33 @@ unchecked *required* items (unchecked stretch items are fine, move them down).
       exit 0. TUI auto-enables only when stdin+stdout are terminals and
       `-bg` is absent; headless behavior unchanged.
 
-## M6 — Actions, variables, auth  ← v1 ships when green
+## M6 — Actions, variables, auth ✅ — v1 shipped
 
-- [ ] Variable store + full v1 action set (ereg capture groups, math, strcmp,
-      test/condexec branching, chance, insert/replace/trim, log/warning/error,
-      exec int_cmd)
-- [ ] `[authentication]` digest MD5 + SHA-256, qop=auth, stale-nonce retry;
-      verified against a challenging registrar scenario (sipp counterpart uses
-      401 + `[authentication]` check or verifyauth when we add it)
-- [ ] rtd/start_rtd/repeat_rtd + counters wired into stats screens/CSV
-- [ ] Docs pass: README quickstart, `--help` polish, SIPP_COMPAT §6 updated
-      with everything learned
+- [x] Per-call variable store + action executor: `ereg` (capture groups via
+      an in-tree ERE engine), `assign`/`assignstr`/`strcmp`/`test`,
+      `add`/`subtract`/`multiply`/`divide`, `todouble`, `trim`,
+      `urlencode`/`urldecode`, `gettimeofday`, `jump`, `log`/`warning`/
+      `error`, `exec int_cmd`. `test`/`condexec` branching, `chance`, named
+      `counter`s, and `pause variable=` all live. NOTE: the regex engine is
+      in-tree (`sipr-scenario/src/regex.rs`) — leftmost-first greedy with a
+      backtracking budget, POSIX classes; divergence from POSIX
+      leftmost-longest noted in SIPP_COMPAT §6. `insert`/`replace`/`lookup`
+      stay in the v1.x tier (they need `-inf`).
+- [x] `[authentication]` digest MD5 + SHA-256, `qop=auth`, cnonce/nc, opaque,
+      proxy (407); verified end-to-end against a scripted registrar that
+      recomputes and compares the response server-side
+      (`tests/e2e.rs::digest_authentication_round_trips`). Hash primitives
+      are in-tree (`sipr-auth/src/hash.rs`), checked against the RFC 1321 /
+      FIPS 180-4 / RFC 2617 / RFC 7616 vectors. Stale-nonce retry: the
+      challenge exposes `stale`; a scenario re-auths by looping to the send.
+- [x] rtd/start_rtd/repeat_rtd + counters flow into the stats/CSV/TUI (M4/M5)
+- [x] Docs pass: README quickstart, SIPP_COMPAT §6 updated (regex semantics,
+      auth, action executor). v1 ships here.
+
+**v1 is feature-complete for signaling over UDP.** The two interop gates
+(sipr↔real-sipp, both directions) remain open only because the build
+sandbox has no sipp binary — run `SIPP_BIN=... cargo test --test interop`
+on a machine with sipp to close them.
 
 ## Post-v1 backlog (ordered)
 

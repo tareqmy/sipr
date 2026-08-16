@@ -101,6 +101,91 @@ fn run_sipr(args: &[&str]) -> std::process::Output {
         .expect("spawn sipr")
 }
 
+/// A UAS that answers only after a digest challenge, verifying the response.
+/// It replies 401 to the first REGISTER (with a fixed nonce/realm) and, on
+/// the authenticated retry, recomputes the expected digest and replies 200
+/// only if it matches — so a green run proves sipr's `[authentication]` math.
+fn spawn_digest_registrar(
+    realm: &'static str,
+    user: &'static str,
+    pass: &'static str,
+) -> (SocketAddr, std::thread::JoinHandle<bool>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind registrar");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let handle = std::thread::spawn(move || {
+        let nonce = "deadbeefcafe";
+        let mut buf = [0u8; 65_535];
+        let mut authenticated = false;
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            if msg.method() != Some("REGISTER") {
+                continue;
+            }
+            match msg.header("Authorization") {
+                None => {
+                    // Challenge.
+                    let mut r = String::from("SIP/2.0 401 Unauthorized\r\n");
+                    for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
+                        for l in msg.header_lines(name) {
+                            r.push_str(l);
+                            r.push_str("\r\n");
+                        }
+                    }
+                    r.push_str(&format!(
+                        "WWW-Authenticate: Digest realm=\"{realm}\", nonce=\"{nonce}\", \
+                         algorithm=MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n"
+                    ));
+                    let _ = sock.send_to(r.as_bytes(), from);
+                }
+                Some(auth) => {
+                    // Recompute the expected response from the header's own
+                    // uri/cnonce/nc and compare.
+                    let field = |k: &str| -> Option<String> {
+                        auth.split(',').find_map(|p| {
+                            let p = p.trim();
+                            p.strip_prefix(&format!("{k}="))
+                                .map(|v| v.trim_matches('"').to_owned())
+                        })
+                    };
+                    let uri = field("uri").unwrap_or_default();
+                    let cnonce = field("cnonce").unwrap_or_default();
+                    let nc = field("nc").unwrap_or_default();
+                    let ha1 = sipr_auth::md5_hex(format!("{user}:{realm}:{pass}").as_bytes());
+                    let ha2 = sipr_auth::md5_hex(format!("REGISTER:{uri}").as_bytes());
+                    let expected = sipr_auth::md5_hex(
+                        format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}").as_bytes(),
+                    );
+                    let got = field("response").unwrap_or_default();
+                    authenticated = got == expected;
+                    let status = if authenticated {
+                        "200 OK"
+                    } else {
+                        "403 Forbidden"
+                    };
+                    let mut r = format!("SIP/2.0 {status}\r\n");
+                    for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
+                        for l in msg.header_lines(name) {
+                            r.push_str(l);
+                            r.push_str("\r\n");
+                        }
+                    }
+                    r.push_str("Content-Length: 0\r\n\r\n");
+                    let _ = sock.send_to(r.as_bytes(), from);
+                    if authenticated {
+                        break;
+                    }
+                }
+            }
+        }
+        authenticated
+    });
+    (addr, handle)
+}
+
 #[test]
 fn embedded_uac_flow_completes_against_scripted_uas() {
     let (addr, uas) = spawn_uas(Duration::from_secs(3));
@@ -420,4 +505,172 @@ fn retransmissions_fire_when_first_invite_is_lost() {
     assert!(err.contains("successful 1 failed 0"), "{err}");
     assert!(err.contains("retrans-sent"), "{err}");
     drop(uas);
+}
+
+#[test]
+fn actions_scenario_runs_against_scripted_uas() {
+    // branching_actions expects optional 100 then 200 (no 180), so it needs a
+    // responder that sends 100+200, not the generic 180+200 spawn_uas helper.
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut answered: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let branch = msg.top_via_branch().unwrap_or_default().to_owned();
+                    if let Some(ok) = answered.get(&branch) {
+                        let _ = sock.send_to(ok, from);
+                        continue;
+                    }
+                    let _ = sock.send_to(&mirror_response(&msg, "100 Trying", false), from);
+                    let ok = mirror_response(&msg, "200 OK", true);
+                    answered.insert(branch, ok.clone());
+                    let _ = sock.send_to(&ok, from);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+    });
+    let scenario = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sipr-scenario/tests/corpus/positive/branching_actions.xml"
+    );
+    let out = run_sipr(&[
+        "-sf",
+        scenario,
+        "-m",
+        "3",
+        "-d",
+        "30",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 3 failed 0"), "{err}");
+    drop(uas);
+}
+
+#[test]
+fn digest_authentication_round_trips() {
+    let (addr, registrar) = spawn_digest_registrar("sip.example.com", "alice", "secret");
+    let scenario = r#"<scenario name="register-auth">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:alice@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:alice@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Contact: <sip:alice@[local_ip]:[local_port]>
+    Max-Forwards: 70
+    Expires: 3600
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:alice@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:alice@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    Contact: <sip:alice@[local_ip]:[local_port]>
+    Authorization: [authentication username=alice password=secret]
+    Max-Forwards: 70
+    Expires: 3600
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("sipr-reg-{}.xml", std::process::id()));
+    std::fs::write(&path, scenario).expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "sipr stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(
+        registrar.join().expect("registrar thread"),
+        "registrar must have accepted sipr's digest response"
+    );
+}
+
+#[test]
+fn digest_uri_matches_what_the_server_verifies() {
+    // The digest URI sipr signs must equal the one it puts in the header,
+    // or the registrar's recomputation (which reads uri= from the header)
+    // would still pass while a real proxy keying on the request-URI fails.
+    // Covered structurally by digest_authentication_round_trips; this is a
+    // focused guard that the [service] default resolves into the URI.
+    let (addr, registrar) = spawn_digest_registrar("r", "u", "p");
+    let scenario = r#"<scenario name="reg">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:u@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:u@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:u@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:u@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    Authorization: [authentication username=u password=p]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+    let path = std::env::temp_dir().join(format!("sipr-reg2-{}.xml", std::process::id()));
+    std::fs::write(&path, scenario).expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(registrar.join().expect("registrar"));
 }

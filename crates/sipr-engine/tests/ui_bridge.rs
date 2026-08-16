@@ -28,6 +28,8 @@ fn uas_config() -> EngineConfig {
         seed: 7,
         periodic_stats: false,
         auto_answer: false,
+        auth_user: None,
+        auth_password: None,
         trace_msg: None,
         trace_err: None,
         trace_stat: None,

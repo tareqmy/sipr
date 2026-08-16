@@ -9,7 +9,30 @@
 use std::fmt::Write as _;
 
 use sipr_net::Inbound;
+use sipr_scenario::model::VarTable;
 use sipr_scenario::template::{Keyword, MsgTemplate, Span};
+
+use crate::actions::VarStore;
+
+/// Optional variable + auth resolution passed to the renderer.
+#[derive(Clone, Copy)]
+pub struct VarCtx<'a> {
+    /// The call's variable store.
+    pub store: &'a VarStore,
+    /// The scenario's variable table (unused placeholder for symmetry).
+    pub vars: &'a VarTable,
+    /// A pending digest challenge captured by a `recv auth="true"`.
+    pub challenge: Option<&'a sipr_auth::Challenge>,
+    /// Auth username / password (`-au`/`-ap` or keyword params).
+    pub auth_user: &'a str,
+    pub auth_password: &'a str,
+    /// Client nonce for digest (stable per call).
+    pub cnonce: &'a str,
+    /// The request method for the message being built.
+    pub method: &'a str,
+    /// The digest URI (request-URI shape).
+    pub digest_uri: &'a str,
+}
 
 /// Marker interpolated for `[len]`, patched after body length is known.
 const LEN_MARKER: &str = "\u{7}SIPR_LEN\u{7}";
@@ -17,6 +40,7 @@ const LEN_MARKER: &str = "\u{7}SIPR_LEN\u{7}";
 const KILL_MARKER: &str = "\u{7}SIPR_KILL\u{7}";
 
 /// Everything the renderer may substitute for one message of one call.
+#[derive(Clone)]
 pub struct RenderCtx<'a> {
     /// `-s` service / called user part.
     pub service: &'a str,
@@ -46,6 +70,8 @@ pub struct RenderCtx<'a> {
     pub routes: &'a [String],
     /// Last received message (renders `[last_*]`, `[next_url]`).
     pub last: Option<&'a Inbound>,
+    /// Variables + auth (present at M6; `None` renders `[$x]` empty).
+    pub var_ctx: Option<VarCtx<'a>>,
 }
 
 /// Rendering failure (unsupported keyword reached the renderer).
@@ -66,11 +92,29 @@ impl std::fmt::Display for RenderError {
 /// support yet (`[$var]`, `[authentication]` — M6). Engine pre-validation
 /// rejects such scenarios up front, so this is defense in depth.
 pub fn render(template: &MsgTemplate, ctx: &RenderCtx<'_>) -> Result<Vec<u8>, RenderError> {
+    Ok(render_string(template, ctx).into_bytes())
+}
+
+/// Render a template to a `String`. Used for message bodies and for
+/// expanding action message templates (log/assignstr) — the `extra` argument
+/// lets callers substitute variables from an arbitrary store (M6 actions).
+#[must_use]
+pub fn render_to_string(
+    template: &MsgTemplate,
+    ctx: &RenderCtx<'_>,
+    _extra: Option<(&VarStore, &VarTable)>,
+) -> String {
+    // The store already lives in ctx.var_ctx for the send path; `extra` is a
+    // convenience for action expansion where ctx carries the same store.
+    render_string(template, ctx)
+}
+
+fn render_string(template: &MsgTemplate, ctx: &RenderCtx<'_>) -> String {
     let mut out = String::with_capacity(512);
     for span in &template.spans {
         match span {
             Span::Lit(l) => out.push_str(l),
-            Span::Kw(kw) => fill(kw, ctx, &mut out)?,
+            Span::Kw(kw) => fill(kw, ctx, &mut out),
         }
     }
     // Delete lines that substituted to nothing (SIPp: "all bytes until the
@@ -82,17 +126,15 @@ pub fn render(template: &MsgTemplate, ctx: &RenderCtx<'_>) -> Result<Vec<u8>, Re
             .collect();
     }
     // Patch [len] with the body length (bytes after the header separator).
-    // [len] lives in the head (Content-Length) in every real scenario, so the
-    // marker does not perturb the body byte count.
     if out.contains(LEN_MARKER) {
         let body_len = out.find("\r\n\r\n").map_or(0, |i| out.len() - (i + 4));
         out = out.replace(LEN_MARKER, &body_len.to_string());
     }
-    Ok(out.into_bytes())
+    out
 }
 
 #[allow(clippy::too_many_lines)] // one arm per keyword; splitting hurts
-fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), RenderError> {
+fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
     match kw {
         Keyword::Service => out.push_str(ctx.service),
         Keyword::RemoteIp => out.push_str(ctx.remote_ip),
@@ -179,9 +221,35 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
                 out.push_str(&lines.join("\r\n"));
             }
         }
-        Keyword::Var(v) => return Err(RenderError(format!("[${v}] executes at M6"))),
-        Keyword::Authentication(_) => {
-            return Err(RenderError("[authentication] executes at M6".into()));
+        Keyword::Var(name) => {
+            if let Some(vc) = &ctx.var_ctx {
+                // Names were interned; look up by re-interning against the table.
+                if let Some(id) = table_lookup(vc.vars, name) {
+                    out.push_str(&vc.store.get(id).as_str());
+                }
+            }
+        }
+        Keyword::Authentication(params) => {
+            if let Some(vc) = &ctx.var_ctx {
+                if let Some(ch) = vc.challenge {
+                    let user = param_or(params, "username", vc.auth_user);
+                    let pass = param_or(params, "password", vc.auth_password);
+                    let cred = sipr_auth::Credentials {
+                        username: user,
+                        password: pass,
+                        method: vc.method,
+                        uri: vc.digest_uri,
+                        cnonce: vc.cnonce,
+                        nc: 1,
+                    };
+                    // authorization_header returns "Name: Digest ..."; the
+                    // scenario supplies the header name context, so emit only
+                    // the value after the colon.
+                    let line = sipr_auth::authorization_header(ch, &cred);
+                    let value = line.split_once(": ").map_or(line.as_str(), |(_, v)| v);
+                    out.push_str(value);
+                }
+            }
         }
         Keyword::Unknown(u) => {
             // Tokenizer emits unknown keywords as literals; reaching here is
@@ -189,7 +257,17 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
             let _ = write!(out, "[{u}]");
         }
     }
-    Ok(())
+}
+
+fn table_lookup(vars: &VarTable, name: &str) -> Option<usize> {
+    (0..vars.len()).find(|&i| vars.name(i) == name)
+}
+
+fn param_or<'a>(params: &'a [(String, String)], key: &str, default: &'a str) -> &'a str {
+    params
+        .iter()
+        .find(|(k, _)| k == key)
+        .map_or(default, |(_, v)| v.as_str())
 }
 
 fn ip_type(ip: &str) -> &'static str {
@@ -230,6 +308,7 @@ mod tests {
             peer_tag: None,
             routes: &[],
             last,
+            var_ctx: None,
         }
     }
 

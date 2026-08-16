@@ -46,6 +46,7 @@ sipr-tui = { workspace = true }
 
 [dev-dependencies]
 sipr-net = { workspace = true }
+sipr-auth = { workspace = true }
 
 [lints]
 workspace = true

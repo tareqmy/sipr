@@ -306,10 +306,28 @@ impl Compiler {
                 );
             }
         }
+        let regexp_match = self.parse_bool_attr(el, "regexp_match");
+        let expect_regex = if regexp_match {
+            let raw = match &expect {
+                Expect::Response(c) => c.clone(),
+                Expect::Request(m) => m.clone(),
+            };
+            match crate::regex::Regex::compile(&raw) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    self.diags
+                        .error(Some(el.line), format!("bad recv pattern '{raw}': {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let recv = RecvStep {
             expect,
             optional: self.parse_bool_attr(el, "optional"),
-            regexp_match: self.parse_bool_attr(el, "regexp_match"),
+            regexp_match,
+            expect_regex,
             timeout_ms: self.parse_num_attr(el, "timeout"),
             ontimeout: None, // resolved in finish()
             record_route_set: self.parse_bool_attr(el, "rrs"),
@@ -598,7 +616,15 @@ impl Compiler {
                         "assign_to",
                     ],
                 );
-                let regexp = self.require_attr(el, "regexp")?;
+                let regexp_raw = self.require_attr(el, "regexp")?;
+                let regexp = match crate::regex::Regex::compile(&regexp_raw) {
+                    Ok(re) => re,
+                    Err(e) => {
+                        self.diags
+                            .error(Some(line), format!("bad ereg pattern '{regexp_raw}': {e}"));
+                        return None;
+                    }
+                };
                 let search_in = match el.attr("search_in").unwrap_or("msg") {
                     "msg" => SearchIn::Msg,
                     "hdr" => SearchIn::Hdr,

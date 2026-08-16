@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use sipr_net::timer::TimerId;
 use sipr_net::{Inbound, NetEvent, RetransSchedule, TimerService, TransportConfig, UdpTransport};
-use sipr_scenario::model::{Expect, PauseSpec, RecvStep, Role, Scenario, Step, StepCommon};
+use sipr_scenario::model::{Action, Expect, PauseSpec, RecvStep, Role, Scenario, Step, StepCommon};
 use sipr_scenario::template::{Keyword, MsgTemplate, Span};
 
 use crate::render::{RenderCtx, render};
@@ -62,6 +62,10 @@ pub struct EngineConfig {
     pub periodic_stats: bool,
     /// `-aa`: auto-answer in-dialog OPTIONS/INFO/UPDATE/NOTIFY with 200.
     pub auto_answer: bool,
+    /// `-au`: default digest username for `[authentication]`.
+    pub auth_user: Option<String>,
+    /// `-ap`: default digest password for `[authentication]`.
+    pub auth_password: Option<String>,
     /// `-trace_msg` destination.
     pub trace_msg: Option<std::path::PathBuf>,
     /// `-trace_err` destination.
@@ -202,6 +206,14 @@ struct CallState {
     last_sent: Option<Vec<u8>>,
     /// Running RTD stopwatches: (name, started-at).
     rtd_starts: Vec<(String, Instant)>,
+    /// Per-call variable store.
+    store: crate::actions::VarStore,
+    /// Named counters (`counter` step attribute).
+    counters: std::collections::HashMap<String, u64>,
+    /// Stable client nonce for digest auth.
+    cnonce: String,
+    /// Pending digest challenge captured by a `recv auth="true"`.
+    challenge: Option<sipr_auth::Challenge>,
     peer_tag: Option<String>,
     routes: Vec<String>,
     last_recv: Option<Inbound>,
@@ -613,9 +625,16 @@ impl<'s> Engine<'s> {
         self.stats.outgoing_created += 1;
         let number = self.stats.created();
         let call_id = self.make_call_id(number);
+        let cnonce = self.make_cnonce(number);
         self.calls.insert(
             call_id.clone(),
-            new_call(number, target, self.config.base_cseq),
+            new_call(
+                number,
+                target,
+                self.config.base_cseq,
+                &self.scenario.vars,
+                cnonce,
+            ),
         );
         self.advance(&call_id);
     }
@@ -628,6 +647,14 @@ impl<'s> Engine<'s> {
                 .replace("%s", &self.local_ip_str),
             None => format!("{number}-{}@{}", self.pid, self.local_ip_str),
         }
+    }
+
+    /// Deterministic-but-unique client nonce for digest auth.
+    fn make_cnonce(&self, number: u64) -> String {
+        format!(
+            "{:016x}",
+            (u64::from(self.pid) << 32) ^ number ^ self.config.seed
+        )
     }
 
     // ---- step execution ------------------------------------------------
@@ -643,15 +670,47 @@ impl<'s> Engine<'s> {
                 self.complete_call(call_id);
                 return;
             };
+            // condexec: run this step only if the variable's set-ness matches.
+            if let Some(common) = step_common(step) {
+                if let Some(v) = common.condexec {
+                    let set = self.calls.get(call_id).is_some_and(|c| c.store.is_set(v));
+                    if set == common.condexec_inverse {
+                        if let Some(call) = self.calls.get_mut(call_id) {
+                            call.index = index + 1;
+                        }
+                        continue;
+                    }
+                }
+            }
             match step {
                 Step::Send(send) => {
-                    let (buf, method_is_new_txn, remote) = {
+                    let first = template_first_word(&send.template).unwrap_or_default();
+                    let is_req = first != "SIP/2.0";
+                    let method_is_new_txn = is_req && first != "ACK" && first != "CANCEL";
+                    let (buf, remote) = {
                         let Some(call) = self.calls.get(call_id) else {
                             return;
                         };
+                        let remote_ip = call.remote.ip().to_string();
+                        let digest_uri = format!(
+                            "sip:{}@{}:{}",
+                            self.config.service,
+                            remote_ip,
+                            call.remote.port()
+                        );
+                        let var_ctx = crate::render::VarCtx {
+                            store: &call.store,
+                            vars: &self.scenario.vars,
+                            challenge: call.challenge.as_ref(),
+                            auth_user: self.config.auth_user.as_deref().unwrap_or(""),
+                            auth_password: self.config.auth_password.as_deref().unwrap_or(""),
+                            cnonce: &call.cnonce,
+                            method: if is_req { &first } else { "REGISTER" },
+                            digest_uri: &digest_uri,
+                        };
                         let ctx = RenderCtx {
                             service: &self.config.service,
-                            remote_ip: &call.remote.ip().to_string(),
+                            remote_ip: &remote_ip,
                             remote_port: call.remote.port(),
                             local_ip: &self.local_ip_str,
                             local_port: self.transport.local_addr().port(),
@@ -664,20 +723,22 @@ impl<'s> Engine<'s> {
                             peer_tag: call.peer_tag.as_deref(),
                             routes: &call.routes,
                             last: call.last_recv.as_ref(),
+                            var_ctx: Some(var_ctx),
                         };
                         match render(&send.template, &ctx) {
-                            Ok(buf) => {
-                                let first = template_first_word(&send.template).unwrap_or_default();
-                                let is_req = first != "SIP/2.0";
-                                let new_txn = is_req && first != "ACK" && first != "CANCEL";
-                                (buf, new_txn, call.remote)
-                            }
+                            Ok(buf) => (buf, call.remote),
                             Err(e) => {
                                 self.fail_call(call_id, &format!("render failed: {e}"));
                                 return;
                             }
                         }
                     };
+                    // Run this send's actions (rare, but SIPp allows them).
+                    if !send.actions.is_empty()
+                        && self.run_step_actions(call_id, &send.actions, index)
+                    {
+                        return;
+                    }
                     let _ = self
                         .transport
                         .send_to(&buf, remote, send.lost_pct)
@@ -689,7 +750,7 @@ impl<'s> Engine<'s> {
                     self.trace_send(&buf, remote);
                     let retrans_ms = send.retrans_ms;
                     let lost_pct = send.lost_pct;
-                    let jump = self.jump_target(&send.common, index);
+                    let jump = self.jump_target(&send.common, index, call_id);
                     let now = Instant::now();
                     let common = send.common.clone();
                     let Some(call) = self.calls.get_mut(call_id) else {
@@ -756,8 +817,8 @@ impl<'s> Engine<'s> {
                     return;
                 }
                 Step::Pause { spec, common } => {
-                    let dur = self.sample_pause(spec);
-                    let jump = self.jump_target(common, index);
+                    let dur = self.sample_pause(spec, call_id);
+                    let jump = self.jump_target(common, index, call_id);
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
@@ -774,10 +835,17 @@ impl<'s> Engine<'s> {
                     call.timer = Some((timer, TimerKind::Pause));
                     return;
                 }
-                Step::Nop { common, .. } => {
-                    let jump = self.jump_target(common, index);
-                    if let Some(call) = self.calls.get_mut(call_id) {
-                        call.index = jump;
+                Step::Nop { common, actions } => {
+                    if !actions.is_empty() && self.run_step_actions(call_id, actions, index) {
+                        return;
+                    }
+                    // A jump action may have moved us; only advance if not.
+                    let moved = self.calls.get(call_id).is_some_and(|c| c.index != index);
+                    if !moved {
+                        let jump = self.jump_target(common, index, call_id);
+                        if let Some(call) = self.calls.get_mut(call_id) {
+                            call.index = jump;
+                        }
                     }
                 }
                 Step::Label { .. } => {
@@ -809,10 +877,23 @@ impl<'s> Engine<'s> {
 
     /// Where execution goes after `index` finishes: `next` (with `chance`),
     /// else the following step.
-    fn jump_target(&mut self, common: &StepCommon, index: usize) -> usize {
+    fn jump_target(&mut self, common: &StepCommon, index: usize, call_id: &str) -> usize {
+        // A named counter ticks when its step executes.
+        if let Some(name) = &common.counter {
+            if let Some(call) = self.calls.get_mut(call_id) {
+                *call.counters.entry(name.clone()).or_insert(0) += 1;
+            }
+        }
         if let Some(dest) = common.next {
-            let take = common.chance.is_none_or(|c| self.rng.next_f64() < c);
-            if take {
+            let test_ok = match common.test {
+                Some(v) => self
+                    .calls
+                    .get(call_id)
+                    .is_some_and(|c| test_truthy(c.store.get(v))),
+                None => true,
+            };
+            let chance_ok = common.chance.is_none_or(|c| self.rng.next_f64() < c);
+            if test_ok && chance_ok {
                 return dest;
             }
         }
@@ -834,11 +915,18 @@ impl<'s> Engine<'s> {
         None
     }
 
-    fn sample_pause(&mut self, spec: &PauseSpec) -> Duration {
+    fn sample_pause(&mut self, spec: &PauseSpec, call_id: &str) -> Duration {
         match spec {
             PauseSpec::Default => self.config.pause_default,
             PauseSpec::Fixed(ms) => Duration::from_millis(*ms),
-            PauseSpec::Variable(_) => self.config.pause_default, // pre-validated out
+            PauseSpec::Variable(v) => {
+                let ms = self
+                    .calls
+                    .get(call_id)
+                    .map_or(0.0, |c| c.store.get(*v).as_num());
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Duration::from_millis(ms.max(0.0) as u64)
+            }
             PauseSpec::Distribution { kind, params } => {
                 let u = self.rng.next_f64();
                 let ms = match (kind.as_str(), params.as_slice()) {
@@ -890,9 +978,16 @@ impl<'s> Engine<'s> {
             {
                 self.stats.incoming_created += 1;
                 let number = self.stats.created();
+                let cnonce = self.make_cnonce(number);
                 self.calls.insert(
                     call_id.clone(),
-                    new_call(number, packet.from, self.config.base_cseq),
+                    new_call(
+                        number,
+                        packet.from,
+                        self.config.base_cseq,
+                        &self.scenario.vars,
+                        cnonce,
+                    ),
                 );
                 // Fall through to normal matching below (window at 0).
             } else {
@@ -1014,7 +1109,111 @@ impl<'s> Engine<'s> {
         call.last_recv = Some(msg.clone());
         call.waiting = false;
         call.index = si + 1;
+        // Capture a digest challenge when this recv has auth="true".
+        let auth = matches!(&self.scenario.steps[si], Step::Recv(r) if r.auth);
+        if auth {
+            let challenge = msg
+                .header("WWW-Authenticate")
+                .and_then(|h| sipr_auth::parse_challenge(h, false))
+                .or_else(|| {
+                    msg.header("Proxy-Authenticate")
+                        .and_then(|h| sipr_auth::parse_challenge(h, true))
+                });
+            if let Some(call) = self.calls.get_mut(call_id) {
+                call.challenge = challenge;
+            }
+        }
+        // Run the recv step's actions (ereg captures, etc.).
+        let recv_actions = match &self.scenario.steps[si] {
+            Step::Recv(r) => r.actions.clone(),
+            _ => Vec::new(),
+        };
+        if !recv_actions.is_empty() && self.run_step_actions(call_id, &recv_actions, si) {
+            return;
+        }
         self.advance(call_id);
+    }
+
+    /// Execute a step's actions against the call's store. Returns true when a
+    /// terminal outcome (fail/stop) removed the call or ended the run — the
+    /// caller must stop touching this call.
+    fn run_step_actions(&mut self, call_id: &str, actions: &[Action], index: usize) -> bool {
+        let Some(call) = self.calls.get(call_id) else {
+            return true;
+        };
+        let remote_ip = call.remote.ip().to_string();
+        let digest_uri = format!(
+            "sip:{}@{}:{}",
+            self.config.service,
+            remote_ip,
+            call.remote.port()
+        );
+        let mut store = call.store.clone();
+        let snapshot = call.store.clone(); // immutable copy for the base ctx
+        let last = call.last_recv.clone();
+        let outcomes = {
+            let var_ctx = crate::render::VarCtx {
+                store: &snapshot,
+                vars: &self.scenario.vars,
+                challenge: call.challenge.as_ref(),
+                auth_user: self.config.auth_user.as_deref().unwrap_or(""),
+                auth_password: self.config.auth_password.as_deref().unwrap_or(""),
+                cnonce: &call.cnonce,
+                method: "REGISTER",
+                digest_uri: &digest_uri,
+            };
+            let ctx = RenderCtx {
+                service: &self.config.service,
+                remote_ip: &remote_ip,
+                remote_port: call.remote.port(),
+                local_ip: &self.local_ip_str,
+                local_port: self.transport.local_addr().port(),
+                transport: "UDP",
+                call_id,
+                call_number: call.number,
+                pid: self.pid,
+                cseq: call.cseq,
+                msg_index: index,
+                peer_tag: call.peer_tag.as_deref(),
+                routes: &call.routes,
+                last: last.as_ref(),
+                var_ctx: Some(var_ctx),
+            };
+            crate::actions::run_actions(actions, &mut store, last.as_ref(), &ctx)
+        };
+        // Persist the mutated store.
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.store = store;
+        }
+        for outcome in outcomes {
+            match outcome {
+                crate::actions::ActionOutcome::Continue => {}
+                crate::actions::ActionOutcome::Log(line) => self.log_err(&line),
+                crate::actions::ActionOutcome::Jump(dest) => {
+                    if let Some(call) = self.calls.get_mut(call_id) {
+                        call.index = dest;
+                    }
+                    self.advance(call_id);
+                    return true;
+                }
+                crate::actions::ActionOutcome::FailCall(why) => {
+                    self.stats.failed_other += 1;
+                    self.log_err(&format!("call {call_id} failed: {why}"));
+                    self.remove_call(call_id);
+                    return true;
+                }
+                crate::actions::ActionOutcome::StopGracefully => {
+                    self.soft_stopping = true;
+                    self.control.stop_pacer.store(true, Ordering::Relaxed);
+                }
+                crate::actions::ActionOutcome::StopNow => {
+                    self.fail_all("exec stop_now");
+                    self.hard_stop = true;
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// `-aa`: answer in-dialog OPTIONS/INFO/UPDATE/NOTIFY with 200 without
@@ -1210,6 +1409,28 @@ impl<'s> Engine<'s> {
     }
 }
 
+/// The shared attributes of a step, when it has any.
+fn step_common(step: &Step) -> Option<&StepCommon> {
+    match step {
+        Step::Send(s) => Some(&s.common),
+        Step::Recv(r) => Some(&r.common),
+        Step::Pause { common, .. } | Step::Nop { common, .. } => Some(common),
+        Step::Label { .. } | Step::Timewait { .. } => None,
+    }
+}
+
+/// SIPp `test`/`condexec` truthiness: a variable counts as true when it is
+/// set and not numerically zero / boolean false.
+fn test_truthy(v: &crate::actions::Value) -> bool {
+    use crate::actions::Value;
+    match v {
+        Value::Unset => false,
+        Value::Bool(b) => *b,
+        Value::Num(n) => *n != 0.0,
+        Value::Str(s) => !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false"),
+    }
+}
+
 /// Short display label for a step (scenario screen rows).
 fn step_label(step: &Step) -> String {
     match step {
@@ -1248,7 +1469,13 @@ fn step_label(step: &Step) -> String {
 }
 
 /// Fresh call state.
-fn new_call(number: u64, remote: SocketAddr, base_cseq: u32) -> CallState {
+fn new_call(
+    number: u64,
+    remote: SocketAddr,
+    base_cseq: u32,
+    vars: &sipr_scenario::model::VarTable,
+    cnonce: String,
+) -> CallState {
     CallState {
         number,
         remote,
@@ -1259,6 +1486,10 @@ fn new_call(number: u64, remote: SocketAddr, base_cseq: u32) -> CallState {
         cseq: base_cseq,
         last_sent: None,
         rtd_starts: Vec::new(),
+        store: crate::actions::VarStore::new(vars),
+        counters: std::collections::HashMap::new(),
+        cnonce,
+        challenge: None,
         peer_tag: None,
         routes: Vec::new(),
         last_recv: None,
@@ -1417,65 +1648,22 @@ fn template_first_word(t: &MsgTemplate) -> Option<String> {
 
 /// Reject scenarios that need features beyond M3, loudly and up front.
 fn validate_for_engine(scenario: &Scenario) -> Result<(), EngineError> {
-    let err = |msg: String| Err(EngineError(msg));
+    // As of M6 the engine executes the full v1 surface; the only things left
+    // to reject are pause distributions the sampler does not implement.
+    // (regexp_match responses now compile to a real matcher.)
     for (i, step) in scenario.steps.iter().enumerate() {
-        let (actions, common, template) = match step {
-            Step::Send(s) => (&s.actions, &s.common, Some(&s.template)),
-            Step::Recv(r) => {
-                if r.regexp_match {
-                    return err(format!(
-                        "step {i}: regexp_match needs the regex engine (M6)"
-                    ));
-                }
-                if let Expect::Response(code) = &r.expect {
-                    if code.parse::<u16>().is_err() {
-                        return err(format!(
-                            "step {i}: response '{code}' is not a status code \
-                             (regex responses land at M6)"
-                        ));
-                    }
-                }
-                (&r.actions, &r.common, None)
-            }
-            Step::Nop { actions, common } => (actions, common, None),
-            Step::Pause { spec, common } => {
-                if matches!(spec, PauseSpec::Variable(_)) {
-                    return err(format!("step {i}: pause variable= needs variables (M6)"));
-                }
-                if let PauseSpec::Distribution { kind, .. } = spec {
-                    if !matches!(
-                        kind.as_str(),
-                        "uniform" | "fixed" | "exponential" | "normal"
-                    ) {
-                        return err(format!(
-                            "step {i}: pause distribution '{kind}' is not implemented yet"
-                        ));
-                    }
-                }
-                if common.test.is_some() || common.condexec.is_some() {
-                    return err(format!("step {i}: test/condexec need variables (M6)"));
-                }
-                continue;
-            }
-            Step::Label { .. } | Step::Timewait { .. } => continue,
-        };
-        if !actions.is_empty() {
-            return err(format!("step {i}: <action> blocks execute at M6"));
-        }
-        if common.test.is_some() || common.condexec.is_some() {
-            return err(format!("step {i}: test/condexec need variables (M6)"));
-        }
-        if let Some(t) = template {
-            for kw in t.keywords() {
-                match kw {
-                    Keyword::Var(v) => {
-                        return err(format!("step {i}: [${v}] executes at M6"));
-                    }
-                    Keyword::Authentication(_) => {
-                        return err(format!("step {i}: [authentication] lands at M6"));
-                    }
-                    _ => {}
-                }
+        if let Step::Pause {
+            spec: PauseSpec::Distribution { kind, .. },
+            ..
+        } = step
+        {
+            if !matches!(
+                kind.as_str(),
+                "uniform" | "fixed" | "exponential" | "normal"
+            ) {
+                return Err(EngineError(format!(
+                    "step {i}: pause distribution '{kind}' is not implemented yet"
+                )));
             }
         }
     }
@@ -1585,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_accepts_uas_and_rejects_m6_features() {
+    fn validation_accepts_v1_features_including_actions_and_auth() {
         let uas = sipr_scenario::compile("uas", sipr_scenario::embedded("uas").unwrap())
             .scenario
             .unwrap();
@@ -1596,18 +1784,35 @@ mod tests {
                  <send><![CDATA[
                    OPTIONS sip:[service]@[remote_ip] SIP/2.0
                    Call-ID: [call_id]
+                   [authentication username=u password=p]
 
                  ]]></send>
                  <recv response="200">
-                   <action><log message="hi"/></action>
+                   <action><ereg regexp="([0-9]+)" search_in="msg" assign_to="whole,n"/></action>
                  </recv>
                </scenario>"#,
         )
         .scenario
         .unwrap();
-        let e = validate_for_engine(&with_actions).unwrap_err();
-        assert!(e.0.contains("M6"), "{e}");
+        assert!(
+            validate_for_engine(&with_actions).is_ok(),
+            "actions + [authentication] run as of M6"
+        );
         assert!(validate_for_engine(&uac()).is_ok());
+        // Still rejected: an unimplemented pause distribution.
+        let bad_dist = sipr_scenario::compile(
+            "t",
+            r#"<scenario name="t">
+                 <send><![CDATA[OPTIONS sip:[service]@[remote_ip] SIP/2.0
+                   Call-ID: [call_id]
+                 ]]></send>
+                 <recv response="200"/>
+                 <pause distribution="weibull(1,2)"/>
+               </scenario>"#,
+        )
+        .scenario
+        .unwrap();
+        assert!(validate_for_engine(&bad_dist).is_err());
     }
 
     #[test]

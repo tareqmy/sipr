@@ -14,6 +14,7 @@
 mod compile;
 pub mod diag;
 pub mod model;
+pub mod regex;
 pub mod template;
 mod xml;
 

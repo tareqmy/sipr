@@ -6,6 +6,7 @@ version = 4
 name = "sipr"
 version = "0.1.0"
 dependencies = [
+ "sipr-auth",
  "sipr-engine",
  "sipr-net",
  "sipr-scenario",
@@ -21,6 +22,7 @@ version = "0.1.0"
 name = "sipr-engine"
 version = "0.1.0"
 dependencies = [
+ "sipr-auth",
  "sipr-net",
  "sipr-scenario",
  "sipr-stats",

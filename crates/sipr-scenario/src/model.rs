@@ -114,6 +114,8 @@ pub struct RecvStep {
     pub optional: bool,
     /// `regexp_match`: treat the expectation as a regular expression.
     pub regexp_match: bool,
+    /// Compiled expectation when `regexp_match` is set.
+    pub expect_regex: Option<crate::regex::Regex>,
     /// `timeout`: ms to wait before `ontimeout` (or call failure).
     pub timeout_ms: Option<u64>,
     /// `ontimeout`: jump target on timeout (resolved from a label id).
@@ -249,8 +251,8 @@ pub enum IntCmd {
 pub enum Action {
     /// Regex capture over the message or a header.
     Ereg {
-        /// The pattern (POSIX ERE in SIPp; engine choice lands M6).
-        regexp: String,
+        /// The compiled pattern (in-tree ERE engine — SIPP_COMPAT §6).
+        regexp: crate::regex::Regex,
         /// Where to search.
         search_in: SearchIn,
         /// Header name when `search_in="hdr"`.

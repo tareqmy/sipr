@@ -43,6 +43,8 @@ pub enum ParseError {
 #[derive(Debug, Clone)]
 pub struct Inbound {
     kind: MsgKind,
+    /// The start line, verbatim (for `ereg start_line` and dumps).
+    start: String,
     /// Header section as text (lossily decoded; SIP headers are ASCII-ish).
     headers: String,
     /// Message body bytes (after the blank line), verbatim.
@@ -83,9 +85,34 @@ impl Inbound {
         }
         Ok(Self {
             kind,
+            start: start.to_owned(),
             headers,
             body: body.to_vec(),
         })
+    }
+
+    /// The start line, verbatim (request or status line).
+    #[must_use]
+    pub fn start_line(&self) -> &str {
+        &self.start
+    }
+
+    /// Reconstruct a text view of the whole message for `ereg search_in="msg"`
+    /// (start line + unfolded headers + body). Not guaranteed byte-identical
+    /// to the wire (headers are unfolded) — matching is line/substring based.
+    #[must_use]
+    pub fn reconstruct(&self) -> String {
+        let mut out =
+            String::with_capacity(self.start.len() + self.headers.len() + self.body.len());
+        out.push_str(&self.start);
+        out.push_str("\r\n");
+        for line in self.headers.lines() {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+        out.push_str("\r\n");
+        out.push_str(&String::from_utf8_lossy(&self.body));
+        out
     }
 
     /// Request or response classification.
