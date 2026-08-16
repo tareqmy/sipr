@@ -11,8 +11,10 @@
 //! Full column parity is a v1-polish item — recorded in SIPP_COMPAT §6.
 
 mod histogram;
+mod snapshot;
 
 pub use histogram::{Histogram, Repartition};
+pub use snapshot::{RtdRow, Snapshot, StepRow, StepStats};
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -61,6 +63,10 @@ pub struct StatSet {
     pub response_repartition: Repartition,
     /// `CallLengthRepartition`.
     pub call_length_repartition: Repartition,
+    /// Per-step counters (scenario screen).
+    pub steps: Vec<StepStats>,
+    /// Short per-step labels, set once by the engine.
+    pub step_labels: Vec<String>,
     // Snapshot of cumulative values at the last CSV dump, for (P) columns.
     last_dump: PeriodSnapshot,
 }
@@ -97,8 +103,21 @@ impl StatSet {
             call_length: Histogram::new(),
             response_repartition: Repartition::new(response_bounds),
             call_length_repartition: Repartition::new(call_length_bounds),
+            steps: Vec::new(),
+            step_labels: Vec::new(),
             last_dump: PeriodSnapshot::default(),
         }
+    }
+
+    /// Size the per-step table and install display labels (engine, once).
+    pub fn init_steps(&mut self, labels: Vec<String>) {
+        self.steps = vec![StepStats::default(); labels.len()];
+        self.step_labels = labels;
+    }
+
+    /// Per-step counter access; out-of-range indices are ignored safely.
+    pub fn step_mut(&mut self, index: usize) -> Option<&mut StepStats> {
+        self.steps.get_mut(index)
     }
 
     /// Total calls created.

@@ -141,7 +141,34 @@ fn run(cli: &Cli) -> ExitCode {
         }),
         stat_interval: std::time::Duration::from_secs(cli.stat_interval_s.unwrap_or(1)),
     };
-    match sipr_engine::run(&scenario, &config) {
+    // Live TUI when attached to a terminal (and not headless/lint mode).
+    let use_tui = {
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal() && std::io::stdin().is_terminal() && !cli.background
+    };
+    let result = if use_tui {
+        let (snap_tx, snap_rx) = std::sync::mpsc::channel::<sipr_stats::Snapshot>();
+        let (key_tx, key_rx) = std::sync::mpsc::channel::<char>();
+        let tui = std::thread::Builder::new()
+            .name("sipr-tui".into())
+            .spawn(move || sipr_tui::run(&snap_rx, &key_tx))
+            .ok();
+        let outcome = sipr_engine::run_with_ui(
+            &scenario,
+            &config,
+            Some(sipr_engine::UiChannels {
+                snapshots: snap_tx,
+                keys: key_rx,
+            }),
+        );
+        if let Some(t) = tui {
+            let _ = t.join(); // restores the terminal before we print
+        }
+        outcome.map(|(report, _)| report)
+    } else {
+        sipr_engine::run(&scenario, &config)
+    };
+    match result {
         Ok(report) => {
             eprintln!("sipr: run complete: {}", report.summary());
             ExitCode::from(report.exit_code())

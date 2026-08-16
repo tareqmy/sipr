@@ -9,5 +9,8 @@
 mod engine;
 mod render;
 
-pub use engine::{EngineConfig, EngineControl, EngineError, RunReport, run, run_with_control};
+pub use engine::{
+    EngineConfig, EngineControl, EngineError, RunReport, UiChannels, run, run_with_control,
+    run_with_ui,
+};
 pub use render::{RenderCtx, RenderError, render};

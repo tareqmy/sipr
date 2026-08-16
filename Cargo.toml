@@ -41,6 +41,8 @@ repository.workspace = true
 [dependencies]
 sipr-scenario = { workspace = true }
 sipr-engine = { workspace = true }
+sipr-stats = { workspace = true }
+sipr-tui = { workspace = true }
 
 [dev-dependencies]
 sipr-net = { workspace = true }

@@ -8,6 +8,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+sipr-stats = { workspace = true }
 
 [lints]
 workspace = true

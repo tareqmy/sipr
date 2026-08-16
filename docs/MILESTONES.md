@@ -108,13 +108,27 @@ unchecked *required* items (unchecked stretch items are fine, move them down).
       `-trace_msg`/`-trace_err` files with SIPp-style framing
 - [x] Periodic stat line in `-bg` mode incl. rtd1 avg/p99
 
-## M5 — TUI
+## M5 — TUI ✅
 
-- [ ] ratatui main screen (rates, counts, response codes, retrans) ≈ SIPp layout
-- [ ] Scenario screen: per-step sent/recv/retrans/timeout/unexpected table
-- [ ] Repartition screen
-- [ ] Keys: `+ - * / p q Q s` per SIPP_COMPAT §4; TUI reads snapshots only
-- [ ] Terminal restored correctly on panic/exit (no wrecked shells)
+- [x] Main screen (rates target/period/avg, call counts, message counters,
+      failure breakdown, RTD table, call length) ≈ SIPp layout. NOTE:
+      hand-rolled ANSI + `stty` raw mode instead of ratatui/crossterm
+      (unreachable registry, same as every dependency decision) — rendering
+      is pure `Snapshot → Vec<String>` functions in `sipr-tui/src/render.rs`
+      and fully unit-tested; the interactive shell is a thin guard layer.
+- [x] Scenario screen: per-step sent/recv/retrans/timeout/unexpected table
+      (per-step counters wired through the engine into `StatSet`)
+- [x] Repartition screen (both tables, placeholder when unconfigured)
+- [x] Keys: `+ - * /` live rate, `p` pause (pacer skips), `q` soft quit,
+      `Q` hard quit, `s` screen cycle; TUI reads 1 s snapshots over a
+      channel and never touches engine state; keys flow back through the
+      same bridge (`run_with_ui`), verified without a terminal in
+      `sipr-engine/tests/ui_bridge.rs`
+- [x] Terminal restored on every path: RawGuard drop (`stty -g` save /
+      restore), panic hook chaining the restore, alternate-screen leave —
+      verified under a real pty (`script`): restore sequence emitted once,
+      exit 0. TUI auto-enables only when stdin+stdout are terminals and
+      `-bg` is absent; headless behavior unchanged.
 
 ## M6 — Actions, variables, auth  ← v1 ships when green
 

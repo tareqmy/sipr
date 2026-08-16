@@ -180,6 +180,8 @@ enum Event {
 struct RetransCtx {
     buf: Vec<u8>,
     lost_pct: Option<f64>,
+    /// Step index of the send, for per-step retrans counters.
+    msg_index: usize,
     attempt: u32,
     schedule: RetransSchedule,
     timer: TimerId,
@@ -221,6 +223,15 @@ impl std::fmt::Display for EngineError {
     }
 }
 
+/// Channels wiring a live UI to the engine: snapshots flow out about once
+/// a second; single-character key commands flow in (`+ - * / p q Q`).
+pub struct UiChannels {
+    /// Engine → UI: periodic stat snapshots.
+    pub snapshots: std::sync::mpsc::Sender<sipr_stats::Snapshot>,
+    /// UI → engine: key commands.
+    pub keys: Receiver<char>,
+}
+
 /// Run a UAC scenario to completion. Blocks until done.
 ///
 /// # Errors
@@ -243,13 +254,26 @@ pub fn run_with_control(
     scenario: &Scenario,
     config: &EngineConfig,
 ) -> Result<(RunReport, EngineControl), EngineError> {
+    run_with_ui(scenario, config, None)
+}
+
+/// [`run`] with an optional live UI attached (see [`UiChannels`]).
+///
+/// # Errors
+///
+/// See [`run`].
+pub fn run_with_ui(
+    scenario: &Scenario,
+    config: &EngineConfig,
+    ui: Option<UiChannels>,
+) -> Result<(RunReport, EngineControl), EngineError> {
     validate_for_engine(scenario)?;
     if scenario.role == Role::Uac && config.target.is_none() {
         return Err(EngineError(
             "this scenario places calls (UAC): a remote target is required".into(),
         ));
     }
-    let mut engine = Engine::new(scenario, config)?;
+    let mut engine = Engine::new(scenario, config, ui)?;
     let control = engine.control.clone();
     let report = engine.run_loop();
     Ok((report, control))
@@ -273,6 +297,10 @@ struct Engine<'s> {
     pacer_carry: f64,
     /// Fraction of the rate period each pacer tick represents.
     tick_ratio: f64,
+    paused: bool,
+    snapshot_tx: Option<std::sync::mpsc::Sender<sipr_stats::Snapshot>>,
+    /// (when, created-count) at the last snapshot, for the period rate.
+    last_snapshot: (Instant, u64),
     soft_stopping: bool,
     hard_stop: bool,
     local_ip_str: String,
@@ -280,8 +308,27 @@ struct Engine<'s> {
 }
 
 impl<'s> Engine<'s> {
-    fn new(scenario: &'s Scenario, config: &EngineConfig) -> Result<Self, EngineError> {
+    fn new(
+        scenario: &'s Scenario,
+        config: &EngineConfig,
+        ui: Option<UiChannels>,
+    ) -> Result<Self, EngineError> {
         let (tx, rx) = channel::<Event>();
+        let snapshot_tx = ui.map(|ui| {
+            // Forward UI key presses into the event loop.
+            let key_tx = tx.clone();
+            let keys = ui.keys;
+            let _keys = std::thread::Builder::new()
+                .name("sipr-ui-keys".into())
+                .spawn(move || {
+                    while let Ok(c) = keys.recv() {
+                        if key_tx.send(Event::Stdin(c)).is_err() {
+                            return;
+                        }
+                    }
+                });
+            ui.snapshots
+        });
         // Bridge net events into the engine channel.
         let (net_tx, net_rx) = channel::<NetEvent>();
         let bridge_tx = tx.clone();
@@ -373,6 +420,11 @@ impl<'s> Engine<'s> {
         if let Some(f) = trace_stat.as_mut() {
             f.write(&sipr_stats::StatSet::csv_header());
         }
+        let mut stat_set = sipr_stats::StatSet::new(
+            &scenario.response_time_repartition,
+            &scenario.call_length_repartition,
+        );
+        stat_set.init_steps(scenario.steps.iter().map(step_label).collect());
         Ok(Self {
             scenario,
             config: config.clone(),
@@ -380,10 +432,7 @@ impl<'s> Engine<'s> {
             timers,
             rx,
             calls: HashMap::new(),
-            stats: sipr_stats::StatSet::new(
-                &scenario.response_time_repartition,
-                &scenario.call_length_repartition,
-            ),
+            stats: stat_set,
             trace_msg: open_trace(&config.trace_msg, "message trace")?,
             trace_err: open_trace(&config.trace_err, "error trace")?,
             trace_stat,
@@ -392,6 +441,9 @@ impl<'s> Engine<'s> {
             control,
             pacer_carry: 0.0,
             tick_ratio: tick.as_secs_f64() / config.rate_period.as_secs_f64(),
+            paused: false,
+            snapshot_tx,
+            last_snapshot: (Instant::now(), 0),
             soft_stopping: false,
             hard_stop: false,
             local_ip_str: local_addr.ip().to_string(),
@@ -438,14 +490,23 @@ impl<'s> Engine<'s> {
                         self.fail_all("hard quit");
                         self.hard_stop = true;
                     }
+                    // SIPp rate keys: +/- by 1, */÷ by 10.
+                    '+' => self.control.set_rate(self.control.rate() + 1.0),
+                    '-' => self.control.set_rate((self.control.rate() - 1.0).max(0.0)),
+                    '*' => self.control.set_rate(self.control.rate() + 10.0),
+                    '/' => self.control.set_rate((self.control.rate() - 10.0).max(0.0)),
+                    'p' => self.paused = !self.paused,
                     _ => {}
                 },
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if self.config.periodic_stats && last_line.elapsed() >= Duration::from_secs(1) {
+            if last_line.elapsed() >= Duration::from_secs(1) {
                 last_line = Instant::now();
-                eprintln!("sipr: {}", self.stats.line(self.calls.len()));
+                if self.config.periodic_stats {
+                    eprintln!("sipr: {}", self.stats.line(self.calls.len()));
+                }
+                self.publish_snapshot();
             }
             if self.trace_stat.is_some() && last_stat_dump.elapsed() >= self.config.stat_interval {
                 last_stat_dump = Instant::now();
@@ -488,6 +549,29 @@ impl<'s> Engine<'s> {
         }
     }
 
+    fn publish_snapshot(&mut self) {
+        let Some(tx) = self.snapshot_tx.as_ref() else {
+            return;
+        };
+        let mut snap = sipr_stats::Snapshot {
+            scenario: self.scenario.name.clone(),
+            uas: self.scenario.role == Role::Uas,
+            rate_target: self.control.rate(),
+            paused: self.paused,
+            ..Default::default()
+        };
+        self.stats.fill_snapshot(&mut snap, self.calls.len());
+        let now = Instant::now();
+        let (last_at, last_created) = self.last_snapshot;
+        #[allow(clippy::cast_precision_loss)]
+        {
+            snap.rate_period = (self.stats.created() - last_created) as f64
+                / now.duration_since(last_at).as_secs_f64().max(1e-9);
+        }
+        self.last_snapshot = (now, self.stats.created());
+        let _ = tx.send(snap); // UI gone → ignored; run continues headless
+    }
+
     fn done_creating(&self) -> bool {
         self.soft_stopping
             || self
@@ -499,7 +583,7 @@ impl<'s> Engine<'s> {
     // ---- pacing --------------------------------------------------------
 
     fn on_pacer_tick(&mut self) {
-        if self.scenario.role == Role::Uas || self.done_creating() {
+        if self.scenario.role == Role::Uas || self.paused || self.done_creating() {
             return;
         }
         self.pacer_carry += self.control.rate() * self.tick_ratio;
@@ -599,6 +683,9 @@ impl<'s> Engine<'s> {
                         .send_to(&buf, remote, send.lost_pct)
                         .unwrap_or(false); // simulated drops still count as "sent"
                     self.stats.messages_sent += 1;
+                    if let Some(s) = self.stats.step_mut(index) {
+                        s.sent += 1;
+                    }
                     self.trace_send(&buf, remote);
                     let retrans_ms = send.retrans_ms;
                     let lost_pct = send.lost_pct;
@@ -636,6 +723,7 @@ impl<'s> Engine<'s> {
                             call.retrans = Some(RetransCtx {
                                 buf,
                                 lost_pct,
+                                msg_index: index,
                                 attempt: 1,
                                 schedule,
                                 timer,
@@ -863,6 +951,9 @@ impl<'s> Engine<'s> {
                     return;
                 }
                 self.stats.unexpected += 1;
+                if let Some(s) = self.stats.step_mut(window_start) {
+                    s.unexpected += 1;
+                }
                 let what = msg
                     .method()
                     .map_or_else(|| format!("{:?}", msg.status_code()), ToOwned::to_owned);
@@ -884,6 +975,9 @@ impl<'s> Engine<'s> {
         key: (String, String, String),
     ) {
         self.stats.messages_matched += 1;
+        if let Some(s) = self.stats.step_mut(si) {
+            s.recv += 1;
+        }
         let (rrs, common) = match &self.scenario.steps[si] {
             Step::Recv(r) => (r.record_route_set, r.common.clone()),
             _ => (false, StepCommon::default()),
@@ -1000,11 +1094,15 @@ impl<'s> Engine<'s> {
         };
         match kind {
             TimerKind::RecvTimeout => {
-                let ontimeout = self.window_mandatory(index).and_then(|(mi, _)| {
-                    match &self.scenario.steps[mi] {
-                        Step::Recv(RecvStep { ontimeout, .. }) => *ontimeout,
-                        _ => None,
+                let mandatory = self.window_mandatory(index);
+                if let Some((mi, _)) = mandatory {
+                    if let Some(s) = self.stats.step_mut(mi) {
+                        s.timeouts += 1;
                     }
+                }
+                let ontimeout = mandatory.and_then(|(mi, _)| match &self.scenario.steps[mi] {
+                    Step::Recv(RecvStep { ontimeout, .. }) => *ontimeout,
+                    _ => None,
                 });
                 match ontimeout {
                     Some(dest) => {
@@ -1024,13 +1122,21 @@ impl<'s> Engine<'s> {
     }
 
     fn on_retrans_timer(&mut self, call_id: &str, generation: u64) {
-        let Some((buf, lost, next)) = self.calls.get_mut(call_id).and_then(|call| {
+        let Some((buf, lost, next, msg_index)) = self.calls.get_mut(call_id).and_then(|call| {
             let r = call.retrans.as_mut()?;
             r.attempt += 1;
-            Some((r.buf.clone(), r.lost_pct, r.schedule.interval(r.attempt)))
+            Some((
+                r.buf.clone(),
+                r.lost_pct,
+                r.schedule.interval(r.attempt),
+                r.msg_index,
+            ))
         }) else {
             return; // call gone or retransmission already cancelled
         };
+        if let Some(s) = self.stats.step_mut(msg_index) {
+            s.retrans += 1;
+        }
         let Some(remote) = self.calls.get(call_id).map(|c| c.remote) else {
             return;
         };
@@ -1101,6 +1207,43 @@ impl<'s> Engine<'s> {
         for id in ids {
             self.fail_call(&id, reason);
         }
+    }
+}
+
+/// Short display label for a step (scenario screen rows).
+fn step_label(step: &Step) -> String {
+    match step {
+        Step::Send(s) => {
+            let what = template_first_word(&s.template).unwrap_or_default();
+            if what == "SIP/2.0" {
+                // Response send: show the status code from the template.
+                let code = s.template.spans.first().map_or(String::new(), |sp| {
+                    if let Span::Lit(l) = sp {
+                        l.split_whitespace().nth(1).unwrap_or("").to_owned()
+                    } else {
+                        String::new()
+                    }
+                });
+                format!("send {code}")
+            } else {
+                format!("send {what}")
+            }
+        }
+        Step::Recv(r) => {
+            let what = match &r.expect {
+                Expect::Response(c) => c.clone(),
+                Expect::Request(m) => m.clone(),
+            };
+            if r.optional {
+                format!("recv {what} (opt)")
+            } else {
+                format!("recv {what}")
+            }
+        }
+        Step::Pause { .. } => "pause".to_owned(),
+        Step::Nop { .. } => "nop".to_owned(),
+        Step::Label { id, .. } => format!("label {id}"),
+        Step::Timewait { ms, .. } => format!("timewait {ms}ms"),
     }
 }
 

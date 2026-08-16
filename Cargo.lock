@@ -9,6 +9,8 @@ dependencies = [
  "sipr-engine",
  "sipr-net",
  "sipr-scenario",
+ "sipr-stats",
+ "sipr-tui",
 ]
 
 [[package]]
@@ -39,3 +41,6 @@ version = "0.1.0"
 [[package]]
 name = "sipr-tui"
 version = "0.1.0"
+dependencies = [
+ "sipr-stats",
+]
