@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use sipr_net::timer::TimerId;
 use sipr_net::{Inbound, NetEvent, RetransSchedule, TimerService, TransportConfig, UdpTransport};
+use sipr_scenario::inject::{InjectMode, InjectionFile};
 use sipr_scenario::model::{Action, Expect, PauseSpec, RecvStep, Role, Scenario, Step, StepCommon};
 use sipr_scenario::template::{Keyword, MsgTemplate, Span};
 
@@ -74,6 +75,8 @@ pub struct EngineConfig {
     pub trace_stat: Option<std::path::PathBuf>,
     /// `-fd`: statistics dump interval.
     pub stat_interval: Duration,
+    /// `-inf`: injection-file paths (CSV) for `[fieldN]`, in order.
+    pub inf_files: Vec<std::path::PathBuf>,
 }
 
 /// Final counters of a run.
@@ -206,6 +209,8 @@ struct CallState {
     last_sent: Option<Vec<u8>>,
     /// Running RTD stopwatches: (name, started-at).
     rtd_starts: Vec<(String, Instant)>,
+    /// Assigned injection-file line per `-inf` file (None = no line).
+    field_lines: Vec<Option<usize>>,
     /// Per-call variable store.
     store: crate::actions::VarStore,
     /// Named counters (`counter` step attribute).
@@ -280,6 +285,29 @@ pub fn run_with_ui(
     ui: Option<UiChannels>,
 ) -> Result<(RunReport, EngineControl), EngineError> {
     validate_for_engine(scenario)?;
+    // A scenario using [fieldN file=K] needs at least K+1 `-inf` files.
+    let max_file = scenario
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Send(send) => Some(&send.template),
+            _ => None,
+        })
+        .flat_map(sipr_scenario::template::MsgTemplate::keywords)
+        .filter_map(|k| match k {
+            Keyword::Field { file, .. } => Some(*file),
+            _ => None,
+        })
+        .max();
+    if let Some(max_file) = max_file {
+        if max_file >= config.inf_files.len() {
+            return Err(EngineError(format!(
+                "scenario uses [field... file={max_file}] but only {} injection \
+                 file(s) were given with -inf",
+                config.inf_files.len()
+            )));
+        }
+    }
     if scenario.role == Role::Uac && config.target.is_none() {
         return Err(EngineError(
             "this scenario places calls (UAC): a remote target is required".into(),
@@ -302,6 +330,8 @@ struct Engine<'s> {
     trace_msg: Option<sipr_stats::TraceFile>,
     trace_err: Option<sipr_stats::TraceFile>,
     trace_stat: Option<sipr_stats::TraceFile>,
+    inf_files: Vec<InjectionFile>,
+    inf_seq: Vec<usize>,
     rng: sipr_net::rng::Rng,
     /// Per-step: CSeq method a response recv must carry (SIPp guard).
     expected_cseq_method: Vec<Option<String>>,
@@ -437,6 +467,27 @@ impl<'s> Engine<'s> {
             &scenario.call_length_repartition,
         );
         stat_set.init_steps(scenario.steps.iter().map(step_label).collect());
+        // Load -inf injection files up front (fail fast on bad files).
+        let mut inf_files = Vec::with_capacity(config.inf_files.len());
+        for path in &config.inf_files {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                EngineError(format!(
+                    "cannot read injection file {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let file =
+                InjectionFile::parse(&path.display().to_string(), &text).map_err(EngineError)?;
+            if file.mode == InjectMode::User {
+                eprintln!(
+                    "sipr: warning: injection file {} uses USER mode, which needs \
+                     -users (unsupported); its [fieldN] will render empty",
+                    path.display()
+                );
+            }
+            inf_files.push(file);
+        }
+        let inf_len = inf_files.len();
         Ok(Self {
             scenario,
             config: config.clone(),
@@ -448,6 +499,8 @@ impl<'s> Engine<'s> {
             trace_msg: open_trace(&config.trace_msg, "message trace")?,
             trace_err: open_trace(&config.trace_err, "error trace")?,
             trace_stat,
+            inf_files,
+            inf_seq: vec![0; inf_len],
             rng: sipr_net::rng::Rng::new(config.seed ^ 0x51B8_0003),
             expected_cseq_method: precompute_cseq_methods(scenario),
             control,
@@ -626,6 +679,7 @@ impl<'s> Engine<'s> {
         let number = self.stats.created();
         let call_id = self.make_call_id(number);
         let cnonce = self.make_cnonce(number);
+        let field_lines = self.assign_field_lines();
         self.calls.insert(
             call_id.clone(),
             new_call(
@@ -634,6 +688,7 @@ impl<'s> Engine<'s> {
                 self.config.base_cseq,
                 &self.scenario.vars,
                 cnonce,
+                field_lines,
             ),
         );
         self.advance(&call_id);
@@ -647,6 +702,30 @@ impl<'s> Engine<'s> {
                 .replace("%s", &self.local_ip_str),
             None => format!("{number}-{}@{}", self.pid, self.local_ip_str),
         }
+    }
+
+    /// Choose this call's line in each injection file, per its mode.
+    fn assign_field_lines(&mut self) -> Vec<Option<usize>> {
+        let mut out = Vec::with_capacity(self.inf_files.len());
+        for (i, file) in self.inf_files.iter().enumerate() {
+            let n = file.len();
+            let line = match file.mode {
+                _ if n == 0 => None,
+                InjectMode::Sequential => {
+                    let l = self.inf_seq[i] % n;
+                    self.inf_seq[i] = self.inf_seq[i].wrapping_add(1);
+                    Some(l)
+                }
+                InjectMode::Random =>
+                {
+                    #[allow(clippy::cast_possible_truncation)]
+                    Some((self.rng.next_u64() % n as u64) as usize)
+                }
+                InjectMode::User => None, // needs -users
+            };
+            out.push(line);
+        }
+        out
     }
 
     /// Deterministic-but-unique client nonce for digest auth.
@@ -724,6 +803,10 @@ impl<'s> Engine<'s> {
                             routes: &call.routes,
                             last: call.last_recv.as_ref(),
                             var_ctx: Some(var_ctx),
+                            fields: crate::render::FieldSource {
+                                files: &self.inf_files,
+                                lines: &call.field_lines,
+                            },
                         };
                         match render(&send.template, &ctx) {
                             Ok(buf) => (buf, call.remote),
@@ -979,6 +1062,7 @@ impl<'s> Engine<'s> {
                 self.stats.incoming_created += 1;
                 let number = self.stats.created();
                 let cnonce = self.make_cnonce(number);
+                let field_lines = self.assign_field_lines();
                 self.calls.insert(
                     call_id.clone(),
                     new_call(
@@ -987,6 +1071,7 @@ impl<'s> Engine<'s> {
                         self.config.base_cseq,
                         &self.scenario.vars,
                         cnonce,
+                        field_lines,
                     ),
                 );
                 // Fall through to normal matching below (window at 0).
@@ -1178,6 +1263,10 @@ impl<'s> Engine<'s> {
                 routes: &call.routes,
                 last: last.as_ref(),
                 var_ctx: Some(var_ctx),
+                fields: crate::render::FieldSource {
+                    files: &self.inf_files,
+                    lines: &call.field_lines,
+                },
             };
             crate::actions::run_actions(actions, &mut store, last.as_ref(), &ctx)
         };
@@ -1475,6 +1564,7 @@ fn new_call(
     base_cseq: u32,
     vars: &sipr_scenario::model::VarTable,
     cnonce: String,
+    field_lines: Vec<Option<usize>>,
 ) -> CallState {
     CallState {
         number,
@@ -1486,6 +1576,7 @@ fn new_call(
         cseq: base_cseq,
         last_sent: None,
         rtd_starts: Vec::new(),
+        field_lines,
         store: crate::actions::VarStore::new(vars),
         counters: std::collections::HashMap::new(),
         cnonce,

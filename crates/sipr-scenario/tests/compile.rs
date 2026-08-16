@@ -315,3 +315,34 @@ fn dump_is_stable_and_informative() {
     assert!(dump.contains("recv response=100 optional"), "{dump}");
     assert!(dump.contains("pause default (-d)"), "{dump}");
 }
+
+#[test]
+fn field_keyword_tokenizes_with_file_and_line() {
+    use sipr_scenario::template::Keyword;
+    let xml = wrap(&format!(
+        r#"{invite}
+           <send><![CDATA[
+             ACK sip:[field0]@[remote_ip] SIP/2.0
+             X-Two: [field2 file=1]
+             X-Line: [field0 line=3]
+             Call-ID: [call_id]
+
+           ]]></send>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let Step::Send(ack) = &sc.steps[1] else {
+        panic!("step 1 not send");
+    };
+    let fields: Vec<_> = ack
+        .template
+        .keywords()
+        .filter_map(|k| match k {
+            Keyword::Field { index, file, line } => Some((*index, *file, *line)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fields, vec![(0, 0, None), (2, 1, None), (0, 0, Some(3))]);
+}

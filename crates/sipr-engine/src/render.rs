@@ -72,6 +72,35 @@ pub struct RenderCtx<'a> {
     pub last: Option<&'a Inbound>,
     /// Variables + auth (present at M6; `None` renders `[$x]` empty).
     pub var_ctx: Option<VarCtx<'a>>,
+    /// Injection files + this call's assigned line per file (`[fieldN]`).
+    pub fields: FieldSource<'a>,
+}
+
+/// `-inf` files plus the current call's assigned line in each (parallel to
+/// `files`). An out-of-range file/line/field renders empty, per SIPp.
+#[derive(Clone, Copy)]
+pub struct FieldSource<'a> {
+    /// Loaded injection files, in `-inf` order.
+    pub files: &'a [sipr_scenario::inject::InjectionFile],
+    /// The call's chosen line per file (`None` = no line, e.g. USER mode).
+    pub lines: &'a [Option<usize>],
+}
+
+impl FieldSource<'_> {
+    /// No injection files.
+    pub const EMPTY: Self = Self {
+        files: &[],
+        lines: &[],
+    };
+
+    /// Resolve `[fieldN file=F line=?]` to its value, or `""`.
+    fn value(&self, index: usize, file: usize, line: Option<usize>) -> &str {
+        let Some(f) = self.files.get(file) else {
+            return "";
+        };
+        let ln = line.or_else(|| self.lines.get(file).copied().flatten());
+        ln.and_then(|l| f.field(l, index)).unwrap_or("")
+    }
 }
 
 /// Rendering failure (unsupported keyword reached the renderer).
@@ -213,6 +242,9 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
         Keyword::MediaIp => out.push_str(ctx.local_ip),
         Keyword::MediaPort => out.push_str("6000"),
         Keyword::MediaIpType => out.push_str(ip_type(ctx.local_ip)),
+        Keyword::Field { index, file, line } => {
+            out.push_str(ctx.fields.value(*index, *file, *line));
+        }
         Keyword::Last(name) => {
             let lines = ctx.last.map(|m| m.header_lines(name)).unwrap_or_default();
             if lines.is_empty() {
@@ -309,6 +341,7 @@ mod tests {
             routes: &[],
             last,
             var_ctx: None,
+            fields: crate::render::FieldSource::EMPTY,
         }
     }
 

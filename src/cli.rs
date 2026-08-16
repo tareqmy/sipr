@@ -78,6 +78,8 @@ pub struct Cli {
     pub call_id_format: Option<String>,
     /// `-max_retrans`: maximum UDP retransmissions per message.
     pub max_retrans: Option<u32>,
+    /// `-inf`: injection files (CSV) for `[fieldN]`; repeatable, in order.
+    pub inf: Vec<std::path::PathBuf>,
 }
 
 impl Default for Cli {
@@ -112,6 +114,7 @@ impl Default for Cli {
             base_cseq: None,
             call_id_format: None,
             max_retrans: None,
+            inf: Vec::new(),
         }
     }
 }
@@ -232,6 +235,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "N",
         "Maximum UDP retransmissions per message",
     ),
+    (
+        "inf",
+        true,
+        "FILE",
+        "Injection file (CSV) for [fieldN]; repeatable",
+    ),
     ("h", false, "", "Print help"),
     ("help", false, "", "Print help"),
     ("v", false, "", "Print version"),
@@ -335,6 +344,7 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "base_cseq" => cli.base_cseq = Some(parse_num(flag, &val(value))?),
         "cid_str" => cli.call_id_format = Some(val(value)),
         "max_retrans" => cli.max_retrans = Some(parse_num(flag, &val(value))?),
+        "inf" => cli.inf.push(std::path::PathBuf::from(val(value))),
         other => return Err(format!("internal error: unhandled flag '-{other}'")),
     }
     Ok(())

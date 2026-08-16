@@ -158,8 +158,25 @@ unchecked *required* items (unchecked stretch items are fine, move them down).
 sandbox has no sipp binary — run `SIPP_BIN=... cargo test --test interop`
 on a machine with sipp to close them.
 
+## M7 — Injection files ✅
+
+- [x] `-inf FILE` (repeatable): SEQUENTIAL / RANDOM / USER mode header (matched
+      by substring, per SIPp), `;`-separated fields, `#` comments, blank line
+      terminates. One line is drawn per call per file — SEQUENTIAL cycles
+      (wrapping), RANDOM picks uniformly, USER defers to `-users` (not yet
+      wired, so USER renders empty with a load-time warning, matching SIPp).
+      Parser is pure (`sipr-scenario/src/inject.rs`), assignment happens once
+      at call birth in the engine.
+- [x] `[fieldN]` keyword resolves to field N of this call's drawn line.
+      sipr extensions over SIPp: `[fieldN file=K]` selects the K-th `-inf`
+      (0-based) and `[fieldN line=M]` pins a literal line. Unknown field/file
+      indices are rejected at load. Verified end-to-end
+      (`tests/e2e.rs::injection_file_fields_land_in_sent_messages`).
+- [x] SIPP_COMPAT §6 documents the injection semantics and the deferral of
+      `lookup`/`insert`/`replace` (indexed-file mutation needs the file store).
+
 ## Post-v1 backlog (ordered)
 
-`-inf` injection + `lookup` → TCP → TLS → 3PCC (`sendCmd`/`recvCmd`) → `-users`
-closed loop → pcap/RTP media (study gossipper first) → AKA auth → IPv6 → HTTP
-control API.
+`lookup`/`insert`/`replace` (indexed injection) → TCP → TLS → 3PCC
+(`sendCmd`/`recvCmd`) → `-users` closed loop → pcap/RTP media (study gossipper
+first) → AKA auth → IPv6 → HTTP control API.

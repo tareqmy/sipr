@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Injection files** — `-inf FILE` (repeatable) loads SIPp-style injection
+  files: a `SEQUENTIAL`/`RANDOM`/`USER` mode header, `;`-separated fields,
+  `#` comments, blank-line terminator. One line is drawn per call per file
+  (SEQUENTIAL cycles, RANDOM picks uniformly, USER defers to `-users`). The
+  `[fieldN]` keyword substitutes field N of the drawn line, with sipr
+  extensions `[fieldN file=K]` (select the K-th `-inf`, 0-based) and
+  `[fieldN line=M]` (pin a literal line). Unknown field/file indices are
+  rejected at load. See `docs/SIPP_COMPAT.md` §6.
+
 ## [0.1.0] — 2026-08-16
 
 First release. A SIPp-compatible SIP testing tool and traffic generator,

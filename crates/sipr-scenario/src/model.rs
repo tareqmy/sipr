@@ -485,6 +485,7 @@ fn keyword_name(k: &Keyword) -> String {
         Keyword::Last(h) => return format!("[last_{h}:]"),
         Keyword::Var(v) => return format!("[${v}]"),
         Keyword::Unknown(u) => return format!("[{u}]"),
+        Keyword::Field { index, file, .. } => return format!("[field{index} file={file}]"),
         Keyword::Authentication(_) => "authentication",
         Keyword::Service => "service",
         Keyword::RemoteIp => "remote_ip",

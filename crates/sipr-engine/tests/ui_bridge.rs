@@ -34,6 +34,7 @@ fn uas_config() -> EngineConfig {
         trace_err: None,
         trace_stat: None,
         stat_interval: Duration::from_secs(1),
+        inf_files: Vec::new(),
     }
 }
 

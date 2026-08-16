@@ -72,7 +72,9 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   `strcmp`, `jump`, `log`/`warning`/`error`, `exec int_cmd`, ...), `test`/
   `condexec` branching, `chance`, and named counters.
 - Keywords incl. `[call_id]`, `[branch]`, `[cseq]`, `[last_*:]`, `[$var]`,
-  `[routes]`, `[peer_tag_param]`, `[len]`, and `[authentication]`.
+  `[routes]`, `[peer_tag_param]`, `[len]`, `[fieldN]`, and `[authentication]`.
+- `-inf FILE` injection files (SEQUENTIAL/RANDOM/USER), one line drawn per call;
+  `[fieldN]` pulls a field, with `file=`/`line=` extensions over SIPp.
 - UAC and UAS roles; open-loop pacing (`-r/-rp/-l/-m`) with rate smoothing.
 - UDP retransmission (T1→T2), recv-window matching verified against SIPp's C++.
 - Digest authentication (MD5 + SHA-256, `qop=auth`, proxy 407).
@@ -90,9 +92,8 @@ Everything is built on the Rust standard library only — no external crates.
 
 ## Not yet (post-v1 roadmap)
 
-TCP/TLS transports, `-inf` injection files (and the `lookup`/`insert`/`replace`
-actions that depend on them), 3PCC (`sendCmd`/`recvCmd`), RTP/pcap media, IPv6,
-and an HTTP control API.
+TCP/TLS transports, indexed-file actions (`lookup`/`insert`/`replace`), 3PCC
+(`sendCmd`/`recvCmd`), RTP/pcap media, IPv6, and an HTTP control API.
 
 ## Brand
 

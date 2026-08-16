@@ -186,5 +186,17 @@ Verify exact SIPp table before closing M3 and update this line.
   `test`/`condexec` truthiness = set and not zero/false/empty; `divide` by
   zero leaves the value unchanged. `exec int_cmd` maps to fail-call /
   graceful-stop / immediate-stop.
+- Injection files `-inf` (M7, verified in `infile.cpp` / `call.cpp`
+  `getFieldFromInputFile`): line 1 is the mode, matched by SUBSTRING —
+  `SEQUENTIAL`, `RANDOM`, or `USER` (SIPp also supports `PRINTF=` virtual
+  lines; sipr does not yet). Data lines follow; a line beginning `#` is a
+  comment, trailing `\r` is stripped, a blank line ends the file. Field
+  separator is `;`, fields are 0-indexed (`[field0]` = first). Each call is
+  assigned ONE line per file at creation (`nextLine`): SEQUENTIAL = a shared
+  per-file counter mod line-count, RANDOM = uniform pick, USER = userId-1
+  (needs `-users`; without it the fields render empty — sipr warns at load).
+  `[fieldN]` uses the default (first) file; sipr adds `[fieldN file=K]`
+  (0-based `-inf` index) and `[fieldN line=M]` (literal line override).
+  `lookup`/`insert`/`replace` (indexed-file mutation) are NOT in this pass.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

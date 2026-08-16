@@ -142,6 +142,7 @@ fn run(cli: &Cli) -> ExitCode {
                 .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_.csv")))
         }),
         stat_interval: std::time::Duration::from_secs(cli.stat_interval_s.unwrap_or(1)),
+        inf_files: cli.inf.clone(),
     };
     // Live TUI when attached to a terminal (and not headless/lint mode).
     let use_tui = {

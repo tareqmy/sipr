@@ -14,4 +14,4 @@ pub use engine::{
     EngineConfig, EngineControl, EngineError, RunReport, UiChannels, run, run_with_control,
     run_with_ui,
 };
-pub use render::{RenderCtx, RenderError, VarCtx, render};
+pub use render::{FieldSource, RenderCtx, RenderError, VarCtx, render};

@@ -674,3 +674,123 @@ fn digest_uri_matches_what_the_server_verifies() {
     );
     assert!(registrar.join().expect("registrar"));
 }
+
+#[test]
+fn injection_file_fields_land_in_sent_messages() {
+    // A UAS that captures the From user-part of each INVITE it sees, so we can
+    // prove sipr substituted [field0] from the -inf file per call.
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut seen_users: Vec<String> = Vec::new();
+        let mut answered: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let branch = msg.top_via_branch().unwrap_or_default().to_owned();
+                    if let Some(ok) = answered.get(&branch) {
+                        let _ = sock.send_to(ok, from);
+                        continue;
+                    }
+                    // Record the From header's user (between "sip:" and "@").
+                    if let Some(from_h) = msg.header("From") {
+                        if let Some(u) = from_h
+                            .split("sip:")
+                            .nth(1)
+                            .and_then(|s| s.split('@').next())
+                        {
+                            seen_users.push(u.to_owned());
+                        }
+                    }
+                    let ok = mirror_response(&msg, "200 OK", true);
+                    answered.insert(branch, ok.clone());
+                    let _ = sock.send_to(&ok, from);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        seen_users
+    });
+
+    // A SEQUENTIAL injection file: three distinct user-parts.
+    let inf = "SEQUENTIAL\nalice;1001\nbob;1002\ncarol;1003\n";
+    let inf_path = std::env::temp_dir().join(format!("sipr-inf-{}.csv", std::process::id()));
+    std::fs::write(&inf_path, inf).expect("write inf");
+
+    let scenario = r#"<scenario name="inf-uac">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:[field0]@[local_ip]:[local_port]>
+    X-Ext: [field1]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Content-Length: 0
+
+  ]]></send>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+    let sc_path = std::env::temp_dir().join(format!("sipr-inf-sc-{}.xml", std::process::id()));
+    std::fs::write(&sc_path, scenario).expect("write scenario");
+
+    let out = run_sipr(&[
+        "-sf",
+        sc_path.to_str().expect("utf8"),
+        "-inf",
+        inf_path.to_str().expect("utf8"),
+        "-m",
+        "3",
+        "-d",
+        "30",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&sc_path);
+    let _ = std::fs::remove_file(&inf_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 3 failed 0"), "{err}");
+
+    let mut users = uas.join().expect("uas thread");
+    users.sort();
+    assert_eq!(
+        users,
+        vec!["alice", "bob", "carol"],
+        "sequential fields per call"
+    );
+}

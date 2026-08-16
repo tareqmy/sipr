@@ -72,6 +72,16 @@ pub enum Keyword {
     Var(String),
     /// `[authentication ...]` with its `key=value` parameters.
     Authentication(Vec<(String, String)>),
+    /// `[fieldN]` — a value from an `-inf` injection file. `file` selects the
+    /// 0-based `-inf` file (default 0); `line` overrides the per-call line.
+    Field {
+        /// 0-based field index within the row.
+        index: usize,
+        /// 0-based `-inf` file index.
+        file: usize,
+        /// Explicit line override (`line=M`), else the call's assigned line.
+        line: Option<usize>,
+    },
     /// Unrecognized keyword: emitted verbatim (including brackets).
     Unknown(String),
 }
@@ -219,8 +229,34 @@ fn classify(body: &str) -> Classified {
         "media_port" => simple(Keyword::MediaPort),
         "media_ip_type" => simple(Keyword::MediaIpType),
         "authentication" => Classified::Keyword(Keyword::Authentication(parse_params(params))),
-        _ => Classified::Unknown,
+        _ => classify_field(name, params),
     }
+}
+
+/// `[fieldN]`, `[fieldN file=K]`, `[fieldN line=M]` — an injection-file value.
+fn classify_field(name: &str, params: &str) -> Classified {
+    let Some(idx) = name.strip_prefix("field") else {
+        return Classified::Unknown;
+    };
+    let Ok(index) = idx.parse::<usize>() else {
+        return Classified::Unknown;
+    };
+    let mut file = 0usize;
+    let mut line = None;
+    for (k, v) in parse_params(params) {
+        match k.as_str() {
+            "file" => match v.parse() {
+                Ok(f) => file = f,
+                Err(_) => return Classified::Unknown,
+            },
+            "line" => match v.parse() {
+                Ok(l) => line = Some(l),
+                Err(_) => return Classified::Unknown,
+            },
+            _ => return Classified::Unknown,
+        }
+    }
+    Classified::Keyword(Keyword::Field { index, file, line })
 }
 
 fn is_var_char(c: char) -> bool {
