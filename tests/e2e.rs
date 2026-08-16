@@ -1,16 +1,17 @@
-//! End-to-end: the sipr binary places real calls over loopback UDP against a
-//! scripted UAS implementing the classic uas flow (INVITE → 180 → 200,
-//! ACK, BYE → 200). This is the always-on complement to the real-SIPp
-//! interop suite in `tests/interop.rs`.
+//! End-to-end: the sipr binary places (and answers) real calls over loopback
+//! against scripted peers implementing the classic uas flow (INVITE → 180 →
+//! 200, ACK, BYE → 200), over both UDP and TCP. This is the always-on
+//! complement to the real-SIPp interop suite in `tests/interop.rs`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::Command;
 use std::time::Duration;
 
-use sipr_net::Inbound;
+use sipr_net::{Inbound, TcpFramer};
 
 /// Minimal scripted UAS. Answers until the socket is idle for `idle`.
 fn spawn_uas(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<UasStats>) {
@@ -920,4 +921,184 @@ fn lookup_reads_indexed_field_by_key() {
         vec!["1003", "1003", "1003"],
         "every call looked up carol -> 1003"
     );
+}
+
+/// What a scripted TCP UAS observed.
+#[derive(Default, Debug)]
+struct TcpUasStats {
+    invites: u64,
+    byes: u64,
+    saw_tcp_via: bool,
+}
+
+/// A scripted UAS speaking SIP over TCP: accept one connection, frame requests
+/// off the stream, and reply on the same connection (180+200 to INVITE, 200 to
+/// BYE). Returns once the peer closes or goes idle for `idle`.
+fn spawn_tcp_uas(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<TcpUasStats>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp uas");
+    let addr = listener.local_addr().expect("addr");
+    let handle = std::thread::spawn(move || {
+        let mut stats = TcpUasStats::default();
+        let Ok((mut stream, _peer)) = listener.accept() else {
+            return stats;
+        };
+        stream.set_read_timeout(Some(idle)).ok();
+        let mut framer = TcpFramer::new();
+        let mut buf = [0u8; 16_384];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break, // peer closed
+                Ok(n) => {
+                    framer.push(&buf[..n]);
+                    while let Some(raw) = framer.next_message() {
+                        let Ok(msg) = Inbound::parse(&raw) else {
+                            continue;
+                        };
+                        match msg.method() {
+                            Some("INVITE") => {
+                                stats.invites += 1;
+                                if msg.header_lines("Via").iter().any(|v| v.contains("/TCP")) {
+                                    stats.saw_tcp_via = true;
+                                }
+                                let ringing = mirror_response(&msg, "180 Ringing", true);
+                                let ok = mirror_response(&msg, "200 OK", true);
+                                let _ = stream.write_all(&ringing);
+                                let _ = stream.write_all(&ok);
+                            }
+                            Some("BYE") => {
+                                stats.byes += 1;
+                                let ok = mirror_response(&msg, "200 OK", false);
+                                let _ = stream.write_all(&ok);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(_) => break, // idle timeout or reset
+            }
+        }
+        stats
+    });
+    (addr, handle)
+}
+
+#[test]
+fn tcp_uac_places_call_over_stream() {
+    // sipr as a TCP UAC (-t t1) dials the UAS, places one call over the single
+    // stream connection, and completes with no retransmissions.
+    let (addr, uas) = spawn_tcp_uas(Duration::from_secs(3));
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "t1",
+        "-m",
+        "1",
+        "-d",
+        "20",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    // TCP carries no SIP retransmissions.
+    assert!(err.contains("retrans-sent 0"), "{err}");
+    let stats = uas.join().expect("tcp uas thread");
+    assert_eq!(stats.invites, 1, "one INVITE framed off the stream");
+    assert_eq!(stats.byes, 1, "call torn down with BYE");
+    assert!(stats.saw_tcp_via, "[transport] rendered TCP in the Via");
+}
+
+#[test]
+fn tcp_uas_answers_over_stream() {
+    // sipr as a TCP UAS (-t t1): a scripted TCP client drives one INVITE dialog
+    // and must get 180 then 200, and a 200 to its BYE, all over one connection.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("pick port")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .args([
+            "-sn",
+            "uas",
+            "-t",
+            "t1",
+            "-p",
+            &port.to_string(),
+            "-timeout",
+            "10",
+            "-bg",
+        ])
+        .spawn()
+        .expect("spawn sipr uas");
+
+    // Connect once sipr has bound its listener.
+    let mut stream = None;
+    for _ in 0..80 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            stream = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut stream = stream.expect("connect to sipr uas");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+
+    let send = |stream: &mut TcpStream, method: &str, cseq: u32| {
+        let msg = format!(
+            "{method} sip:svc@127.0.0.1:{port} SIP/2.0\r\n\
+             Via: SIP/2.0/TCP 127.0.0.1:55060;branch=z9hG4bK-tcp-{cseq}\r\n\
+             From: <sip:caller@127.0.0.1>;tag=cli-tcp-1\r\n\
+             To: <sip:svc@127.0.0.1:{port}>\r\n\
+             Call-ID: tcp-call-1\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Contact: <sip:caller@127.0.0.1:55060>\r\n\
+             Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
+        );
+        stream.write_all(msg.as_bytes()).expect("client write");
+    };
+    let read_statuses = |stream: &mut TcpStream, framer: &mut TcpFramer, until: u16| -> Vec<u16> {
+        let mut buf = [0u8; 16_384];
+        let mut seen = Vec::new();
+        while !seen.contains(&until) {
+            let Ok(n) = stream.read(&mut buf) else { break };
+            if n == 0 {
+                break;
+            }
+            framer.push(&buf[..n]);
+            while let Some(raw) = framer.next_message() {
+                if let Ok(m) = Inbound::parse(&raw) {
+                    if let Some(code) = m.status_code() {
+                        seen.push(code);
+                    }
+                }
+            }
+        }
+        seen
+    };
+
+    let mut framer = TcpFramer::new();
+    send(&mut stream, "INVITE", 1);
+    let invite_statuses = read_statuses(&mut stream, &mut framer, 200);
+    assert!(
+        invite_statuses.contains(&180) && invite_statuses.contains(&200),
+        "expected 180 and 200 to INVITE, got {invite_statuses:?}"
+    );
+    send(&mut stream, "ACK", 1);
+    send(&mut stream, "BYE", 2);
+    let bye_statuses = read_statuses(&mut stream, &mut framer, 200);
+    assert!(
+        bye_statuses.contains(&200),
+        "expected 200 to BYE, got {bye_statuses:?}"
+    );
+
+    drop(stream);
+    let _ = child.kill();
+    let _ = child.wait();
 }

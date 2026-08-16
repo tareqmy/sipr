@@ -17,11 +17,13 @@ pub mod message;
 pub mod retrans;
 pub mod rng;
 pub mod table;
+pub mod tcp;
 pub mod timer;
 pub mod transport;
 
 pub use message::{Inbound, MsgKind, ParseError};
 pub use retrans::RetransSchedule;
 pub use table::CallTable;
+pub use tcp::{TcpFramer, TcpTransport};
 pub use timer::{TimerQueue, TimerService};
 pub use transport::{InboundPacket, NetEvent, TransportConfig, UdpTransport};

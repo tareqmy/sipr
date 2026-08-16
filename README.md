@@ -78,6 +78,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
 - Indexed injection: `-infindex FILE FIELD` plus `<lookup>`/`<insert>`/
   `<replace>` actions for keyed, mutable CSV data.
 - UAC and UAS roles; open-loop pacing (`-r/-rp/-l/-m`) with rate smoothing.
+- UDP (`-t u1`) and TCP (`-t t1`) transports; TCP frames by Content-Length and
+  carries no SIP retransmissions (reliable transport).
 - UDP retransmission (T1→T2), recv-window matching verified against SIPp's C++.
 - Digest authentication (MD5 + SHA-256, `qop=auth`, proxy 407).
 - Live TUI, `-bg` headless stat lines, `-trace_msg`/`-trace_err`/`-trace_stat`
@@ -94,8 +96,8 @@ Everything is built on the Rust standard library only — no external crates.
 
 ## Not yet (post-v1 roadmap)
 
-TCP/TLS transports, 3PCC (`sendCmd`/`recvCmd`), RTP/pcap media, IPv6, and an
-HTTP control API.
+TLS transport, 3PCC (`sendCmd`/`recvCmd`), RTP/pcap media, IPv6, and an HTTP
+control API.
 
 ## Brand
 

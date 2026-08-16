@@ -19,7 +19,9 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use sipr_net::timer::TimerId;
-use sipr_net::{Inbound, NetEvent, RetransSchedule, TimerService, TransportConfig, UdpTransport};
+use sipr_net::{
+    Inbound, NetEvent, RetransSchedule, TcpTransport, TimerService, TransportConfig, UdpTransport,
+};
 use sipr_scenario::inject::{InjectMode, InjectionFile};
 use sipr_scenario::model::{Action, Expect, PauseSpec, RecvStep, Role, Scenario, Step, StepCommon};
 use sipr_scenario::template::{Keyword, MsgTemplate, Span};
@@ -80,6 +82,18 @@ pub struct EngineConfig {
     /// `-infindex FILE FIELD`: build a lookup index on `FIELD` of the injection
     /// file named `FILE` (matched by basename), enabling `<lookup>`.
     pub inf_index: Vec<(String, usize)>,
+    /// `-t`: which transport to run.
+    pub transport: TransportKind,
+}
+
+/// Transport selection (`-t`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportKind {
+    /// `u1`: UDP, one socket shared by all calls (SIPp default).
+    #[default]
+    UdpMono,
+    /// `t1`: TCP, one connection per peer (client dials, server accepts).
+    TcpMono,
 }
 
 /// Final counters of a run.
@@ -299,10 +313,36 @@ pub fn run_with_ui(
     Ok((report, control))
 }
 
+/// The bound transport, dispatched by kind. Both variants expose the same
+/// address/send surface the engine uses.
+enum Transport {
+    Udp(UdpTransport),
+    Tcp(TcpTransport),
+}
+
+impl Transport {
+    fn local_addr(&self) -> SocketAddr {
+        match self {
+            Self::Udp(u) => u.local_addr(),
+            Self::Tcp(t) => t.local_addr(),
+        }
+    }
+
+    fn send_to(&self, data: &[u8], to: SocketAddr, lost_pct: Option<f64>) -> std::io::Result<bool> {
+        match self {
+            Self::Udp(u) => u.send_to(data, to, lost_pct),
+            Self::Tcp(t) => t.send_to(data, to, lost_pct),
+        }
+    }
+}
+
 struct Engine<'s> {
     scenario: &'s Scenario,
     config: EngineConfig,
-    transport: UdpTransport,
+    transport: Transport,
+    /// `[transport]` token and whether the transport is reliable (no retrans).
+    transport_token: &'static str,
+    reliable: bool,
     timers: TimerService<Event>,
     rx: Receiver<Event>,
     calls: HashMap<String, CallState>,
@@ -363,17 +403,37 @@ impl<'s> Engine<'s> {
                     }
                 }
             });
-        let transport = UdpTransport::bind(
-            &TransportConfig {
-                local_ip: config.local_ip,
-                port: config.port,
-                send_loss_pct: 0.0,
-                recv_loss_pct: 0.0,
-                loss_seed: config.seed,
-            },
-            net_tx,
-        )
-        .map_err(|e| EngineError(format!("cannot bind UDP socket: {e}")))?;
+        let tcfg = TransportConfig {
+            local_ip: config.local_ip,
+            port: config.port,
+            send_loss_pct: 0.0,
+            recv_loss_pct: 0.0,
+            loss_seed: config.seed,
+        };
+        let (transport, transport_token, reliable) = match config.transport {
+            TransportKind::UdpMono => {
+                let u = UdpTransport::bind(&tcfg, net_tx)
+                    .map_err(|e| EngineError(format!("cannot bind UDP socket: {e}")))?;
+                (Transport::Udp(u), "UDP", false)
+            }
+            TransportKind::TcpMono => {
+                let t = match scenario.role {
+                    // Client: one mono-socket connection to the target, opened now.
+                    Role::Uac => {
+                        let remote = config
+                            .target
+                            .ok_or_else(|| EngineError("TCP UAC needs a remote target".into()))?;
+                        TcpTransport::connect(&tcfg, net_tx, remote).map_err(|e| {
+                            EngineError(format!("cannot connect TCP to {remote}: {e}"))
+                        })?
+                    }
+                    // Server: listen and accept, framing each connection.
+                    Role::Uas => TcpTransport::listen(&tcfg, net_tx)
+                        .map_err(|e| EngineError(format!("cannot bind TCP listener: {e}")))?,
+                };
+                (Transport::Tcp(t), "TCP", true)
+            }
+        };
         let timers = TimerService::start(tx.clone());
         let control = EngineControl {
             rate_millis: Arc::new(AtomicU64::new(0)),
@@ -487,6 +547,8 @@ impl<'s> Engine<'s> {
             scenario,
             config: config.clone(),
             transport,
+            transport_token,
+            reliable,
             timers,
             rx,
             calls: HashMap::new(),
@@ -789,7 +851,7 @@ impl<'s> Engine<'s> {
                             remote_port: call.remote.port(),
                             local_ip: &self.local_ip_str,
                             local_port: self.transport.local_addr().port(),
-                            transport: "UDP",
+                            transport: self.transport_token,
                             call_id,
                             call_number: call.number,
                             pid: self.pid,
@@ -844,7 +906,9 @@ impl<'s> Engine<'s> {
                     if let Some(old) = call.retrans.take() {
                         self.timers.cancel(old.timer);
                     }
-                    if let Some(base) = retrans_ms {
+                    // Reliable transports (TCP/TLS) carry no SIP-layer
+                    // retransmissions (RFC 3261 §18.2).
+                    if let Some(base) = retrans_ms.filter(|_| !self.reliable) {
                         let schedule = RetransSchedule::new(
                             Some(base),
                             self.config.max_retrans,
@@ -1249,7 +1313,7 @@ impl<'s> Engine<'s> {
                 remote_port: call.remote.port(),
                 local_ip: &self.local_ip_str,
                 local_port: self.transport.local_addr().port(),
-                transport: "UDP",
+                transport: self.transport_token,
                 call_id,
                 call_number: call.number,
                 pid: self.pid,

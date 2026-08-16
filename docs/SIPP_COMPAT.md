@@ -218,5 +218,23 @@ Verify exact SIPp table before closing M3 and update this line.
   mutations (`insert`/`replace`) share them on the single engine thread. The
   standalone `<index>` action is not supported — use `-infindex`. `PRINTF=`
   virtual-line files remain out.
+- TCP transport `-t t1` (M8): SIP over TCP is a byte stream, so message
+  boundaries come from `Content-Length`, not packet edges (RFC 3261 §7.5). A
+  framer reads headers up to the first `\r\n\r\n`, then exactly Content-Length
+  body bytes; leading `\r\n` runs (keep-alive pings, RFC 5626) are skipped.
+  sipr keeps one connection per peer — the client (`UAC`) dials the target
+  once at start-up and the server (`UAS`) accepts, framing each; responses go
+  back on the connection the request arrived on (keyed by peer address, like
+  SIPp routes by the socket the message came in on). Reliable transports carry
+  NO SIP retransmissions (RFC 3261 §18.2), so `retrans=`/`-max_retrans` are
+  ignored under `t1`. SIPp's multi-socket `tn` maps onto the same
+  connection-per-peer model. Not yet: TLS (`l1`), connection re-dial after a
+  drop, and `-t un`/`ui`.
+- Message framing fix surfaced by TCP: every SIP message must end with the
+  header/body separator (`\r\n\r\n`) even with no body (RFC 3261 §7). sipr's
+  CDATA normalization trimmed the trailing blank line for body-less messages
+  (180, ACK, empty 200); UDP datagrams hid it, but TCP framing and real SIPp
+  need it, so normalization now restores the separator when a message has no
+  body.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

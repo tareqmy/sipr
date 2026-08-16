@@ -193,7 +193,23 @@ on a machine with sipp to close them.
       now balances nested brackets to parse `line=[$1]`. Verified end-to-end
       (`tests/e2e.rs::lookup_reads_indexed_field_by_key`). SIPP_COMPAT §6.
 
+## M9 — TCP transport (`-t t1`) ✅
+
+- [x] `sipr-net/src/tcp.rs`: a `TcpFramer` that de-frames a byte stream into
+      SIP messages by `Content-Length` (RFC 3261 §7.5), skipping keep-alive
+      CRLFs, and a `TcpTransport` with one connection per peer — the UAC dials
+      the target once, the UAS accepts, each connection gets a framed reader
+      thread, and writes route back by peer address. Unit + integration tested.
+- [x] Engine transport abstracted into a `Udp`/`Tcp` enum; `-t t1` binds TCP by
+      role (connect for UAC, listen for UAS), `[transport]` renders `TCP`, and
+      SIP retransmissions are gated off for reliable transports (RFC 3261
+      §18.2). CLI accepts `t1`/`tn`. Both directions covered end to end
+      (`tcp_uac_places_call_over_stream`, `tcp_uas_answers_over_stream`).
+- [x] Fixed a latent framing bug the stream transport exposed: body-less
+      messages were missing the mandatory `\r\n\r\n` header/body separator
+      (UDP hid it). SIPP_COMPAT §6.
+
 ## Post-v1 backlog (ordered)
 
-TCP → TLS → 3PCC (`sendCmd`/`recvCmd`) → `-users` closed loop → pcap/RTP media
+TLS → 3PCC (`sendCmd`/`recvCmd`) → `-users` closed loop → pcap/RTP media
 (study gossipper first) → AKA auth → IPv6 → HTTP control API.

@@ -129,6 +129,14 @@ pub fn normalize_cdata(raw: &str) -> String {
         out.push_str(line.trim_end_matches('\r'));
         out.push_str("\r\n");
     }
+    // Every SIP message needs the header/body separator (RFC 3261 §7): an empty
+    // line after the last header, even with no body. Trimming trailing blank
+    // lines above drops it for body-less messages (180, ACK, empty 200); UDP
+    // datagrams tolerate the omission, but TCP framing keys on `\r\n\r\n`, and
+    // real SIPp expects it. Restore it when the message carries no body.
+    if !out.contains("\r\n\r\n") {
+        out.push_str("\r\n");
+    }
     out
 }
 
@@ -331,6 +339,22 @@ mod tests {
     #[test]
     fn normalize_empty_is_empty() {
         assert_eq!(normalize_cdata("  \n \n"), "");
+    }
+
+    #[test]
+    fn normalize_bodyless_message_keeps_separator() {
+        // A no-body message must still end with the header/body blank line so
+        // TCP framing (and real SIPp) can find its boundary.
+        let raw = "\n  SIP/2.0 180 Ringing\n  CSeq: 1 INVITE\n  Content-Length: 0\n";
+        let text = normalize_cdata(raw);
+        assert_eq!(
+            text,
+            "SIP/2.0 180 Ringing\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(text.ends_with("\r\n\r\n"));
+        // A message that already has a body keeps its single separator.
+        let with_body = normalize_cdata("INVITE x\nVia: y\n\nv=0\n");
+        assert_eq!(with_body, "INVITE x\r\nVia: y\r\n\r\nv=0\r\n");
     }
 
     #[test]

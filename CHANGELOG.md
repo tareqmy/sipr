@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **TCP transport** — `-t t1` runs SIP over TCP. A stream framer de-frames
+  messages by `Content-Length` (RFC 3261 §7.5); the client keeps one
+  connection to the target, the server accepts connections and replies on the
+  one each request arrived on. Reliable transport, so no SIP retransmissions
+  are scheduled. `-t tn` is accepted as an alias. See `docs/SIPP_COMPAT.md` §6.
 - **Injection files** — `-inf FILE` (repeatable) loads SIPp-style injection
   files: a `SEQUENTIAL`/`RANDOM`/`USER` mode header, `;`-separated fields,
   `#` comments, blank-line terminator. One line is drawn per call per file
@@ -23,6 +28,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   matched line or -1), `<insert file=… value=…/>` (appends a row), and
   `<replace file=… line=… value=…/>` (swaps a row) operate on that data at
   runtime. The canonical use is `lookup → [fieldN line=[$var]]`.
+
+### Fixed
+
+- Body-less SIP messages (180, ACK, empty 200) now always include the
+  mandatory `\r\n\r\n` header/body separator. UDP tolerated its absence; TCP
+  framing and real-SIPp interop require it.
 
 ## [0.1.0] — 2026-08-16
 

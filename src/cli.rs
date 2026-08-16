@@ -10,11 +10,13 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-/// Transport mode (`-t`). Only UDP mono-socket until the TCP/TLS milestones.
+/// Transport mode (`-t`). UDP and TCP mono-socket; TLS is a later milestone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     /// `u1`: UDP with one socket shared by all calls (SIPp's default).
     UdpMono,
+    /// `t1`: TCP with one connection per peer (client dials, server accepts).
+    TcpMono,
 }
 
 /// Parsed configuration. Field defaults follow SIPp where SIPp documents one.
@@ -381,11 +383,16 @@ fn parse_num<T: std::str::FromStr>(flag: &str, raw: &str) -> Result<T, String> {
 fn parse_transport(s: &str) -> Result<Transport, String> {
     match s {
         "u1" => Ok(Transport::UdpMono),
-        "un" | "ui" | "t1" | "tn" | "l1" | "ln" => Err(format!(
-            "transport mode '{s}' is not implemented yet — only 'u1' (UDP \
-             mono-socket) is supported in v1; TCP/TLS come post-v1"
+        // SIPp's `tn` (multi-socket) collapses onto our one-connection-per-peer
+        // model; accept it as an alias for `t1`.
+        "t1" | "tn" => Ok(Transport::TcpMono),
+        "un" | "ui" | "l1" | "ln" => Err(format!(
+            "transport mode '{s}' is not implemented yet — 'u1' (UDP) and 't1' \
+             (TCP) are supported; TLS comes later"
         )),
-        other => Err(format!("unknown transport mode '{other}' (expected 'u1')")),
+        other => Err(format!(
+            "unknown transport mode '{other}' (expected 'u1' or 't1')"
+        )),
     }
 }
 
@@ -530,8 +537,10 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_transport_rejected_helpfully() {
-        let err = run(&["-t", "t1"]).unwrap_err();
+    fn transport_modes_parse_and_reject() {
+        assert_eq!(cli(&["-t", "t1", "host"]).transport, Transport::TcpMono);
+        // TLS is still out.
+        let err = run(&["-t", "l1"]).unwrap_err();
         assert!(err.contains("not implemented yet"), "{err}");
         let err = run(&["-t", "x9"]).unwrap_err();
         assert!(err.contains("unknown transport mode"), "{err}");

@@ -36,6 +36,7 @@ fn uas_config() -> EngineConfig {
         stat_interval: Duration::from_secs(1),
         inf_files: Vec::new(),
         inf_index: Vec::new(),
+        transport: sipr_engine::TransportKind::UdpMono,
     }
 }
 
