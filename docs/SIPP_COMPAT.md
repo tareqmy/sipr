@@ -32,14 +32,15 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 
 `ereg` (with `assign_to`, `check_it`, `header`, `regexp`, `search_in`,
 `start_line`), `log`, `warning`, `error`, `assign`, `assignstr`, `strcmp`,
-`test`, `add`, `subtract`, `multiply`, `divide`, `todouble`, `jump`, `insert`,
-`replace`, `trim`, `gettimeofday`, `urlencode`, `urldecode`,
+`test`, `add`, `subtract`, `multiply`, `divide`, `todouble`, `jump`, `trim`,
+`gettimeofday`, `urlencode`, `urldecode`,
 `exec` with `int_cmd` only (`stop_now`, `stop_gracefully`, `stop_call`).
 
 ### v1.x tier (fast follow)
 
-`sendCmd`/`recvCmd` + `dest`/`src` (3PCC), `lookup` + `-inf` injection files +
-`[fieldN]`, `sample`, `setdest`, `exec command=` (external process),
+`sendCmd`/`recvCmd` + `dest`/`src` (3PCC), `lookup`/`insert`/`replace`/`index`
+(they operate on `-inf` injection-file rows, so they land with injection
+files) + `[fieldN]`, `sample`, `setdest`, `exec command=` (external process),
 `start_txn`/`ack_txn`/`response_txn` (manual transaction naming).
 
 ### Later / with media & transports
@@ -113,5 +114,19 @@ Verify exact SIPp table before closing M3 and update this line.
   is what is sent), except Content-Length when `[len]` present or body exists
   (verify), and CRLF normalization of line endings. `-nd` disables scenario
   defaults behaviors. Record exact findings here.
+- Diagnostics policy as implemented (M1): unknown *elements* and *actions*
+  are hard errors (skipping a step silently would change call flow); unknown
+  *attributes* warn and are ignored; unknown *keywords* warn and pass through
+  verbatim (IPv6 literals like `[2001:db8::1]` in URIs depend on this).
+  `--check` treats any diagnostic, warnings included, as failure.
+- Template CDATA normalization (M1, `template::normalize_cdata`): every line
+  left-trimmed, line endings → CRLF, leading/trailing blank lines dropped,
+  single trailing CRLF appended; internal blank line (header/body separator)
+  preserved. TO VERIFY against `scenario.cpp` message construction at M3
+  interop — especially whether SIPp appends CRLFCRLF or CRLF.
+- `<pause sanity_check>` only tunes a runtime warning in SIPp; sipr accepts
+  and ignores it (comment in `compile_pause`).
+- The DTD spells the recv SDP attribute `ignosesdp` (sic); SIPp docs use
+  `ignoresdp`. sipr recognizes both spellings (and rejects them until media).
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

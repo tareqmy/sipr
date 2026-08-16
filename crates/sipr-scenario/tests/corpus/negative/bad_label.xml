@@ -1,0 +1,8 @@
+<!-- expect: undefined label -->
+<scenario name="jump to nowhere">
+  <send><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Call-ID: [call_id]
+  ]]></send>
+  <recv response="200" next="nowhere"/>
+</scenario>

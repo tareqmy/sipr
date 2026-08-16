@@ -58,9 +58,11 @@ acceptance tests.
   must behave like SIPp. New CLI flags must use SIPp's names where an equivalent
   exists (`-sf`, `-r`, `-l`, `-m`, ...). Do not invent alternative names for things
   SIPp already has a name for.
-- **Never silently ignore scenario input.** Unknown XML elements, attributes, or
-  keywords produce a loud warning with file:line context (or a hard error in
-  `--check` mode). Silent skips are the worst SIPp failure mode; we do not inherit it.
+- **Never silently ignore scenario input.** Unknown XML *elements and actions*
+  are hard errors (silently skipping a step would change the call flow);
+  unknown *attributes and keywords* produce a loud warning with file:line
+  context; `--check` treats any diagnostic, warnings included, as failure.
+  Silent skips are the worst SIPp failure mode; we do not inherit it.
 - **Hot path discipline** (per-message send/recv code): no allocations beyond
   template slot filling, no locks held across `.await`, no synchronous I/O, no
   regex compilation. Message templates are pre-tokenized at scenario load; if you

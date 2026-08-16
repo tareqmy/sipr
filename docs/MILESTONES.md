@@ -19,17 +19,25 @@ unchecked *required* items (unchecked stretch items are fine, move them down).
 - [x] CI: fmt + clippy(-D warnings) + test on push
 - [x] `rust-toolchain.toml`, MSRV (1.85) recorded in CONVENTIONS.md
 
-## M1 — Scenario front end
+## M1 — Scenario front end ✅
 
-- [ ] quick-xml parser → IR for full v1 tier of SIPP_COMPAT §1 (elements,
-      attrs, actions), with file:line errors
-- [ ] Keyword tokenizer: full v1 keyword list; unknown keyword = loud warning,
-      verbatim passthrough
-- [ ] Label/next/jump references validated at compile; variables resolved to
-      indices; `Reference` suppresses unused warnings
-- [ ] `--check` mode: lint + print compiled IR; non-zero exit on error
-- [ ] Golden corpus passing (see TESTING §2), incl. negative goldens for
-      unsupported media scenarios
+- [x] XML parser → IR for full v1 tier of SIPP_COMPAT §1 (elements, attrs,
+      actions), with file:line errors. NOTE: hand-rolled XML subset parser
+      (`sipr-scenario/src/xml.rs`, like SIPp's own `xp_parser.cpp`) instead of
+      quick-xml — zero deps, exact line tracking; swap only if the XML surface
+      outgrows it.
+- [x] Keyword tokenizer: full v1 keyword list (+ `[media_*]` placeholders);
+      unknown keyword = loud warning, verbatim passthrough (IPv6 literals in
+      URIs rely on this)
+- [x] Label/next/ontimeout references validated and resolved to step indices;
+      variables interned to table ids; read-never-set = error, set-never-read
+      = warning, `Reference` suppresses
+- [x] `--check` mode: lint + print compiled IR; exit 1 on any diagnostic
+      (warnings included — check mode is strict); `-sf` role detection now
+      drives the remote-target requirement
+- [x] Golden corpus passing (`tests/corpus/{positive,negative}`), incl.
+      negative goldens for media/3PCC/unknown-element scenarios with expected
+      error markers
 
 ## M2 — Net + message layer
 

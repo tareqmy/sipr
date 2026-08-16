@@ -1,0 +1,7 @@
+<!-- expect: 3PCC -->
+<scenario name="3pcc controller">
+  <sendCmd><![CDATA[
+    Call-ID: [call_id]
+  ]]></sendCmd>
+  <recv response="200"/>
+</scenario>

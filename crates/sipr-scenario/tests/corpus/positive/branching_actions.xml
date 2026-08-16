@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- Exercises the v1 action set, variables, labels, and conditional jumps. -->
+
+<scenario name="Branching and actions">
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPrTagB[call_number]
+      To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: sip:sipr@[local_ip]:[local_port]
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+
+  <recv response="200" start_rtd="true">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="Contact:" check_it="true" assign_to="contact"/>
+      <ereg regexp="([0-9]{3})" search_in="msg" assign_to="whole,code"/>
+      <todouble assign_to="code_num" variable="code"/>
+      <test assign_to="is_ok" variable="code_num" compare="equal" value="200"/>
+      <strcmp assign_to="same" variable="whole" value="SIP/2.0 200 OK"/>
+      <log message="contact=[$contact] whole=[$whole] same=[$same]"/>
+    </action>
+  </recv>
+
+  <nop next="ack" test="is_ok">
+    <action>
+      <gettimeofday assign_to="sec,usec"/>
+      <add assign_to="sec" value="1"/>
+      <log message="time [$sec].[$usec]"/>
+    </action>
+  </nop>
+
+  <nop>
+    <action>
+      <warning message="200 did not look OK; failing the call"/>
+      <exec int_cmd="stop_call"/>
+    </action>
+  </nop>
+
+  <label id="ack"/>
+
+  <send>
+    <![CDATA[
+
+      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPrTagB[call_number]
+      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <pause distribution="uniform(200,1000)"/>
+
+  <send retrans="500" rtd="true">
+    <![CDATA[
+
+      BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPrTagB[call_number]
+      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true"/>
+</scenario>
