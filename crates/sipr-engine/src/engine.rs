@@ -28,8 +28,8 @@ use crate::render::{RenderCtx, render};
 /// Engine configuration, distilled from the CLI.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Remote target for outbound calls.
-    pub target: SocketAddr,
+    /// Remote target for outbound calls (required for UAC scenarios).
+    pub target: Option<SocketAddr>,
     /// Local IP to bind (`-i`).
     pub local_ip: Option<IpAddr>,
     /// Local port to bind (`-p`).
@@ -60,6 +60,16 @@ pub struct EngineConfig {
     pub seed: u64,
     /// Print periodic stat lines (headless mode).
     pub periodic_stats: bool,
+    /// `-aa`: auto-answer in-dialog OPTIONS/INFO/UPDATE/NOTIFY with 200.
+    pub auto_answer: bool,
+    /// `-trace_msg` destination.
+    pub trace_msg: Option<std::path::PathBuf>,
+    /// `-trace_err` destination.
+    pub trace_err: Option<std::path::PathBuf>,
+    /// `-trace_stat` destination (`-stf`).
+    pub trace_stat: Option<std::path::PathBuf>,
+    /// `-fd`: statistics dump interval.
+    pub stat_interval: Duration,
 }
 
 /// Final counters of a run.
@@ -177,10 +187,19 @@ struct RetransCtx {
 
 struct CallState {
     number: u64,
+    /// Where this call's messages go (per-call for UAS; `-target` for UAC).
+    remote: SocketAddr,
     /// Next step to execute; when `waiting`, start of the recv window.
     index: usize,
     waiting: bool,
+    /// In timewait: absorb retransmissions, never fail.
+    completing: bool,
+    started: Instant,
     cseq: u32,
+    /// Last message we sent (re-sent when the peer retransmits).
+    last_sent: Option<Vec<u8>>,
+    /// Running RTD stopwatches: (name, started-at).
+    rtd_starts: Vec<(String, Instant)>,
     peer_tag: Option<String>,
     routes: Vec<String>,
     last_recv: Option<Inbound>,
@@ -225,6 +244,11 @@ pub fn run_with_control(
     config: &EngineConfig,
 ) -> Result<(RunReport, EngineControl), EngineError> {
     validate_for_engine(scenario)?;
+    if scenario.role == Role::Uac && config.target.is_none() {
+        return Err(EngineError(
+            "this scenario places calls (UAC): a remote target is required".into(),
+        ));
+    }
     let mut engine = Engine::new(scenario, config)?;
     let control = engine.control.clone();
     let report = engine.run_loop();
@@ -238,7 +262,10 @@ struct Engine<'s> {
     timers: TimerService<Event>,
     rx: Receiver<Event>,
     calls: HashMap<String, CallState>,
-    stats: RunReport,
+    stats: sipr_stats::StatSet,
+    trace_msg: Option<sipr_stats::TraceFile>,
+    trace_err: Option<sipr_stats::TraceFile>,
+    trace_stat: Option<sipr_stats::TraceFile>,
     rng: sipr_net::rng::Rng,
     /// Per-step: CSeq method a response recv must carry (SIPp guard).
     expected_cseq_method: Vec<Option<String>>,
@@ -324,6 +351,28 @@ impl<'s> Engine<'s> {
             timers.arm(t, Event::GlobalTimeout);
         }
         let local_addr = transport.local_addr();
+        eprintln!(
+            "sipr: bound to {local_addr} ({})",
+            match scenario.role {
+                Role::Uac => "placing calls",
+                Role::Uas => "answering calls",
+            }
+        );
+        let open_trace = |path: &Option<std::path::PathBuf>,
+                          what: &str|
+         -> Result<Option<sipr_stats::TraceFile>, EngineError> {
+            path.as_ref()
+                .map(|p| {
+                    sipr_stats::TraceFile::create(p).map_err(|e| {
+                        EngineError(format!("cannot create {what} file {}: {e}", p.display()))
+                    })
+                })
+                .transpose()
+        };
+        let mut trace_stat = open_trace(&config.trace_stat, "statistics")?;
+        if let Some(f) = trace_stat.as_mut() {
+            f.write(&sipr_stats::StatSet::csv_header());
+        }
         Ok(Self {
             scenario,
             config: config.clone(),
@@ -331,7 +380,13 @@ impl<'s> Engine<'s> {
             timers,
             rx,
             calls: HashMap::new(),
-            stats: RunReport::default(),
+            stats: sipr_stats::StatSet::new(
+                &scenario.response_time_repartition,
+                &scenario.call_length_repartition,
+            ),
+            trace_msg: open_trace(&config.trace_msg, "message trace")?,
+            trace_err: open_trace(&config.trace_err, "error trace")?,
+            trace_stat,
             rng: sipr_net::rng::Rng::new(config.seed ^ 0x51B8_0003),
             expected_cseq_method: precompute_cseq_methods(scenario),
             control,
@@ -347,6 +402,7 @@ impl<'s> Engine<'s> {
     fn run_loop(&mut self) -> RunReport {
         let started = Instant::now();
         let mut last_line = Instant::now();
+        let mut last_stat_dump = Instant::now();
         // First tick immediately: SIPp starts placing calls right away.
         self.on_pacer_tick();
         loop {
@@ -354,7 +410,7 @@ impl<'s> Engine<'s> {
                 break;
             }
             match self.rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(Event::Net(NetEvent::Packet(p))) => self.on_packet(&p.message),
+                Ok(Event::Net(NetEvent::Packet(p))) => self.on_packet(&p),
                 Ok(Event::Net(NetEvent::Garbage { .. })) => self.stats.garbage += 1,
                 Ok(Event::Net(NetEvent::SocketError(kind))) => {
                     eprintln!("sipr: socket error: {kind:?}; stopping");
@@ -389,12 +445,47 @@ impl<'s> Engine<'s> {
             }
             if self.config.periodic_stats && last_line.elapsed() >= Duration::from_secs(1) {
                 last_line = Instant::now();
-                eprintln!("sipr: live {} | {}", self.calls.len(), self.stats.summary());
+                eprintln!("sipr: {}", self.stats.line(self.calls.len()));
+            }
+            if self.trace_stat.is_some() && last_stat_dump.elapsed() >= self.config.stat_interval {
+                last_stat_dump = Instant::now();
+                let row = self.stats.csv_row(self.calls.len());
+                if let Some(f) = self.trace_stat.as_mut() {
+                    f.write(&row);
+                    f.flush();
+                }
             }
         }
         self.control.stop_pacer.store(true, Ordering::Relaxed);
-        self.stats.elapsed = started.elapsed();
-        self.stats.clone()
+        // Final CSV row + flush all trace files.
+        if self.trace_stat.is_some() {
+            let row = self.stats.csv_row(self.calls.len());
+            if let Some(f) = self.trace_stat.as_mut() {
+                f.write(&row);
+            }
+        }
+        for f in [
+            &mut self.trace_msg,
+            &mut self.trace_err,
+            &mut self.trace_stat,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            f.flush();
+        }
+        RunReport {
+            created: self.stats.created(),
+            successful: self.stats.successful,
+            failed: self.stats.failed(),
+            messages_sent: self.stats.messages_sent,
+            messages_matched: self.stats.messages_matched,
+            retrans_sent: self.stats.retrans_sent,
+            retrans_recv: self.stats.retrans_recv,
+            unexpected: self.stats.unexpected,
+            garbage: self.stats.garbage,
+            elapsed: started.elapsed(),
+        }
     }
 
     fn done_creating(&self) -> bool {
@@ -402,13 +493,13 @@ impl<'s> Engine<'s> {
             || self
                 .config
                 .max_calls
-                .is_some_and(|m| self.stats.created >= m)
+                .is_some_and(|m| self.stats.created() >= m)
     }
 
     // ---- pacing --------------------------------------------------------
 
     fn on_pacer_tick(&mut self) {
-        if self.done_creating() {
+        if self.scenario.role == Role::Uas || self.done_creating() {
             return;
         }
         self.pacer_carry += self.control.rate() * self.tick_ratio;
@@ -432,23 +523,16 @@ impl<'s> Engine<'s> {
     }
 
     fn start_call(&mut self) {
-        self.stats.created += 1;
-        let number = self.stats.created;
-        let call_id = self.make_call_id(number);
-        let call = CallState {
-            number,
-            index: 0,
-            waiting: false,
-            cseq: self.config.base_cseq,
-            peer_tag: None,
-            routes: Vec::new(),
-            last_recv: None,
-            last_recv_key: None,
-            retrans: None,
-            timer: None,
-            generation: 0,
+        let Some(target) = self.config.target else {
+            return; // unreachable: validated in run_with_control
         };
-        self.calls.insert(call_id.clone(), call);
+        self.stats.outgoing_created += 1;
+        let number = self.stats.created();
+        let call_id = self.make_call_id(number);
+        self.calls.insert(
+            call_id.clone(),
+            new_call(number, target, self.config.base_cseq),
+        );
         self.advance(&call_id);
     }
 
@@ -477,14 +561,14 @@ impl<'s> Engine<'s> {
             };
             match step {
                 Step::Send(send) => {
-                    let (buf, is_request, method_is_new_txn) = {
+                    let (buf, method_is_new_txn, remote) = {
                         let Some(call) = self.calls.get(call_id) else {
                             return;
                         };
                         let ctx = RenderCtx {
                             service: &self.config.service,
-                            remote_ip: &self.config.target.ip().to_string(),
-                            remote_port: self.config.target.port(),
+                            remote_ip: &call.remote.ip().to_string(),
+                            remote_port: call.remote.port(),
                             local_ip: &self.local_ip_str,
                             local_port: self.transport.local_addr().port(),
                             transport: "UDP",
@@ -502,7 +586,7 @@ impl<'s> Engine<'s> {
                                 let first = template_first_word(&send.template).unwrap_or_default();
                                 let is_req = first != "SIP/2.0";
                                 let new_txn = is_req && first != "ACK" && first != "CANCEL";
-                                (buf, is_req, new_txn)
+                                (buf, new_txn, call.remote)
                             }
                             Err(e) => {
                                 self.fail_call(call_id, &format!("render failed: {e}"));
@@ -510,21 +594,25 @@ impl<'s> Engine<'s> {
                             }
                         }
                     };
-                    let sent = self
+                    let _ = self
                         .transport
-                        .send_to(&buf, self.config.target, send.lost_pct)
-                        .unwrap_or(false);
-                    let _ = sent; // simulated drops still count as "sent"
+                        .send_to(&buf, remote, send.lost_pct)
+                        .unwrap_or(false); // simulated drops still count as "sent"
                     self.stats.messages_sent += 1;
+                    self.trace_send(&buf, remote);
                     let retrans_ms = send.retrans_ms;
                     let lost_pct = send.lost_pct;
                     let jump = self.jump_target(&send.common, index);
+                    let now = Instant::now();
+                    let common = send.common.clone();
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
-                    if is_request && method_is_new_txn {
+                    apply_rtds(call, &mut self.stats, &common, now);
+                    if method_is_new_txn {
                         call.cseq = call.cseq.wrapping_add(1);
                     }
+                    call.last_sent = Some(buf.clone());
                     // Replace any pending retransmission with this send's.
                     if let Some(old) = call.retrans.take() {
                         self.timers.cancel(old.timer);
@@ -614,6 +702,7 @@ impl<'s> Engine<'s> {
                         return;
                     };
                     call.generation += 1;
+                    call.completing = true;
                     call.index = index + 1;
                     let timer = self.timers.arm(
                         Duration::from_millis(*ms),
@@ -684,16 +773,15 @@ impl<'s> Engine<'s> {
 
     // ---- inbound -------------------------------------------------------
 
-    fn on_packet(&mut self, msg: &Inbound) {
+    fn on_packet(&mut self, packet: &sipr_net::InboundPacket) {
+        let msg = &packet.message;
+        self.trace_recv(packet);
         let Some(call_id) = msg.call_id().map(ToOwned::to_owned) else {
             self.stats.unexpected += 1;
             return;
         };
-        if !self.calls.contains_key(&call_id) {
-            self.stats.unexpected += 1;
-            return;
-        }
-        // Inbound retransmission dedupe (branch + CSeq + start line).
+        // Inbound retransmission dedupe (branch + CSeq + start line). SIPp
+        // answers a retransmitted request by re-sending the last response.
         let key = (
             msg.top_via_branch().unwrap_or_default().to_owned(),
             msg.header("CSeq").unwrap_or_default().to_owned(),
@@ -702,61 +790,67 @@ impl<'s> Engine<'s> {
                 |c| c.to_string(),
             ),
         );
-        if self
-            .calls
-            .get(&call_id)
-            .is_some_and(|c| c.last_recv_key.as_ref() == Some(&key))
-        {
-            self.stats.retrans_recv += 1;
-            return;
+        if !self.calls.contains_key(&call_id) {
+            // UAS: an unknown Call-ID carrying the scenario's initial request
+            // creates a new call.
+            if self.scenario.role == Role::Uas
+                && msg.method().is_some()
+                && matches!(
+                    scan_for_match(self.scenario, &self.expected_cseq_method, 0, true, msg),
+                    Scan::Forward(_)
+                )
+            {
+                self.stats.incoming_created += 1;
+                let number = self.stats.created();
+                self.calls.insert(
+                    call_id.clone(),
+                    new_call(number, packet.from, self.config.base_cseq),
+                );
+                // Fall through to normal matching below (window at 0).
+            } else {
+                self.stats.unexpected += 1;
+                self.log_err(&format!("out-of-call message ignored (Call-ID {call_id})"));
+                return;
+            }
         }
-        let (window_start, waiting) = match self.calls.get(&call_id) {
-            Some(c) => (c.index, c.waiting),
+        let (window_start, waiting, completing, is_dup) = match self.calls.get(&call_id) {
+            Some(c) => (
+                c.index,
+                c.waiting,
+                c.completing,
+                c.last_recv_key.as_ref() == Some(&key),
+            ),
             None => return,
         };
+        if is_dup {
+            self.stats.retrans_recv += 1;
+            // Re-send our last message (SIPp: retransmitted request → last
+            // response again; harmless for a duplicated response).
+            let resend = self
+                .calls
+                .get(&call_id)
+                .and_then(|c| c.last_sent.clone().map(|b| (b, c.remote)));
+            if let Some((buf, remote)) = resend {
+                let _ = self.transport.send_to(&buf, remote, None);
+                self.stats.retrans_sent += 1;
+                self.trace_send(&buf, remote);
+            }
+            return;
+        }
+        if completing {
+            // Timewait: absorb without failing (deadcall behavior).
+            self.stats.unexpected += 1;
+            return;
+        }
         let scan = scan_for_match(
             self.scenario,
             &self.expected_cseq_method,
             window_start,
-            waiting,
+            waiting || window_start == 0,
             msg,
         );
         match scan {
-            Scan::Forward(si) => {
-                self.stats.messages_matched += 1;
-                let rrs = matches!(&self.scenario.steps[si], Step::Recv(r) if r.record_route_set);
-                let Some(call) = self.calls.get_mut(&call_id) else {
-                    return;
-                };
-                // A matched recv cancels the pending retransmission
-                // (call.cpp: next_retrans = 0) and the window timeout.
-                if let Some(r) = call.retrans.take() {
-                    self.timers.cancel(r.timer);
-                }
-                if let Some((t, _)) = call.timer.take() {
-                    self.timers.cancel(t);
-                }
-                call.generation += 1;
-                if let Some(tag) = if msg.status_code().is_some() {
-                    msg.to_tag()
-                } else {
-                    msg.from_tag()
-                } {
-                    call.peer_tag = Some(tag.to_owned());
-                }
-                if rrs {
-                    call.routes = msg
-                        .header_values("Record-Route")
-                        .into_iter()
-                        .map(ToOwned::to_owned)
-                        .collect();
-                }
-                call.last_recv_key = Some(key);
-                call.last_recv = Some(msg.clone());
-                call.waiting = false;
-                call.index = si + 1;
-                self.advance(&call_id);
-            }
+            Scan::Forward(si) => self.on_matched(&call_id, si, msg, key),
             Scan::Old => {
                 // Late/repeated optional (e.g. another 180): absorbed.
                 self.stats.messages_matched += 1;
@@ -765,9 +859,128 @@ impl<'s> Engine<'s> {
                 }
             }
             Scan::NoMatch => {
+                if self.try_auto_answer(&call_id, msg) {
+                    return;
+                }
                 self.stats.unexpected += 1;
-                self.fail_call(&call_id, "unexpected message");
+                let what = msg
+                    .method()
+                    .map_or_else(|| format!("{:?}", msg.status_code()), ToOwned::to_owned);
+                self.log_err(&format!(
+                    "unexpected {what} for call {call_id}; call failed"
+                ));
+                self.stats.failed_unexpected += 1;
+                self.remove_call(&call_id);
             }
+        }
+    }
+
+    /// Common handling for a message matched at step `si`.
+    fn on_matched(
+        &mut self,
+        call_id: &str,
+        si: usize,
+        msg: &Inbound,
+        key: (String, String, String),
+    ) {
+        self.stats.messages_matched += 1;
+        let (rrs, common) = match &self.scenario.steps[si] {
+            Step::Recv(r) => (r.record_route_set, r.common.clone()),
+            _ => (false, StepCommon::default()),
+        };
+        let now = Instant::now();
+        let Some(call) = self.calls.get_mut(call_id) else {
+            return;
+        };
+        // A matched recv cancels the pending retransmission
+        // (call.cpp: next_retrans = 0) and the window timeout.
+        if let Some(r) = call.retrans.take() {
+            self.timers.cancel(r.timer);
+        }
+        if let Some((t, _)) = call.timer.take() {
+            self.timers.cancel(t);
+        }
+        call.generation += 1;
+        if let Some(tag) = if msg.status_code().is_some() {
+            msg.to_tag()
+        } else {
+            msg.from_tag()
+        } {
+            call.peer_tag = Some(tag.to_owned());
+        }
+        if rrs {
+            call.routes = msg
+                .header_values("Record-Route")
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+        apply_rtds(call, &mut self.stats, &common, now);
+        call.last_recv_key = Some(key);
+        call.last_recv = Some(msg.clone());
+        call.waiting = false;
+        call.index = si + 1;
+        self.advance(call_id);
+    }
+
+    /// `-aa`: answer in-dialog OPTIONS/INFO/UPDATE/NOTIFY with 200 without
+    /// disturbing the scenario. Returns true when handled.
+    fn try_auto_answer(&mut self, call_id: &str, msg: &Inbound) -> bool {
+        if !self.config.auto_answer {
+            return false;
+        }
+        let Some(method) = msg.method() else {
+            return false;
+        };
+        if !matches!(method, "OPTIONS" | "INFO" | "UPDATE" | "NOTIFY") {
+            return false;
+        }
+        let Some(remote) = self.calls.get(call_id).map(|c| c.remote) else {
+            return false;
+        };
+        let mut out = String::from("SIP/2.0 200 OK\r\n");
+        for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
+            for line in msg.header_lines(name) {
+                out.push_str(line);
+                out.push_str("\r\n");
+            }
+        }
+        out.push_str("Content-Length: 0\r\n\r\n");
+        let buf = out.into_bytes();
+        let _ = self.transport.send_to(&buf, remote, None);
+        self.stats.auto_answered += 1;
+        self.trace_send(&buf, remote);
+        true
+    }
+
+    fn trace_send(&mut self, buf: &[u8], remote: SocketAddr) {
+        if let Some(f) = self.trace_msg.as_mut() {
+            f.write(&sipr_stats::frame_message(
+                "UDP message sent to",
+                &remote.to_string(),
+                self.stats.started.elapsed(),
+                buf,
+            ));
+        }
+    }
+
+    fn trace_recv(&mut self, packet: &sipr_net::InboundPacket) {
+        if self.trace_msg.is_some() {
+            let framed = sipr_stats::frame_message(
+                "UDP message received from",
+                &packet.from.to_string(),
+                self.stats.started.elapsed(),
+                &packet.raw,
+            );
+            if let Some(f) = self.trace_msg.as_mut() {
+                f.write(&framed);
+            }
+        }
+    }
+
+    fn log_err(&mut self, line: &str) {
+        if let Some(f) = self.trace_err.as_mut() {
+            f.write(&format!("{line}\n"));
         }
     }
 
@@ -818,8 +1031,12 @@ impl<'s> Engine<'s> {
         }) else {
             return; // call gone or retransmission already cancelled
         };
-        let _ = self.transport.send_to(&buf, self.config.target, lost);
+        let Some(remote) = self.calls.get(call_id).map(|c| c.remote) else {
+            return;
+        };
+        let _ = self.transport.send_to(&buf, remote, lost);
         self.stats.retrans_sent += 1;
+        self.trace_send(&buf, remote);
         match next {
             Some(interval) => {
                 let timer = self.timers.arm(
@@ -854,13 +1071,28 @@ impl<'s> Engine<'s> {
         if let Some(mut call) = self.calls.remove(call_id) {
             self.cancel_call_timers(&mut call);
             self.stats.successful += 1;
+            self.stats.record_call_length(call.started.elapsed());
         }
     }
 
-    fn fail_call(&mut self, call_id: &str, _reason: &str) {
+    /// Remove a call and record its duration WITHOUT bumping a failure
+    /// counter — the caller has already categorized the failure.
+    fn remove_call(&mut self, call_id: &str) {
         if let Some(mut call) = self.calls.remove(call_id) {
             self.cancel_call_timers(&mut call);
-            self.stats.failed += 1;
+            self.stats.record_call_length(call.started.elapsed());
+        }
+    }
+
+    fn fail_call(&mut self, call_id: &str, reason: &str) {
+        if self.calls.contains_key(call_id) {
+            match reason {
+                r if r.contains("retransmissions") => self.stats.failed_retrans += 1,
+                r if r.contains("timeout") => self.stats.failed_timeout += 1,
+                _ => self.stats.failed_other += 1,
+            }
+            self.log_err(&format!("call {call_id} failed: {reason}"));
+            self.remove_call(call_id);
         }
     }
 
@@ -868,6 +1100,56 @@ impl<'s> Engine<'s> {
         let ids: Vec<String> = self.calls.keys().cloned().collect();
         for id in ids {
             self.fail_call(&id, reason);
+        }
+    }
+}
+
+/// Fresh call state.
+fn new_call(number: u64, remote: SocketAddr, base_cseq: u32) -> CallState {
+    CallState {
+        number,
+        remote,
+        index: 0,
+        waiting: false,
+        completing: false,
+        started: Instant::now(),
+        cseq: base_cseq,
+        last_sent: None,
+        rtd_starts: Vec::new(),
+        peer_tag: None,
+        routes: Vec::new(),
+        last_recv: None,
+        last_recv_key: None,
+        retrans: None,
+        timer: None,
+        generation: 0,
+    }
+}
+
+/// Apply a step's RTD attributes: start stopwatches, stop them into the
+/// histograms, restart when `repeat_rtd`. Free function to keep borrows of
+/// the call and the stats disjoint.
+fn apply_rtds(
+    call: &mut CallState,
+    stats: &mut sipr_stats::StatSet,
+    common: &StepCommon,
+    now: Instant,
+) {
+    if let Some(name) = &common.start_rtd {
+        match call.rtd_starts.iter_mut().find(|(n, _)| n == name) {
+            Some(slot) => slot.1 = now,
+            None => call.rtd_starts.push((name.clone(), now)),
+        }
+    }
+    if let Some(name) = &common.rtd {
+        if let Some(pos) = call.rtd_starts.iter().position(|(n, _)| n == name) {
+            let (_, started) = call.rtd_starts[pos];
+            stats.record_rtd(name, now.saturating_duration_since(started));
+            if common.repeat_rtd {
+                call.rtd_starts[pos].1 = now;
+            } else {
+                call.rtd_starts.swap_remove(pos);
+            }
         }
     }
 }
@@ -993,9 +1275,6 @@ fn template_first_word(t: &MsgTemplate) -> Option<String> {
 /// Reject scenarios that need features beyond M3, loudly and up front.
 fn validate_for_engine(scenario: &Scenario) -> Result<(), EngineError> {
     let err = |msg: String| Err(EngineError(msg));
-    if scenario.role == Role::Uas {
-        return err("UAS mode is not implemented yet (M4) — this scenario answers calls".into());
-    }
     for (i, step) in scenario.steps.iter().enumerate() {
         let (actions, common, template) = match step {
             Step::Send(s) => (&s.actions, &s.common, Some(&s.template)),
@@ -1163,11 +1442,11 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_m6_features_and_uas() {
+    fn validation_accepts_uas_and_rejects_m6_features() {
         let uas = sipr_scenario::compile("uas", sipr_scenario::embedded("uas").unwrap())
             .scenario
             .unwrap();
-        assert!(validate_for_engine(&uas).is_err());
+        assert!(validate_for_engine(&uas).is_ok(), "UAS runs as of M4");
         let with_actions = sipr_scenario::compile(
             "t",
             r#"<scenario name="t">

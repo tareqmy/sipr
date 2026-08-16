@@ -73,10 +73,11 @@ fn default_scenario_is_uac_and_needs_target() {
 }
 
 #[test]
-fn uas_without_target_reaches_m4_stub() {
-    let o = sipr(&["-sn", "uas", "-p", "15060"]);
-    assert_code(&o, 99);
-    assert!(stderr(&o).contains("UAS mode is not implemented yet"));
+fn uas_runs_and_exits_99_when_no_calls_arrive() {
+    let o = sipr(&["-sn", "uas", "-timeout", "1"]);
+    assert_code(&o, 99); // listened, processed nothing
+    let err = stderr(&o);
+    assert!(err.contains("answering calls"), "{err}");
 }
 
 #[test]
@@ -176,9 +177,9 @@ fn sf_uas_scenario_needs_no_target() {
              ]]></send>
            </scenario>"#,
     );
-    let o = sipr(&["-sf", uas.path()]);
-    assert_code(&o, 99);
-    assert!(stderr(&o).contains("Uas"), "{}", stderr(&o));
+    let o = sipr(&["-sf", uas.path(), "-timeout", "1"]);
+    assert_code(&o, 99); // ran as a UAS, no calls arrived
+    assert!(stderr(&o).contains("answering calls"), "{}", stderr(&o));
 }
 
 #[test]

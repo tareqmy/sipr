@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 sipr-scenario = { workspace = true }
 sipr-net = { workspace = true }
+sipr-stats = { workspace = true }
 
 [lints]
 workspace = true

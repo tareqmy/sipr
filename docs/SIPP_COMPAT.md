@@ -124,6 +124,18 @@ Verify exact SIPp table before closing M3 and update this line.
 - Pacing: SIPp smooths call starts within the rate period rather than
   bursting `-r` calls at once; sipr ticks every ≤20 ms and accumulates
   fractional starts.
+- UAS behaviors (M4): an inbound retransmission (same branch/CSeq/start
+  line) is answered by re-sending our last message; during `timewait` the
+  call absorbs traffic without failing (SIPp deadcall). `-aa` answers
+  in-dialog OPTIONS/INFO/UPDATE/NOTIFY with a 200 mirroring
+  Via/From/To/Call-ID/CSeq. UAS calls reply to the request's source
+  address (Via received/rport handling: post-v1).
+- `-trace_stat` CSV (M4): a pragmatic subset of SIPp's columns with the
+  (P)/(C) periodic/cumulative naming and `;` separators — CurrentTime,
+  ElapsedTime, CallRate, Incoming/OutgoingCall, TotalCallCreated,
+  CurrentCall, Successful/FailedCall, Retransmissions, AutoAnswered,
+  UnexpectedMessage, ResponseTime1 (avg/stddev/max ms), CallLength.
+  Full column parity with SIPp is a v1-polish item.
 - `-l` cap: calls above the concurrent cap are not queued — the pacer simply
   does not start them; effective rate drops.
 - `[branch]` must be unique per transaction and RFC 3261 magic-cookie prefixed

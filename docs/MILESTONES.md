@@ -85,15 +85,28 @@ unchecked *required* items (unchecked stretch items are fine, move them down).
       cps baseline recorded in `benches/BASELINES.md` (~2000 cps sustained,
       far-end-bound)
 
-## M4 — UAS mode + stats
+## M4 — UAS mode + stats ✅ (one interop gate pending, same as M3)
 
-- [ ] UAS call creation from initial requests; embedded uas scenario; sipr↔sipr
-      self-test green; sipp-uac ↔ sipr-uas green
-- [ ] `[last_*]`, `rrs`+`[routes]`, `[peer_tag_param]` correct as callee
-- [ ] `-aa` auto-answers in-dialog OPTIONS/INFO/UPDATE/NOTIFY
-- [ ] Stats: SIPp counter set, RTDs (hdrhistogram), both repartitions,
-      `-trace_stat`/`-stf`/`-fd` CSV output, `-trace_msg`/`-trace_err` files
-- [ ] Periodic stat line output in `-bg` headless mode
+- [x] UAS call creation from initial requests (unknown Call-ID matching the
+      initial window creates a call bound to the packet's source address);
+      embedded uas scenario runs; sipr↔sipr self-test green (E2E test +
+      50 000 calls at 5000 cps in BASELINES.md); retransmitted inbound
+      requests are answered by re-sending the last response; timewait
+      absorbs late traffic without failing (deadcall behavior)
+- [ ] sipp-uac ↔ sipr-uas: harness ready (`tests/interop.rs`), needs a sipp
+      binary — same local run as the M3 gate closes both
+- [x] `[last_*]`, `rrs`+`[routes]`, `[peer_tag_param]` correct as callee —
+      proven by the self-test (the uac's ACK/BYE dialogs only complete if
+      the uas mirrors correctly)
+- [x] `-aa` auto-answers in-dialog OPTIONS/INFO/UPDATE/NOTIFY with a
+      mirrored 200 (E2E test drives an unexpected in-dialog OPTIONS)
+- [x] Stats: SIPp counter set incl. failure breakdown and auto-answered;
+      RTDs via an in-tree 1 ms-bucket histogram (hdrhistogram unavailable —
+      same dependency situation as always, recorded in the crate docs);
+      both repartitions; `-trace_stat`/`-stf`/`-fd` CSV (pragmatic subset
+      of SIPp's columns with (P)/(C) naming — SIPP_COMPAT §6);
+      `-trace_msg`/`-trace_err` files with SIPp-style framing
+- [x] Periodic stat line in `-bg` mode incl. rtd1 avg/p99
 
 ## M5 — TUI
 

@@ -176,6 +176,203 @@ fn silence_leads_to_failed_calls_and_exit_1() {
     assert!(err.contains("failed 1"), "{err}");
 }
 
+/// A free loopback UDP port (bind-then-drop).
+fn free_port() -> u16 {
+    let s = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    s.local_addr().expect("addr").port()
+}
+
+#[test]
+fn sipr_uas_answers_sipr_uac_self_test() {
+    let port = free_port();
+    let uas = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .args([
+            "-sn",
+            "uas",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-m",
+            "5",
+            "-timeout",
+            "20",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn uas");
+    std::thread::sleep(Duration::from_millis(300)); // let it bind
+    let uac = run_sipr(&[
+        "-sn",
+        "uac",
+        "-r",
+        "20",
+        "-m",
+        "5",
+        "-d",
+        "50",
+        "-timeout",
+        "15",
+        &format!("127.0.0.1:{port}"),
+    ]);
+    let uac_err = String::from_utf8_lossy(&uac.stderr);
+    assert_eq!(uac.status.code(), Some(0), "uac stderr:\n{uac_err}");
+    assert!(
+        uac_err.contains("created 5 successful 5 failed 0"),
+        "uac summary:\n{uac_err}"
+    );
+    let uas_out = uas.wait_with_output().expect("uas exit");
+    let uas_err = String::from_utf8_lossy(&uas_out.stderr);
+    assert_eq!(uas_out.status.code(), Some(0), "uas stderr:\n{uas_err}");
+    assert!(
+        uas_err.contains("created 5 successful 5 failed 0"),
+        "uas summary:\n{uas_err}"
+    );
+}
+
+#[test]
+fn uas_auto_answers_in_dialog_options_with_aa() {
+    let port = free_port();
+    let uas = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .args([
+            "-sn",
+            "uas",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-aa",
+            "-m",
+            "1",
+            "-timeout",
+            "15",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn uas");
+    std::thread::sleep(Duration::from_millis(300));
+    // UAC flow with an in-dialog OPTIONS the UAS scenario does not expect.
+    let uac_scenario = r#"<scenario name="uac-with-options">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="180" optional="true"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <send retrans="500"><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 OPTIONS
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 3 BYE
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("sipr-aa-{}.xml", std::process::id()));
+    std::fs::write(&path, uac_scenario).expect("write scenario");
+    let uac = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-m",
+        "1",
+        "-timeout",
+        "10",
+        &format!("127.0.0.1:{port}"),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let uac_err = String::from_utf8_lossy(&uac.stderr);
+    assert_eq!(uac.status.code(), Some(0), "uac stderr:\n{uac_err}");
+    let uas_out = uas.wait_with_output().expect("uas exit");
+    let uas_err = String::from_utf8_lossy(&uas_out.stderr);
+    assert_eq!(uas_out.status.code(), Some(0), "uas stderr:\n{uas_err}");
+}
+
+#[test]
+fn trace_files_are_written() {
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let dir = std::env::temp_dir().join(format!("sipr-traces-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .args([
+            "-sn",
+            "uac",
+            "-m",
+            "2",
+            "-d",
+            "30",
+            "-timeout",
+            "15",
+            "-trace_msg",
+            "-trace_err",
+            "-trace_stat",
+            &addr.to_string(),
+        ])
+        .output()
+        .expect("run sipr");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let msg_log = names.iter().find(|n| n.ends_with("_messages.log"));
+    let csv = names.iter().find(|n| n.ends_with("_.csv"));
+    assert!(msg_log.is_some() && csv.is_some(), "files: {names:?}");
+    let msg_content =
+        std::fs::read_to_string(dir.join(msg_log.expect("msg log"))).expect("read log");
+    assert!(
+        msg_content.contains("INVITE sip:service@"),
+        "message log content"
+    );
+    assert!(msg_content.contains("received from"), "inbound traced too");
+    let csv_content = std::fs::read_to_string(dir.join(csv.expect("csv"))).expect("read csv");
+    assert!(csv_content.starts_with("CurrentTime;"), "csv header");
+    assert!(csv_content.lines().count() >= 2, "csv rows:\n{csv_content}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn retransmissions_fire_when_first_invite_is_lost() {
     // A UAS that ignores the first INVITE per branch: the call only

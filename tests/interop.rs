@@ -131,3 +131,79 @@ fn uac_against_real_sipp_uas() {
     // is also fine — sipr's side already proved the flows completed.
     let _ = wait_with_timeout(&mut sipp_proc.0, Duration::from_secs(10));
 }
+
+#[test]
+fn real_sipp_uac_against_sipr_uas() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::real_sipp_uac_against_sipr_uas — no sipp binary found. \
+             Set SIPP_BIN=/path/to/sipp or put sipp on PATH (docs/TESTING.md §4)."
+        );
+        return;
+    };
+    let port = free_port();
+    let mut sipr_uas = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .args([
+                "-sn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "5",
+                "-timeout",
+                "30",
+            ])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sipr uas"),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let mut sipp_uac = Reaper(
+        Command::new(&sipp)
+            .args([
+                "-sn",
+                "uac",
+                "-i",
+                "127.0.0.1",
+                "-r",
+                "10",
+                "-m",
+                "5",
+                "-d",
+                "100",
+                "-timeout",
+                "20s",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uac"),
+    );
+    let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
+    assert_eq!(sipp_code, Some(0), "sipp uac must exit 0");
+    let sipr_code = wait_with_timeout(&mut sipr_uas.0, Duration::from_secs(15));
+    let stderr = sipr_uas
+        .0
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        sipr_code,
+        Some(0),
+        "sipr uas must exit 0; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("successful 5 failed 0"),
+        "sipr uas summary:\n{stderr}"
+    );
+}

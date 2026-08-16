@@ -24,6 +24,8 @@ pub const MAX_DATAGRAM: usize = 65_535;
 pub struct InboundPacket {
     /// The parsed message (start line + lazy header access).
     pub message: Inbound,
+    /// The datagram exactly as received (for `-trace_msg`).
+    pub raw: Vec<u8>,
     /// Sender address.
     pub from: SocketAddr,
     /// Arrival timestamp.
@@ -96,6 +98,7 @@ impl UdpTransport {
                             let event = match Inbound::parse(&buf[..n]) {
                                 Ok(message) => NetEvent::Packet(InboundPacket {
                                     message,
+                                    raw: buf[..n].to_vec(),
                                     from,
                                     received_at: Instant::now(),
                                 }),

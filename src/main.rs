@@ -13,8 +13,6 @@ use crate::cli::{Cli, Invocation};
 
 /// Usage-error exit code.
 const EXIT_USAGE: u8 = 2;
-/// Exit code used until the engine exists: aborted, no calls processed.
-const EXIT_NO_CALLS: u8 = 99;
 /// Fatal error exit code (SIPp uses -1, i.e. 255).
 const EXIT_FATAL: u8 = 255;
 
@@ -89,29 +87,29 @@ fn run(cli: &Cli) -> ExitCode {
         return fatal(&format!("scenario '{scenario_name}' failed to compile"));
     };
 
-    // UAS mode lands at M4; until then only UAC scenarios run.
-    if scenario.role == Role::Uas {
-        eprintln!(
-            "sipr {}: scenario '{scenario_name}' accepted ({} steps, Uas) — UAS \
-             mode is not implemented yet (M4; see docs/MILESTONES.md). Exiting.",
-            env!("CARGO_PKG_VERSION"),
-            scenario.steps.len(),
+    // A UAC needs somewhere to send calls; a UAS listens and needs none.
+    let target = match (scenario.role, cli.target.as_deref()) {
+        (Role::Uac, None) => {
+            return fatal(&format!(
+                "remote target required: scenario '{scenario_name}' is a UAC — \
+                 pass REMOTE_HOST[:PORT]"
+            ));
+        }
+        (_, Some(raw)) => match resolve_target(raw) {
+            Ok(t) => Some(t),
+            Err(e) => return fatal(&e),
+        },
+        (Role::Uas, None) => None,
+    };
+
+    // Trace file names follow SIPp: <scenario>_<pid>_<kind>.
+    let base = std::path::Path::new(&scenario_name)
+        .file_stem()
+        .map_or_else(
+            || scenario_name.clone(),
+            |s| s.to_string_lossy().into_owned(),
         );
-        return ExitCode::from(EXIT_NO_CALLS);
-    }
-
-    // A UAC needs somewhere to send calls.
-    let Some(target_raw) = cli.target.as_deref() else {
-        return fatal(&format!(
-            "remote target required: scenario '{scenario_name}' is a UAC — \
-             pass REMOTE_HOST[:PORT]"
-        ));
-    };
-    let target = match resolve_target(target_raw) {
-        Ok(t) => t,
-        Err(e) => return fatal(&e),
-    };
-
+    let pid = std::process::id();
     let config = sipr_engine::EngineConfig {
         target,
         local_ip: cli.local_ip,
@@ -129,6 +127,19 @@ fn run(cli: &Cli) -> ExitCode {
         call_id_format: cli.call_id_format.clone(),
         seed: 0,
         periodic_stats: cli.background,
+        auto_answer: cli.auto_answer,
+        trace_msg: cli
+            .trace_msg
+            .then(|| std::path::PathBuf::from(format!("{base}_{pid}_messages.log"))),
+        trace_err: cli
+            .trace_err
+            .then(|| std::path::PathBuf::from(format!("{base}_{pid}_errors.log"))),
+        trace_stat: cli.trace_stat.then(|| {
+            cli.stat_file
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_.csv")))
+        }),
+        stat_interval: std::time::Duration::from_secs(cli.stat_interval_s.unwrap_or(1)),
     };
     match sipr_engine::run(&scenario, &config) {
         Ok(report) => {
