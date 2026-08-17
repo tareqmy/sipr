@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use sipr_net::timer::TimerId;
 use sipr_net::{
-    Inbound, NetEvent, RetransSchedule, TcpTransport, TimerService, TransportConfig, UdpTransport,
+    Inbound, NetEvent, RetransSchedule, TcpTransport, TimerService, TransportConfig, TwinChannel,
+    UdpTransport,
 };
 use sipr_scenario::inject::{InjectMode, InjectionFile};
 use sipr_scenario::model::{Action, Expect, PauseSpec, RecvStep, Role, Scenario, Step, StepCommon};
@@ -84,6 +85,9 @@ pub struct EngineConfig {
     pub inf_index: Vec<(String, usize)>,
     /// `-t`: which transport to run.
     pub transport: TransportKind,
+    /// `-3pcc HOST:PORT`: the twin control socket for classic 3PCC. The role
+    /// (dial vs listen) is derived from the scenario's first twin command.
+    pub twin_addr: Option<SocketAddr>,
 }
 
 /// Transport selection (`-t`).
@@ -199,6 +203,8 @@ enum Event {
     PacerTick,
     GlobalTimeout,
     Stdin(char),
+    /// A 3PCC command arrived on the twin control channel.
+    TwinCmd(String),
 }
 
 struct RetransCtx {
@@ -218,6 +224,8 @@ struct CallState {
     /// Next step to execute; when `waiting`, start of the recv window.
     index: usize,
     waiting: bool,
+    /// Blocked on a `<recvCmd>` waiting for a 3PCC twin command.
+    awaiting_cmd: bool,
     /// In timewait: absorb retransmissions, never fail.
     completing: bool,
     started: Instant,
@@ -313,6 +321,25 @@ pub fn run_with_ui(
     Ok((report, control))
 }
 
+/// Which end of the 3PCC twin socket this instance is.
+#[derive(Clone, Copy)]
+enum TwinRole {
+    /// First twin command is `sendCmd`: dial the peer (controller A).
+    Connect,
+    /// First twin command is `recvCmd`: listen for the peer (controller B).
+    Listen,
+}
+
+/// Decide the twin role from the scenario's first twin command, or `None` when
+/// the scenario has none.
+fn twin_role(scenario: &Scenario) -> Option<TwinRole> {
+    scenario.steps.iter().find_map(|s| match s {
+        Step::SendCmd { .. } => Some(TwinRole::Connect),
+        Step::RecvCmd { .. } => Some(TwinRole::Listen),
+        _ => None,
+    })
+}
+
 /// The bound transport, dispatched by kind. Both variants expose the same
 /// address/send surface the engine uses.
 enum Transport {
@@ -352,6 +379,10 @@ struct Engine<'s> {
     trace_stat: Option<sipr_stats::TraceFile>,
     inf_files: Vec<std::cell::RefCell<InjectionFile>>,
     inf_seq: Vec<usize>,
+    /// 3PCC twin control channel (`-3pcc`), when the scenario uses it.
+    twin: Option<TwinChannel>,
+    /// Twin commands that arrived before a call was ready to consume them.
+    pending_cmds: std::collections::VecDeque<String>,
     rng: sipr_net::rng::Rng,
     /// Per-step: CSeq method a response recv must carry (SIPp guard).
     expected_cseq_method: Vec<Option<String>>,
@@ -433,6 +464,41 @@ impl<'s> Engine<'s> {
                 };
                 (Transport::Tcp(t), "TCP", true)
             }
+        };
+        // 3PCC twin control channel. The role comes from the first twin command
+        // in the scenario: sendCmd-first dials the peer, recvCmd-first listens.
+        let twin = match (twin_role(scenario), config.twin_addr) {
+            (Some(role), Some(addr)) => {
+                let (twin_tx, twin_rx) = channel::<String>();
+                let bridge_tx = tx.clone();
+                std::thread::Builder::new()
+                    .name("sipr-twin-bridge".into())
+                    .spawn(move || {
+                        while let Ok(cmd) = twin_rx.recv() {
+                            if bridge_tx.send(Event::TwinCmd(cmd)).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .ok();
+                let ch = match role {
+                    TwinRole::Connect => TwinChannel::connect(addr, twin_tx).map_err(|e| {
+                        EngineError(format!("cannot connect 3PCC twin socket {addr}: {e}"))
+                    })?,
+                    TwinRole::Listen => TwinChannel::listen(addr, twin_tx).map_err(|e| {
+                        EngineError(format!("cannot bind 3PCC twin socket {addr}: {e}"))
+                    })?,
+                };
+                Some(ch)
+            }
+            (Some(_), None) => {
+                return Err(EngineError(
+                    "scenario uses <sendCmd>/<recvCmd> (3PCC) but no twin address \
+                     was given — pass -3pcc HOST:PORT"
+                        .into(),
+                ));
+            }
+            (None, _) => None,
         };
         let timers = TimerService::start(tx.clone());
         let control = EngineControl {
@@ -558,6 +624,8 @@ impl<'s> Engine<'s> {
             trace_stat,
             inf_files,
             inf_seq: vec![0; inf_len],
+            twin,
+            pending_cmds: std::collections::VecDeque::new(),
             rng: sipr_net::rng::Rng::new(config.seed ^ 0x51B8_0003),
             expected_cseq_method: precompute_cseq_methods(scenario),
             control,
@@ -620,6 +688,7 @@ impl<'s> Engine<'s> {
                     'p' => self.paused = !self.paused,
                     _ => {}
                 },
+                Ok(Event::TwinCmd(cmd)) => self.on_twin_cmd(cmd),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -991,6 +1060,41 @@ impl<'s> Engine<'s> {
                         }
                     }
                 }
+                Step::SendCmd { template, common } => {
+                    if self.twin.is_none() {
+                        self.fail_call(call_id, "3PCC <sendCmd> reached but no -3pcc twin socket");
+                        return;
+                    }
+                    let Some(rendered) = self.render_call_template(call_id, index, template) else {
+                        return;
+                    };
+                    let result = self.twin.as_ref().map(|t| t.send(&rendered));
+                    if let Some(Err(e)) = result {
+                        self.fail_call(call_id, &format!("3PCC <sendCmd> failed: {e}"));
+                        return;
+                    }
+                    let jump = self.jump_target(common, index, call_id);
+                    if let Some(call) = self.calls.get_mut(call_id) {
+                        call.index = jump;
+                    }
+                }
+                Step::RecvCmd {
+                    actions, common, ..
+                } => {
+                    // Consume a queued command immediately, else block until one
+                    // arrives (Event::TwinCmd wakes the call).
+                    if let Some(cmd) = self.pending_cmds.pop_front() {
+                        if self.deliver_recv_cmd(call_id, index, actions, common, &cmd) {
+                            return;
+                        }
+                        // index advanced in place; the loop runs the next step.
+                    } else {
+                        if let Some(call) = self.calls.get_mut(call_id) {
+                            call.awaiting_cmd = true;
+                        }
+                        return;
+                    }
+                }
                 Step::Label { .. } => {
                     if let Some(call) = self.calls.get_mut(call_id) {
                         call.index = index + 1;
@@ -1283,6 +1387,18 @@ impl<'s> Engine<'s> {
     /// terminal outcome (fail/stop) removed the call or ended the run — the
     /// caller must stop touching this call.
     fn run_step_actions(&mut self, call_id: &str, actions: &[Action], index: usize) -> bool {
+        self.run_step_actions_inner(call_id, actions, index, None)
+    }
+
+    /// Shared body for step actions. `cmd_text` is set only for `<recvCmd>`,
+    /// where `ereg` searches the raw twin command instead of a SIP message.
+    fn run_step_actions_inner(
+        &mut self,
+        call_id: &str,
+        actions: &[Action],
+        index: usize,
+        cmd_text: Option<&str>,
+    ) -> bool {
         let Some(call) = self.calls.get(call_id) else {
             return true;
         };
@@ -1328,7 +1444,10 @@ impl<'s> Engine<'s> {
                     lines: &call.field_lines,
                 },
             };
-            crate::actions::run_actions(actions, &mut store, last.as_ref(), &ctx)
+            match cmd_text {
+                Some(text) => crate::actions::run_cmd_actions(actions, &mut store, text, &ctx),
+                None => crate::actions::run_actions(actions, &mut store, last.as_ref(), &ctx),
+            }
         };
         // Persist the mutated store.
         if let Some(call) = self.calls.get_mut(call_id) {
@@ -1363,6 +1482,110 @@ impl<'s> Engine<'s> {
             }
         }
         false
+    }
+
+    /// Render a call's template (a 3PCC `<sendCmd>` body) to a string, using
+    /// the same keyword/variable context as message rendering.
+    fn render_call_template(
+        &self,
+        call_id: &str,
+        index: usize,
+        template: &MsgTemplate,
+    ) -> Option<String> {
+        let call = self.calls.get(call_id)?;
+        let remote_ip = call.remote.ip().to_string();
+        let digest_uri = format!(
+            "sip:{}@{}:{}",
+            self.config.service,
+            remote_ip,
+            call.remote.port()
+        );
+        let var_ctx = crate::render::VarCtx {
+            store: &call.store,
+            vars: &self.scenario.vars,
+            challenge: call.challenge.as_ref(),
+            auth_user: self.config.auth_user.as_deref().unwrap_or(""),
+            auth_password: self.config.auth_password.as_deref().unwrap_or(""),
+            cnonce: &call.cnonce,
+            method: "REGISTER",
+            digest_uri: &digest_uri,
+        };
+        let ctx = RenderCtx {
+            service: &self.config.service,
+            remote_ip: &remote_ip,
+            remote_port: call.remote.port(),
+            local_ip: &self.local_ip_str,
+            local_port: self.transport.local_addr().port(),
+            transport: self.transport_token,
+            call_id,
+            call_number: call.number,
+            pid: self.pid,
+            cseq: call.cseq,
+            msg_index: index,
+            peer_tag: call.peer_tag.as_deref(),
+            routes: &call.routes,
+            last: call.last_recv.as_ref(),
+            var_ctx: Some(var_ctx),
+            fields: crate::render::FieldSource {
+                files: &self.inf_files,
+                lines: &call.field_lines,
+            },
+        };
+        Some(crate::render::render_to_string(template, &ctx, None))
+    }
+
+    /// Run a `<recvCmd>`'s actions against `cmd`, then advance the call. Returns
+    /// true when a control-flow outcome (jump/fail/stop) already handled it.
+    fn deliver_recv_cmd(
+        &mut self,
+        call_id: &str,
+        index: usize,
+        actions: &[Action],
+        common: &StepCommon,
+        cmd: &str,
+    ) -> bool {
+        if !actions.is_empty() && self.run_step_actions_inner(call_id, actions, index, Some(cmd)) {
+            return true; // actions jumped/failed/stopped
+        }
+        let moved = self.calls.get(call_id).is_some_and(|c| c.index != index);
+        if !moved {
+            let jump = self.jump_target(common, index, call_id);
+            if let Some(call) = self.calls.get_mut(call_id) {
+                call.index = jump;
+            }
+        }
+        false
+    }
+
+    /// A twin command arrived: hand it to a call blocked on `<recvCmd>`, or
+    /// queue it until one is.
+    fn on_twin_cmd(&mut self, cmd: String) {
+        let waiting = self
+            .calls
+            .iter()
+            .find(|(_, c)| c.awaiting_cmd)
+            .map(|(id, _)| id.clone());
+        let Some(call_id) = waiting else {
+            self.pending_cmds.push_back(cmd);
+            return;
+        };
+        let index = self.calls.get(&call_id).map_or(0, |c| c.index);
+        let (actions, common) = match self.scenario.steps.get(index) {
+            Some(Step::RecvCmd {
+                actions, common, ..
+            }) => (actions, common),
+            _ => {
+                // The blocked call is not on a recvCmd anymore; re-queue.
+                self.pending_cmds.push_back(cmd);
+                return;
+            }
+        };
+        if let Some(call) = self.calls.get_mut(&call_id) {
+            call.awaiting_cmd = false;
+        }
+        if !self.deliver_recv_cmd(&call_id, index, actions, common, &cmd) {
+            self.advance(&call_id);
+        }
     }
 
     /// `-aa`: answer in-dialog OPTIONS/INFO/UPDATE/NOTIFY with 200 without
@@ -1563,7 +1786,10 @@ fn step_common(step: &Step) -> Option<&StepCommon> {
     match step {
         Step::Send(s) => Some(&s.common),
         Step::Recv(r) => Some(&r.common),
-        Step::Pause { common, .. } | Step::Nop { common, .. } => Some(common),
+        Step::Pause { common, .. }
+        | Step::Nop { common, .. }
+        | Step::SendCmd { common, .. }
+        | Step::RecvCmd { common, .. } => Some(common),
         Step::Label { .. } | Step::Timewait { .. } => None,
     }
 }
@@ -1612,6 +1838,8 @@ fn step_label(step: &Step) -> String {
         }
         Step::Pause { .. } => "pause".to_owned(),
         Step::Nop { .. } => "nop".to_owned(),
+        Step::SendCmd { .. } => "sendCmd".to_owned(),
+        Step::RecvCmd { .. } => "recvCmd".to_owned(),
         Step::Label { id, .. } => format!("label {id}"),
         Step::Timewait { ms, .. } => format!("timewait {ms}ms"),
     }
@@ -1631,6 +1859,7 @@ fn new_call(
         remote,
         index: 0,
         waiting: false,
+        awaiting_cmd: false,
         completing: false,
         started: Instant::now(),
         cseq: base_cseq,

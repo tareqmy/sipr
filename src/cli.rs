@@ -84,6 +84,8 @@ pub struct Cli {
     pub inf: Vec<std::path::PathBuf>,
     /// `-infindex FILE FIELD`: build a `<lookup>` index; repeatable.
     pub inf_index: Vec<(String, usize)>,
+    /// `-3pcc HOST:PORT`: classic 3PCC twin control socket.
+    pub three_pcc: Option<String>,
 }
 
 impl Default for Cli {
@@ -120,6 +122,7 @@ impl Default for Cli {
             max_retrans: None,
             inf: Vec::new(),
             inf_index: Vec::new(),
+            three_pcc: None,
         }
     }
 }
@@ -252,6 +255,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "FILE FIELD",
         "Index an -inf file on FIELD for <lookup>; repeatable",
     ),
+    (
+        "3pcc",
+        true,
+        "HOST:PORT",
+        "3PCC twin control socket (sendCmd/recvCmd)",
+    ),
     ("h", false, "", "Print help"),
     ("help", false, "", "Print help"),
     ("v", false, "", "Print version"),
@@ -370,6 +379,7 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "cid_str" => cli.call_id_format = Some(val(value)),
         "max_retrans" => cli.max_retrans = Some(parse_num(flag, &val(value))?),
         "inf" => cli.inf.push(std::path::PathBuf::from(val(value))),
+        "3pcc" => cli.three_pcc = Some(val(value)),
         other => return Err(format!("internal error: unhandled flag '-{other}'")),
     }
     Ok(())

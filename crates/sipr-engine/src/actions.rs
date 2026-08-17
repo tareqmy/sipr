@@ -128,9 +128,30 @@ pub fn run_actions(
     last_msg: Option<&Inbound>,
     base_ctx: &RenderCtx<'_>,
 ) -> Vec<ActionOutcome> {
+    run_actions_impl(actions, store, last_msg, None, base_ctx)
+}
+
+/// Like [`run_actions`], but `ereg` searches the raw 3PCC command `cmd_text`
+/// instead of a received SIP message (`<recvCmd>` actions).
+pub fn run_cmd_actions(
+    actions: &[Action],
+    store: &mut VarStore,
+    cmd_text: &str,
+    base_ctx: &RenderCtx<'_>,
+) -> Vec<ActionOutcome> {
+    run_actions_impl(actions, store, None, Some(cmd_text), base_ctx)
+}
+
+fn run_actions_impl(
+    actions: &[Action],
+    store: &mut VarStore,
+    last_msg: Option<&Inbound>,
+    cmd_text: Option<&str>,
+    base_ctx: &RenderCtx<'_>,
+) -> Vec<ActionOutcome> {
     let mut out = Vec::new();
     for action in actions {
-        let outcome = run_one(action, store, last_msg, base_ctx);
+        let outcome = run_one(action, store, last_msg, cmd_text, base_ctx);
         let terminal = !matches!(outcome, ActionOutcome::Continue | ActionOutcome::Log(_));
         out.push(outcome);
         if terminal {
@@ -155,6 +176,7 @@ fn run_one(
     action: &Action,
     store: &mut VarStore,
     last_msg: Option<&Inbound>,
+    cmd_text: Option<&str>,
     base_ctx: &RenderCtx<'_>,
 ) -> ActionOutcome {
     match action {
@@ -166,7 +188,10 @@ fn run_one(
             check_it,
             assign_to,
         } => {
-            let haystack = ereg_haystack(*search_in, header.as_deref(), *start_line, last_msg);
+            let haystack = match cmd_text {
+                Some(text) => cmd_haystack(*search_in, header.as_deref(), text),
+                None => ereg_haystack(*search_in, header.as_deref(), *start_line, last_msg),
+            };
             match regexp.find_strings(haystack.as_bytes()) {
                 Some(caps) => {
                     // assign_to[0] gets the whole match; [1..] get groups.
@@ -342,6 +367,26 @@ fn run_one(
                 Ok(()) => ActionOutcome::Continue,
                 Err(e) => ActionOutcome::FailCall(e),
             }
+        }
+    }
+}
+
+/// Haystack for `<recvCmd>` actions: the raw twin command text (`search_in`
+/// `msg`), or a header extracted from it (`hdr`). The command is a plain text
+/// blob (SIPp treats it likewise), so header extraction is a simple line scan.
+fn cmd_haystack(search_in: SearchIn, header: Option<&str>, text: &str) -> String {
+    match search_in {
+        SearchIn::Msg => text.to_owned(),
+        SearchIn::Hdr => {
+            let want = header.unwrap_or("").trim_end_matches(':');
+            text.lines()
+                .filter_map(|l| {
+                    l.split_once(':').and_then(|(name, val)| {
+                        name.trim().eq_ignore_ascii_case(want).then(|| val.trim())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n")
         }
     }
 }

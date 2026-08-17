@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- Classic 3PCC controller-A shape: INVITE a peer, capture an offer from the
+     200, forward it to the twin with <sendCmd>, receive the answer with
+     <recvCmd>, and echo it into the ACK. Compiles clean; the twin socket is a
+     runtime concern (-3pcc). -->
+<scenario name="3PCC controller A">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:a@[local_ip]:[local_port]>;tag=[pid]a[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:a@[local_ip]:[local_port]>
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+
+  <recv response="200" rtd="true">
+    <action>
+      <ereg regexp="Content-Type:.*" search_in="msg" assign_to="1"/>
+    </action>
+  </recv>
+
+  <sendCmd><![CDATA[
+    Call-ID: [call_id]
+    [$1]
+  ]]></sendCmd>
+
+  <recvCmd>
+    <action>
+      <ereg regexp="Content-Type:.*" search_in="msg" assign_to="2"/>
+    </action>
+  </recvCmd>
+
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:a@[local_ip]:[local_port]>;tag=[pid]a[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    [$2]
+    Content-Length: 0
+
+  ]]></send>
+
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:a@[local_ip]:[local_port]>;tag=[pid]a[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+
+  <recv response="200"/>
+</scenario>

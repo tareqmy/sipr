@@ -170,14 +170,8 @@ impl Compiler {
                     self.var_reads(v);
                 }
             }
-            "sendCmd" | "recvCmd" => self.diags.error(
-                Some(el.line),
-                format!(
-                    "<{}> (3PCC) is not supported yet — planned for v1.x \
-                     (docs/SIPP_COMPAT.md §1)",
-                    el.name
-                ),
-            ),
+            "sendCmd" => self.compile_send_cmd(el),
+            "recvCmd" => self.compile_recv_cmd(el),
             other => self.diags.error(
                 Some(el.line),
                 format!("unknown element <{other}> — refusing to silently skip a step"),
@@ -388,6 +382,76 @@ impl Compiler {
             }
         }
         self.steps.push(Step::Nop { actions, common });
+    }
+
+    /// `<sendCmd>` — a 3PCC control command whose CDATA is the message body
+    /// (SIPp appends an ESC delimiter on the wire; the engine does that).
+    fn compile_send_cmd(&mut self, el: &Element) {
+        // `dest=` (extended 3pcc peer routing) is not supported.
+        if el.attr("dest").is_some() {
+            self.diags.error(
+                Some(el.line),
+                "sendCmd 'dest' (extended 3PCC) is not supported yet — classic -3pcc only",
+            );
+        }
+        let common = self.parse_common(el, &["dest"]);
+        let mut body = String::new();
+        let mut cdata_line = el.line;
+        for node in &el.children {
+            match node {
+                Node::CData { text, line } => {
+                    if body.is_empty() {
+                        cdata_line = *line;
+                    }
+                    body.push_str(text);
+                }
+                Node::Text(t) => {
+                    if !t.trim().is_empty() {
+                        body.push_str(t);
+                    }
+                }
+                Node::Element(a) => self.diags.error(
+                    Some(a.line),
+                    format!("unexpected <{}> inside <sendCmd>", a.name),
+                ),
+            }
+        }
+        let normalized = template::normalize_cdata(&body);
+        if normalized.is_empty() {
+            self.diags
+                .error(Some(el.line), "<sendCmd> has no command body (CDATA)");
+        }
+        let template = self.templ(&normalized, cdata_line);
+        self.steps.push(Step::SendCmd { template, common });
+    }
+
+    /// `<recvCmd>` — wait for a twin command; its `<action>`s run against the
+    /// received command text.
+    fn compile_recv_cmd(&mut self, el: &Element) {
+        if el.attr("src").is_some() {
+            self.diags.error(
+                Some(el.line),
+                "recvCmd 'src' (extended 3PCC) is not supported yet — classic -3pcc only",
+            );
+        }
+        let common = self.parse_common(el, &["optional", "src"]);
+        let optional = self.parse_bool_attr(el, "optional");
+        let mut actions = Vec::new();
+        for a in el.child_elements() {
+            if a.name == "action" {
+                actions.extend(self.parse_actions(a));
+            } else {
+                self.diags.error(
+                    Some(a.line),
+                    format!("unexpected <{}> inside <recvCmd>", a.name),
+                );
+            }
+        }
+        self.steps.push(Step::RecvCmd {
+            actions,
+            common,
+            optional,
+        });
     }
 
     fn compile_label(&mut self, el: &Element) {
@@ -962,9 +1026,12 @@ impl Compiler {
                             Slot::Next => Some(&mut r.common.next),
                             Slot::Ontimeout => Some(&mut r.ontimeout),
                         },
-                        Some(Step::Pause { common, .. } | Step::Nop { common, .. }) => {
-                            Some(&mut common.next)
-                        }
+                        Some(
+                            Step::Pause { common, .. }
+                            | Step::Nop { common, .. }
+                            | Step::SendCmd { common, .. }
+                            | Step::RecvCmd { common, .. },
+                        ) => Some(&mut common.next),
                         _ => None,
                     };
                     if let Some(slot) = slot {
@@ -984,7 +1051,7 @@ impl Compiler {
             let actions = match step {
                 Step::Send(s) => &s.actions,
                 Step::Recv(r) => &r.actions,
-                Step::Nop { actions, .. } => actions,
+                Step::Nop { actions, .. } | Step::RecvCmd { actions, .. } => actions,
                 _ => continue,
             };
             for a in actions {

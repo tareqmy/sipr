@@ -138,9 +138,38 @@ fn unknown_element_is_an_error() {
 }
 
 #[test]
-fn threepcc_is_a_clear_error() {
-    let xml = wrap(r#"<sendCmd><![CDATA[Call-ID: [call_id]]]></sendCmd>"#);
-    assert!(errors(&xml).iter().any(|e| e.contains("3PCC")));
+fn threepcc_send_and_recv_cmd_compile() {
+    // Controller-A shape: capture from a recv, sendCmd it, recvCmd the reply.
+    let xml = wrap(&format!(
+        r#"{invite}
+           <recv response="200">
+             <action><ereg regexp="Content-Type:.*" search_in="msg" assign_to="1"/></action>
+           </recv>
+           <sendCmd><![CDATA[
+             Call-ID: [call_id]
+             [$1]
+           ]]></sendCmd>
+           <recvCmd>
+             <action><ereg regexp="Content-Type:.*" search_in="msg" assign_to="2"/></action>
+           </recvCmd>
+           <Reference variables="2"/>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    assert!(matches!(sc.steps[2], Step::SendCmd { .. }));
+    assert!(matches!(sc.steps[3], Step::RecvCmd { .. }));
+}
+
+#[test]
+fn extended_3pcc_attrs_are_rejected() {
+    let xml = wrap(r#"<recvCmd src="s1"/>"#);
+    assert!(
+        errors(&xml).iter().any(|e| e.contains("extended 3PCC")),
+        "{:?}",
+        errors(&xml)
+    );
 }
 
 #[test]

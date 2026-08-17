@@ -38,13 +38,14 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 
 ### v1.x tier (fast follow)
 
-`sendCmd`/`recvCmd` + `dest`/`src` (3PCC), `sample`, `setdest`,
-`exec command=` (external process), `start_txn`/`ack_txn`/`response_txn`
-(manual transaction naming). `index` as a standalone action stays out — sipr
-builds the index from `-infindex` at load, not from a scenario action.
+`sample`, `setdest`, `exec command=` (external process),
+`start_txn`/`ack_txn`/`response_txn` (manual transaction naming). `index` as a
+standalone action stays out — sipr builds the index from `-infindex` at load,
+not from a scenario action. Extended 3PCC (`-master`/`-slave`/`-slave_cfg` with
+`dest=`/`src=` peer routing) also stays out; classic `-3pcc` is supported.
 
-`-inf` injection + `[fieldN]` and `lookup`/`insert`/`replace` shipped in M7
-(see §6).
+`-inf` injection + `[fieldN]` and `lookup`/`insert`/`replace` shipped in M7,
+classic 3PCC (`sendCmd`/`recvCmd`) in M10 (see §6).
 
 ### Later / with media & transports
 
@@ -236,5 +237,19 @@ Verify exact SIPp table before closing M3 and update this line.
   (180, ACK, empty 200); UDP datagrams hid it, but TCP framing and real SIPp
   need it, so normalization now restores the separator when a message has no
   body.
+- Classic 3PCC `-3pcc HOST:PORT` (M10, verified in `scenario.cpp` role
+  detection, `call.cpp` `sendCmdMessage`/`sendCmdBuffer`, `sipp.cpp`
+  `SIPP_OPTION_3PCC`): two instances coordinate over a separate TCP "twin"
+  socket, exchanging command messages each terminated by a single ESC byte
+  (0x1B — SIPp's `delimitor[0]=27`). The role comes from the scenario's first
+  twin command: `sendCmd`-first dials the peer (controller A, started last),
+  `recvCmd`-first listens (controller B); both take the same `-3pcc` address.
+  `<sendCmd>` renders its CDATA (keywords/variables) and writes it plus ESC;
+  `<recvCmd>` blocks the call until a command arrives, then runs its `<action>`s
+  with `ereg` searching the raw command text (SIPp strips a trailing CRLF and
+  matches against the blob). Commands are opaque text used to pass SDP/tags
+  between the two controllers, e.g. `<sendCmd>` a captured offer then
+  `<recvCmd>` the answer. Not supported: extended master/slave 3PCC, optional
+  `recvCmd` fall-through, and twin reconnection.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

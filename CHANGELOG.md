@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Classic 3PCC** — `-3pcc HOST:PORT` plus `<sendCmd>`/`<recvCmd>` steps let
+  two sipr instances coordinate over a separate ESC-delimited TCP "twin"
+  socket. The role is derived from the scenario's first twin command
+  (`sendCmd`-first dials, `recvCmd`-first listens); `<recvCmd>` blocks the call
+  until a command arrives and runs its actions against the command text. See
+  `docs/SIPP_COMPAT.md` §6.
 - **TCP transport** — `-t t1` runs SIP over TCP. A stream framer de-frames
   messages by `Content-Length` (RFC 3261 §7.5); the client keeps one
   connection to the target, the server accepts connections and replies on the

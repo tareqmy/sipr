@@ -11,7 +11,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::Command;
 use std::time::Duration;
 
-use sipr_net::{Inbound, TcpFramer};
+use sipr_net::{EscFramer, Inbound, TcpFramer};
 
 /// Minimal scripted UAS. Answers until the socket is idle for `idle`.
 fn spawn_uas(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<UasStats>) {
@@ -1101,4 +1101,167 @@ fn tcp_uas_answers_over_stream() {
     drop(stream);
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn threepcc_controller_a_round_trips_a_command() {
+    // sipr runs as 3PCC controller-A: it INVITEs a UDP UAS, captures a token
+    // from the 200, <sendCmd>s it over the twin socket, <recvCmd>s the peer's
+    // answer, and stamps it into the ACK. The test plays both the UDP UAS and
+    // the twin peer. Proving X-Answer: WORLD reaches the ACK exercises the
+    // whole SIP -> twin -> SIP path.
+
+    // Twin socket (sipr-A dials this at startup, since sendCmd comes first).
+    let twin = TcpListener::bind("127.0.0.1:0").expect("bind twin");
+    let twin_addr = twin.local_addr().expect("twin addr");
+    let twin_thread = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = twin.accept() else {
+            return;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("twin timeout");
+        let mut framer = EscFramer::new();
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = stream.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            framer.push(&buf[..n]);
+            if let Some(cmd) = framer.next_command() {
+                // A's command carries "X-Offer: hello"; reply with the answer.
+                assert!(cmd.contains("X-Offer: hello"), "got twin cmd: {cmd:?}");
+                let reply = "Call-ID: c\r\nX-Answer: WORLD";
+                stream.write_all(reply.as_bytes()).expect("twin reply");
+                stream.write_all(&[0x1b]).expect("twin esc");
+                stream.flush().ok();
+                break;
+            }
+        }
+    });
+
+    // UDP UAS: 200 with a token, capture the ACK's X-Answer, answer BYE.
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let uas_addr = sock.local_addr().expect("uas addr");
+    sock.set_read_timeout(Some(Duration::from_secs(6)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut acked_answer: Option<String> = None;
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let mut ok = String::from("SIP/2.0 200 OK\r\n");
+                    for h in msg.header_lines("Via") {
+                        ok.push_str(h);
+                        ok.push_str("\r\n");
+                    }
+                    for h in msg.header_lines("From") {
+                        ok.push_str(h);
+                        ok.push_str("\r\n");
+                    }
+                    let to = msg.header("To").unwrap_or_default();
+                    ok.push_str(&format!("To: {to};tag=uas3pcc\r\n"));
+                    ok.push_str(&format!(
+                        "Call-ID: {}\r\n",
+                        msg.call_id().unwrap_or_default()
+                    ));
+                    ok.push_str(&format!(
+                        "CSeq: {}\r\n",
+                        msg.header("CSeq").unwrap_or_default()
+                    ));
+                    ok.push_str("X-Token: hello\r\nContent-Length: 0\r\n\r\n");
+                    let _ = sock.send_to(ok.as_bytes(), from);
+                }
+                Some("ACK") => {
+                    acked_answer = msg.header("X-Answer").map(str::to_owned);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        acked_answer
+    });
+
+    let scenario = r#"<scenario name="3pcc-a">
+  <send retrans="500"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:a@[local_ip]:[local_port]>;tag=[pid]a[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:a@[local_ip]:[local_port]>
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200">
+    <action><ereg regexp="X-Token: (.*)" search_in="msg" assign_to="1,2"/></action>
+  </recv>
+  <sendCmd><![CDATA[
+    Call-ID: [call_id]
+    X-Offer: [$2]
+  ]]></sendCmd>
+  <recvCmd>
+    <action><ereg regexp="X-Answer: (.*)" search_in="msg" assign_to="3,4"/></action>
+  </recvCmd>
+  <send><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:a@[local_ip]:[local_port]>;tag=[pid]a[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    X-Answer: [$4]
+    Content-Length: 0
+
+  ]]></send>
+  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:a@[local_ip]:[local_port]>;tag=[pid]a[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+    let sc_path = std::env::temp_dir().join(format!("sipr-3pcc-{}.xml", std::process::id()));
+    std::fs::write(&sc_path, scenario).expect("write scenario");
+
+    let out = run_sipr(&[
+        "-sf",
+        sc_path.to_str().expect("utf8"),
+        "-3pcc",
+        &twin_addr.to_string(),
+        "-m",
+        "1",
+        "-d",
+        "20",
+        "-timeout",
+        "15",
+        "-bg",
+        &uas_addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&sc_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+
+    twin_thread.join().expect("twin thread");
+    let answer = uas.join().expect("uas thread");
+    assert_eq!(
+        answer.as_deref(),
+        Some("WORLD"),
+        "twin answer must reach the ACK's X-Answer header"
+    );
 }

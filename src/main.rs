@@ -148,6 +148,13 @@ fn run(cli: &Cli) -> ExitCode {
             crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
             crate::cli::Transport::TcpMono => sipr_engine::TransportKind::TcpMono,
         },
+        twin_addr: match &cli.three_pcc {
+            Some(raw) => match resolve_target(raw) {
+                Ok(addr) => Some(addr),
+                Err(e) => return fatal(&format!("-3pcc: {e}")),
+            },
+            None => None,
+        },
     };
     // Live TUI when attached to a terminal (and not headless/lint mode).
     let use_tui = {

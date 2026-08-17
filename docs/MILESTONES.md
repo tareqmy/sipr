@@ -209,7 +209,22 @@ on a machine with sipp to close them.
       messages were missing the mandatory `\r\n\r\n` header/body separator
       (UDP hid it). SIPP_COMPAT §6.
 
+## M10 — Classic 3PCC (`sendCmd`/`recvCmd`) ✅
+
+- [x] `sipr-net/src/twin.rs`: an `EscFramer` (0x1B-delimited) and a
+      `TwinChannel` over one TCP connection — `connect()` for controller A,
+      `listen()` for controller B, with a framed reader thread delivering
+      commands. Unit + loopback tested.
+- [x] Scenario `<sendCmd>` (rendered CDATA command) and `<recvCmd>` (blocks the
+      call; its `<action>`s' `ereg` searches the raw command text). Compiler +
+      model, with extended-3PCC `dest=`/`src=` rejected. `-3pcc HOST:PORT` CLI.
+- [x] Engine wiring: the twin role is derived from the scenario's first twin
+      command (sendCmd→dial, recvCmd→listen); `Event::TwinCmd` wakes a call
+      blocked on `<recvCmd>`, with a pending-command queue for ordering.
+      Verified end to end (`tests/e2e.rs::threepcc_controller_a_round_trips_a_command`
+      drives SIP → twin → SIP through the real binary). SIPP_COMPAT §6.
+
 ## Post-v1 backlog (ordered)
 
-TLS → 3PCC (`sendCmd`/`recvCmd`) → `-users` closed loop → pcap/RTP media
-(study gossipper first) → AKA auth → IPv6 → HTTP control API.
+TLS → `-users` closed loop → pcap/RTP media (study gossipper first) → AKA auth
+→ IPv6 → HTTP control API.

@@ -171,6 +171,23 @@ pub enum Step {
         /// Shared attributes.
         common: StepCommon,
     },
+    /// 3PCC: send a command to the twin over the control channel (`<sendCmd>`).
+    SendCmd {
+        /// The command body, rendered with keywords/variables at send time.
+        template: MsgTemplate,
+        /// Shared attributes.
+        common: StepCommon,
+    },
+    /// 3PCC: wait for a command from the twin, then run actions against its
+    /// text (`<recvCmd>`).
+    RecvCmd {
+        /// Actions executed against the received command text.
+        actions: Vec<Action>,
+        /// Shared attributes.
+        common: StepCommon,
+        /// `optional="true"`.
+        optional: bool,
+    },
     /// Jump target marker (no-op at runtime).
     Label {
         /// The label id.
@@ -464,6 +481,19 @@ impl Scenario {
                 Step::Nop { actions, common } => {
                     format!("nop actions={}{}", actions.len(), common_suffix(common))
                 }
+                Step::SendCmd { common, .. } => {
+                    format!("sendCmd (3pcc){}", common_suffix(common))
+                }
+                Step::RecvCmd {
+                    actions,
+                    common,
+                    optional,
+                } => format!(
+                    "recvCmd (3pcc) actions={}{}{}",
+                    actions.len(),
+                    if *optional { " optional" } else { "" },
+                    common_suffix(common)
+                ),
                 Step::Label { id, .. } => format!("label '{id}'"),
                 Step::Timewait { ms, .. } => format!("timewait {ms}ms"),
             };
