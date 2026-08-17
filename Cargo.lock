@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "sipr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sipr-auth",
  "sipr-engine",
@@ -16,11 +16,11 @@ dependencies = [
 
 [[package]]
 name = "sipr-auth"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sipr-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sipr-auth",
  "sipr-net",
@@ -30,19 +30,19 @@ dependencies = [
 
 [[package]]
 name = "sipr-net"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sipr-scenario"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sipr-stats"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sipr-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sipr-stats",
 ]

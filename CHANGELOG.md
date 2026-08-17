@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-08-17
+
+Post-v1 feature drop: TCP transport, injection files with indexed lookups,
+classic 3PCC, and closed-loop `-users` mode. Still standard-library only.
+
 ### Added
 
 - **Closed-loop `-users`** — `-users N` keeps N concurrent calls, each holding
@@ -101,5 +106,6 @@ library — no external crates.
   leftmost-longest — identical on the patterns real scenarios use; see
   `docs/SIPP_COMPAT.md` §6.
 
-[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/tareqmy/sipr/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/tareqmy/sipr/releases/tag/v0.1.0
