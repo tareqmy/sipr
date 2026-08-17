@@ -62,16 +62,15 @@ unchecked *required* items (unchecked stretch items are fine, move them down).
       unavailable in this build env; the seeded equivalent is reproducible
       by construction.
 
-## M3 — UAC end to end  ← first interop milestone (one gate pending)
+## M3 — UAC end to end ✅ — first interop milestone
 
-- [ ] Embedded uac scenario completes against real `sipp -sn uas`; 0 failed.
-      STATUS: the harness exists (`tests/interop.rs`, resolves `$SIPP_BIN` /
-      PATH, visible skip otherwise) but no sipp binary exists in the build
-      sandbox — run `SIPP_BIN=~/development/cprojects/sipp/sipp cargo test
-      --test interop` on the dev machine to close this box. The equivalent
-      flow IS verified end-to-end in-container against a scripted UAS
-      (`tests/e2e.rs`): INVITE–180–200–ACK–pause–BYE–200, 20 000 calls at
-      2000 cps, 0 failed, plus lost-first-INVITE retransmission recovery.
+- [x] Embedded uac scenario completes against real `sipp -sn uas`; 0 failed.
+      Verified 2026-08-17 on the dev machine against SIPp v3.7.7 (Homebrew,
+      on PATH): `cargo test -p sipr --test interop` — both directions pass.
+      The same flow is also verified end-to-end in-container against a
+      scripted UAS (`tests/e2e.rs`): INVITE–180–200–ACK–pause–BYE–200,
+      20 000 calls at 2000 cps, 0 failed, plus lost-first-INVITE
+      retransmission recovery.
 - [x] Pacer: `-r`, `-rp`, `-l` (non-queuing cap), `-m`; smoothing within the
       rate period (≤20 ms sub-ticks); runtime rate change API
       (`EngineControl::set_rate`, consumed by the TUI at M5)
@@ -85,7 +84,7 @@ unchecked *required* items (unchecked stretch items are fine, move them down).
       cps baseline recorded in `benches/BASELINES.md` (~2000 cps sustained,
       far-end-bound)
 
-## M4 — UAS mode + stats ✅ (one interop gate pending, same as M3)
+## M4 — UAS mode + stats ✅
 
 - [x] UAS call creation from initial requests (unknown Call-ID matching the
       initial window creates a call bound to the packet's source address);
@@ -93,8 +92,8 @@ unchecked *required* items (unchecked stretch items are fine, move them down).
       50 000 calls at 5000 cps in BASELINES.md); retransmitted inbound
       requests are answered by re-sending the last response; timewait
       absorbs late traffic without failing (deadcall behavior)
-- [ ] sipp-uac ↔ sipr-uas: harness ready (`tests/interop.rs`), needs a sipp
-      binary — same local run as the M3 gate closes both
+- [x] sipp-uac ↔ sipr-uas: verified 2026-08-17 against real SIPp v3.7.7
+      (`cargo test -p sipr --test interop`), same run as the M3 gate
 - [x] `[last_*]`, `rrs`+`[routes]`, `[peer_tag_param]` correct as callee —
       proven by the self-test (the uac's ACK/BYE dialogs only complete if
       the uas mirrors correctly)
