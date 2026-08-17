@@ -1,6 +1,6 @@
 //! End-to-end: the sipr binary places (and answers) real calls over loopback
 //! against scripted peers implementing the classic uas flow (INVITE → 180 →
-//! 200, ACK, BYE → 200), over both UDP and TCP. This is the always-on
+//! 200, ACK, BYE → 200), over UDP, TCP, and TLS. This is the always-on
 //! complement to the real-SIPp interop suite in `tests/interop.rs`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -1064,6 +1064,305 @@ fn tcp_uas_answers_over_stream() {
         stream.write_all(msg.as_bytes()).expect("client write");
     };
     let read_statuses = |stream: &mut TcpStream, framer: &mut TcpFramer, until: u16| -> Vec<u16> {
+        let mut buf = [0u8; 16_384];
+        let mut seen = Vec::new();
+        while !seen.contains(&until) {
+            let Ok(n) = stream.read(&mut buf) else { break };
+            if n == 0 {
+                break;
+            }
+            framer.push(&buf[..n]);
+            while let Some(raw) = framer.next_message() {
+                if let Ok(m) = Inbound::parse(&raw) {
+                    if let Some(code) = m.status_code() {
+                        seen.push(code);
+                    }
+                }
+            }
+        }
+        seen
+    };
+
+    let mut framer = TcpFramer::new();
+    send(&mut stream, "INVITE", 1);
+    let invite_statuses = read_statuses(&mut stream, &mut framer, 200);
+    assert!(
+        invite_statuses.contains(&180) && invite_statuses.contains(&200),
+        "expected 180 and 200 to INVITE, got {invite_statuses:?}"
+    );
+    send(&mut stream, "ACK", 1);
+    send(&mut stream, "BYE", 2);
+    let bye_statuses = read_statuses(&mut stream, &mut framer, 200);
+    assert!(
+        bye_statuses.contains(&200),
+        "expected 200 to BYE, got {bye_statuses:?}"
+    );
+
+    drop(stream);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// --------------------------------------------------------------------------
+// TLS (`-t l1`): the TCP flows again, with a rustls layer in between.
+// --------------------------------------------------------------------------
+
+/// A fresh self-signed identity: PEM files (for the sipr process under test)
+/// plus the in-memory DER pair (for scripted rustls peers).
+struct TlsIdentity {
+    _dir: tempfile::TempDir,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    cert_der: rustls::pki_types::CertificateDer<'static>,
+    key_der: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+fn tls_identity() -> TlsIdentity {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("cert");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).expect("write cert");
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key");
+    let key_der =
+        rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("key der");
+    TlsIdentity {
+        _dir: dir,
+        cert_path,
+        key_path,
+        cert_der: cert.cert.der().clone(),
+        key_der,
+    }
+}
+
+fn ring_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    std::sync::Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// Test-only "trust anything" verifier, mirroring SIPp's no-`-tls_ca` mode.
+#[derive(Debug)]
+struct AcceptAnyCert(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// What a scripted TLS UAS observed.
+#[derive(Default, Debug)]
+struct TlsUasStats {
+    invites: u64,
+    byes: u64,
+    saw_tls_via: bool,
+}
+
+/// A scripted UAS speaking SIP over TLS: accept one connection, handshake,
+/// frame requests off the decrypted stream, reply on the same connection.
+fn spawn_tls_uas(
+    identity: &TlsIdentity,
+    idle: Duration,
+) -> (SocketAddr, std::thread::JoinHandle<TlsUasStats>) {
+    let server_config = rustls::ServerConfig::builder_with_provider(ring_provider())
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![identity.cert_der.clone()],
+            identity.key_der.clone_key(),
+        )
+        .expect("server config");
+    let server_config = std::sync::Arc::new(server_config);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind tls uas");
+    let addr = listener.local_addr().expect("addr");
+    let handle = std::thread::spawn(move || {
+        let mut stats = TlsUasStats::default();
+        let Ok((sock, _peer)) = listener.accept() else {
+            return stats;
+        };
+        sock.set_read_timeout(Some(idle)).ok();
+        let conn = rustls::ServerConnection::new(server_config).expect("server conn");
+        let mut stream = rustls::StreamOwned::new(conn, sock);
+        let mut framer = TcpFramer::new();
+        let mut buf = [0u8; 16_384];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break, // peer closed
+                Ok(n) => {
+                    framer.push(&buf[..n]);
+                    while let Some(raw) = framer.next_message() {
+                        let Ok(msg) = Inbound::parse(&raw) else {
+                            continue;
+                        };
+                        match msg.method() {
+                            Some("INVITE") => {
+                                stats.invites += 1;
+                                if msg.header_lines("Via").iter().any(|v| v.contains("/TLS")) {
+                                    stats.saw_tls_via = true;
+                                }
+                                let ringing = mirror_response(&msg, "180 Ringing", true);
+                                let ok = mirror_response(&msg, "200 OK", true);
+                                let _ = stream.write_all(&ringing);
+                                let _ = stream.write_all(&ok);
+                            }
+                            Some("BYE") => {
+                                stats.byes += 1;
+                                let ok = mirror_response(&msg, "200 OK", false);
+                                let _ = stream.write_all(&ok);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(_) => break, // idle timeout, reset, or TLS error
+            }
+        }
+        stats
+    });
+    (addr, handle)
+}
+
+#[test]
+fn tls_uac_places_call_over_stream() {
+    // sipr as a TLS UAC (-t l1) handshakes with the UAS, places one call over
+    // the encrypted stream, and completes with no retransmissions.
+    let identity = tls_identity();
+    let (addr, uas) = spawn_tls_uas(&identity, Duration::from_secs(3));
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "l1",
+        "-tls_cert",
+        identity.cert_path.to_str().expect("utf8 path"),
+        "-tls_key",
+        identity.key_path.to_str().expect("utf8 path"),
+        "-m",
+        "1",
+        "-d",
+        "20",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    // TLS is reliable: no SIP retransmissions.
+    assert!(err.contains("retrans-sent 0"), "{err}");
+    let stats = uas.join().expect("tls uas thread");
+    assert_eq!(stats.invites, 1, "one INVITE framed off the TLS stream");
+    assert_eq!(stats.byes, 1, "call torn down with BYE");
+    assert!(stats.saw_tls_via, "[transport] rendered TLS in the Via");
+}
+
+#[test]
+fn tls_uas_answers_over_stream() {
+    // sipr as a TLS UAS (-t l1): a scripted rustls client drives one INVITE
+    // dialog and must get 180 then 200, and a 200 to its BYE.
+    let identity = tls_identity();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .expect("pick port")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .args([
+            "-sn",
+            "uas",
+            "-t",
+            "l1",
+            "-tls_cert",
+            identity.cert_path.to_str().expect("utf8 path"),
+            "-tls_key",
+            identity.key_path.to_str().expect("utf8 path"),
+            "-p",
+            &port.to_string(),
+            "-timeout",
+            "10",
+            "-bg",
+        ])
+        .spawn()
+        .expect("spawn sipr uas");
+
+    // Connect once sipr has bound its listener.
+    let mut sock = None;
+    for _ in 0..80 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            sock = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let sock = sock.expect("connect to sipr uas");
+    sock.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let client_config = rustls::ClientConfig::builder_with_provider(ring_provider())
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyCert(ring_provider())))
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1").expect("name");
+    let conn = rustls::ClientConnection::new(std::sync::Arc::new(client_config), server_name)
+        .expect("client conn");
+    let mut stream = rustls::StreamOwned::new(conn, sock);
+
+    type TlsClient = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+    let send = |stream: &mut TlsClient, method: &str, cseq: u32| {
+        let msg = format!(
+            "{method} sip:svc@127.0.0.1:{port} SIP/2.0\r\n\
+             Via: SIP/2.0/TLS 127.0.0.1:55061;branch=z9hG4bK-tls-{cseq}\r\n\
+             From: <sip:caller@127.0.0.1>;tag=cli-tls-1\r\n\
+             To: <sip:svc@127.0.0.1:{port}>\r\n\
+             Call-ID: tls-call-1\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Contact: <sip:caller@127.0.0.1:55061>\r\n\
+             Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
+        );
+        stream.write_all(msg.as_bytes()).expect("client write");
+    };
+    let read_statuses = |stream: &mut TlsClient, framer: &mut TcpFramer, until: u16| -> Vec<u16> {
         let mut buf = [0u8; 16_384];
         let mut seen = Vec::new();
         while !seen.contains(&until) {

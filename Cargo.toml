@@ -23,6 +23,15 @@ sipr-engine = { path = "crates/sipr-engine", version = "0.1.1" }
 sipr-auth = { path = "crates/sipr-auth", version = "0.1.1" }
 sipr-stats = { path = "crates/sipr-stats", version = "0.1.1" }
 sipr-tui = { path = "crates/sipr-tui", version = "0.1.1" }
+# TLS (M13): rustls with the `ring` provider, NOT the default `aws-lc-rs` —
+# ring builds with `cc` alone (no cmake, no system OpenSSL), keeping the
+# build portable (docs/CONVENTIONS.md §Dependencies).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+# Test-only: generate self-signed certificates at test time (no expiring
+# PEM fixtures in the repo).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tempfile = "3"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -56,6 +65,10 @@ sipr-tui = { workspace = true }
 [dev-dependencies]
 sipr-net = { workspace = true }
 sipr-auth = { workspace = true }
+# Scripted TLS peers in tests/e2e.rs and cert generation for interop.
+rustls = { workspace = true }
+rcgen = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

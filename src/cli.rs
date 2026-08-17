@@ -10,13 +10,32 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-/// Transport mode (`-t`). UDP and TCP mono-socket; TLS is a later milestone.
+/// Transport mode (`-t`).
+// The shared `Mono` postfix is SIPp's own taxonomy (`u1`/`t1`/`l1` = one
+// socket) and will contrast with per-call multi-socket modes if those land.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     /// `u1`: UDP with one socket shared by all calls (SIPp's default).
     UdpMono,
     /// `t1`: TCP with one connection per peer (client dials, server accepts).
     TcpMono,
+    /// `l1`: TLS over TCP, same connection-per-peer model.
+    TlsMono,
+}
+
+/// `-tls_version` argument. SIPp accepts 1.0–1.3; rustls has no pre-1.2
+/// support, so 1.0/1.1 are rejected at parse time (documented divergence,
+/// docs/SIPP_COMPAT.md §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsVersionArg {
+    /// Autonegotiate (SIPp's default): TLS 1.2 or 1.3.
+    #[default]
+    Auto,
+    /// Pin TLS 1.2.
+    V1_2,
+    /// Pin TLS 1.3.
+    V1_3,
 }
 
 /// Parsed configuration. Field defaults follow SIPp where SIPp documents one.
@@ -88,6 +107,16 @@ pub struct Cli {
     pub three_pcc: Option<String>,
     /// `-users N`: closed-loop mode with N constant concurrent users.
     pub users: Option<usize>,
+    /// `-tls_cert`: TLS certificate file (SIPp default: `cacert.pem`).
+    pub tls_cert: PathBuf,
+    /// `-tls_key`: TLS private key file (SIPp default: `cakey.pem`).
+    pub tls_key: PathBuf,
+    /// `-tls_ca`: CA file; presence switches peer verification ON.
+    pub tls_ca: Option<PathBuf>,
+    /// `-tls_crl`: CRL file; presence also switches verification ON.
+    pub tls_crl: Option<PathBuf>,
+    /// `-tls_version`: pin the TLS protocol version.
+    pub tls_version: TlsVersionArg,
 }
 
 impl Default for Cli {
@@ -126,6 +155,11 @@ impl Default for Cli {
             inf_index: Vec::new(),
             three_pcc: None,
             users: None,
+            tls_cert: PathBuf::from("cacert.pem"),
+            tls_key: PathBuf::from("cakey.pem"),
+            tls_ca: None,
+            tls_crl: None,
+            tls_version: TlsVersionArg::Auto,
         }
     }
 }
@@ -188,7 +222,7 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "t",
         true,
         "MODE",
-        "Transport mode; only 'u1' (UDP) in v1 [default: u1]",
+        "Transport mode: u1 (UDP), t1 (TCP), l1 (TLS) [default: u1]",
     ),
     (
         "s",
@@ -269,6 +303,36 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         true,
         "N",
         "Closed loop: keep N concurrent users constant",
+    ),
+    (
+        "tls_cert",
+        true,
+        "FILE",
+        "TLS certificate file [default: cacert.pem]",
+    ),
+    (
+        "tls_key",
+        true,
+        "FILE",
+        "TLS private key file [default: cakey.pem]",
+    ),
+    (
+        "tls_ca",
+        true,
+        "FILE",
+        "TLS CA file; enables peer verification",
+    ),
+    (
+        "tls_crl",
+        true,
+        "FILE",
+        "TLS certificate revocation list; enables verification",
+    ),
+    (
+        "tls_version",
+        true,
+        "VER",
+        "Pin the TLS version: 1.2 | 1.3 [default: autonegotiate]",
     ),
     ("h", false, "", "Print help"),
     ("help", false, "", "Print help"),
@@ -396,6 +460,11 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "inf" => cli.inf.push(std::path::PathBuf::from(val(value))),
         "3pcc" => cli.three_pcc = Some(val(value)),
         "users" => cli.users = Some(parse_num(flag, &val(value))?),
+        "tls_cert" => cli.tls_cert = PathBuf::from(val(value)),
+        "tls_key" => cli.tls_key = PathBuf::from(val(value)),
+        "tls_ca" => cli.tls_ca = Some(PathBuf::from(val(value))),
+        "tls_crl" => cli.tls_crl = Some(PathBuf::from(val(value))),
+        "tls_version" => cli.tls_version = parse_tls_version(&val(value))?,
         other => return Err(format!("internal error: unhandled flag '-{other}'")),
     }
     Ok(())
@@ -409,15 +478,30 @@ fn parse_num<T: std::str::FromStr>(flag: &str, raw: &str) -> Result<T, String> {
 fn parse_transport(s: &str) -> Result<Transport, String> {
     match s {
         "u1" => Ok(Transport::UdpMono),
-        // SIPp's `tn` (multi-socket) collapses onto our one-connection-per-peer
-        // model; accept it as an alias for `t1`.
+        // SIPp's `tn`/`ln` (multi-socket) collapse onto our
+        // one-connection-per-peer model; accept them as aliases.
         "t1" | "tn" => Ok(Transport::TcpMono),
-        "un" | "ui" | "l1" | "ln" => Err(format!(
-            "transport mode '{s}' is not implemented yet — 'u1' (UDP) and 't1' \
-             (TCP) are supported; TLS comes later"
+        "l1" | "ln" => Ok(Transport::TlsMono),
+        "un" | "ui" => Err(format!(
+            "transport mode '{s}' is not implemented yet — 'u1' (UDP), 't1' \
+             (TCP), and 'l1' (TLS) are supported"
         )),
         other => Err(format!(
-            "unknown transport mode '{other}' (expected 'u1' or 't1')"
+            "unknown transport mode '{other}' (expected 'u1', 't1', or 'l1')"
+        )),
+    }
+}
+
+fn parse_tls_version(s: &str) -> Result<TlsVersionArg, String> {
+    match s {
+        "1.2" => Ok(TlsVersionArg::V1_2),
+        "1.3" => Ok(TlsVersionArg::V1_3),
+        "1.0" | "1.1" => Err(format!(
+            "TLS {s} is not supported by sipr (rustls implements 1.2 and 1.3 \
+             only; SIPp accepts 1.0–1.3)"
+        )),
+        other => Err(format!(
+            "invalid value '{other}' for option '-tls_version' (expected 1.2 or 1.3)"
         )),
     }
 }
@@ -565,11 +649,45 @@ mod tests {
     #[test]
     fn transport_modes_parse_and_reject() {
         assert_eq!(cli(&["-t", "t1", "host"]).transport, Transport::TcpMono);
-        // TLS is still out.
-        let err = run(&["-t", "l1"]).unwrap_err();
+        assert_eq!(cli(&["-t", "l1", "host"]).transport, Transport::TlsMono);
+        // ln collapses onto connection-per-peer, like tn.
+        assert_eq!(cli(&["-t", "ln", "host"]).transport, Transport::TlsMono);
+        let err = run(&["-t", "un"]).unwrap_err();
         assert!(err.contains("not implemented yet"), "{err}");
         let err = run(&["-t", "x9"]).unwrap_err();
         assert!(err.contains("unknown transport mode"), "{err}");
+    }
+
+    #[test]
+    fn tls_flags_parse_and_version_gates() {
+        let c = cli(&[
+            "-t",
+            "l1",
+            "-tls_cert",
+            "my.pem",
+            "-tls_key",
+            "my.key",
+            "-tls_ca",
+            "ca.pem",
+            "host",
+        ]);
+        assert_eq!(c.tls_cert, PathBuf::from("my.pem"));
+        assert_eq!(c.tls_key, PathBuf::from("my.key"));
+        assert_eq!(c.tls_ca, Some(PathBuf::from("ca.pem")));
+        // SIPp defaults.
+        let d = cli(&["host"]);
+        assert_eq!(d.tls_cert, PathBuf::from("cacert.pem"));
+        assert_eq!(d.tls_key, PathBuf::from("cakey.pem"));
+        assert_eq!(d.tls_version, TlsVersionArg::Auto);
+        // Version pins: 1.2/1.3 parse; 1.0/1.1 are a documented divergence.
+        assert_eq!(
+            cli(&["-tls_version", "1.3", "host"]).tls_version,
+            TlsVersionArg::V1_3
+        );
+        let err = run(&["-tls_version", "1.0"]).unwrap_err();
+        assert!(err.contains("not supported by sipr"), "{err}");
+        let err = run(&["-tls_version", "2"]).unwrap_err();
+        assert!(err.contains("-tls_version"), "{err}");
     }
 
     #[test]

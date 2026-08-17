@@ -78,8 +78,10 @@ Scenario/mode: `-sf <file>` `-sn uac|uas` `-sd` (dump embedded) `--check` (sipr
 addition: lint scenario and exit).
 Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 `-d <pause ms default>` `-users` (v1.x closed loop).
-Network: `-p <local port>` `-i <local ip>` `-t u1` (UDP mono-socket; other modes
-later) `-s <service>` (called number) `-mi`/`-mp` reserved (media, later).
+Network: `-p <local port>` `-i <local ip>` `-t u1|t1|l1` (UDP / TCP / TLS
+mono-socket; `tn`/`ln` accepted as aliases) `-s <service>` (called number)
+`-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version` (TLS material,
+SIPp defaults `cacert.pem`/`cakey.pem`) `-mi`/`-mp` reserved (media, later).
 Auth: `-au`/`-ap` (username/password defaults for `[authentication]`).
 Tracing/output: `-trace_msg` `-trace_err` `-trace_stat` `-stf <file>`
 `-fd <interval s>` `-nd` (no defaults) `-timeout <s>` `-bg` (headless).
@@ -274,5 +276,28 @@ Verify exact SIPp table before closing M3 and update this line.
   `[media_ip_type]` render `6` for a colon-bearing address. `-i` takes a v6
   local address directly. Not exercised in the build sandbox (no v6 loopback);
   the e2e self-skips there and runs where `::1` binds.
+- TLS `-t l1` (M13, verified in `sslsocket.cpp` `TLS_init_context`/
+  `SSL_new_client`/`SSL_new_server`, `socket.cpp` handshake/read/write paths,
+  `sipp.cpp` option table): TLS is exactly the TCP path with a TLS layer —
+  same Content-Length framing, same connection-per-peer model (`ln` collapses
+  onto it like `tn`), no SIP retransmissions, default port stays 5060 (SIPp
+  has no 5061 constant), no `sips:` scheme anywhere, `[transport]` renders
+  `TLS`. Cert/key default to `cacert.pem`/`cakey.pem` in the CWD and are
+  required to start (SIPp loads them into both client and server contexts, so
+  the client always presents its cert when asked). **Peer verification is OFF
+  unless `-tls_ca` or `-tls_crl` is given**; when on, the client validates
+  the chain but never the hostname (no `X509_check_host` in SIPp), and the
+  server demands + verifies a client cert (`SSL_VERIFY_PEER |
+  FAIL_IF_NO_PEER_CERT` — mutual TLS is a side effect of `-tls_ca`). SNI is
+  sent only for named (non-IP) targets; sipr resolves targets before dialing,
+  so like SIPp with an IP target it sends none. Deliberate divergences:
+  (1) a failed inbound handshake drops that connection with a warning — SIPp
+  kills the whole process on `SSL_accept` failure; (2) `-tls_version 1.0/1.1`
+  are rejected (rustls starts at 1.2; SIPp's floor is 1.0); (3) encrypted
+  keys are rejected — SIPp silently decrypts with the hardcoded passphrase
+  `ksgr` (`sslsocket.cpp` `passwd_call_back_routine`); (4) `setdest` to TLS
+  is fatal in SIPp and unsupported here too. Also noted: sipp's *client*
+  stream bind (TCP and TLS) reuses its own listening port, which fails with
+  EADDRINUSE on macOS — the reverse interop test self-skips there.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

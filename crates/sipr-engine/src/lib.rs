@@ -14,4 +14,7 @@ pub use engine::{
     EngineConfig, EngineControl, EngineError, RunReport, TransportKind, UiChannels, run,
     run_with_control, run_with_ui,
 };
+// Re-exported so the binary can build a TLS config without depending on
+// sipr-net directly.
 pub use render::{FieldSource, RenderCtx, RenderError, VarCtx, render};
+pub use sipr_net::{TlsConfig, TlsVersion};

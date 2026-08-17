@@ -155,6 +155,7 @@ fn run(cli: &Cli) -> ExitCode {
         transport: match cli.transport {
             crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
             crate::cli::Transport::TcpMono => sipr_engine::TransportKind::TcpMono,
+            crate::cli::Transport::TlsMono => sipr_engine::TransportKind::TlsMono,
         },
         twin_addr: match &cli.three_pcc {
             Some(raw) => match resolve_target(raw) {
@@ -164,6 +165,19 @@ fn run(cli: &Cli) -> ExitCode {
             None => None,
         },
         users: cli.users,
+        // Built only when TLS is selected: cert/key defaults (cacert.pem /
+        // cakey.pem, like SIPp) would otherwise error on absent files.
+        tls: (cli.transport == crate::cli::Transport::TlsMono).then(|| sipr_engine::TlsConfig {
+            cert: cli.tls_cert.clone(),
+            key: cli.tls_key.clone(),
+            ca: cli.tls_ca.clone(),
+            crl: cli.tls_crl.clone(),
+            version: match cli.tls_version {
+                crate::cli::TlsVersionArg::Auto => sipr_engine::TlsVersion::Auto,
+                crate::cli::TlsVersionArg::V1_2 => sipr_engine::TlsVersion::V1_2,
+                crate::cli::TlsVersionArg::V1_3 => sipr_engine::TlsVersion::V1_3,
+            },
+        }),
     };
     // Live TUI when attached to a terminal (and not headless/lint mode).
     let use_tui = {

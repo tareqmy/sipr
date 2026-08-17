@@ -6,7 +6,7 @@
   <a href="https://github.com/tareqmy/sipr/actions/workflows/ci.yml"><img src="https://github.com/tareqmy/sipr/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-B7410E" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/rust-1.85%2B-B7410E" alt="Rust 1.85+">
-  <img src="https://img.shields.io/badge/dependencies-std--only-5E7A52" alt="std-only">
+  <img src="https://img.shields.io/badge/dependencies-no%20system%20libs-5E7A52" alt="no system libraries">
 </p>
 
 # sipr
@@ -17,14 +17,14 @@ sipr plays SIP call flows described in SIPp-compatible XML scenarios — as call
 (UAC) or callee (UAS) — at a controlled call rate, with a live terminal
 dashboard. Think `sipp -sn uac -r 50`, rebuilt in safe, dependency-free Rust.
 
-**Status: v1 feature-complete for signaling over UDP.** In loopback benchmarks
+**Status: v1 feature-complete for signaling over UDP, TCP, and TLS.** In loopback benchmarks
 it sustains tens of thousands of calls per second with zero failures — see
 `benches/BASELINES.md`.
 
 ## Install
 
-sipr builds from source with a stock Rust toolchain (1.85+), no external
-crates or system libraries required:
+sipr builds from source with a stock Rust toolchain (1.85+), no system
+libraries required (TLS is pure-Rust `rustls` — no OpenSSL):
 
 ```sh
 git clone https://github.com/tareqmy/sipr && cd sipr
@@ -84,8 +84,10 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
 - IPv6 targets (`[::1]`, `[2001:db8::1]:5060`, bare `::1`) with automatic v6
   binding; `[local_ip]`/`[remote_ip]` are bracketed in URIs and Via.
 - UAC and UAS roles; open-loop pacing (`-r/-rp/-l/-m`) with rate smoothing.
-- UDP (`-t u1`) and TCP (`-t t1`) transports; TCP frames by Content-Length and
-  carries no SIP retransmissions (reliable transport).
+- UDP (`-t u1`), TCP (`-t t1`), and TLS (`-t l1`) transports; streams frame by
+  Content-Length and carry no SIP retransmissions (reliable transports). TLS
+  takes SIPp's `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version`
+  flags with SIPp's verification semantics.
 - UDP retransmission (T1→T2), recv-window matching verified against SIPp's C++.
 - Digest authentication (MD5 + SHA-256, `qop=auth`, proxy 407).
 - Live TUI, `-bg` headless stat lines, `-trace_msg`/`-trace_err`/`-trace_stat`
@@ -102,7 +104,7 @@ Everything is built on the Rust standard library only — no external crates.
 
 ## Not yet (post-v1 roadmap)
 
-TLS transport, RTP/pcap media, and an HTTP control API.
+RTP/pcap media, AKA authentication, and an HTTP control API.
 
 ## Brand
 

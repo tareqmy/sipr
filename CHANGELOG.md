@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **TLS transport (`-t l1`)** — SIP over TLS with SIPp's exact semantics:
+  same connection-per-peer model and Content-Length framing as TCP, no SIP
+  retransmissions, port 5060, `[transport]` renders `TLS`. `-tls_cert` /
+  `-tls_key` (defaults `cacert.pem`/`cakey.pem`), `-tls_ca` / `-tls_crl`
+  (presence enables SIPp-style verification: chain but not hostname on the
+  client, mandatory client cert on the server), `-tls_version 1.2|1.3`.
+  Built on `rustls` with the `ring` provider — the workspace's first
+  external dependency, still no system OpenSSL required. Divergences from
+  SIPp documented in `docs/SIPP_COMPAT.md` §6.
+
+### Changed
+
+- The `dependencies: std-only` claim is retired: `sipr-net` now carries
+  `rustls`/`rustls-pemfile` for the TLS transport. Everything else remains
+  std; the build still needs no system libraries.
+
 - **IPv6** — targets accept bracketed (`[::1]`, `[2001:db8::1]:5060`) and
   bare-literal (`::1`) IPv6, with automatic `::` binding when a v6 target is
   given without `-i`. `[local_ip]`/`[remote_ip]` render bracketed inside URIs

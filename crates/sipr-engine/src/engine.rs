@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use sipr_net::timer::TimerId;
 use sipr_net::{
-    Inbound, NetEvent, RetransSchedule, TcpTransport, TimerService, TransportConfig, TwinChannel,
-    UdpTransport,
+    Inbound, NetEvent, RetransSchedule, TcpTransport, TimerService, TlsTransport, TransportConfig,
+    TwinChannel, UdpTransport,
 };
 use sipr_scenario::inject::{InjectMode, InjectionFile};
 use sipr_scenario::model::{Action, Expect, PauseSpec, RecvStep, Role, Scenario, Step, StepCommon};
@@ -91,6 +91,8 @@ pub struct EngineConfig {
     /// `-users N`: closed-loop mode — keep N concurrent calls, each holding a
     /// 1-based user id (drives `[userid]`/`[users]` and USER injection files).
     pub users: Option<usize>,
+    /// `-tls_*` options; required when `transport` is [`TransportKind::TlsMono`].
+    pub tls: Option<sipr_net::TlsConfig>,
 }
 
 /// Transport selection (`-t`).
@@ -101,6 +103,8 @@ pub enum TransportKind {
     UdpMono,
     /// `t1`: TCP, one connection per peer (client dials, server accepts).
     TcpMono,
+    /// `l1`: TLS over TCP, same connection-per-peer model.
+    TlsMono,
 }
 
 /// Final counters of a run.
@@ -350,6 +354,7 @@ fn twin_role(scenario: &Scenario) -> Option<TwinRole> {
 enum Transport {
     Udp(UdpTransport),
     Tcp(TcpTransport),
+    Tls(TlsTransport),
 }
 
 impl Transport {
@@ -357,6 +362,7 @@ impl Transport {
         match self {
             Self::Udp(u) => u.local_addr(),
             Self::Tcp(t) => t.local_addr(),
+            Self::Tls(t) => t.local_addr(),
         }
     }
 
@@ -364,6 +370,7 @@ impl Transport {
         match self {
             Self::Udp(u) => u.send_to(data, to, lost_pct),
             Self::Tcp(t) => t.send_to(data, to, lost_pct),
+            Self::Tls(t) => t.send_to(data, to, lost_pct),
         }
     }
 }
@@ -470,6 +477,28 @@ impl<'s> Engine<'s> {
                         .map_err(|e| EngineError(format!("cannot bind TCP listener: {e}")))?,
                 };
                 (Transport::Tcp(t), "TCP", true)
+            }
+            TransportKind::TlsMono => {
+                let tls_cfg = config
+                    .tls
+                    .as_ref()
+                    .ok_or_else(|| EngineError("TLS transport needs TLS configuration".into()))?;
+                let t = match scenario.role {
+                    // Client: dial + handshake now; a failure is a startup error.
+                    Role::Uac => {
+                        let remote = config
+                            .target
+                            .ok_or_else(|| EngineError("TLS UAC needs a remote target".into()))?;
+                        TlsTransport::connect(&tcfg, tls_cfg, net_tx, remote).map_err(|e| {
+                            EngineError(format!("cannot connect TLS to {remote}: {e}"))
+                        })?
+                    }
+                    // Server: listen; each accepted connection handshakes on
+                    // its own thread and a bad client is dropped, not fatal.
+                    Role::Uas => TlsTransport::listen(&tcfg, tls_cfg, net_tx)
+                        .map_err(|e| EngineError(format!("cannot bind TLS listener: {e}")))?,
+                };
+                (Transport::Tls(t), "TLS", true)
             }
         };
         // 3PCC twin control channel. The role comes from the first twin command

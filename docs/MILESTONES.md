@@ -248,6 +248,45 @@ on a machine with sipp to close them.
       e2e (`ipv6_uac_places_call_over_loopback`) runs where `::1` binds and
       self-skips in the v6-less build sandbox. SIPP_COMPAT §6.
 
+## M13 — TLS transport (`-t l1`) ✅
+
+Behavioral oracle: `sslsocket.cpp` / `socket.cpp` in the SIPp source. TLS is
+the TCP path with a TLS layer on top — same framing, same connection-per-peer
+model, same no-retransmission rule, same default port 5060, no `sips:` scheme.
+First external dependency of the workspace: `rustls` (with the `ring`
+provider — pure-ish Rust, builds with `cc` only, no system OpenSSL; this is a
+selling point vs SIPp's mandatory OpenSSL) + `rustls-pemfile`; `rcgen`
+dev-only for generating test certs at test time. Rationale recorded in
+CONVENTIONS §Dependencies.
+
+- [x] `sipr-net/src/tls.rs`: `TlsTransport` mirroring `TcpTransport`
+      (connect/listen/local_addr/send_to), reusing `TcpFramer`. rustls
+      connection per peer: handshake completes in connect/accept, a reader
+      thread feeds the framer, writes lock the connection briefly to encrypt.
+      A failed *inbound* handshake drops that connection with a loud warning —
+      deliberate divergence from SIPp, which kills the whole process on
+      `SSL_accept` failure (SIPP_COMPAT §6).
+- [x] Config/CLI, SIPp names: `-t l1` (and `ln`, collapsing onto
+      connection-per-peer like `tn`); `-tls_cert` [cacert.pem], `-tls_key`
+      [cakey.pem], `-tls_ca`, `-tls_crl`, `-tls_version`. Verification matches
+      SIPp: OFF unless `-tls_ca`/`-tls_crl` given; when on, the client checks
+      the chain but NOT the hostname, and the server demands + verifies a
+      client cert (mutual TLS); the client always presents its cert if asked.
+      Documented divergences: `-tls_version 1.0/1.1` errors (rustls has no
+      TLS ≤1.1; SIPp's floor is 1.0), encrypted keys rejected (SIPp uses a
+      hardcoded passphrase `ksgr`).
+- [x] Engine: `TransportKind::TlsMono`, `Transport::Tls` arm, `[transport]`
+      renders `TLS` (Via `SIP/2.0/TLS`, `transport=TLS` in Contact),
+      `reliable = true` so retransmissions stay off.
+- [x] Tests: tls.rs unit tests (roundtrip, mutual TLS, mute-peer handshake
+      failure, missing-cert error, 1.3 pin); e2e loopback both directions with
+      an rcgen cert (`tls_uac_places_call_over_stream`,
+      `tls_uas_answers_over_stream`); interop vs real sipp (`-t l1` both
+      roles), self-skipping when the sipp binary lacks TLS — and the
+      sipp-as-client direction also self-skips on macOS, where sipp's own
+      stream-client bind fails (EADDRINUSE; note in SIPP_COMPAT §6).
+      fmt/clippy/test all green.
+
 ## Post-v1 backlog (ordered)
 
-TLS → pcap/RTP media (study gossipper first) → AKA auth → HTTP control API.
+pcap/RTP media (study gossipper first) → AKA auth → HTTP control API.

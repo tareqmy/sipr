@@ -12,6 +12,12 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

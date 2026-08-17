@@ -39,6 +39,7 @@ fn uas_config() -> EngineConfig {
         transport: sipr_engine::TransportKind::UdpMono,
         twin_addr: None,
         users: None,
+        tls: None,
     }
 }
 

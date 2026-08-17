@@ -45,7 +45,8 @@
 Sanctioned: `tokio`, `tokio-util`, `rsip`, `quick-xml`, `ratatui`,
 `crossterm`, `regex`, `hdrhistogram`, `thiserror`, `anyhow`, `tracing`,
 `tracing-subscriber`, `rand`, `md-5`, `sha2`, `dashmap`, `arc-swap`, `bytes`,
-and for tests `proptest`, `criterion`, `assert_cmd`, `tempfile`. Add them to
+`rustls`, `rustls-pemfile`,
+and for tests `proptest`, `criterion`, `assert_cmd`, `tempfile`, `rcgen`. Add them to
 `[workspace.dependencies]` when a milestone first needs them. The CLI is a
 deliberate exception: `src/cli.rs` is a bespoke table-driven parser (not clap)
 because SIPp's single-dash multi-char flags don't fit clap's model — extend
@@ -53,6 +54,14 @@ the `FLAGS` table there rather than introducing clap.
 Anything else: state the reason in the commit/PR description. Prefer std over a
 crate for trivial needs. No crates with native/C dependencies without discussion
 (portability is a selling point vs SIPp's build).
+
+TLS note (M13): `rustls` is used with `default-features = false` and the
+`ring` provider — NOT the default `aws-lc-rs`, whose C build can require
+cmake. `ring` vendors its own C/asm but builds with `cc` alone, keeping
+`cargo build` dependency-free at the system level (no OpenSSL headers — the
+exact pain point of building SIPp with TLS). `rcgen` (dev-only, `ring`
+feature) generates test certificates at test time so no expiring PEM
+fixtures are checked in.
 
 ## Testing (summary — full detail in TESTING.md)
 
