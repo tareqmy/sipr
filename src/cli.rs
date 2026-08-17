@@ -86,6 +86,8 @@ pub struct Cli {
     pub inf_index: Vec<(String, usize)>,
     /// `-3pcc HOST:PORT`: classic 3PCC twin control socket.
     pub three_pcc: Option<String>,
+    /// `-users N`: closed-loop mode with N constant concurrent users.
+    pub users: Option<usize>,
 }
 
 impl Default for Cli {
@@ -123,6 +125,7 @@ impl Default for Cli {
             inf: Vec::new(),
             inf_index: Vec::new(),
             three_pcc: None,
+            users: None,
         }
     }
 }
@@ -261,6 +264,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "HOST:PORT",
         "3PCC twin control socket (sendCmd/recvCmd)",
     ),
+    (
+        "users",
+        true,
+        "N",
+        "Closed loop: keep N concurrent users constant",
+    ),
     ("h", false, "", "Print help"),
     ("help", false, "", "Print help"),
     ("v", false, "", "Print version"),
@@ -342,6 +351,12 @@ where
     if cli.sf.is_some() && cli.sn.is_some() {
         return Err("options '-sf' and '-sn' cannot be used together".to_owned());
     }
+    if cli.users.is_some() && cli.limit.is_some() {
+        return Err(
+            "options '-users' and '-l' cannot be used together (users mode is closed-loop)"
+                .to_owned(),
+        );
+    }
     Ok(Invocation::Run(Box::new(cli)))
 }
 
@@ -380,6 +395,7 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "max_retrans" => cli.max_retrans = Some(parse_num(flag, &val(value))?),
         "inf" => cli.inf.push(std::path::PathBuf::from(val(value))),
         "3pcc" => cli.three_pcc = Some(val(value)),
+        "users" => cli.users = Some(parse_num(flag, &val(value))?),
         other => return Err(format!("internal error: unhandled flag '-{other}'")),
     }
     Ok(())

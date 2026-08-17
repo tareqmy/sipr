@@ -224,7 +224,21 @@ on a machine with sipp to close them.
       Verified end to end (`tests/e2e.rs::threepcc_controller_a_round_trips_a_command`
       drives SIP → twin → SIP through the real binary). SIPP_COMPAT §6.
 
+## M11 — `-users` closed loop ✅
+
+- [x] `-users N`: closed-loop generation keeping N concurrent calls. A free-user
+      pool (1..=N) hands each call a 1-based user id; a finished call returns its
+      id and `refill_users` opens a replacement immediately, so the population
+      stays constant until `-m` total. The rate pacer is disabled in users mode;
+      `-users` and `-l` are mutually exclusive.
+- [x] `[userid]`/`[users]` keywords, and USER-mode `-inf` files now resolve
+      line = userId-1 (the M7 stub is lit up). Verified end to end
+      (`tests/e2e.rs::users_closed_loop_binds_user_to_injection_line`: three
+      users each run twice under `-users 3 -m 6`, each `[field0]` matching its
+      `[userid]`). SIPP_COMPAT §6.
+- [x] Deferred: per-user persistent variables and runtime user-count changes.
+
 ## Post-v1 backlog (ordered)
 
-TLS → `-users` closed loop → pcap/RTP media (study gossipper first) → AKA auth
-→ IPv6 → HTTP control API.
+TLS → pcap/RTP media (study gossipper first) → AKA auth → IPv6 → HTTP control
+API.

@@ -55,8 +55,8 @@ classic 3PCC (`sendCmd`/`recvCmd`) in M10 (see §6).
 ## 2. Keywords (v1)
 
 `[service]` `[remote_ip]` `[remote_port]` `[local_ip]` `[local_ip_type]`
-`[local_port]` `[transport]` `[call_id]` `[call_number]` `[cseq]` `[branch]`
-`[msg_index]` `[pid]` `[routes]` `[next_url]` `[peer_tag_param]`
+`[local_port]` `[transport]` `[call_id]` `[call_number]` `[userid]` `[users]`
+`[cseq]` `[branch]` `[msg_index]` `[pid]` `[routes]` `[next_url]` `[peer_tag_param]`
 `[last_*]` (verbatim copy of header(s) from last received message, e.g.
 `[last_Via:]`, `[last_From:]`) `[$var]` `[authentication]` (+ `username=`/
 `password=` params) `[len]` (Content-Length auto-compute) `[field0..N]` (v1.x,
@@ -198,7 +198,8 @@ Verify exact SIPp table before closing M3 and update this line.
   separator is `;`, fields are 0-indexed (`[field0]` = first). Each call is
   assigned ONE line per file at creation (`nextLine`): SEQUENTIAL = a shared
   per-file counter mod line-count, RANDOM = uniform pick, USER = userId-1
-  (needs `-users`; without it the fields render empty — sipr warns at load).
+  (M11 — supported under `-users`; without `-users` the fields render empty and
+  sipr warns at load).
   `[fieldN]` uses the default (first) file. `file=` selects another file by
   its SIPp key — the BASENAME of the `-inf` path (`sipp.cpp`
   `SIPP_OPTION_INPUT_FILE` strips the directory); sipr also accepts a 0-based
@@ -251,5 +252,16 @@ Verify exact SIPp table before closing M3 and update this line.
   between the two controllers, e.g. `<sendCmd>` a captured offer then
   `<recvCmd>` the answer. Not supported: extended master/slave 3PCC, optional
   `recvCmd` fall-through, and twin reconnection.
+- `-users N` closed loop (M11, verified in `call_generation_task.cpp`
+  `run`/`free_user`/`set_users`, `call.cpp` `init` line assignment and
+  `[userid]`/`[users]` keywords, `sipp.cpp` `SIPP_OPTION_USERS`): instead of
+  open-loop rate pacing, keep N concurrent calls, each holding a 1-based user
+  id drawn from a free pool (1..N). A finished call returns its id and a
+  replacement opens immediately (`calls_to_open = users - current_calls`), so
+  the population stays constant until `-m` total is reached. `-users` and `-l`
+  are mutually exclusive. USER-mode `-inf` files resolve line = userId-1
+  (SIPp `nextLine(userId)`); `[userid]` renders the id, `[users]` the count.
+  Not supported: per-user persistent variables (SIPp's `userVarMap`) and
+  dynamic user-count changes at runtime — sipr's `-users` is a fixed N.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

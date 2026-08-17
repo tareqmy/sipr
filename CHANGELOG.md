@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Closed-loop `-users`** — `-users N` keeps N concurrent calls, each holding
+  a stable 1-based user id; a finished call's id is recycled into a replacement
+  immediately. Adds the `[userid]`/`[users]` keywords and lights up USER-mode
+  `-inf` injection (line = user id − 1). Mutually exclusive with `-l`. See
+  `docs/SIPP_COMPAT.md` §6.
 - **Classic 3PCC** — `-3pcc HOST:PORT` plus `<sendCmd>`/`<recvCmd>` steps let
   two sipr instances coordinate over a separate ESC-delimited TCP "twin"
   socket. The role is derived from the scenario's first twin command

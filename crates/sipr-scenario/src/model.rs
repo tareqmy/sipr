@@ -557,6 +557,8 @@ fn keyword_name(k: &Keyword) -> String {
         Keyword::Transport => "transport",
         Keyword::CallId => "call_id",
         Keyword::CallNumber => "call_number",
+        Keyword::UserId => "userid",
+        Keyword::Users => "users",
         Keyword::Cseq => "cseq",
         Keyword::Branch => "branch",
         Keyword::MsgIndex => "msg_index",

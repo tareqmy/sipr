@@ -43,6 +43,10 @@ pub enum Keyword {
     CallId,
     /// `[call_number]` — 1-based call counter.
     CallNumber,
+    /// `[userid]` — this call's 1-based user id (`-users` mode; 0 otherwise).
+    UserId,
+    /// `[users]` — the configured `-users` count (0 when not in users mode).
+    Users,
     /// `[cseq]` — current CSeq value.
     Cseq,
     /// `[branch]` — per-transaction Via branch.
@@ -250,6 +254,8 @@ fn classify(body: &str) -> Classified {
         "transport" => simple(Keyword::Transport),
         "call_id" => simple(Keyword::CallId),
         "call_number" => simple(Keyword::CallNumber),
+        "userid" => simple(Keyword::UserId),
+        "users" => simple(Keyword::Users),
         "cseq" => simple(Keyword::Cseq),
         "branch" => simple(Keyword::Branch),
         "msg_index" => simple(Keyword::MsgIndex),

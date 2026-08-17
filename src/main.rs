@@ -155,6 +155,7 @@ fn run(cli: &Cli) -> ExitCode {
             },
             None => None,
         },
+        users: cli.users,
     };
     // Live TUI when attached to a terminal (and not headless/lint mode).
     let use_tui = {

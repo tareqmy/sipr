@@ -38,6 +38,7 @@ fn uas_config() -> EngineConfig {
         inf_index: Vec::new(),
         transport: sipr_engine::TransportKind::UdpMono,
         twin_addr: None,
+        users: None,
     }
 }
 

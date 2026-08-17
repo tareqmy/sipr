@@ -60,6 +60,10 @@ pub struct RenderCtx<'a> {
     pub call_id: &'a str,
     /// 1-based call number.
     pub call_number: u64,
+    /// This call's 1-based user id (`-users` mode; 0 otherwise).
+    pub user_id: u64,
+    /// Configured `-users` count (0 when not in users mode).
+    pub users_total: u64,
     /// Process id discriminator.
     pub pid: u32,
     /// Current CSeq counter value.
@@ -247,6 +251,12 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
         Keyword::CallNumber => {
             let _ = write!(out, "{}", ctx.call_number);
         }
+        Keyword::UserId => {
+            let _ = write!(out, "{}", ctx.user_id);
+        }
+        Keyword::Users => {
+            let _ = write!(out, "{}", ctx.users_total);
+        }
         Keyword::Cseq => {
             let _ = write!(out, "{}", ctx.cseq);
         }
@@ -431,6 +441,8 @@ mod tests {
             transport: "UDP",
             call_id: "1-99@10.0.0.1",
             call_number: 1,
+            user_id: 0,
+            users_total: 0,
             pid: 99,
             cseq: 1,
             msg_index: 0,

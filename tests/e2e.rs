@@ -1265,3 +1265,144 @@ fn threepcc_controller_a_round_trips_a_command() {
         "twin answer must reach the ACK's X-Answer header"
     );
 }
+
+#[test]
+fn users_closed_loop_binds_user_to_injection_line() {
+    // -users 3 keeps 3 concurrent calls, each holding a stable 1-based user id.
+    // A USER-mode -inf file maps user N -> line N-1, so every call's [field0]
+    // must match its [userid] (1->alice, 2->bob, 3->carol). With -m 6, the
+    // three users each run twice as the closed loop recycles them.
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let uas_addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(6)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        // (userid, field0, users_total) captured from each distinct INVITE.
+        let mut seen: Vec<(String, String, String)> = Vec::new();
+        let mut answered: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let branch = msg.top_via_branch().unwrap_or_default().to_owned();
+                    if let Some(ok) = answered.get(&branch) {
+                        let _ = sock.send_to(ok, from);
+                        continue;
+                    }
+                    let uid = msg.header("X-User").unwrap_or_default().trim().to_owned();
+                    let users = msg.header("X-Users").unwrap_or_default().trim().to_owned();
+                    let field = msg
+                        .header("From")
+                        .and_then(|h| h.split("sip:").nth(1))
+                        .and_then(|s| s.split('@').next())
+                        .unwrap_or_default()
+                        .to_owned();
+                    seen.push((uid, field, users));
+                    let ok = mirror_response(&msg, "200 OK", true);
+                    answered.insert(branch, ok.clone());
+                    let _ = sock.send_to(&ok, from);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        seen
+    });
+
+    let inf = "USER\nalice\nbob\ncarol\n";
+    let inf_dir = std::env::temp_dir().join(format!("sipr-users-{}", std::process::id()));
+    std::fs::create_dir_all(&inf_dir).expect("mkdir");
+    let inf_path = inf_dir.join("users.csv");
+    std::fs::write(&inf_path, inf).expect("write inf");
+
+    let scenario = r#"<scenario name="users-uac">
+  <send retrans="500"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[local_ip]:[local_port]>;tag=[pid]u[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:[field0]@[local_ip]:[local_port]>
+    X-User: [userid]
+    X-Users: [users]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[local_ip]:[local_port]>;tag=[pid]u[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Content-Length: 0
+
+  ]]></send>
+  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[local_ip]:[local_port]>;tag=[pid]u[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+    let sc_path = std::env::temp_dir().join(format!("sipr-users-sc-{}.xml", std::process::id()));
+    std::fs::write(&sc_path, scenario).expect("write scenario");
+
+    let out = run_sipr(&[
+        "-sf",
+        sc_path.to_str().expect("utf8"),
+        "-inf",
+        inf_path.to_str().expect("utf8"),
+        "-users",
+        "3",
+        "-m",
+        "6",
+        "-d",
+        "20",
+        "-timeout",
+        "15",
+        "-bg",
+        &uas_addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&sc_path);
+    let _ = std::fs::remove_file(&inf_path);
+    let _ = std::fs::remove_dir(&inf_dir);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 6 failed 0"), "{err}");
+
+    let mut seen = uas.join().expect("uas thread");
+    assert_eq!(seen.len(), 6, "six calls total from three recycled users");
+    // Every call: [users] is 3, and [field0] matches the user id's row.
+    let expected = |uid: &str| match uid {
+        "1" => "alice",
+        "2" => "bob",
+        "3" => "carol",
+        _ => "?",
+    };
+    for (uid, field, users) in &seen {
+        assert_eq!(users, "3", "[users] must render the -users count");
+        assert_eq!(field, expected(uid), "user {uid} must map to its row");
+    }
+    // Each user id ran exactly twice (closed-loop recycling).
+    seen.sort();
+    let ids: Vec<&str> = seen.iter().map(|(u, _, _)| u.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["1", "1", "2", "2", "3", "3"],
+        "each user recycled once"
+    );
+}

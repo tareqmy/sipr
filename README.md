@@ -79,6 +79,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   `<replace>` actions for keyed, mutable CSV data.
 - Classic 3PCC (`-3pcc HOST:PORT`) with `<sendCmd>`/`<recvCmd>` over an
   ESC-framed twin socket.
+- Closed-loop `-users N` mode with `[userid]`/`[users]` and per-user USER-mode
+  injection (line = user id − 1).
 - UAC and UAS roles; open-loop pacing (`-r/-rp/-l/-m`) with rate smoothing.
 - UDP (`-t u1`) and TCP (`-t t1`) transports; TCP frames by Content-Length and
   carries no SIP retransmissions (reliable transport).

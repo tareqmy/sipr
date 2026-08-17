@@ -88,6 +88,9 @@ pub struct EngineConfig {
     /// `-3pcc HOST:PORT`: the twin control socket for classic 3PCC. The role
     /// (dial vs listen) is derived from the scenario's first twin command.
     pub twin_addr: Option<SocketAddr>,
+    /// `-users N`: closed-loop mode — keep N concurrent calls, each holding a
+    /// 1-based user id (drives `[userid]`/`[users]` and USER injection files).
+    pub users: Option<usize>,
 }
 
 /// Transport selection (`-t`).
@@ -226,6 +229,8 @@ struct CallState {
     waiting: bool,
     /// Blocked on a `<recvCmd>` waiting for a 3PCC twin command.
     awaiting_cmd: bool,
+    /// `-users` mode: this call's 1-based user id (returned to the pool at end).
+    user_id: Option<usize>,
     /// In timewait: absorb retransmissions, never fail.
     completing: bool,
     started: Instant,
@@ -383,6 +388,8 @@ struct Engine<'s> {
     twin: Option<TwinChannel>,
     /// Twin commands that arrived before a call was ready to consume them.
     pending_cmds: std::collections::VecDeque<String>,
+    /// `-users` closed loop: the pool of free user ids (1..=N).
+    free_users: std::collections::VecDeque<usize>,
     rng: sipr_net::rng::Rng,
     /// Per-step: CSeq method a response recv must carry (SIPp guard).
     expected_cseq_method: Vec<Option<String>>,
@@ -588,10 +595,10 @@ impl<'s> Engine<'s> {
                 |n| n.to_string_lossy().into_owned(),
             );
             let file = InjectionFile::parse(&name, &text).map_err(EngineError)?;
-            if file.mode == InjectMode::User {
+            if file.mode == InjectMode::User && config.users.is_none() {
                 eprintln!(
-                    "sipr: warning: injection file {name} uses USER mode, which needs \
-                     -users (unsupported); its [fieldN] will render empty"
+                    "sipr: warning: injection file {name} uses USER mode but -users \
+                     was not given; its [fieldN] will render empty"
                 );
             }
             inf_files.push(std::cell::RefCell::new(file));
@@ -626,6 +633,9 @@ impl<'s> Engine<'s> {
             inf_seq: vec![0; inf_len],
             twin,
             pending_cmds: std::collections::VecDeque::new(),
+            free_users: config
+                .users
+                .map_or_else(Default::default, |n| (1..=n).collect()),
             rng: sipr_net::rng::Rng::new(config.seed ^ 0x51B8_0003),
             expected_cseq_method: precompute_cseq_methods(scenario),
             control,
@@ -647,6 +657,7 @@ impl<'s> Engine<'s> {
         let mut last_stat_dump = Instant::now();
         // First tick immediately: SIPp starts placing calls right away.
         self.on_pacer_tick();
+        self.refill_users(); // users mode opens its initial N calls now
         loop {
             if self.hard_stop || (self.done_creating() && self.calls.is_empty()) {
                 break;
@@ -692,6 +703,8 @@ impl<'s> Engine<'s> {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            // Closed-loop: replace any calls that just ended (no-op otherwise).
+            self.refill_users();
             if last_line.elapsed() >= Duration::from_secs(1) {
                 last_line = Instant::now();
                 if self.config.periodic_stats {
@@ -774,7 +787,12 @@ impl<'s> Engine<'s> {
     // ---- pacing --------------------------------------------------------
 
     fn on_pacer_tick(&mut self) {
-        if self.scenario.role == Role::Uas || self.paused || self.done_creating() {
+        // Users mode is closed-loop (event-driven via refill_users), not paced.
+        if self.config.users.is_some()
+            || self.scenario.role == Role::Uas
+            || self.paused
+            || self.done_creating()
+        {
             return;
         }
         self.pacer_carry += self.control.rate() * self.tick_ratio;
@@ -793,11 +811,11 @@ impl<'s> Engine<'s> {
                 self.pacer_carry = 0.0;
                 return;
             }
-            self.start_call();
+            self.start_call(None);
         }
     }
 
-    fn start_call(&mut self) {
+    fn start_call(&mut self, user_id: Option<usize>) {
         let Some(target) = self.config.target else {
             return; // unreachable: validated in run_with_control
         };
@@ -805,7 +823,7 @@ impl<'s> Engine<'s> {
         let number = self.stats.created();
         let call_id = self.make_call_id(number);
         let cnonce = self.make_cnonce(number);
-        let field_lines = self.assign_field_lines();
+        let field_lines = self.assign_field_lines(user_id);
         self.calls.insert(
             call_id.clone(),
             new_call(
@@ -815,9 +833,24 @@ impl<'s> Engine<'s> {
                 &self.scenario.vars,
                 cnonce,
                 field_lines,
+                user_id,
             ),
         );
         self.advance(&call_id);
+    }
+
+    /// `-users` closed loop: open replacement calls until N are live (or the
+    /// `-m` cap / free pool runs out). No-op outside users mode.
+    fn refill_users(&mut self) {
+        let Some(n) = self.config.users else {
+            return;
+        };
+        while self.calls.len() < n && !self.done_creating() {
+            let Some(uid) = self.free_users.pop_front() else {
+                break;
+            };
+            self.start_call(Some(uid));
+        }
     }
 
     fn make_call_id(&self, number: u64) -> String {
@@ -830,8 +863,10 @@ impl<'s> Engine<'s> {
         }
     }
 
-    /// Choose this call's line in each injection file, per its mode.
-    fn assign_field_lines(&mut self) -> Vec<Option<usize>> {
+    /// Choose this call's line in each injection file, per its mode. In USER
+    /// mode the line is `userId - 1` (SIPp `nextLine`), or `None` when there is
+    /// no user id (not `-users` mode) or it exceeds the file.
+    fn assign_field_lines(&mut self, user_id: Option<usize>) -> Vec<Option<usize>> {
         let mut out = Vec::with_capacity(self.inf_files.len());
         for (i, cell) in self.inf_files.iter().enumerate() {
             let file = cell.borrow();
@@ -848,7 +883,7 @@ impl<'s> Engine<'s> {
                     #[allow(clippy::cast_possible_truncation)]
                     Some((self.rng.next_u64() % n as u64) as usize)
                 }
-                InjectMode::User => None, // needs -users
+                InjectMode::User => user_id.filter(|&u| u >= 1 && u - 1 < n).map(|u| u - 1),
             };
             out.push(line);
         }
@@ -923,6 +958,8 @@ impl<'s> Engine<'s> {
                             transport: self.transport_token,
                             call_id,
                             call_number: call.number,
+                            user_id: call.user_id.map_or(0, |u| u as u64),
+                            users_total: self.config.users.map_or(0, |n| n as u64),
                             pid: self.pid,
                             cseq: call.cseq,
                             msg_index: index,
@@ -1226,7 +1263,8 @@ impl<'s> Engine<'s> {
                 self.stats.incoming_created += 1;
                 let number = self.stats.created();
                 let cnonce = self.make_cnonce(number);
-                let field_lines = self.assign_field_lines();
+                // Incoming (UAS) calls have no user id.
+                let field_lines = self.assign_field_lines(None);
                 self.calls.insert(
                     call_id.clone(),
                     new_call(
@@ -1236,6 +1274,7 @@ impl<'s> Engine<'s> {
                         &self.scenario.vars,
                         cnonce,
                         field_lines,
+                        None,
                     ),
                 );
                 // Fall through to normal matching below (window at 0).
@@ -1432,6 +1471,8 @@ impl<'s> Engine<'s> {
                 transport: self.transport_token,
                 call_id,
                 call_number: call.number,
+                user_id: call.user_id.map_or(0, |u| u as u64),
+                users_total: self.config.users.map_or(0, |n| n as u64),
                 pid: self.pid,
                 cseq: call.cseq,
                 msg_index: index,
@@ -1519,6 +1560,8 @@ impl<'s> Engine<'s> {
             transport: self.transport_token,
             call_id,
             call_number: call.number,
+            user_id: call.user_id.map_or(0, |u| u as u64),
+            users_total: self.config.users.map_or(0, |n| n as u64),
             pid: self.pid,
             cseq: call.cseq,
             msg_index: index,
@@ -1749,6 +1792,7 @@ impl<'s> Engine<'s> {
             self.cancel_call_timers(&mut call);
             self.stats.successful += 1;
             self.stats.record_call_length(call.started.elapsed());
+            self.return_user(&call);
         }
     }
 
@@ -1758,6 +1802,15 @@ impl<'s> Engine<'s> {
         if let Some(mut call) = self.calls.remove(call_id) {
             self.cancel_call_timers(&mut call);
             self.stats.record_call_length(call.started.elapsed());
+            self.return_user(&call);
+        }
+    }
+
+    /// Return a finished call's user id to the free pool (`-users` mode), so a
+    /// replacement call can reuse it.
+    fn return_user(&mut self, call: &CallState) {
+        if let Some(uid) = call.user_id {
+            self.free_users.push_back(uid);
         }
     }
 
@@ -1853,6 +1906,7 @@ fn new_call(
     vars: &sipr_scenario::model::VarTable,
     cnonce: String,
     field_lines: Vec<Option<usize>>,
+    user_id: Option<usize>,
 ) -> CallState {
     CallState {
         number,
@@ -1860,6 +1914,7 @@ fn new_call(
         index: 0,
         waiting: false,
         awaiting_cmd: false,
+        user_id,
         completing: false,
         started: Instant::now(),
         cseq: base_cseq,
