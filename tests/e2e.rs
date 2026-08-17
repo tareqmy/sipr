@@ -1406,3 +1406,70 @@ fn users_closed_loop_binds_user_to_injection_line() {
         "each user recycled once"
     );
 }
+
+#[test]
+fn ipv6_uac_places_call_over_loopback() {
+    // sipr places a call to an IPv6 target and must bracket [local_ip]/
+    // [remote_ip] in URIs and Via. Skips where the host has no IPv6 loopback
+    // (e.g. this build sandbox); runs for real anywhere ::1 binds.
+    let Ok(sock) = UdpSocket::bind("[::1]:0") else {
+        eprintln!("skip ipv6_uac_places_call_over_loopback: no IPv6 loopback");
+        return;
+    };
+    let uas_addr = sock.local_addr().expect("addr"); // [::1]:port
+    sock.set_read_timeout(Some(Duration::from_secs(6)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut saw_v6_uri = false;
+        let mut answered: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let branch = msg.top_via_branch().unwrap_or_default().to_owned();
+                    if let Some(ok) = answered.get(&branch) {
+                        let _ = sock.send_to(ok, from);
+                        continue;
+                    }
+                    // Via and request-URI must carry the bracketed IPv6 literal.
+                    let via_ok = msg.header_lines("Via").iter().any(|v| v.contains("[::1]"));
+                    let uri_ok = msg.start_line().contains("@[::1]:");
+                    saw_v6_uri = via_ok && uri_ok;
+                    let ok = mirror_response(&msg, "200 OK", true);
+                    answered.insert(branch, ok.clone());
+                    let _ = sock.send_to(&ok, from);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        saw_v6_uri
+    });
+
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-i",
+        "::1",
+        "-m",
+        "1",
+        "-d",
+        "20",
+        "-timeout",
+        "15",
+        "-bg",
+        &uas_addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(
+        uas.join().expect("uas thread"),
+        "INVITE must bracket the IPv6 address in Via and request-URI"
+    );
+}

@@ -237,11 +237,11 @@ fn render_string(template: &MsgTemplate, ctx: &RenderCtx<'_>) -> String {
 fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
     match kw {
         Keyword::Service => out.push_str(ctx.service),
-        Keyword::RemoteIp => out.push_str(ctx.remote_ip),
+        Keyword::RemoteIp => push_ip_for_uri(out, ctx.remote_ip),
         Keyword::RemotePort => {
             let _ = write!(out, "{}", ctx.remote_port);
         }
-        Keyword::LocalIp => out.push_str(ctx.local_ip),
+        Keyword::LocalIp => push_ip_for_uri(out, ctx.local_ip),
         Keyword::LocalIpType => out.push_str(ip_type(ctx.local_ip)),
         Keyword::LocalPort => {
             let _ = write!(out, "{}", ctx.local_port);
@@ -411,6 +411,19 @@ fn param_or<'a>(params: &'a [(String, String)], key: &str, default: &'a str) -> 
 
 fn ip_type(ip: &str) -> &'static str {
     if ip.contains(':') { "6" } else { "4" }
+}
+
+/// Emit an IP for use inside a SIP URI / Via: an IPv6 address is bracketed
+/// (`[2001:db8::1]`), matching SIPp's `local_ip_w_brackets`. `[media_ip]` stays
+/// raw because SDP `c=`/`o=` addresses are never bracketed.
+fn push_ip_for_uri(out: &mut String, ip: &str) {
+    if ip.contains(':') && !ip.starts_with('[') {
+        out.push('[');
+        out.push_str(ip);
+        out.push(']');
+    } else {
+        out.push_str(ip);
+    }
 }
 
 fn strip_angle_brackets(contact: &str) -> &str {
@@ -585,6 +598,22 @@ mod tests {
             lines: &[Some(0)],
         };
         assert!(fs2.lookup_line("plain.csv", "x").is_err());
+    }
+
+    #[test]
+    fn ipv6_ip_is_bracketed_in_uri_but_media_stays_raw() {
+        let mut c = ctx(None);
+        c.local_ip = "2001:db8::1";
+        c.remote_ip = "2001:db8::2";
+        let text = String::from_utf8(render(&uac_invite_template(), &c).unwrap()).unwrap();
+        // Request-URI and Via bracket the IPv6 address (SIPp local_ip_w_brackets).
+        assert!(text.contains("@[2001:db8::2]:5060"), "request-URI:\n{text}");
+        assert!(
+            text.contains("UDP [2001:db8::1]:5061;branch="),
+            "Via:\n{text}"
+        );
+        // SDP address type is 6, and the c= line keeps the raw (unbracketed) IP.
+        assert!(text.contains("c=IN IP6 2001:db8::1"), "SDP c=:\n{text}");
     }
 
     #[test]

@@ -263,5 +263,16 @@ Verify exact SIPp table before closing M3 and update this line.
   (SIPp `nextLine(userId)`); `[userid]` renders the id, `[users]` the count.
   Not supported: per-user persistent variables (SIPp's `userVarMap`) and
   dynamic user-count changes at runtime — sipr's `-users` is a fixed N.
+- IPv6 (M12, verified in `call.cpp` `E_Message_Local_IP`/`E_Message_Remote_IP`
+  → `local_ip_w_brackets`/`remote_ip_w_brackets` vs `E_Message_Media_IP` →
+  raw `media_ip`): `[local_ip]`/`[remote_ip]` render the address bracketed when
+  it is IPv6 (`[2001:db8::1]`), so URIs and Via lines are well-formed, while
+  `[media_ip]` stays raw for SDP `c=`/`o=` lines (SIPp brackets `[local_ip]`
+  even in the SDP `o=` line — sipr matches that verbatim). Targets accept
+  bracketed (`[::1]`, `[2001:db8::1]:5060`) and bare-literal (`::1`) IPv6; a v6
+  target with no `-i` auto-binds the `::` family. `[local_ip_type]`/
+  `[media_ip_type]` render `6` for a colon-bearing address. `-i` takes a v6
+  local address directly. Not exercised in the build sandbox (no v6 loopback);
+  the e2e self-skips there and runs where `::1` binds.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

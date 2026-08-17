@@ -81,6 +81,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   ESC-framed twin socket.
 - Closed-loop `-users N` mode with `[userid]`/`[users]` and per-user USER-mode
   injection (line = user id − 1).
+- IPv6 targets (`[::1]`, `[2001:db8::1]:5060`, bare `::1`) with automatic v6
+  binding; `[local_ip]`/`[remote_ip]` are bracketed in URIs and Via.
 - UAC and UAS roles; open-loop pacing (`-r/-rp/-l/-m`) with rate smoothing.
 - UDP (`-t u1`) and TCP (`-t t1`) transports; TCP frames by Content-Length and
   carries no SIP retransmissions (reliable transport).
@@ -100,7 +102,7 @@ Everything is built on the Rust standard library only — no external crates.
 
 ## Not yet (post-v1 roadmap)
 
-TLS transport, RTP/pcap media, IPv6, and an HTTP control API.
+TLS transport, RTP/pcap media, and an HTTP control API.
 
 ## Brand
 

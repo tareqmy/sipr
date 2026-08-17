@@ -110,9 +110,17 @@ fn run(cli: &Cli) -> ExitCode {
             |s| s.to_string_lossy().into_owned(),
         );
     let pid = std::process::id();
+    // A v6 target needs a v6 local socket; default the bind family to `::` when
+    // the target is IPv6 and no explicit -i was given.
+    let local_ip = cli.local_ip.or_else(|| {
+        target.and_then(|t| {
+            t.is_ipv6()
+                .then_some(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
+        })
+    });
     let config = sipr_engine::EngineConfig {
         target,
-        local_ip: cli.local_ip,
+        local_ip,
         port: cli.port,
         service: cli.service.clone(),
         rate: cli.rate,
@@ -193,18 +201,31 @@ fn run(cli: &Cli) -> ExitCode {
     }
 }
 
-/// Resolve `host[:port]` (port defaults to 5060). Bare IPv6 literals are a
-/// post-v1 concern (docs/SIPP_COMPAT.md roadmap).
+/// Resolve `host[:port]` to a socket address (port defaults to 5060).
+/// Accepts IPv4, hostnames, and IPv6 in bracketed (`[::1]`, `[2001:db8::1]:5060`)
+/// or bare-literal (`::1`) form.
 fn resolve_target(raw: &str) -> Result<std::net::SocketAddr, String> {
-    use std::net::ToSocketAddrs;
-    let candidate = if raw
+    use std::net::{Ipv6Addr, ToSocketAddrs};
+    let candidate = if raw.starts_with('[') {
+        // Bracketed IPv6: "[addr]" needs a default port; "[addr]:port" is ready.
+        if raw.contains("]:") {
+            raw.to_owned()
+        } else {
+            format!("{raw}:5060")
+        }
+    } else if raw.parse::<Ipv6Addr>().is_ok() {
+        // Bare IPv6 literal without a port — bracket it and add the default.
+        format!("[{raw}]:5060")
+    } else if raw
         .rsplit(':')
         .next()
         .is_some_and(|p| p.parse::<u16>().is_ok())
         && raw.matches(':').count() == 1
     {
+        // host:port (IPv4 or hostname).
         raw.to_owned()
     } else {
+        // host with no port.
         format!("{raw}:5060")
     };
     candidate
@@ -233,4 +254,36 @@ fn latin1_tolerant(bytes: Vec<u8>) -> String {
 fn fatal(msg: &str) -> ExitCode {
     eprintln!("sipr: error: {msg}");
     ExitCode::from(EXIT_FATAL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_target;
+
+    #[test]
+    fn resolve_target_covers_v4_v6_and_hostnames() {
+        // IPv4 with and without a port.
+        assert_eq!(
+            resolve_target("127.0.0.1").unwrap().to_string(),
+            "127.0.0.1:5060"
+        );
+        assert_eq!(
+            resolve_target("127.0.0.1:5080").unwrap().to_string(),
+            "127.0.0.1:5080"
+        );
+        // Bare IPv6 literal -> bracketed with the default port.
+        assert_eq!(resolve_target("::1").unwrap().to_string(), "[::1]:5060");
+        assert_eq!(
+            resolve_target("2001:db8::1").unwrap().to_string(),
+            "[2001:db8::1]:5060"
+        );
+        // Bracketed IPv6, with and without a port.
+        assert_eq!(resolve_target("[::1]").unwrap().to_string(), "[::1]:5060");
+        assert_eq!(
+            resolve_target("[2001:db8::1]:5080").unwrap().to_string(),
+            "[2001:db8::1]:5080"
+        );
+        // localhost resolves (to v4 or v6); just ensure it succeeds with a port.
+        assert!(resolve_target("localhost:5060").is_ok());
+    }
 }

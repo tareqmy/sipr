@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **IPv6** — targets accept bracketed (`[::1]`, `[2001:db8::1]:5060`) and
+  bare-literal (`::1`) IPv6, with automatic `::` binding when a v6 target is
+  given without `-i`. `[local_ip]`/`[remote_ip]` render bracketed inside URIs
+  and Via (SIPp's `local_ip_w_brackets`), while `[media_ip]` stays raw for SDP.
+  See `docs/SIPP_COMPAT.md` §6.
+
 ## [0.1.1] — 2026-08-17
 
 Post-v1 feature drop: TCP transport, injection files with indexed lookups,

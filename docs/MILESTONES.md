@@ -238,7 +238,17 @@ on a machine with sipp to close them.
       `[userid]`). SIPP_COMPAT §6.
 - [x] Deferred: per-user persistent variables and runtime user-count changes.
 
+## M12 — IPv6 ✅
+
+- [x] Targets accept bracketed IPv6 (`[::1]`, `[2001:db8::1]:5060`) and bare
+      literals (`::1`); `resolve_target` handles all forms, and a v6 target with
+      no `-i` auto-binds the `::` family. `-i` already took a v6 local address.
+- [x] `[local_ip]`/`[remote_ip]` render bracketed for IPv6 (SIPp
+      `local_ip_w_brackets`) so URIs/Via are well-formed; `[media_ip]` stays raw
+      for SDP. Unit-tested (`resolve_target`, render bracketing); the loopback
+      e2e (`ipv6_uac_places_call_over_loopback`) runs where `::1` binds and
+      self-skips in the v6-less build sandbox. SIPP_COMPAT §6.
+
 ## Post-v1 backlog (ordered)
 
-TLS → pcap/RTP media (study gossipper first) → AKA auth → IPv6 → HTTP control
-API.
+TLS → pcap/RTP media (study gossipper first) → AKA auth → HTTP control API.
