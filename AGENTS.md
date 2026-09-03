@@ -4,8 +4,11 @@ sipr is a SIPp-like SIP testing tool and traffic generator written in Rust. It p
 call flows described in SIPp's XML scenario format, as UAC or UAS, at a controlled
 rate, and reports live (TUI) and aggregate statistics.
 
-**Current state: pre-M0.** No code exists yet. `PLAN.md` is the master plan; work
-proceeds milestone by milestone against `docs/MILESTONES.md`.
+**Current state: v1 shipped, M0–M13 complete** (UDP/TCP/TLS transports, UAC/UAS,
+stats + TUI, actions/auth, `-inf` injection, 3PCC, `-users`, IPv6). `PLAN.md` is the
+master plan (its dependency choices were superseded by in-tree implementations —
+`docs/MILESTONES.md` notes record each swap); the post-v1 backlog at the bottom of
+`docs/MILESTONES.md` is what comes next.
 
 ## Read this first
 
