@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-03
+
 ### Added
 
 - **TLS transport (`-t l1`)** — SIP over TLS with SIPp's exact semantics:
@@ -130,6 +132,7 @@ library — no external crates.
   leftmost-longest — identical on the patterns real scenarios use; see
   `docs/SIPP_COMPAT.md` §6.
 
-[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/tareqmy/sipr/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/tareqmy/sipr/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/tareqmy/sipr/releases/tag/v0.1.0
