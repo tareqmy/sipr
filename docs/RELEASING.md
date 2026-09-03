@@ -35,7 +35,7 @@ Expect all four flows green: sipr-UAC ↔ sipp-UAS, sipp-UAC ↔ sipr-UAS.
 
 ```sh
 git tag -a v0.1.0 -m "sipr v0.1.0"
-git push origin main --tags
+git push origin master --tags
 ```
 
 ## 4. Publish to crates.io (optional)
