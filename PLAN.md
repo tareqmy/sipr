@@ -2,9 +2,14 @@
 
 A SIPp-like SIP testing tool and traffic generator, written in Rust.
 
-**Decisions locked in:** rsip for message parsing/generation with our own transport +
-transaction layer · SIPp XML-compatible scenarios · v1 scope is signaling-only over UDP ·
-CLI + live ratatui TUI.
+**Decisions locked in:** our own SIP message layer + transport + transaction layer
+(a tester's stack, not a compliant one) · SIPp XML-compatible scenarios · v1 scope is
+signaling-only over UDP · CLI + live TUI.
+
+> **Status (2026-09-03):** v1 shipped (M0–M6) and the post-v1 milestones through M13
+> are done — see `docs/MILESTONES.md`. The crate choices below were revisited during
+> implementation: almost everything ended up in-tree (§3.1). The architecture and
+> milestone rationale are otherwise as written.
 
 ---
 
@@ -27,7 +32,7 @@ control API. Explicit non-goal overall: being a general-purpose SIP stack — th
 layer is deliberately a *tester's* transaction layer (it must be able to send broken
 messages, ignore retransmission rules on demand, inject `lost`/`retrans` behavior).
 
-This is why we build our own transaction layer on top of `rsip` instead of using a
+This is why we build our own message and transaction layer instead of using a
 full stack like `rsipstack`: a compliant stack actively prevents the rule-breaking a
 test tool needs.
 
@@ -43,14 +48,14 @@ the checklist of what "SIPp-like" ultimately means:
 | `call.cpp` (300KB!) | per-call state machine executing scenario steps | `sipr-engine::call` |
 | `call_generation_task.cpp`, `ratetask.cpp` | open-loop call arrival at rate `-r`/`-rp` | `sipr-engine::pacer` |
 | `socket.cpp` | transport, socket mgmt, retransmissions | `sipr-net` |
-| `sip_parser.cpp`, `message.cpp` | SIP message parse/build | `rsip` (external crate) |
+| `sip_parser.cpp`, `message.cpp` | SIP message parse/build | `sipr-net::message` (in-tree lazy parser) + `sipr-scenario` templates |
 | `auth.cpp`, `milenage.c` | digest + AKA authentication | `sipr-auth` (digest only in v1) |
 | `actions.cpp`, `variables.cpp` | `<action>` exec: ereg/assign/test/…, call variables | `sipr-scenario::actions` |
 | `stat.cpp` | counters, RTDs, repartitions, CSV dumps | `sipr-stats` |
-| `screen.cpp` | ncurses live UI | `sipr-tui` (ratatui) |
+| `screen.cpp` | ncurses live UI | `sipr-tui` (hand-rolled ANSI) |
 | `infile.cpp` | `-inf` CSV injection files | `sipr-scenario::infile` |
 | `rtpstream.cpp`, `jlsrtp.cpp`, `prepare_pcap.c`, `send_packets.c` | media | out of v1 scope |
-| `watchdog.cpp`, `logger.cpp` | health, trace files | `tracing` + small glue |
+| `watchdog.cpp`, `logger.cpp` | health, trace files | `sipr-stats` trace writers + small glue |
 
 Two structural lessons from the C++ worth keeping in mind: `call.cpp` grew to 300KB
 because scenario execution, message building, retransmission logic and stats all live in
@@ -71,22 +76,41 @@ sipr/
 │   ├── sipr-engine/      # call state machine, pacer, call table, dialog bookkeeping
 │   ├── sipr-auth/        # RFC 2617/7616 digest for [authentication]
 │   ├── sipr-stats/       # counters, HDR histograms, repartitions, CSV export
-│   └── sipr-tui/         # ratatui screens + key handling
-└── src/main.rs           # thin bin: clap CLI → wire everything together
+│   └── sipr-tui/         # ANSI screens + key handling
+└── src/main.rs           # thin bin: table-driven SIPp-style CLI → wire everything together
 ```
 
-External load-bearing crates: `rsip` (SIP message parse/generate), `tokio` (runtime,
-UDP, timers), `quick-xml` (scenario parsing), `clap`, `ratatui` + `crossterm`, `regex`
-(ereg, keyword scanning), `hdrhistogram` (response-time distributions), `tracing`
-(message/error trace files), `rand` (chance/lost/pauses), `md-5`/`sha2` (digest auth).
+**External crates (as shipped):** `rustls` + `rustls-pemfile` for the TLS transport
+(M13, `ring` provider — no system OpenSSL), and dev-only `rcgen` + `tempfile` for
+test certificates. That is the whole list. The original plan named `rsip`, `tokio`,
+`quick-xml`, `clap`, `ratatui`/`crossterm`, `regex`, `hdrhistogram`, `tracing`,
+`rand`, `md-5`/`sha2`; each was replaced by a small in-tree implementation, and the
+per-milestone notes in `docs/MILESTONES.md` record why:
+
+| Need | Planned crate | Shipped instead |
+|---|---|---|
+| CLI parsing | `clap` | table-driven parser in `src/cli.rs` (SIPp's single-dash multi-char flags don't fit clap) |
+| Scenario XML | `quick-xml` | `sipr-scenario/src/xml.rs`, a subset parser with exact line tracking (like SIPp's `xp_parser.cpp`) |
+| Inbound SIP parse | `rsip` | `sipr-net/src/message.rs`, lazy and panic-free on arbitrary bytes; templates are raw bytes with slot filling |
+| Runtime, UDP, timers | `tokio`, `tokio-util` | std threads feeding one mpsc event channel; pure `TimerQueue` + condvar driver |
+| `ereg` regex | `regex` | `sipr-scenario/src/regex.rs`, a backtracking ERE engine with a step budget |
+| RTD histograms | `hdrhistogram` | `sipr-stats/src/histogram.rs`, 1 ms buckets |
+| TUI | `ratatui` + `crossterm` | hand-rolled ANSI + `stty` raw mode, rendering as pure `Snapshot → Vec<String>` |
+| Trace files | `tracing` | plain writers in `sipr-stats` with SIPp-style framing |
+| Randomness | `rand` | seeded xorshift (deterministic, reproducible `lost`/`chance`) |
+| Digest hashes | `md-5`, `sha2` | `sipr-auth/src/hash.rs`, checked against the RFC/FIPS vectors |
+
+The sanctioned set for future additions is in `docs/CONVENTIONS.md` §Dependencies.
 
 ### 3.2 Runtime model
 
-The core is an **open-loop pacer feeding a sharded call table**, all on tokio:
+The core is an **open-loop pacer feeding a sharded call table**, on std threads
+(one event-loop thread fed by an mpsc channel — SIPp's single-loop shape — with the
+socket reader and timer driver as separate threads):
 
 - One (later N, `SO_REUSEPORT`) UDP socket driven by a recv loop task. Inbound datagrams
-  are parsed with `rsip` and routed by Call-ID to their call's mailbox (an mpsc sender
-  stored in a sharded `DashMap`-style call table). Unmatched inbound requests either
+  are parsed by the in-tree message parser and routed by Call-ID to their call in a
+  sharded call table. Unmatched inbound requests either
   spawn a new UAS call (server mode) or count as `OutOfCall` messages.
 - Each active call is a small state machine object — **not** one spawned task per call by
   default. Calls advance via events (message-in, timer-fired, pause-elapsed) delivered to
@@ -95,11 +119,12 @@ The core is an **open-loop pacer feeding a sharded call table**, all on tokio:
 - The pacer implements SIPp's open-loop arrival: every `rate_period` (default 1s), start
   `-r` new calls, respecting `-l` (max concurrent), `-m` (total), with burst smoothing
   within the period. Rate changes come from the TUI (`+`/`-`/`*`/`/` keys) or CLI.
-- A timer service (tokio-util `DelayQueue` or hashed wheel) owns retransmission timers
+- A timer service (pure `TimerQueue` + condvar thread driver) owns retransmission timers
   (T1=500ms doubling to T2=4s for unreliable transport, as in RFC 3261 §17), `recv`
   timeouts, pauses, and global watchdog deadlines.
 - Stats are lock-free-ish: per-worker counters aggregated by a 1s ticker into the
-  snapshot the TUI and CSV writer read. RTDs (`start_rtd`/`rtd` attrs) use hdrhistogram.
+  snapshot the TUI and CSV writer read. RTDs (`start_rtd`/`rtd` attrs) use the in-tree
+  1 ms-bucket histogram.
 
 ### 3.3 Scenario IR and execution
 
@@ -140,16 +165,16 @@ silent skip — half of SIPp debugging misery is silent scenario behavior.
 Each milestone ends with something runnable, and from M3 on, every milestone is
 validated against real SIPp from `cprojects/sipp` as the interop peer.
 
-**M0 — Scaffolding (small).** Workspace + crates, clap CLI skeleton mirroring SIPp flag
+**M0 — Scaffolding (small).** Workspace + crates, CLI skeleton mirroring SIPp flag
 names (`-sf -sn -r -rp -l -m -d -s -p -i -t u1 -trace_msg -trace_err -trace_stat -nd
 -timeout -bg`), CI (fmt, clippy, test), embedded `uac`/`uas` default scenarios as string
 constants (port them from SIPp's `-sd` dumps).
 
-**M1 — Scenario front end.** quick-xml → IR for the v1 surface; keyword tokenizer;
+**M1 — Scenario front end.** XML → IR for the v1 surface; keyword tokenizer;
 golden tests: parse every signaling-only XML in `sipp/sipp_scenarios/` and the docs
 examples without error; `sipr --check -sf x.xml` lint mode that prints the compiled IR.
 
-**M2 — Net + message layer.** UDP transport with rsip round-trip (parse → build byte-
+**M2 — Net + message layer.** UDP transport with message round-trip (parse → build byte-
 identical where possible); timer wheel; UDP retransmission schedule with per-send
 override (`retrans` attr) and `lost` simulation; Call-ID router + call table.
 
@@ -165,7 +190,7 @@ keywords, `rrs`/`[routes]`/`[peer_tag_param]` for dialog correctness as callee; 
 breakdowns, retransmissions, response-code tallies), RTDs + repartitions, `-trace_stat`
 CSV with SIPp-compatible column naming where sane, periodic `-fd` dumps.
 
-**M5 — TUI.** ratatui screens replicating SIPp's ncurses layout: main stats screen and
+**M5 — TUI.** Terminal screens replicating SIPp's ncurses layout: main stats screen and
 per-step scenario screen (messages sent/recv/retrans/timeout/unexpected per step),
 repartition screen; keys `+ - * /` (rate), `p` (pause traffic), `q` (soft quit), `Q`
 (hard quit), `s` screens cycle. Also `-bg`-style headless mode with periodic stat lines,
@@ -186,10 +211,11 @@ before designing), AKA auth (`milenage`), IPv6, HTTP control API.
 Unit tests per crate (parser goldens, keyword expansion, timer math, digest vectors from
 RFC 7616). Integration: a `tests/interop` harness that shells out to the real `sipp`
 binary — every scenario runs sipr-as-UAC vs sipp-as-UAS and the reverse, asserting both
-sides exit 0 and counters agree. Property tests (proptest) on the message tokenizer
-(random CDATA never panics, round-trips). Performance gate from M3: a criterion bench +
-a loopback cps test in CI so throughput regressions are visible per-PR; target ≥ SIPp's
-single-core cps early, multi-core scaling by v1.
+sides exit 0 and counters agree. Fuzz-style no-panic tests on the inbound parser and
+tokenizer (`crates/sipr-net/tests/no_panic.rs`: seeded random bytes, truncations, mutations — proptest
+was unavailable, the seeded equivalent is reproducible by construction). Performance
+gate from M3: `make bench` (loopback sipr-UAC vs sipr-UAS) with numbers recorded in
+`benches/BASELINES.md`; target ≥ SIPp's single-core cps early.
 
 ## 6. Risks and open questions
 
@@ -197,15 +223,14 @@ The big one is **compatibility depth**: SIPp's DTD is small but its *behavior* i
 (exact keyword expansion quirks, default header injection, when Contact/tags are added,
 `optional` recv reordering rules). Mitigation: interop harness from M3 onward, and
 `call.cpp`/`scenario.cpp` as the reference — read the C++ when behavior is ambiguous,
-the docs lie less than they omit. Second: rsip is parse/generate only and its strictness
-may reject the deliberately-malformed messages testers send — mitigation: treat templates
-as raw bytes with slot filling (we mostly don't need rsip on the send path, only for
-parsing inbound and extracting fields). Third: TUI + async + high cps contention — keep
-the TUI a pure reader of 1s snapshots, never on the hot path.
+the docs lie less than they omit. Second: an off-the-shelf SIP parser's strictness
+may reject the deliberately-malformed messages testers send — mitigation (adopted):
+templates are raw bytes with slot filling, and the in-tree inbound parser is lazy and
+tolerant. Third: TUI + high cps contention — keep the TUI a pure reader of 1s
+snapshots, never on the hot path.
 
-## 7. Immediate next steps
+## 7. Next steps
 
-1. `cargo init` the workspace + crate skeletons (M0), mirror CLI flags in clap.
-2. Port SIPp's embedded `uac`/`uas` default scenarios into `sipr-scenario/assets/`.
-3. Build the M1 parser against the DTD surface above, using `sipp/sipp_scenarios/*.xml`
-   as the first golden corpus.
+M0–M13 are done. The ordered post-v1 backlog lives at the bottom of
+`docs/MILESTONES.md`: pcap/RTP media (study gossipper first) → AKA auth → HTTP
+control API.
