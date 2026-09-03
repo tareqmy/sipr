@@ -23,9 +23,12 @@ Colocated `#[cfg(test)]` modules. Required coverage by crate:
 compile without warnings, plus `*.expected` IR dumps for a subset.
 Seed corpus: the embedded uac/uas defaults, signaling-only files from
 `../../cprojects/sipp/sipp_scenarios/` (registration ones: `mcd_register.xml`,
-`uc360_register*.xml`), and examples from SIPp docs. Media/SRTP scenarios from
-that directory are *negative* goldens for now: they must fail loudly with the
-correct "unsupported: rtp_stream" style message, not crash or silently skip.
+`uc360_register*.xml`), and examples from SIPp docs. `play_pcap_*` scenarios
+are positive goldens since M14; `rtp_stream`/SRTP scenarios from that
+directory are *negative* goldens for now: they must fail loudly with the
+correct "not supported yet" message, not crash or silently skip. Media e2e
+tests fabricate their pcap fixtures with `sipr_media::pcap::build` — no
+binary captures are checked in.
 
 ## 3. Property tests (proptest)
 

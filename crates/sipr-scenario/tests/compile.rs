@@ -173,13 +173,89 @@ fn extended_3pcc_attrs_are_rejected() {
 }
 
 #[test]
-fn media_exec_is_a_clear_error() {
+fn play_pcap_exec_compiles_to_a_media_action() {
+    use sipr_scenario::model::MediaKind;
     let xml = wrap(&format!(
         r#"{invite}
-           <nop><action><exec play_pcap_audio="x.pcap"/></action></nop>"#,
+           <recv response="200" ignoresdp="true"/>
+           <nop><action><exec play_pcap_audio="pcap/x.pcap"/></action></nop>
+           <nop><action><exec play_pcap_video=" v.pcap "/></action></nop>"#,
         invite = send_invite()
     ));
-    assert!(errors(&xml).iter().any(|e| e.contains("media")));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let pcaps: Vec<(MediaKind, &str)> = sc.pcap_actions().collect();
+    assert_eq!(
+        pcaps,
+        vec![
+            (MediaKind::Audio, "pcap/x.pcap"),
+            (MediaKind::Video, "v.pcap")
+        ]
+    );
+    assert!(sc.has_media());
+    assert!(matches!(&sc.steps[1], Step::Recv(r) if r.ignore_sdp));
+}
+
+#[test]
+fn unsupported_media_execs_are_clear_errors() {
+    for attr in [
+        r#"rtp_stream="beep.wav""#,
+        r#"rtp_echo="startaudio""#,
+        r#"play_dtmf="1234""#,
+        r#"play_pcap="x.pcap""#,
+        r#"play_pcap_audio="a.pcap" play_pcap_video="v.pcap""#,
+        r#"play_pcap_audio="a.pcap" int_cmd="stop_call""#,
+        r#"play_pcap_audio=" ""#,
+        r#"play_pcap_audio="[pcap]""#,
+    ] {
+        let xml = wrap(&format!(
+            r#"{invite}
+               <nop><action><exec {attr}/></action></nop>"#,
+            invite = send_invite()
+        ));
+        let errs = errors(&xml);
+        assert!(!errs.is_empty(), "{attr}: expected an error");
+        assert!(errs.iter().any(|e| e.contains("exec")), "{attr}: {errs:?}");
+    }
+}
+
+#[test]
+fn media_port_keyword_forms_tokenize() {
+    use sipr_scenario::template::Keyword;
+    let xml = wrap(
+        r#"<send><![CDATA[
+        INVITE sip:x SIP/2.0
+
+        m=audio [media_port] RTP/AVP 0
+        a=rtcp:[media_port+1]
+        m=video [auto_media_port+2] RTP/AVP 96
+    ]]></send>"#,
+    );
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let Step::Send(send) = &sc.steps[0] else {
+        panic!("send")
+    };
+    let kws: Vec<&Keyword> = send.template.keywords().collect();
+    assert_eq!(
+        kws,
+        vec![
+            &Keyword::MediaPort {
+                auto: false,
+                offset: 0
+            },
+            &Keyword::MediaPort {
+                auto: false,
+                offset: 1
+            },
+            &Keyword::MediaPort {
+                auto: true,
+                offset: 2
+            },
+        ]
+    );
 }
 
 #[test]

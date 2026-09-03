@@ -1,0 +1,11 @@
+<!-- expect: not supported yet -->
+<scenario name="rtp_stream is not supported yet">
+  <send><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Call-ID: [call_id]
+  ]]></send>
+  <recv response="200"/>
+  <nop>
+    <action><exec rtp_stream="pcap/beep.wav,-1,8"/></action>
+  </nop>
+</scenario>

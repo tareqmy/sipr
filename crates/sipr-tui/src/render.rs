@@ -137,6 +137,14 @@ fn render_main(snap: &Snapshot, pal: &Palette) -> Vec<String> {
             snap.failed_unexpected, snap.failed_timeout, snap.failed_retrans, snap.failed_other
         ));
     }
+    if snap.rtp_streams_started > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let kb = snap.rtp_bytes_sent as f64 / 1024.0;
+        out.push(format!(
+            "  RTP:      {:>8} streams   {:>8} pckts sent   {kb:>9.1} kB",
+            snap.rtp_streams_started, snap.rtp_packets_sent
+        ));
+    }
     out.push(String::new());
     for r in &snap.rtds {
         let tag = pal.paint(pal.label, &format!("RTD {:<4}", r.name));
@@ -282,6 +290,20 @@ mod tests {
         assert!(all.contains("RTD 1"), "{all}");
         assert!(all.contains("30 timeout"), "{all}");
         assert!(all.contains("[q] quit"), "{all}");
+    }
+
+    #[test]
+    fn main_screen_shows_rtp_only_when_media_ran() {
+        let quiet = render(&snap(), Screen::Main).join("\n");
+        assert!(!quiet.contains("RTP:"), "{quiet}");
+        let mut s = snap();
+        s.rtp_streams_started = 3;
+        s.rtp_packets_sent = 1200;
+        s.rtp_bytes_sent = 2048;
+        let all = render(&s, Screen::Main).join("\n");
+        assert!(all.contains("3 streams"), "{all}");
+        assert!(all.contains("1200 pckts sent"), "{all}");
+        assert!(all.contains("2.0 kB"), "{all}");
     }
 
     #[test]

@@ -1,10 +1,10 @@
-<!-- expect: media -->
-<scenario name="pcap play is not supported yet">
+<scenario name="pcap play">
   <send><![CDATA[
     INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
     Call-ID: [call_id]
   ]]></send>
   <recv response="200"/>
+  <recv response="200" optional="true" ignoresdp="true"/>
   <nop>
     <action><exec play_pcap_audio="pcap/g711a.pcap"/></action>
   </nop>

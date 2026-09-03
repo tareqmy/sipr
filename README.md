@@ -90,10 +90,14 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   flags with SIPp's verification semantics.
 - UDP retransmission (T1→T2), recv-window matching verified against SIPp's C++.
 - Digest authentication (MD5 + SHA-256, `qop=auth`, proxy 407).
+- pcap replay: `<exec play_pcap_audio="file.pcap"/>` streams a capture's RTP
+  to the peer's SDP endpoint from `-mi`/`-mp` (`[media_port]`,
+  `[auto_media_port]`) — ordinary UDP sockets, so no root needed.
 - Live TUI, `-bg` headless stat lines, `-trace_msg`/`-trace_err`/`-trace_stat`
   files, RTDs and repartition tables.
 
-Everything is built on the Rust standard library only — no external crates.
+Everything is built on the Rust standard library, plus `rustls` for the TLS
+transport — no system libraries (no OpenSSL, no libpcap), no root for media.
 
 ## Documentation
 
@@ -104,7 +108,8 @@ Everything is built on the Rust standard library only — no external crates.
 
 ## Not yet (post-v1 roadmap)
 
-RTP/pcap media, AKA authentication, and an HTTP control API.
+RTP streaming/DTMF/echo (`rtp_stream`, `play_dtmf`), AKA authentication, and
+an HTTP control API.
 
 ## Brand
 

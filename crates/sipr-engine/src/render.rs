@@ -54,6 +54,10 @@ pub struct RenderCtx<'a> {
     pub local_ip: &'a str,
     /// Local bound port.
     pub local_port: u16,
+    /// Media address (`-mi`, default local IP) for `[media_ip]`.
+    pub media_ip: &'a str,
+    /// Base media port (`-mp`, default 6000) for `[media_port]`.
+    pub media_port: u16,
     /// Transport token (`UDP` in v1).
     pub transport: &'a str,
     /// This call's Call-ID.
@@ -316,9 +320,12 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
             }
         }
         Keyword::Len => out.push_str(LEN_MARKER),
-        Keyword::MediaIp => out.push_str(ctx.local_ip),
-        Keyword::MediaPort => out.push_str("6000"),
-        Keyword::MediaIpType => out.push_str(ip_type(ctx.local_ip)),
+        Keyword::MediaIp => out.push_str(ctx.media_ip),
+        Keyword::MediaPort { auto, offset } => {
+            let port = media_port_value(ctx.media_port, *auto, *offset, ctx.call_number);
+            let _ = write!(out, "{port}");
+        }
+        Keyword::MediaIpType => out.push_str(ip_type(ctx.media_ip)),
         Keyword::Field { index, file, line } => {
             if let Some(fi) = ctx.fields.resolve_file(file.as_deref()) {
                 // No `line=` → the call's assigned line. With `line=`, an
@@ -409,6 +416,21 @@ fn param_or<'a>(params: &'a [(String, String)], key: &str, default: &'a str) -> 
         .map_or(default, |(_, v)| v.as_str())
 }
 
+/// The port `[media_port]` / `[auto_media_port]` (+`offset`) renders for
+/// call `call_number`, and therefore the local port its RTP is sent from.
+/// `auto` reserves a 4-port block per call and wraps after 2500 calls, as
+/// SIPp's `auto_media_port` does (`call.cpp`: `4 * (number - 1) % 10000`).
+#[must_use]
+pub fn media_port_value(base: u16, auto: bool, offset: u16, call_number: u64) -> u16 {
+    let block = if auto {
+        (4 * call_number.saturating_sub(1)) % 10_000
+    } else {
+        0
+    };
+    let port = u64::from(base) + block + u64::from(offset);
+    u16::try_from(port).unwrap_or(u16::MAX)
+}
+
 fn ip_type(ip: &str) -> &'static str {
     if ip.contains(':') { "6" } else { "4" }
 }
@@ -451,6 +473,8 @@ mod tests {
             remote_port: 5060,
             local_ip: "10.0.0.1",
             local_port: 5061,
+            media_ip: "10.0.0.1",
+            media_port: 6000,
             transport: "UDP",
             call_id: "1-99@10.0.0.1",
             call_number: 1,
@@ -604,6 +628,7 @@ mod tests {
     fn ipv6_ip_is_bracketed_in_uri_but_media_stays_raw() {
         let mut c = ctx(None);
         c.local_ip = "2001:db8::1";
+        c.media_ip = "2001:db8::1";
         c.remote_ip = "2001:db8::2";
         let text = String::from_utf8(render(&uac_invite_template(), &c).unwrap()).unwrap();
         // Request-URI and Via bracket the IPv6 address (SIPp local_ip_w_brackets).

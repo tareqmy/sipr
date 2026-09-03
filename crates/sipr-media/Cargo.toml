@@ -1,6 +1,6 @@
 [package]
-name = "sipr-engine"
-description = "sipr: the per-call state machine, call table, pacer, and dialog bookkeeping"
+name = "sipr-media"
+description = "sipr: pcap replay and RTP media — a pure-Rust pcap reader, SDP endpoint discovery, and the packet scheduler"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,11 +12,6 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-sipr-scenario = { workspace = true }
-sipr-net = { workspace = true }
-sipr-auth = { workspace = true }
-sipr-stats = { workspace = true }
-sipr-media = { workspace = true }
 
 [lints]
 workspace = true

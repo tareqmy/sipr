@@ -55,6 +55,12 @@ pub struct StatSet {
     pub unexpected: u64,
     /// Datagrams that were not SIP.
     pub garbage: u64,
+    /// pcap replays started (`exec play_pcap_*`).
+    pub rtp_streams_started: u64,
+    /// RTP/UDP datagrams sent by media replays (sampled from the media thread).
+    pub rtp_packets_sent: u64,
+    /// Payload bytes sent by media replays.
+    pub rtp_bytes_sent: u64,
     /// Response-time stopwatches by RTD name (`"1"`, `"2"`, ...).
     pub rtd: HashMap<String, Histogram>,
     /// Call duration histogram (created → ended).
@@ -99,6 +105,9 @@ impl StatSet {
             auto_answered: 0,
             unexpected: 0,
             garbage: 0,
+            rtp_streams_started: 0,
+            rtp_packets_sent: 0,
+            rtp_bytes_sent: 0,
             rtd: HashMap::new(),
             call_length: Histogram::new(),
             response_repartition: Repartition::new(response_bounds),
@@ -157,9 +166,17 @@ impl StatSet {
                 h.percentile_ms(99.0)
             )
         });
+        let rtp_part = if self.rtp_streams_started > 0 {
+            format!(
+                " | rtp {} streams {} pkts",
+                self.rtp_streams_started, self.rtp_packets_sent
+            )
+        } else {
+            String::new()
+        };
         format!(
             "live {live} created {} ok {} failed {} | sent {} matched {} \
-             retrans {}/{} unexpected {} garbage {}{rtd_part}",
+             retrans {}/{} unexpected {} garbage {}{rtd_part}{rtp_part}",
             self.created(),
             self.successful,
             self.failed(),

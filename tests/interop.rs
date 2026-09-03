@@ -450,3 +450,162 @@ fn real_sipp_tls_uac_against_sipr_uas() {
         "sipr uas summary:\n{stderr}"
     );
 }
+
+/// sipr plays a pcap at real sipp: sipp's UAS answers with SDP (`c=`/`m=audio
+/// [media_port]`), and `-rtp_echo` makes it bind that port so the RTP has a
+/// real listener. Proves SDP endpoint discovery against SIPp's own answer
+/// format and that the replay runs alongside the signaling. sipp's own
+/// `play_pcap` needs a raw socket (root), so the reverse direction is not
+/// testable here.
+#[test]
+fn uac_pcap_against_real_sipp_uas() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::uac_pcap_against_real_sipp_uas — no sipp binary found. \
+             Set SIPP_BIN=/path/to/sipp or put sipp on PATH (docs/TESTING.md §4)."
+        );
+        return;
+    };
+    let port = free_port();
+    // sipp's echo binds media_port and media_port+2: pick an even base.
+    let sipp_media = free_port() & !1;
+    let sipr_media = free_port();
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let pcap_path = dir.join(format!("sipr-interop-{pid}.pcap"));
+    std::fs::write(
+        &pcap_path,
+        sipr_media::pcap::build::rtp_capture(10, 20_000, 6000),
+    )
+    .expect("write pcap");
+    let scenario_path = dir.join(format!("sipr-interop-{pid}.xml"));
+    std::fs::write(
+        &scenario_path,
+        format!(
+            r#"<scenario name="uac-pcap-interop">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]p[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+    s=-
+    c=IN IP[media_ip_type] [media_ip]
+    t=0 0
+    m=audio [auto_media_port] RTP/AVP 8
+    a=rtpmap:8 PCMA/8000
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]p[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <nop><action><exec play_pcap_audio="{pcap}"/></action></nop>
+  <pause milliseconds="400"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]p[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#,
+            pcap = pcap_path.display()
+        ),
+    )
+    .expect("write scenario");
+    let mut sipp_proc = Reaper(
+        Command::new(&sipp)
+            .args([
+                "-sn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-mi",
+                "127.0.0.1",
+                "-mp",
+                &sipp_media.to_string(),
+                "-rtp_echo",
+                "-m",
+                "3",
+                "-timeout",
+                "30s",
+                "-bg",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uas"),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let mut sipr_proc = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .args([
+                "-sf",
+                scenario_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-mp",
+                &sipr_media.to_string(),
+                "-r",
+                "5",
+                "-m",
+                "3",
+                "-timeout",
+                "20",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sipr"),
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_proc.0, Duration::from_secs(25));
+    let _ = std::fs::remove_file(&pcap_path);
+    let _ = std::fs::remove_file(&scenario_path);
+    let stderr = sipr_proc
+        .0
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    assert_eq!(sipr_code, Some(0), "sipr must exit 0; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("successful 3 failed 0"),
+        "sipr summary:\n{stderr}"
+    );
+    assert!(stderr.contains("rtp-sent 30"), "sipr summary:\n{stderr}");
+    let _ = wait_with_timeout(&mut sipp_proc.0, Duration::from_secs(10));
+}

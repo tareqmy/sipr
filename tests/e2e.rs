@@ -1772,3 +1772,221 @@ fn ipv6_uac_places_call_over_loopback() {
         "INVITE must bracket the IPv6 address in Via and request-URI"
     );
 }
+
+// ---- media: pcap replay ----------------------------------------------------
+
+/// Like [`mirror_response`], but the 200 OK carries an SDP answer directing
+/// audio to `media`, so sipr learns where to replay its pcap.
+fn mirror_response_with_sdp(msg: &Inbound, status: &str, media: SocketAddr) -> Vec<u8> {
+    let mut head = String::from_utf8(mirror_response(msg, status, true)).expect("utf8");
+    let body = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n",
+        ip = media.ip(),
+        port = media.port()
+    );
+    head = head.replace(
+        "Content-Length: 0\r\n\r\n",
+        &format!(
+            "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        ),
+    );
+    head.push_str(&body);
+    head.into_bytes()
+}
+
+/// A UAS whose answers carry SDP pointing at `media`, plus the RTP sink
+/// bound there. Returns (signaling addr, media addr, uas thread, sink thread
+/// yielding every `(source, payload)` it received until idle).
+#[allow(clippy::type_complexity)]
+fn spawn_media_uas(
+    idle: Duration,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    std::thread::JoinHandle<UasStats>,
+    std::thread::JoinHandle<Vec<(SocketAddr, Vec<u8>)>>,
+) {
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let media = sink.local_addr().expect("addr");
+    sink.set_read_timeout(Some(idle)).expect("timeout");
+    let sink_thread = std::thread::spawn(move || {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = sink.recv_from(&mut buf) {
+            got.push((from, buf[..n].to_vec()));
+        }
+        got
+    });
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(idle)).expect("timeout");
+    let uas_thread = std::thread::spawn(move || {
+        let mut stats = UasStats::default();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    stats.invites += 1;
+                    let _ = sock.send_to(&mirror_response(&msg, "180 Ringing", true), from);
+                    let _ = sock.send_to(&mirror_response_with_sdp(&msg, "200 OK", media), from);
+                }
+                Some("BYE") => {
+                    stats.byes += 1;
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        stats
+    });
+    (addr, media, uas_thread, sink_thread)
+}
+
+/// A pcap-playing UAC scenario: `[auto_media_port]` so concurrent calls get
+/// distinct local ports, and the pause covers the capture's duration.
+fn pcap_uac_scenario(pcap_path: &str) -> String {
+    format!(
+        r#"<scenario name="uac-pcap">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]p[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+    s=-
+    c=IN IP[media_ip_type] [media_ip]
+    t=0 0
+    m=audio [auto_media_port] RTP/AVP 8
+    a=rtpmap:8 PCMA/8000
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]p[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <nop><action><exec play_pcap_audio="{pcap_path}"/></action></nop>
+  <pause milliseconds="400"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]p[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#
+    )
+}
+
+#[test]
+fn play_pcap_audio_replays_capture_to_the_sdp_endpoint() {
+    let (addr, _media, uas, sink) = spawn_media_uas(Duration::from_secs(2));
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let pcap_path = dir.join(format!("sipr-e2e-{pid}.pcap"));
+    // 10 frames, 20 ms apart: 180 ms of "audio".
+    let capture = sipr_media::pcap::build::rtp_capture(10, 20_000, 6000);
+    std::fs::write(&pcap_path, &capture).expect("write pcap");
+    let expected = sipr_media::pcap::parse(&capture).expect("parse");
+    let scenario_path = dir.join(format!("sipr-e2e-{pid}.xml"));
+    std::fs::write(
+        &scenario_path,
+        pcap_uac_scenario(pcap_path.to_str().expect("utf8")),
+    )
+    .expect("write scenario");
+    let media_base = free_port();
+    let out = run_sipr(&[
+        "-sf",
+        scenario_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-mp",
+        &media_base.to_string(),
+        "-r",
+        "10",
+        "-m",
+        "2",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&pcap_path);
+    let _ = std::fs::remove_file(&scenario_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 2 failed 0"), "{err}");
+    assert!(err.contains("rtp-sent 20"), "{err}");
+    let stats = uas.join().expect("uas");
+    assert_eq!(stats.byes, 2, "{stats:?}");
+    let got = sink.join().expect("sink");
+    assert_eq!(got.len(), 20, "frames received: {}", got.len());
+    // Every payload is a frame of the capture, verbatim.
+    for (_, payload) in &got {
+        assert!(
+            expected.frames.iter().any(|f| f.payload == *payload),
+            "unknown payload {payload:?}"
+        );
+    }
+    // Two calls, two auto_media_port blocks: base and base+4, 10 frames each.
+    let mut ports: Vec<u16> = got.iter().map(|(from, _)| from.port()).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    assert_eq!(ports, vec![media_base, media_base + 4], "{ports:?}");
+    for p in ports {
+        assert_eq!(got.iter().filter(|(f, _)| f.port() == p).count(), 10);
+    }
+}
+
+#[test]
+fn play_pcap_with_a_missing_file_is_fatal_at_startup() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let scenario_path = dir.join(format!("sipr-e2e-nopcap-{pid}.xml"));
+    std::fs::write(&scenario_path, pcap_uac_scenario("does-not-exist.pcap")).expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        scenario_path.to_str().expect("utf8"),
+        "-m",
+        "1",
+        "-timeout",
+        "5",
+        "-bg",
+        "127.0.0.1:5",
+    ]);
+    let _ = std::fs::remove_file(&scenario_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("play_pcap_audio"), "{err}");
+    assert!(err.contains("does-not-exist.pcap"), "{err}");
+}

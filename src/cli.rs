@@ -65,6 +65,10 @@ pub struct Cli {
     pub port: Option<u16>,
     /// `-i`: local IP address to bind.
     pub local_ip: Option<IpAddr>,
+    /// `-mi`: media (RTP) address for `[media_ip]`; defaults to the local IP.
+    pub media_ip: Option<IpAddr>,
+    /// `-mp` / `-min_rtp_port`: base media port for `[media_port]`.
+    pub media_port: Option<u16>,
     /// `-t`: transport mode.
     pub transport: Transport,
     /// `-s`: service / called user part, substituted for `[service]`.
@@ -134,6 +138,8 @@ impl Default for Cli {
             pause_ms: 3000,
             port: None,
             local_ip: None,
+            media_ip: None,
+            media_port: None,
             transport: Transport::UdpMono,
             service: "service".to_owned(),
             auth_user: None,
@@ -218,6 +224,19 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "Local port [default: system-chosen free port]",
     ),
     ("i", true, "IP", "Local IP address to bind"),
+    (
+        "mi",
+        true,
+        "IP",
+        "Media (RTP) IP for [media_ip] [default: the local IP]",
+    ),
+    (
+        "mp",
+        true,
+        "PORT",
+        "Base media port for [media_port] / [auto_media_port] [default: 6000]",
+    ),
+    ("min_rtp_port", true, "PORT", "Same as -mp (SIPp alias)"),
     (
         "t",
         true,
@@ -440,6 +459,8 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "d" => cli.pause_ms = parse_num(flag, &val(value))?,
         "p" => cli.port = Some(parse_num(flag, &val(value))?),
         "i" => cli.local_ip = Some(parse_num(flag, &val(value))?),
+        "mi" => cli.media_ip = Some(parse_num(flag, &val(value))?),
+        "mp" | "min_rtp_port" => cli.media_port = Some(parse_num(flag, &val(value))?),
         "t" => cli.transport = parse_transport(&val(value))?,
         "s" => cli.service = val(value),
         "au" => cli.auth_user = Some(val(value)),
@@ -656,6 +677,19 @@ mod tests {
         assert!(err.contains("not implemented yet"), "{err}");
         let err = run(&["-t", "x9"]).unwrap_err();
         assert!(err.contains("unknown transport mode"), "{err}");
+    }
+
+    #[test]
+    fn media_flags_parse_with_sipp_alias() {
+        let c = cli(&["-mi", "10.0.0.5", "-mp", "7000", "127.0.0.1"]);
+        assert_eq!(c.media_ip, Some("10.0.0.5".parse().unwrap()));
+        assert_eq!(c.media_port, Some(7000));
+        let c = cli(&["-min_rtp_port", "8000", "127.0.0.1"]);
+        assert_eq!(c.media_port, Some(8000));
+        assert!(run(&["-mp", "x", "127.0.0.1"]).is_err());
+        let c = cli(&["127.0.0.1"]);
+        assert_eq!(c.media_ip, None);
+        assert_eq!(c.media_port, None);
     }
 
     #[test]

@@ -18,13 +18,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+use sipr_media::{MediaEvent, MediaPlayer, PcapStream, StreamSpec};
 use sipr_net::timer::TimerId;
 use sipr_net::{
     Inbound, NetEvent, RetransSchedule, TcpTransport, TimerService, TlsTransport, TransportConfig,
     TwinChannel, UdpTransport,
 };
 use sipr_scenario::inject::{InjectMode, InjectionFile};
-use sipr_scenario::model::{Action, Expect, PauseSpec, RecvStep, Role, Scenario, Step, StepCommon};
+use sipr_scenario::model::{
+    Action, Expect, MediaKind, PauseSpec, RecvStep, Role, Scenario, Step, StepCommon,
+};
 use sipr_scenario::template::{Keyword, MsgTemplate, Span};
 
 use crate::render::{RenderCtx, render};
@@ -93,7 +96,18 @@ pub struct EngineConfig {
     pub users: Option<usize>,
     /// `-tls_*` options; required when `transport` is [`TransportKind::TlsMono`].
     pub tls: Option<sipr_net::TlsConfig>,
+    /// `-mi`: media address for `[media_ip]` and the RTP sockets (default:
+    /// the local signaling IP).
+    pub media_ip: Option<IpAddr>,
+    /// `-mp` / `-min_rtp_port`: base port for `[media_port]` (default 6000).
+    pub media_port: Option<u16>,
+    /// Directory of the `-sf` file: pcap paths resolve there first, then in
+    /// the working directory (SIPp `find_file`).
+    pub scenario_dir: Option<std::path::PathBuf>,
 }
+
+/// SIPp's `DEFAULT_MEDIA_PORT`.
+const DEFAULT_MEDIA_PORT: u16 = 6000;
 
 /// Transport selection (`-t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -128,6 +142,8 @@ pub struct RunReport {
     pub unexpected: u64,
     /// Datagrams that were not SIP at all.
     pub garbage: u64,
+    /// RTP datagrams sent by pcap replays.
+    pub rtp_packets_sent: u64,
     /// Wall-clock duration of the run.
     pub elapsed: Duration,
 }
@@ -148,9 +164,14 @@ impl RunReport {
     /// One-line summary for logs.
     #[must_use]
     pub fn summary(&self) -> String {
+        let rtp = if self.rtp_packets_sent > 0 {
+            format!(" rtp-sent {}", self.rtp_packets_sent)
+        } else {
+            String::new()
+        };
         format!(
             "created {} successful {} failed {} | sent {} matched {} \
-             retrans-sent {} retrans-recv {} unexpected {} garbage {} | {:.1?}",
+             retrans-sent {} retrans-recv {} unexpected {} garbage {}{rtp} | {:.1?}",
             self.created,
             self.successful,
             self.failed,
@@ -212,6 +233,8 @@ enum Event {
     Stdin(char),
     /// A 3PCC command arrived on the twin control channel.
     TwinCmd(String),
+    /// The media thread finished or abandoned a replay.
+    Media(MediaEvent),
 }
 
 struct RetransCtx {
@@ -256,6 +279,9 @@ struct CallState {
     peer_tag: Option<String>,
     routes: Vec<String>,
     last_recv: Option<Inbound>,
+    /// Remote media endpoints learned from received SDP, by [`MediaKind`]
+    /// index. Stale values persist when a later SDP omits a stream (SIPp).
+    remote_media: [Option<SocketAddr>; 3],
     /// (branch, cseq-line, start-line-ish) key for inbound retrans dedupe.
     last_recv_key: Option<(String, String, String)>,
     retrans: Option<RetransCtx>,
@@ -412,6 +438,16 @@ struct Engine<'s> {
     hard_stop: bool,
     local_ip_str: String,
     pid: u32,
+    /// The media thread, started only when the scenario plays pcaps.
+    media: Option<MediaPlayer>,
+    /// Parsed captures by the scenario's file attribute, loaded once.
+    pcaps: HashMap<String, Arc<PcapStream>>,
+    media_ip: IpAddr,
+    media_ip_str: String,
+    media_port: u16,
+    /// Per [`MediaKind`]: which `[media_port]` form (auto, +offset) the SDP
+    /// uses on that `m=` line — the local port a replay must send from.
+    port_layout: [(bool, u16); 3],
 }
 
 impl<'s> Engine<'s> {
@@ -535,6 +571,26 @@ impl<'s> Engine<'s> {
                 ));
             }
             (None, _) => None,
+        };
+        // Media: captures are parsed once here (SIPp: at scenario parse) and
+        // the media thread exists only when something will be played.
+        let pcaps = load_pcaps(scenario, config)?;
+        let media = if pcaps.is_empty() {
+            None
+        } else {
+            let (media_tx, media_rx) = channel::<MediaEvent>();
+            let bridge_tx = tx.clone();
+            std::thread::Builder::new()
+                .name("sipr-media-bridge".into())
+                .spawn(move || {
+                    while let Ok(ev) = media_rx.recv() {
+                        if bridge_tx.send(Event::Media(ev)).is_err() {
+                            return;
+                        }
+                    }
+                })
+                .ok();
+            Some(MediaPlayer::start(media_tx))
         };
         let timers = TimerService::start(tx.clone());
         let control = EngineControl {
@@ -677,6 +733,15 @@ impl<'s> Engine<'s> {
             hard_stop: false,
             local_ip_str: local_addr.ip().to_string(),
             pid: std::process::id(),
+            media,
+            pcaps,
+            media_ip: config.media_ip.unwrap_or_else(|| local_addr.ip()),
+            media_ip_str: config
+                .media_ip
+                .unwrap_or_else(|| local_addr.ip())
+                .to_string(),
+            media_port: config.media_port.unwrap_or(DEFAULT_MEDIA_PORT),
+            port_layout: media_port_layout(scenario),
         })
     }
 
@@ -729,6 +794,7 @@ impl<'s> Engine<'s> {
                     _ => {}
                 },
                 Ok(Event::TwinCmd(cmd)) => self.on_twin_cmd(cmd),
+                Ok(Event::Media(ev)) => self.on_media_event(ev),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -736,6 +802,7 @@ impl<'s> Engine<'s> {
             self.refill_users();
             if last_line.elapsed() >= Duration::from_secs(1) {
                 last_line = Instant::now();
+                self.sample_media_counters();
                 if self.config.periodic_stats {
                     eprintln!("sipr: {}", self.stats.line(self.calls.len()));
                 }
@@ -751,6 +818,7 @@ impl<'s> Engine<'s> {
             }
         }
         self.control.stop_pacer.store(true, Ordering::Relaxed);
+        self.sample_media_counters();
         // Final CSV row + flush all trace files.
         if self.trace_stat.is_some() {
             let row = self.stats.csv_row(self.calls.len());
@@ -778,7 +846,18 @@ impl<'s> Engine<'s> {
             retrans_recv: self.stats.retrans_recv,
             unexpected: self.stats.unexpected,
             garbage: self.stats.garbage,
+            rtp_packets_sent: self.stats.rtp_packets_sent,
             elapsed: started.elapsed(),
+        }
+    }
+
+    /// Copy the media thread's atomics into the stat set (once a second and
+    /// at the end), so the TUI/CSV/report see them without touching the
+    /// media thread.
+    fn sample_media_counters(&mut self) {
+        if let Some(m) = self.media.as_ref() {
+            self.stats.rtp_packets_sent = m.packets_sent();
+            self.stats.rtp_bytes_sent = m.bytes_sent();
         }
     }
 
@@ -984,6 +1063,8 @@ impl<'s> Engine<'s> {
                             remote_port: call.remote.port(),
                             local_ip: &self.local_ip_str,
                             local_port: self.transport.local_addr().port(),
+                            media_ip: &self.media_ip_str,
+                            media_port: self.media_port,
                             transport: self.transport_token,
                             call_id,
                             call_number: call.number,
@@ -1390,10 +1471,11 @@ impl<'s> Engine<'s> {
         if let Some(s) = self.stats.step_mut(si) {
             s.recv += 1;
         }
-        let (rrs, common) = match &self.scenario.steps[si] {
-            Step::Recv(r) => (r.record_route_set, r.common.clone()),
-            _ => (false, StepCommon::default()),
+        let (rrs, ignore_sdp, common) = match &self.scenario.steps[si] {
+            Step::Recv(r) => (r.record_route_set, r.ignore_sdp, r.common.clone()),
+            _ => (false, false, StepCommon::default()),
         };
+        let has_media = self.media.is_some();
         let now = Instant::now();
         let Some(call) = self.calls.get_mut(call_id) else {
             return;
@@ -1423,6 +1505,9 @@ impl<'s> Engine<'s> {
         }
         apply_rtds(call, &mut self.stats, &common, now);
         call.last_recv_key = Some(key);
+        if has_media && !ignore_sdp {
+            learn_remote_media(call, msg);
+        }
         call.last_recv = Some(msg.clone());
         call.waiting = false;
         call.index = si + 1;
@@ -1497,6 +1582,8 @@ impl<'s> Engine<'s> {
                 remote_port: call.remote.port(),
                 local_ip: &self.local_ip_str,
                 local_port: self.transport.local_addr().port(),
+                media_ip: &self.media_ip_str,
+                media_port: self.media_port,
                 transport: self.transport_token,
                 call_id,
                 call_number: call.number,
@@ -1549,9 +1636,81 @@ impl<'s> Engine<'s> {
                     self.hard_stop = true;
                     return true;
                 }
+                crate::actions::ActionOutcome::PlayPcap { kind, file } => {
+                    self.start_pcap(call_id, kind, &file);
+                }
             }
         }
         false
+    }
+
+    // ---- media ---------------------------------------------------------
+
+    /// `exec play_pcap_*`: replay `file` to the endpoint this call learned
+    /// for `kind`. Non-blocking; a missing endpoint or a socket failure is
+    /// logged and the call carries on (SIPp: warning, replay aborted).
+    fn start_pcap(&mut self, call_id: &str, kind: MediaKind, file: &str) {
+        let tag = kind.as_str();
+        let Some(stream) = self.pcaps.get(file).cloned() else {
+            self.log_err(&format!(
+                "call {call_id}: play_pcap_{tag}: '{file}' was not loaded"
+            ));
+            return;
+        };
+        let Some(call) = self.calls.get(call_id) else {
+            return;
+        };
+        let number = call.number;
+        let remote = call.remote_media[kind.index()];
+        let Some(remote) = remote else {
+            self.log_err(&format!(
+                "call {call_id}: play_pcap_{tag}: no remote {tag} endpoint yet (no SDP \
+                 with a live m={tag} line received) — not playing"
+            ));
+            return;
+        };
+        let (auto, offset) = self.port_layout[kind.index()];
+        let local_port = crate::render::media_port_value(self.media_port, auto, offset, number);
+        let spec = StreamSpec {
+            call_id: call_id.to_owned(),
+            tag: tag.to_owned(),
+            stream,
+            local_ip: self.media_ip,
+            local_port,
+            remote,
+        };
+        let Some(media) = self.media.as_ref() else {
+            return;
+        };
+        match media.play(spec) {
+            Ok(()) => self.stats.rtp_streams_started += 1,
+            Err(e) => {
+                let line = format!(
+                    "call {call_id}: play_pcap_{tag}: cannot open media socket \
+                     {}:{local_port} → {remote}: {e}",
+                    self.media_ip
+                );
+                eprintln!("sipr: warning: {line}");
+                self.log_err(&line);
+            }
+        }
+    }
+
+    fn on_media_event(&mut self, ev: MediaEvent) {
+        match ev {
+            MediaEvent::Finished { .. } => {}
+            MediaEvent::SendError {
+                call_id,
+                tag,
+                error,
+            } => {
+                let line = format!(
+                    "call {call_id}: play_pcap_{tag}: send failed: {error} — replay aborted"
+                );
+                eprintln!("sipr: warning: {line}");
+                self.log_err(&line);
+            }
+        }
     }
 
     /// Render a call's template (a 3PCC `<sendCmd>` body) to a string, using
@@ -1586,6 +1745,8 @@ impl<'s> Engine<'s> {
             remote_port: call.remote.port(),
             local_ip: &self.local_ip_str,
             local_port: self.transport.local_addr().port(),
+            media_ip: &self.media_ip_str,
+            media_port: self.media_port,
             transport: self.transport_token,
             call_id,
             call_number: call.number,
@@ -1819,6 +1980,7 @@ impl<'s> Engine<'s> {
     fn complete_call(&mut self, call_id: &str) {
         if let Some(mut call) = self.calls.remove(call_id) {
             self.cancel_call_timers(&mut call);
+            self.stop_media(call_id);
             self.stats.successful += 1;
             self.stats.record_call_length(call.started.elapsed());
             self.return_user(&call);
@@ -1830,8 +1992,17 @@ impl<'s> Engine<'s> {
     fn remove_call(&mut self, call_id: &str) {
         if let Some(mut call) = self.calls.remove(call_id) {
             self.cancel_call_timers(&mut call);
+            self.stop_media(call_id);
             self.stats.record_call_length(call.started.elapsed());
             self.return_user(&call);
+        }
+    }
+
+    /// A call that ends takes its media with it (SIPp joins the media thread
+    /// in the call destructor).
+    fn stop_media(&self, call_id: &str) {
+        if let Some(m) = self.media.as_ref() {
+            m.stop(call_id, None);
         }
     }
 
@@ -1957,6 +2128,7 @@ fn new_call(
         peer_tag: None,
         routes: Vec::new(),
         last_recv: None,
+        remote_media: [None; 3],
         last_recv_key: None,
         retrans: None,
         timer: None,
@@ -2108,6 +2280,131 @@ fn template_first_word(t: &MsgTemplate) -> Option<String> {
         Span::Lit(l) => l.split_whitespace().next().map(ToOwned::to_owned),
         Span::Kw(Keyword::Last(_) | Keyword::Var(_)) | Span::Kw(_) => None,
     }
+}
+
+/// Learn where the peer wants media from a received message's SDP —
+/// SIPp's `get_remote_media_addr`: any response with a body, or an
+/// INVITE/ACK/PRACK request. Streams absent from this SDP keep their
+/// previous endpoint.
+fn learn_remote_media(call: &mut CallState, msg: &Inbound) {
+    let body = msg.body();
+    if body.is_empty() {
+        return;
+    }
+    if msg.status_code().is_none() && !matches!(msg.method(), Some("INVITE" | "ACK" | "PRACK")) {
+        return;
+    }
+    for kind in MediaKind::ALL {
+        if let Some(addr) = sipr_media::sdp::remote_endpoint(body, kind.as_str()) {
+            call.remote_media[kind.index()] = Some(addr);
+        }
+    }
+}
+
+/// Which `[media_port]` form each `m=<kind>` line of the scenario's SDP
+/// uses: `(auto_media_port?, +offset)`. That rendered port is the local
+/// port the kind's replay must send from, so the peer sees RTP coming from
+/// the port we advertised. SIPp discovers this at render time by scanning
+/// the output buffer backwards for "audio"/"video"/"image"; the templates
+/// are pre-tokenized here, so it is read off the spans once. Defaults to
+/// plain `[media_port]` for a kind the SDP never mentions.
+fn media_port_layout(scenario: &Scenario) -> [(bool, u16); 3] {
+    let mut layout = [(false, 0u16); 3];
+    let mut found = [false; 3];
+    for step in &scenario.steps {
+        let Step::Send(send) = step else { continue };
+        let mut line = String::new();
+        for span in &send.template.spans {
+            match span {
+                Span::Lit(text) => match text.rfind('\n') {
+                    Some(pos) => line = text[pos + 1..].to_owned(),
+                    None => line.push_str(text),
+                },
+                Span::Kw(Keyword::MediaPort { auto, offset }) => {
+                    let head = line.trim_start();
+                    for kind in MediaKind::ALL {
+                        if head.starts_with(&format!("m={} ", kind.as_str()))
+                            && !found[kind.index()]
+                        {
+                            found[kind.index()] = true;
+                            layout[kind.index()] = (*auto, *offset);
+                        }
+                    }
+                    line.push('?');
+                }
+                Span::Kw(_) => line.push('?'),
+            }
+        }
+    }
+    layout
+}
+
+/// Resolve and parse every `play_pcap_*` file once. A missing or malformed
+/// capture is fatal before any call starts (SIPp: fatal at scenario parse).
+fn load_pcaps(
+    scenario: &Scenario,
+    config: &EngineConfig,
+) -> Result<HashMap<String, Arc<PcapStream>>, EngineError> {
+    let mut pcaps: HashMap<String, Arc<PcapStream>> = HashMap::new();
+    for (kind, file) in scenario.pcap_actions() {
+        if pcaps.contains_key(file) {
+            continue;
+        }
+        let path = resolve_media_file(file, config.scenario_dir.as_deref());
+        let bytes = std::fs::read(&path).map_err(|e| {
+            EngineError(format!(
+                "play_pcap_{}: cannot read '{file}' ({}): {e}",
+                kind.as_str(),
+                path.display()
+            ))
+        })?;
+        let stream = sipr_media::pcap::parse(&bytes).map_err(|e| {
+            EngineError(format!(
+                "play_pcap_{}: cannot load '{file}' ({}): {e}",
+                kind.as_str(),
+                path.display()
+            ))
+        })?;
+        if stream.is_empty() {
+            eprintln!(
+                "sipr: warning: pcap '{file}' contains no UDP packets — play_pcap_{} will \
+                 send nothing",
+                kind.as_str()
+            );
+        } else if stream.skipped > 0 {
+            eprintln!(
+                "sipr: pcap '{file}': {} packets, {} non-UDP packets skipped",
+                stream.len(),
+                stream.skipped
+            );
+        }
+        pcaps.insert(file.to_owned(), Arc::new(stream));
+    }
+    Ok(pcaps)
+}
+
+/// SIPp `find_file`: absolute paths as-is; otherwise next to the scenario
+/// file when that exists, else relative to the working directory (with the
+/// same warning SIPp prints when it falls back).
+fn resolve_media_file(file: &str, scenario_dir: Option<&std::path::Path>) -> std::path::PathBuf {
+    let raw = std::path::Path::new(file);
+    if raw.is_absolute() {
+        return raw.to_path_buf();
+    }
+    if let Some(dir) = scenario_dir {
+        let beside = dir.join(raw);
+        if beside.is_file() {
+            return beside;
+        }
+        if !dir.as_os_str().is_empty() {
+            eprintln!(
+                "sipr: warning: '{file}' not found next to the scenario ({}); trying the \
+                 working directory",
+                dir.display()
+            );
+        }
+    }
+    raw.to_path_buf()
 }
 
 /// Reject scenarios that need features beyond M3, loudly and up front.

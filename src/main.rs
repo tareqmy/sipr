@@ -165,6 +165,14 @@ fn run(cli: &Cli) -> ExitCode {
             None => None,
         },
         users: cli.users,
+        media_ip: cli.media_ip,
+        media_port: cli.media_port,
+        // pcap paths resolve next to the scenario file first (SIPp find_file).
+        scenario_dir: cli
+            .sf
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf),
         // Built only when TLS is selected: cert/key defaults (cacert.pem /
         // cakey.pem, like SIPp) would otherwise error on absent files.
         tls: (cli.transport == crate::cli::Transport::TlsMono).then(|| sipr_engine::TlsConfig {

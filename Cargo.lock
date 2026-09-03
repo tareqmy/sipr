@@ -271,6 +271,7 @@ dependencies = [
  "rustls",
  "sipr-auth",
  "sipr-engine",
+ "sipr-media",
  "sipr-net",
  "sipr-scenario",
  "sipr-stats",
@@ -287,10 +288,15 @@ name = "sipr-engine"
 version = "0.2.0"
 dependencies = [
  "sipr-auth",
+ "sipr-media",
  "sipr-net",
  "sipr-scenario",
  "sipr-stats",
 ]
+
+[[package]]
+name = "sipr-media"
+version = "0.2.0"
 
 [[package]]
 name = "sipr-net"

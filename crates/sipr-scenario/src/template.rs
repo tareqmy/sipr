@@ -63,11 +63,19 @@ pub enum Keyword {
     PeerTagParam,
     /// `[len]` — computed Content-Length (body bytes after substitution).
     Len,
-    /// `[media_ip]` — placeholder until media lands (defaults to local IP).
+    /// `[media_ip]` — the `-mi` media address (defaults to the local IP).
     MediaIp,
-    /// `[media_port]` — placeholder until media lands.
-    MediaPort,
-    /// `[media_ip_type]` — placeholder until media lands.
+    /// `[media_port]` / `[auto_media_port]`, optionally with a `+N` offset
+    /// (`[media_port+1]` for RTCP, `[media_port+2]` for video). `media_port`
+    /// is the `-mp` base for every call; `auto_media_port` reserves a
+    /// 4-port block per call (`base + 4*(call_number-1) % 10000`), as SIPp.
+    MediaPort {
+        /// `auto_media_port` (per-call block) vs plain `media_port`.
+        auto: bool,
+        /// The `+N` suffix, 0 when absent.
+        offset: u16,
+    },
+    /// `[media_ip_type]` — `4` or `6` for the media address.
     MediaIpType,
     /// `[last_Name:]` — verbatim copy of header(s) from the last received
     /// message. The stored string is the header name without the colon.
@@ -265,11 +273,30 @@ fn classify(body: &str) -> Classified {
         "peer_tag_param" => simple(Keyword::PeerTagParam),
         "len" => simple(Keyword::Len),
         "media_ip" => simple(Keyword::MediaIp),
-        "media_port" => simple(Keyword::MediaPort),
         "media_ip_type" => simple(Keyword::MediaIpType),
         "authentication" => Classified::Keyword(Keyword::Authentication(parse_params(params))),
-        _ => classify_field(name, params),
+        _ => match classify_media_port(name) {
+            Some(kw) => simple(kw),
+            None => classify_field(name, params),
+        },
     }
+}
+
+/// `[media_port]`, `[auto_media_port]`, and their `+N` offset forms.
+fn classify_media_port(name: &str) -> Option<Keyword> {
+    let (auto, rest) = if let Some(r) = name.strip_prefix("auto_media_port") {
+        (true, r)
+    } else if let Some(r) = name.strip_prefix("media_port") {
+        (false, r)
+    } else {
+        return None;
+    };
+    let offset = if rest.is_empty() {
+        0
+    } else {
+        rest.strip_prefix('+')?.parse::<u16>().ok()?
+    };
+    Some(Keyword::MediaPort { auto, offset })
 }
 
 /// `[fieldN]`, `[fieldN file=NAME]`, `[fieldN line=M|[$var]]` — an

@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **pcap replay (`exec play_pcap_audio|video|image=`)** — SIPp's media
+  feature, without the raw socket: a new std-only `sipr-media` crate reads
+  classic pcap files (Ethernet/802.1Q, raw IP, Linux cooked, BSD loopback;
+  IPv4/IPv6 UDP), learns the peer's media endpoint from its SDP, and replays
+  the UDP payloads verbatim on the capture's timeline from one scheduler
+  thread, through ordinary UDP sockets bound to the advertised media port —
+  no root, no libpcap. `-mi`/`-mp` (`-min_rtp_port`), `[auto_media_port]`,
+  `[media_port+N]`, `<recv ignoresdp>`. RTP counters on the TUI, `-bg` line,
+  and the final summary. Divergences from SIPp in `docs/SIPP_COMPAT.md` §6.
+
 ## [0.2.0] — 2026-09-03
 
 ### Added

@@ -1,0 +1,23 @@
+//! `sipr-media`: pcap replay and RTP media (milestone M14).
+//!
+//! Three pieces, all std-only:
+//!
+//! - [`pcap`] — a pure-Rust reader for classic pcap files that extracts the
+//!   UDP payloads and their relative timing. No libpcap: sipr only ever
+//!   *reads* capture files, never captures live traffic.
+//! - [`sdp`] — the minimal SDP scan that learns where the peer wants media
+//!   (`c=` + `m=<kind> <port>`), the same crude scan SIPp does.
+//! - [`replay`] — the media thread: one scheduler for every active stream,
+//!   sending each stream's frames on the capture's absolute timeline.
+//!
+//! Behavioral oracle: SIPp's `prepare_pcap.c` / `send_packets.c`
+//! (`exec play_pcap_*`). Deliberate divergences are recorded in
+//! `docs/SIPP_COMPAT.md` §6 — chiefly that sipr sends through ordinary UDP
+//! sockets bound to the media port (no raw socket, so no root needed).
+
+pub mod pcap;
+pub mod replay;
+pub mod sdp;
+
+pub use pcap::{Frame, PcapError, PcapStream};
+pub use replay::{MediaEvent, MediaPlayer, StreamSpec};

@@ -47,10 +47,11 @@ not from a scenario action. Extended 3PCC (`-master`/`-slave`/`-slave_cfg` with
 `-inf` injection + `[fieldN]` and `lookup`/`insert`/`replace` shipped in M7,
 classic 3PCC (`sendCmd`/`recvCmd`) in M10 (see §6).
 
-### Later / with media & transports
+### Media (M14+)
 
-`exec play_pcap*`, `exec rtp_stream`, `rtp_echo`, `verifyauth`, `closecon`,
-`pauserestore`, `ignoresdp`.
+Shipped in M14: `exec play_pcap_audio|video|image=` and `<recv ignoresdp>`
+(see §6). Still later: `exec rtp_stream`, `exec play_dtmf`, `rtp_echo`
+(M15), `verifyauth`, `closecon`, `pauserestore`.
 
 ## 2. Keywords (v1)
 
@@ -63,10 +64,11 @@ classic 3PCC (`sendCmd`/`recvCmd`) in M10 (see §6).
 with injection files) `[date]` `[timestamp]` `[cseq+n]`-style arithmetic if
 present in corpus scenarios (verify against C++).
 
-Media placeholders `[media_ip]` `[media_port]` `[media_ip_type]` appear in the
-default uac/uas scenarios' SDP bodies, so the keyword engine must substitute
-them in v1 even though no media flows: SIPp sources them from `-mi`/`-mp`
-(defaulting media_ip to the local IP). Pin exact defaults at M3.
+Media keywords (M14): `[media_ip]` (`-mi`, default the local IP),
+`[media_ip_type]`, `[media_port]` (`-mp`, default 6000, the same value for
+every call — as in SIPp), `[auto_media_port]` (per-call 4-port block:
+`base + 4*(call_number-1) % 10000`, SIPp's undocumented keyword), and the
+`+N` offset forms `[media_port+1]` / `[auto_media_port+2]` (RTCP, video).
 
 Keyword parameters use SIPp syntax `[keyword param=value]`. Unknown keywords:
 loud warning + left verbatim in the message (match SIPp behavior — verify in
@@ -81,7 +83,10 @@ Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 Network: `-p <local port>` `-i <local ip>` `-t u1|t1|l1` (UDP / TCP / TLS
 mono-socket; `tn`/`ln` accepted as aliases) `-s <service>` (called number)
 `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version` (TLS material,
-SIPp defaults `cacert.pem`/`cakey.pem`) `-mi`/`-mp` reserved (media, later).
+SIPp defaults `cacert.pem`/`cakey.pem`).
+Media: `-mi <ip>` (media address; default local IP) `-mp <port>` (base media
+port, default 6000; `-min_rtp_port` is SIPp's alias — note SIPp's `-mp` is
+*that* alias too, not a fixed port).
 Auth: `-au`/`-ap` (username/password defaults for `[authentication]`).
 Tracing/output: `-trace_msg` `-trace_err` `-trace_stat` `-stf <file>`
 `-fd <interval s>` `-nd` (no defaults) `-timeout <s>` `-bg` (headless).
@@ -299,5 +304,38 @@ Verify exact SIPp table before closing M3 and update this line.
   is fatal in SIPp and unsupported here too. Also noted: sipp's *client*
   stream bind (TCP and TLS) reuses its own listening port, which fails with
   EADDRINUSE on macOS — the reverse interop test self-skips there.
+- pcap replay `exec play_pcap_*` (M14; verified in `prepare_pcap.c`
+  `prepare_pkts`, `send_packets.c` `send_packets`/`do_sleep`, `call.cpp`
+  `get_remote_media_addr` (~l.349), the `media_port`/`auto_media_port`
+  keyword handler (~l.2789), `E_AT_PLAY_PCAP_*` execution (~l.6196),
+  `sipp.cpp` `setup_media_sockets`): SIPp parses the file once at scenario
+  load (missing/truncated = fatal; "recapture with `-s0`"), keeps the UDP
+  header + payload of every UDP packet with no RTP filtering, and replays
+  on a **raw socket** rewriting only the UDP ports (`port_diff` = packet's
+  destination port minus the lowest destination port in the file, added to
+  the SDP-learned remote port and the advertised local port) — the RTP
+  header is sent **verbatim**, so every call replaying one file emits the
+  same SSRC/seq/timestamps. Timing tracks the capture's absolute timeline
+  (`didsleep` vs elapsed), out-of-order timestamps get no delay. The action
+  is non-blocking (a `<pause>` must cover the file's duration) and one
+  media thread per call means audio cancels video and vice versa. The
+  remote endpoint is the first `c=IN IP4/IP6` + `m=audio|video|image` of any
+  *response* with a body or any INVITE/ACK/PRACK request, unless the recv
+  has `ignoresdp`; streams absent from a later SDP keep their old address.
+  `[media_port]` is `min_rtp_port` (6000) for every call unless `-rtp_echo`
+  bumps it at startup; `[auto_media_port]` = `+ 4*(call-1) % 10000`; the
+  *local* port used by a replay is whatever `[media_port]` rendered on the
+  SDP line containing "audio"/"video"/"image". sipr matches all of that
+  with these deliberate divergences: (1) ordinary UDP sockets bound to the
+  media port — no raw socket, **no root**; the sockets are not `connect`ed
+  so a silent peer's ICMP errors never abort a replay; (2) non-UDP/non-IP
+  packets in a capture are skipped with a count, not fatal (SIPp aborts on
+  an unknown EtherType); (3) audio/video/image streams of one call are
+  independent — playing one does not cancel another; (4) a port-0 (held)
+  `m=` line is skipped in favour of a later live one (SIPp's rtpstream path
+  does this, its pcap path does not); (5) 802.11 captures are rejected
+  (unsupported link type) — recapture on the wired side. `play_pcap=` (in
+  the DTD, never implemented by SIPp) is an error pointing at
+  `play_pcap_audio=`. Bracketed `-key` values are not supported yet.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

@@ -93,6 +93,12 @@ pub struct Snapshot {
     pub unexpected: u64,
     /// Non-SIP datagrams.
     pub garbage: u64,
+    /// pcap replays started.
+    pub rtp_streams_started: u64,
+    /// RTP datagrams sent by media replays.
+    pub rtp_packets_sent: u64,
+    /// Payload bytes sent by media replays.
+    pub rtp_bytes_sent: u64,
     /// RTD summaries, sorted by name.
     pub rtds: Vec<RtdRow>,
     /// Call-length summary (count, mean ms, max ms).
@@ -125,6 +131,9 @@ impl crate::StatSet {
         snap.auto_answered = self.auto_answered;
         snap.unexpected = self.unexpected;
         snap.garbage = self.garbage;
+        snap.rtp_streams_started = self.rtp_streams_started;
+        snap.rtp_packets_sent = self.rtp_packets_sent;
+        snap.rtp_bytes_sent = self.rtp_bytes_sent;
         #[allow(clippy::cast_precision_loss)]
         {
             snap.rate_cumulative = self.created() as f64 / snap.elapsed.as_secs_f64().max(1e-9);

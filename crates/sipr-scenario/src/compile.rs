@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use crate::diag::{Diagnostic, Diagnostics};
 use crate::model::{
-    Action, ArithOp, CompareOp, Expect, IntCmd, Operand, PauseSpec, RecvStep, Role, Scenario,
-    SearchIn, SendStep, Step, StepCommon, StepIndex, VarId, VarTable,
+    Action, ArithOp, CompareOp, Expect, IntCmd, MediaKind, Operand, PauseSpec, RecvStep, Role,
+    Scenario, SearchIn, SendStep, Step, StepCommon, StepIndex, VarId, VarTable,
 };
 use crate::template::{self, Keyword, MsgTemplate};
 use crate::xml::{self, Element, Node};
@@ -260,14 +260,9 @@ impl Compiler {
                 "attribute 'response_txn' (manual transactions) is not supported yet — v1.x",
             );
         }
-        for sdp in ["ignoresdp", "ignosesdp"] {
-            if el.attr(sdp).is_some() {
-                self.diags.error(
-                    Some(el.line),
-                    "attribute 'ignoresdp' is not supported yet — media milestones",
-                );
-            }
-        }
+        // The DTD misspells it `ignosesdp`; SIPp accepts both.
+        let ignore_sdp =
+            self.parse_bool_attr(el, "ignoresdp") || self.parse_bool_attr(el, "ignosesdp");
         let common = self.parse_common(el, ATTRS);
         let expect = match (el.attr("response"), el.attr("request")) {
             (Some(r), None) => Expect::Response(r.to_owned()),
@@ -332,6 +327,7 @@ impl Compiler {
             record_route_set: self.parse_bool_attr(el, "rrs"),
             auth: self.parse_bool_attr(el, "auth"),
             lost_pct: self.parse_num_attr(el, "lost"),
+            ignore_sdp,
             actions,
             common,
         };
@@ -908,20 +904,35 @@ impl Compiler {
                         "command",
                         "play_pcap",
                         "play_pcap_audio",
+                        "play_pcap_video",
+                        "play_pcap_image",
+                        "play_dtmf",
                         "rtp_stream",
                         "rtp_echo",
                     ],
                 );
-                for media in ["play_pcap", "play_pcap_audio", "rtp_stream", "rtp_echo"] {
-                    if el.attr(media).is_some() {
+                for later in ["rtp_stream", "rtp_echo", "play_dtmf"] {
+                    if el.attr(later).is_some() {
                         self.diags.error(
                             Some(line),
                             format!(
-                                "exec {media}= (media) is not supported yet — media milestones"
+                                "exec {later}= is not supported yet — M15 (RTP streaming, \
+                                 DTMF, echo)"
                             ),
                         );
                         return None;
                     }
+                }
+                if el.attr("play_pcap").is_some() {
+                    self.diags.error(
+                        Some(line),
+                        "exec play_pcap= is declared in sipp.dtd but SIPp never implemented \
+                         it — use play_pcap_audio= (or _video/_image)",
+                    );
+                    return None;
+                }
+                if let Some(action) = self.parse_play_pcap(el) {
+                    return action;
                 }
                 if el.attr("command").is_some() {
                     self.diags.error(
@@ -1000,6 +1011,62 @@ impl Compiler {
                 None
             }
         }
+    }
+
+    /// `exec play_pcap_audio|video|image="file"`. `Some(None)` when the
+    /// element is a pcap action but invalid (already diagnosed); `None` when
+    /// it carries no pcap attribute at all.
+    fn parse_play_pcap(&mut self, el: &Element) -> Option<Option<Action>> {
+        const ATTRS: [(&str, MediaKind); 3] = [
+            ("play_pcap_audio", MediaKind::Audio),
+            ("play_pcap_video", MediaKind::Video),
+            ("play_pcap_image", MediaKind::Image),
+        ];
+        let present: Vec<(MediaKind, &str)> = ATTRS
+            .iter()
+            .filter_map(|(attr, kind)| el.attr(attr).map(|v| (*kind, v)))
+            .collect();
+        let (kind, file) = *present.first()?;
+        if present.len() > 1 {
+            self.diags.error(
+                Some(el.line),
+                "exec: only one play_pcap_* attribute per action (SIPp plays one \
+                 stream per exec)",
+            );
+            return Some(None);
+        }
+        if el.attr("int_cmd").is_some() || el.attr("command").is_some() {
+            self.diags.error(
+                Some(el.line),
+                "exec: play_pcap_* cannot be combined with int_cmd= or command=",
+            );
+            return Some(None);
+        }
+        let file = file.trim();
+        if file.is_empty() {
+            self.diags.error(
+                Some(el.line),
+                format!("exec play_pcap_{}= needs a file name", kind.as_str()),
+            );
+            return Some(None);
+        }
+        if file.starts_with('[') && file.ends_with(']') {
+            // SIPp looks a bracketed value up in its `-key` table; sipr has
+            // no -key yet, so this would be a literal path that cannot exist.
+            self.diags.error(
+                Some(el.line),
+                format!(
+                    "exec play_pcap_{}=\"{file}\": bracketed -key references are not \
+                     supported yet — write the path",
+                    kind.as_str()
+                ),
+            );
+            return Some(None);
+        }
+        Some(Some(Action::PlayPcap {
+            kind,
+            file: file.to_owned(),
+        }))
     }
 
     fn require_attr(&mut self, el: &Element, name: &str) -> Option<String> {

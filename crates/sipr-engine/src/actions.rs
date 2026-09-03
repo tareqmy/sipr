@@ -118,6 +118,14 @@ pub enum ActionOutcome {
     StopGracefully,
     /// Stop the whole run immediately (`exec stop_now`).
     StopNow,
+    /// Start a pcap replay for this call (`exec play_pcap_*`). Not terminal:
+    /// the scenario continues immediately, as in SIPp.
+    PlayPcap {
+        /// Which stream.
+        kind: sipr_scenario::model::MediaKind,
+        /// The file as written in the scenario (the engine's pcap table key).
+        file: String,
+    },
 }
 
 /// Run every action in order, mutating the store and collecting outcomes.
@@ -152,7 +160,10 @@ fn run_actions_impl(
     let mut out = Vec::new();
     for action in actions {
         let outcome = run_one(action, store, last_msg, cmd_text, base_ctx);
-        let terminal = !matches!(outcome, ActionOutcome::Continue | ActionOutcome::Log(_));
+        let terminal = !matches!(
+            outcome,
+            ActionOutcome::Continue | ActionOutcome::Log(_) | ActionOutcome::PlayPcap { .. }
+        );
         out.push(outcome);
         if terminal {
             break;
@@ -326,6 +337,10 @@ fn run_one(
             store.set(*variable, Value::Str(decoded));
             ActionOutcome::Continue
         }
+        Action::PlayPcap { kind, file } => ActionOutcome::PlayPcap {
+            kind: *kind,
+            file: file.clone(),
+        },
         Action::ExecInt(cmd) => match cmd {
             sipr_scenario::model::IntCmd::StopCall => {
                 ActionOutcome::FailCall("exec stop_call".into())

@@ -13,15 +13,19 @@ sipr/
 │   ├── sipr-net/         # UDP transport, socket mgmt, timer service, retransmit schedule
 │   ├── sipr-engine/      # call state machine, call table, pacer, dialog bookkeeping
 │   ├── sipr-auth/        # digest auth (RFC 2617/7616) for [authentication]
-│   ├── sipr-stats/       # counters, hdrhistogram RTDs, repartitions, CSV export
-│   └── sipr-tui/         # ratatui screens, key handling
-└── src/main.rs           # bin: clap CLI → assemble and run
+│   ├── sipr-stats/       # counters, RTD histograms, repartitions, CSV export
+│   ├── sipr-media/       # pcap reader, SDP endpoint scan, RTP replay scheduler (M14)
+│   └── sipr-tui/         # terminal screens, key handling
+└── src/main.rs           # bin: SIPp-style CLI → assemble and run
 ```
 
 Dependency direction (must stay acyclic):
 `sipr-tui` → `sipr-stats` → (nothing internal);
-`sipr-engine` → `sipr-scenario`, `sipr-net`, `sipr-auth`, `sipr-stats`;
-`sipr-scenario`, `sipr-net`, `sipr-auth` depend on no internal crate.
+`sipr-engine` → `sipr-scenario`, `sipr-net`, `sipr-auth`, `sipr-stats`, `sipr-media`;
+`sipr-scenario`, `sipr-net`, `sipr-auth`, `sipr-media` depend on no internal crate.
+The media thread (`sipr-media::replay`) follows the same rule as every other
+thread: it owns its sockets, receives owned stream specs over a channel, and
+reports back with events — it never touches engine state.
 The binary depends on all. `rsip` types may appear in `sipr-net` and `sipr-engine`
 APIs; scenario IR types must not leak rsip types (templates are raw bytes + slots).
 

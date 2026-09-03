@@ -126,6 +126,9 @@ pub struct RecvStep {
     pub auth: bool,
     /// `lost`: simulated loss percentage.
     pub lost_pct: Option<f64>,
+    /// `ignoresdp`: do not learn the remote media endpoint from this
+    /// message's SDP (media milestones).
+    pub ignore_sdp: bool,
     /// Actions run when the message matches.
     pub actions: Vec<Action>,
     /// Shared attributes.
@@ -263,6 +266,43 @@ pub enum IntCmd {
     StopCall,
 }
 
+/// Which media stream an `exec play_pcap_*` action feeds. Each kind is
+/// independent: its own SDP `m=` line, its own local port, its own replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaKind {
+    /// `play_pcap_audio` — the `m=audio` stream.
+    Audio,
+    /// `play_pcap_video` — the `m=video` stream.
+    Video,
+    /// `play_pcap_image` — the `m=image` stream (T.38 / UDPTL).
+    Image,
+}
+
+impl MediaKind {
+    /// Every kind, in index order.
+    pub const ALL: [Self; 3] = [Self::Audio, Self::Video, Self::Image];
+
+    /// The SDP media name (`audio` / `video` / `image`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Image => "image",
+        }
+    }
+
+    /// Stable index (0..3) for per-call arrays.
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Audio => 0,
+            Self::Video => 1,
+            Self::Image => 2,
+        }
+    }
+}
+
 /// A v1 action (docs/SIPP_COMPAT.md §1).
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -366,6 +406,16 @@ pub enum Action {
     },
     /// Internal command.
     ExecInt(IntCmd),
+    /// `exec play_pcap_audio|video|image="file"`: replay a capture's UDP
+    /// payloads to the peer's media endpoint (learned from its SDP). The
+    /// file is resolved and parsed once by the engine at startup; `file` is
+    /// the attribute text verbatim.
+    PlayPcap {
+        /// Which stream (`m=` line / local port) this feeds.
+        kind: MediaKind,
+        /// The pcap path as written in the scenario.
+        file: String,
+    },
     /// Look up a key in an indexed injection file; store the matched line
     /// number (or -1 on a miss) into a variable.
     Lookup {
@@ -412,6 +462,31 @@ pub struct Scenario {
 }
 
 impl Scenario {
+    /// Every action of every step, in step order.
+    pub fn all_actions(&self) -> impl Iterator<Item = &Action> {
+        self.steps.iter().flat_map(|step| match step {
+            Step::Send(s) => s.actions.iter(),
+            Step::Recv(r) => r.actions.iter(),
+            Step::Nop { actions, .. } | Step::RecvCmd { actions, .. } => actions.iter(),
+            _ => [].iter(),
+        })
+    }
+
+    /// The `(kind, file)` of every `play_pcap_*` action.
+    pub fn pcap_actions(&self) -> impl Iterator<Item = (MediaKind, &str)> {
+        self.all_actions().filter_map(|a| match a {
+            Action::PlayPcap { kind, file } => Some((*kind, file.as_str())),
+            _ => None,
+        })
+    }
+
+    /// True when any step plays media (SIPp's `hasMedia`): the engine then
+    /// learns remote media endpoints from received SDP.
+    #[must_use]
+    pub fn has_media(&self) -> bool {
+        self.pcap_actions().next().is_some()
+    }
+
     /// Human-readable dump of the compiled IR (used by `--check`).
     #[must_use]
     pub fn dump(&self) -> String {
@@ -547,6 +622,18 @@ fn keyword_name(k: &Keyword) -> String {
                 None => format!("[field{index}]"),
             };
         }
+        Keyword::MediaPort { auto, offset } => {
+            let base = if *auto {
+                "auto_media_port"
+            } else {
+                "media_port"
+            };
+            return if *offset > 0 {
+                format!("[{base}+{offset}]")
+            } else {
+                format!("[{base}]")
+            };
+        }
         Keyword::Authentication(_) => "authentication",
         Keyword::Service => "service",
         Keyword::RemoteIp => "remote_ip",
@@ -568,7 +655,6 @@ fn keyword_name(k: &Keyword) -> String {
         Keyword::PeerTagParam => "peer_tag_param",
         Keyword::Len => "len",
         Keyword::MediaIp => "media_ip",
-        Keyword::MediaPort => "media_port",
         Keyword::MediaIpType => "media_ip_type",
     };
     format!("[{simple}]")

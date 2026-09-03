@@ -40,6 +40,9 @@ fn uas_config() -> EngineConfig {
         twin_addr: None,
         users: None,
         tls: None,
+        media_ip: None,
+        media_port: None,
+        scenario_dir: None,
     }
 }
 

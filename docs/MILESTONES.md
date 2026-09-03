@@ -287,6 +287,54 @@ CONVENTIONS §Dependencies.
       stream-client bind fails (EADDRINUSE; note in SIPP_COMPAT §6).
       fmt/clippy/test all green.
 
+## M14 — pcap replay (`exec play_pcap_*`) ✅
+
+Behavioral oracle: `prepare_pcap.c` / `send_packets.c` / `call.cpp`
+(`get_remote_media_addr`, `[media_port]`/`[auto_media_port]`), studied
+alongside gossipper's Go media engine (scale lessons: one scheduler thread,
+absolute timeline, sockets per stream, no per-stream threads). Design and
+divergences in SIPP_COMPAT §6.
+
+- [x] New std-only crate `sipr-media`: a pure-Rust classic-pcap reader
+      (`pcap.rs`: µs/ns magic either byte order; Ethernet + one 802.1Q tag,
+      raw IP, Linux SLL v1/v2, BSD null/loop; IPv4 any IHL, IPv6 without
+      extension headers; non-UDP packets skipped and counted; truncated
+      captures rejected with SIPp's `-s0` hint), the SDP endpoint scan
+      (`sdp.rs`: session/media-level `c=`, first live `m=<kind>`, port 0
+      skipped), and the replay scheduler (`replay.rs`: one `sipr-media`
+      thread, min-heap of due streams, frames sent at `start + offset` on the
+      capture's absolute timeline with burst catch-up, one UDP socket per
+      destination-port offset preserving SIPp's `port_diff` mapping, RTP
+      bytes verbatim). No libpcap, no raw sockets, no root.
+- [x] Scenario: `exec play_pcap_audio|video|image=` → `Action::PlayPcap`
+      (one per exec; `play_pcap=` is rejected as SIPp never implemented it;
+      `rtp_stream`/`rtp_echo`/`play_dtmf` are clear "M15" errors);
+      `<recv ignoresdp>` (and the DTD's `ignosesdp`) accepted;
+      `[auto_media_port]` and `[media_port+N]`/`[auto_media_port+N]` keyword
+      forms. Corpus: `negative/media_pcap.xml` became
+      `positive/pcap_play.xml`; `negative/media_rtp_stream.xml` added.
+- [x] Engine: `-mi`/`-mp` (`-min_rtp_port` alias) → `[media_ip]`,
+      `[media_port]` (default 6000; `auto` = `+ 4*(call-1) % 10000`), pcaps
+      resolved next to the `-sf` file then the CWD and parsed once at startup
+      (missing/malformed = fatal, like SIPp), remote endpoints learned from
+      any response body or INVITE/ACK/PRACK request SDP (stale values kept),
+      the local port per kind read off the SDP template's `m=` line at load
+      (SIPp's runtime "audio"/"video"/"image" line scan, done once), replay
+      stopped on every call teardown path, socket/send failures logged and
+      the call continues. Stats: `rtp_streams_started`/`rtp_packets_sent`/
+      `rtp_bytes_sent` sampled once a second into the stat set, TUI main
+      screen line, `-bg` line, and the final summary (`rtp-sent N`).
+- [x] Tests: 23 unit tests in `sipr-media` (incl. a deterministic no-panic
+      sweep of truncations/mutations), compiler tests for every exec form,
+      e2e `play_pcap_audio_replays_capture_to_the_sdp_endpoint` (two calls,
+      distinct `auto_media_port` blocks, every payload verbatim) and
+      `play_pcap_with_a_missing_file_is_fatal_at_startup`, interop
+      `uac_pcap_against_real_sipp_uas` (sipp `-rtp_echo` UAS answers with
+      its own SDP; 30/30 frames sent). fmt/clippy/test green.
+- [x] Deferred to M15: `rtp_stream` (file/pattern streaming, pause/resume),
+      `play_dtmf` (RFC 4733 generation), `rtp_echo`, `-rtpcheck`, `-key`
+      lookups in `play_pcap_*` values, `~` expansion in media paths.
+
 ## Post-v1 backlog (ordered)
 
-pcap/RTP media (study gossipper first) → AKA auth → HTTP control API.
+RTP streaming + DTMF + echo (M15) → AKA auth → HTTP control API.
