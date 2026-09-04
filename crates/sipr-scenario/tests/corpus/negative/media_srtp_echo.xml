@@ -1,4 +1,4 @@
-<!-- expect: not supported yet -->
+<!-- expect: not supported -->
 <scenario name="rtp_echo exec is not supported yet">
   <send><![CDATA[
     INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0

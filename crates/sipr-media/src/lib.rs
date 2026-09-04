@@ -19,11 +19,13 @@
 //! sockets bound to the media port (no raw socket, so no root needed).
 
 pub mod dtmf;
+pub mod echo;
 pub mod pcap;
 pub mod replay;
 pub mod rtp;
 pub mod sdp;
 
+pub use echo::EchoServer;
 pub use pcap::{Frame, PcapError, PcapStream};
 pub use replay::{MediaEvent, MediaPlayer, Source, StreamSpec};
 pub use rtp::{RtpParams, RtpSource};

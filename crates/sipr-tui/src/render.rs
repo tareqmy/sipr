@@ -145,6 +145,18 @@ fn render_main(snap: &Snapshot, pal: &Palette) -> Vec<String> {
             snap.rtp_streams_started, snap.rtp_packets_sent
         ));
     }
+    if snap.rtp_check_ok + snap.rtp_check_failed > 0 {
+        out.push(format!(
+            "  RTP check: {:>7} passed   {:>8} failed",
+            snap.rtp_check_ok, snap.rtp_check_failed
+        ));
+    }
+    if snap.rtp_echo_packets + snap.rtp_echo2_packets > 0 {
+        out.push(format!(
+            "  RTP echo: {:>8} pckts 1st stream   {:>8} pckts 2nd stream",
+            snap.rtp_echo_packets, snap.rtp_echo2_packets
+        ));
+    }
     out.push(String::new());
     for r in &snap.rtds {
         let tag = pal.paint(pal.label, &format!("RTD {:<4}", r.name));

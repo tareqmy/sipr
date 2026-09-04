@@ -109,6 +109,15 @@ pub struct EngineConfig {
     pub rtp_payload: Option<u8>,
     /// `-random_base_ssrc`: seed the SSRC base randomly (SIPp: `0xCA110000`).
     pub random_base_ssrc: bool,
+    /// `-rtp_echo`: echo RTP received on the media port (+2) back.
+    pub rtp_echo: bool,
+    /// `-mb`: echo receive buffer size (default 2048).
+    pub media_bufsize: Option<usize>,
+    /// `-audiotolerance`: judge audio `rtp_stream` echo checks against this
+    /// failure ratio; `None` = do not judge (SIPp judges always, default 1.0).
+    pub audio_tolerance: Option<f64>,
+    /// `-videotolerance`: same for video streams.
+    pub video_tolerance: Option<f64>,
     /// Directory of the `-sf` file: pcap paths resolve there first, then in
     /// the working directory (SIPp `find_file`).
     pub scenario_dir: Option<std::path::PathBuf>,
@@ -170,15 +179,23 @@ pub struct RunReport {
     pub garbage: u64,
     /// RTP datagrams sent by pcap replays.
     pub rtp_packets_sent: u64,
+    /// RTP echo checks that passed their tolerance.
+    pub rtp_check_ok: u64,
+    /// RTP echo checks that failed their tolerance (SIPp: exit -3).
+    pub rtp_check_failed: u64,
     /// Wall-clock duration of the run.
     pub elapsed: Duration,
 }
 
 impl RunReport {
-    /// SIPp-compatible exit code (docs/SIPP_COMPAT.md §5).
+    /// SIPp-compatible exit code (docs/SIPP_COMPAT.md §5). A failed RTP
+    /// check wins over everything, as in SIPp (`EXIT_RTPCHECK_FAILED` = -3,
+    /// which the shell sees as 253).
     #[must_use]
     pub fn exit_code(&self) -> u8 {
-        if self.failed > 0 {
+        if self.rtp_check_failed > 0 {
+            253
+        } else if self.failed > 0 {
             1
         } else if self.successful > 0 {
             0
@@ -190,11 +207,18 @@ impl RunReport {
     /// One-line summary for logs.
     #[must_use]
     pub fn summary(&self) -> String {
-        let rtp = if self.rtp_packets_sent > 0 {
+        let mut rtp = if self.rtp_packets_sent > 0 {
             format!(" rtp-sent {}", self.rtp_packets_sent)
         } else {
             String::new()
         };
+        let checks = self.rtp_check_ok + self.rtp_check_failed;
+        if checks > 0 {
+            rtp.push_str(&format!(
+                " rtpcheck {}/{checks} failed",
+                self.rtp_check_failed
+            ));
+        }
         format!(
             "created {} successful {} failed {} | sent {} matched {} \
              retrans-sent {} retrans-recv {} unexpected {} garbage {}{rtp} | {:.1?}",
@@ -497,6 +521,8 @@ struct Engine<'s> {
     _http: Option<sipr_control::http::HttpServer>,
     /// `set rate-scale`: the step multiplier for the rate keys.
     rate_scale: f64,
+    /// `-rtp_echo`: the global echo sockets, when enabled.
+    echo: Option<sipr_media::EchoServer>,
 }
 
 impl<'s> Engine<'s> {
@@ -625,6 +651,33 @@ impl<'s> Engine<'s> {
         // the media thread exists only when something will be played.
         let pcaps = load_pcaps(scenario, config)?;
         let rtp_files = load_rtp_files(scenario, config)?;
+        // -rtp_echo binds the media port (and +2) up front, probing upward
+        // like SIPp; the port that bound is what [media_port] renders.
+        let echo_ip = config
+            .media_ip
+            .unwrap_or_else(|| transport.local_addr().ip());
+        let mut media_port = config.media_port.unwrap_or(DEFAULT_MEDIA_PORT);
+        let echo = if config.rtp_echo {
+            let bufsize = config
+                .media_bufsize
+                .unwrap_or(sipr_media::echo::DEFAULT_BUFSIZE);
+            let server = sipr_media::EchoServer::start(echo_ip, media_port, bufsize)
+                .map_err(|e| EngineError(format!("-rtp_echo: cannot bind media sockets: {e}")))?;
+            media_port = server.media_port;
+            eprintln!(
+                "sipr: RTP echo on {echo_ip}:{media_port} and {echo_ip}:{}",
+                media_port.wrapping_add(2)
+            );
+            Some(server)
+        } else {
+            if scenario.toggles_rtp_echo() {
+                eprintln!(
+                    "sipr: warning: the scenario uses <rtp_echo> but -rtp_echo was not given — \
+                     nothing is echoing"
+                );
+            }
+            None
+        };
         let media = if !scenario.has_media() {
             None
         } else {
@@ -864,10 +917,10 @@ impl<'s> Engine<'s> {
                 .media_ip
                 .unwrap_or_else(|| local_addr.ip())
                 .to_string(),
-            media_port: config.media_port.unwrap_or(DEFAULT_MEDIA_PORT),
+            media_port,
             port_layout: media_port_layout(scenario),
             rtp_files,
-            next_rtp_port: config.media_port.unwrap_or(DEFAULT_MEDIA_PORT),
+            next_rtp_port: media_port,
             max_rtp_port: config.max_rtp_port.unwrap_or(u16::MAX),
             rtp_payload: config.rtp_payload.unwrap_or(DEFAULT_RTP_PAYLOAD),
             ssrc_base: if config.random_base_ssrc {
@@ -882,6 +935,7 @@ impl<'s> Engine<'s> {
             control_snapshot,
             _http: http,
             rate_scale: 1.0,
+            echo,
         })
     }
 
@@ -944,6 +998,7 @@ impl<'s> Engine<'s> {
         }
         self.control.stop_pacer.store(true, Ordering::Relaxed);
         self.sample_media_counters();
+        self.collect_final_media_events();
         // Final CSV row + flush all trace files.
         if self.trace_stat.is_some() {
             let row = self.stats.csv_row(self.calls.len());
@@ -972,8 +1027,33 @@ impl<'s> Engine<'s> {
             unexpected: self.stats.unexpected,
             garbage: self.stats.garbage,
             rtp_packets_sent: self.stats.rtp_packets_sent,
+            rtp_check_ok: self.stats.rtp_check_ok,
+            rtp_check_failed: self.stats.rtp_check_failed,
             elapsed: started.elapsed(),
         }
+    }
+
+    /// Streams that end with their calls report their RTP-check tallies
+    /// asynchronously; the last of them arrive after the call map empties.
+    /// Shut the media thread down (it flushes every stream's tally on the
+    /// way out) and drain what the bridge forwards before the report.
+    fn collect_final_media_events(&mut self) {
+        if self.media.take().is_none() {
+            return;
+        }
+        let mut quiet_rounds = 0;
+        while quiet_rounds < 3 {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Event::Media(ev)) => {
+                    self.on_media_event(ev);
+                    quiet_rounds = 0;
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => quiet_rounds += 1,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        self.sample_media_counters();
     }
 
     /// Copy the media thread's atomics into the stat set (once a second and
@@ -983,6 +1063,10 @@ impl<'s> Engine<'s> {
         if let Some(m) = self.media.as_ref() {
             self.stats.rtp_packets_sent = m.packets_sent();
             self.stats.rtp_bytes_sent = m.bytes_sent();
+        }
+        if let Some(e) = self.echo.as_ref() {
+            self.stats.rtp_echo_packets = e.audio.packets.load(Ordering::Relaxed);
+            self.stats.rtp_echo2_packets = e.video.packets.load(Ordering::Relaxed);
         }
     }
 
@@ -1989,6 +2073,11 @@ impl<'s> Engine<'s> {
                 crate::actions::ActionOutcome::PlayDtmf(value) => {
                     self.start_dtmf(call_id, &value);
                 }
+                crate::actions::ActionOutcome::RtpEcho(on) => {
+                    if let Some(e) = self.echo.as_ref() {
+                        e.set_enabled(on);
+                    }
+                }
             }
         }
         false
@@ -2269,6 +2358,39 @@ impl<'s> Engine<'s> {
     fn on_media_event(&mut self, ev: MediaEvent) {
         match ev {
             MediaEvent::Finished { .. } => {}
+            MediaEvent::CheckResult {
+                call_id,
+                tag,
+                video,
+                sent,
+                failed,
+                bytes_in,
+            } => {
+                self.stats.rtp_bytes_received += bytes_in;
+                // SIPp judges every stream against its tolerance (default
+                // 1.0, so a peer that never echoes fails the run); sipr only
+                // judges when a tolerance was asked for.
+                let tolerance = if video {
+                    self.config.video_tolerance
+                } else {
+                    self.config.audio_tolerance
+                };
+                if let Some(tol) = tolerance
+                    && sent > 0
+                {
+                    #[allow(clippy::cast_precision_loss)]
+                    let ratio = failed as f64 / sent as f64;
+                    if ratio >= tol {
+                        self.stats.rtp_check_failed += 1;
+                        self.log_err(&format!(
+                            "call {call_id}: {tag}: RTP check FAILED — {failed}/{sent} packets \
+                             ({ratio:.2} ≥ tolerance {tol})"
+                        ));
+                    } else {
+                        self.stats.rtp_check_ok += 1;
+                    }
+                }
+            }
             MediaEvent::SendError {
                 call_id,
                 tag,

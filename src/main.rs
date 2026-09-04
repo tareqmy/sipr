@@ -170,6 +170,10 @@ fn run(cli: &Cli) -> ExitCode {
         max_rtp_port: cli.max_rtp_port,
         rtp_payload: cli.rtp_payload,
         random_base_ssrc: cli.random_base_ssrc,
+        rtp_echo: cli.rtp_echo,
+        media_bufsize: cli.media_bufsize,
+        audio_tolerance: cli.audio_tolerance,
+        video_tolerance: cli.video_tolerance,
         control_port: cli.control_port,
         control_ip: cli.control_ip,
         http_addr: match cli.http.as_deref() {

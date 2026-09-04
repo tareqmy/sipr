@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **RTP echo and the RTP check** — `-rtp_echo` (with `-mb`) echoes RTP
+  received on the media port and media port + 2 back to its sender, with
+  SIPp's counters and the `<rtp_echo value="0|1"/>` action to toggle it;
+  `rtp_stream` sockets now read back what the peer echoes and compare it
+  to what was sent, and `-audiotolerance` / `-videotolerance` turn that
+  into SIPp's verdict: a failed check exits 253 (SIPp's -3). Unlike SIPp,
+  a stream is judged only when a tolerance flag is given. New counters on
+  the TUI, the `-bg` line, and `/stats`.
+
 ## [0.6.0] — 2026-09-04
 
 ### Added

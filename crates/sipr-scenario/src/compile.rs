@@ -915,8 +915,8 @@ impl Compiler {
                 if el.attr("rtp_echo").is_some() {
                     self.diags.error(
                         Some(line),
-                        "exec rtp_echo= (SRTP echo control) is not supported yet — later \
-                         milestone",
+                        "exec rtp_echo=startaudio|… (per-call SRTP echo) is not supported — \
+                         use -rtp_echo and the <rtp_echo value=> action for plain RTP echo",
                     );
                     return None;
                 }
@@ -1021,7 +1021,28 @@ impl Compiler {
                 );
                 None
             }
-            "closecon" | "pauserestore" | "verifyauth" | "rtp_echo" => {
+            "rtp_echo" => {
+                self.warn_unknown_attrs(el, &["value", "variable"]);
+                if el.attr("variable").is_some() {
+                    self.diags.error(
+                        Some(line),
+                        "<rtp_echo variable=…> is not supported yet — use value=\"0|1\"",
+                    );
+                    return None;
+                }
+                let value = self.require_attr(el, "value")?;
+                match value.trim().parse::<f64>() {
+                    Ok(v) => Some(Action::RtpEchoState(v != 0.0)),
+                    Err(_) => {
+                        self.diags.error(
+                            Some(line),
+                            format!("<rtp_echo value=\"{value}\">: expected a number (0 = off)"),
+                        );
+                        None
+                    }
+                }
+            }
+            "closecon" | "pauserestore" | "verifyauth" => {
                 self.diags.error(
                     Some(line),
                     format!(

@@ -262,6 +262,21 @@ fn silence_leads_to_failed_calls_and_exit_1() {
     assert!(err.contains("failed 1"), "{err}");
 }
 
+/// A base port such that `base..base+span` are all free right now, for
+/// scenarios that spread calls over `[auto_media_port]` blocks.
+fn free_port_block(span: u16) -> u16 {
+    for _ in 0..100 {
+        let base = free_port().max(20_000) & !1;
+        let held: Vec<_> = (0..span)
+            .map(|i| UdpSocket::bind(("127.0.0.1", base + i)))
+            .collect();
+        if held.iter().all(Result::is_ok) {
+            return base;
+        }
+    }
+    panic!("no free port block of {span}");
+}
+
 /// A free loopback UDP port (bind-then-drop).
 fn free_port() -> u16 {
     let s = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -1924,7 +1939,7 @@ fn play_pcap_audio_replays_capture_to_the_sdp_endpoint() {
         pcap_uac_scenario(pcap_path.to_str().expect("utf8")),
     )
     .expect("write scenario");
-    let media_base = free_port();
+    let media_base = free_port_block(8);
     let out = run_sipr(&[
         "-sf",
         scenario_path.to_str().expect("utf8"),
@@ -2601,4 +2616,168 @@ fn http_api_off_loopback_needs_a_token() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_ne!(out.status.code(), Some(0));
     assert!(err.contains("--sipr-http-token"), "{err}");
+}
+
+// ---- RTP echo + rtpcheck -------------------------------------------------------
+
+/// sipr against sipr: a `-rtp_echo` UAS echoes the UAC's pattern stream
+/// back, and with a tolerance given the UAC judges the echo check.
+#[test]
+fn rtp_echo_uas_makes_the_uac_rtpcheck_pass() {
+    let sip_port = free_port();
+    let uas_media = free_port_block(4);
+    let uac_media = free_port_block(4);
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sn",
+        "uas",
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &sip_port.to_string(),
+        "-mi",
+        "127.0.0.1",
+        "-mp",
+        &uas_media.to_string(),
+        "-rtp_echo",
+        "-cp",
+        "0",
+        "-m",
+        "2",
+        "-timeout",
+        "20",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let scenario_path = dir.join(format!("sipr-e2e-echo-{pid}.xml"));
+    std::fs::write(
+        &scenario_path,
+        rtp_stream_uac_scenario("unused")
+            .replace(
+                r#"rtp_stream="unused,2,8,PCMA/8000""#,
+                r#"rtp_stream="apattern,1,8""#,
+            )
+            .replace(
+                r#"<nop><action><exec play_dtmf="1,50"/></action></nop>"#,
+                "",
+            ),
+    )
+    .expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        scenario_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-mp",
+        &uac_media.to_string(),
+        "-audiotolerance",
+        "0.5",
+        "-cp",
+        "0",
+        "-r",
+        "5",
+        "-m",
+        "2",
+        "-timeout",
+        "20",
+        "-bg",
+        &format!("127.0.0.1:{sip_port}"),
+    ]);
+    let _ = std::fs::remove_file(&scenario_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "uac stderr:\n{err}");
+    assert!(err.contains("successful 2 failed 0"), "{err}");
+    assert!(err.contains("rtpcheck 0/2 failed"), "{err}");
+    let code = wait_exit(&mut uas, Duration::from_secs(15));
+    let uerr = uas_err.join().expect("uas stderr");
+    assert_eq!(code, Some(0), "uas stderr:\n{uerr}");
+    assert!(uerr.contains("RTP echo on 127.0.0.1:"), "{uerr}");
+    assert!(uerr.contains(" echo "), "echo counters:\n{uerr}");
+}
+
+/// Without an echoing peer and with a tolerance given, the check fails
+/// and the run exits with SIPp's -3 (253) even though the calls succeeded.
+#[test]
+fn rtpcheck_against_a_silent_peer_exits_253_when_a_tolerance_is_set() {
+    let (addr, _uas, _media, _sink) = {
+        let (a, m, u, s) = spawn_media_uas(Duration::from_secs(2));
+        (a, u, m, s)
+    };
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let scenario_path = dir.join(format!("sipr-e2e-nocheck-{pid}.xml"));
+    let scenario = rtp_stream_uac_scenario("unused")
+        .replace(
+            r#"rtp_stream="unused,2,8,PCMA/8000""#,
+            r#"rtp_stream="apattern,1,8""#,
+        )
+        .replace(
+            r#"<nop><action><exec play_dtmf="1,50"/></action></nop>"#,
+            "",
+        );
+    std::fs::write(&scenario_path, &scenario).expect("write");
+    let base = &[
+        "-sf",
+        scenario_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-mp",
+        &free_port().to_string(),
+        "-cp",
+        "0",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+    ];
+    // No tolerance: the sink swallows the RTP, nothing is judged, exit 0.
+    let mut args: Vec<&str> = base.to_vec();
+    let target = addr.to_string();
+    args.push(&target);
+    let out = run_sipr(&args);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(!err.contains("rtpcheck"), "{err}");
+    // With a tolerance: judged and failed → 253.
+    let mut args: Vec<&str> = base.to_vec();
+    args.extend(["-audiotolerance", "1.0", &target]);
+    let out = run_sipr(&args);
+    let _ = std::fs::remove_file(&scenario_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(253), "{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(err.contains("rtpcheck 1/1 failed"), "{err}");
+}
+
+#[test]
+fn rtp_echo_action_toggles_the_global_echo() {
+    // Compiles (positive corpus covers the action); here: the engine warns
+    // when the scenario toggles echo without -rtp_echo.
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let path = dir.join(format!("sipr-e2e-echotoggle-{pid}.xml"));
+    std::fs::write(
+        &path,
+        r#"<scenario name="toggle"><recv request="INVITE"/><nop><action><rtp_echo value="0"/></action></nop></scenario>"#,
+    )
+    .expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-cp",
+        "0",
+        "-m",
+        "1",
+        "-timeout",
+        "1",
+        "-bg",
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("uses <rtp_echo> but -rtp_echo was not given"),
+        "{err}"
+    );
 }

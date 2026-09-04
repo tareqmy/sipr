@@ -463,6 +463,9 @@ pub enum Action {
     /// `exec play_dtmf="digits[,tone_ms]"` (keywords allowed, as SIPp
     /// renders the value): RFC 4733 events on the audio stream.
     PlayDtmf(MsgTemplate),
+    /// `<rtp_echo value="0|1"/>`: switch the process-wide `-rtp_echo`
+    /// echoing off or on (SIPp's global `rtp_echo_state`).
+    RtpEchoState(bool),
     /// Look up a key in an indexed injection file; store the matched line
     /// number (or -1 on a miss) into a variable.
     Lookup {
@@ -545,6 +548,13 @@ impl Scenario {
                 Action::PlayPcap { .. } | Action::RtpStream(_) | Action::PlayDtmf(_)
             )
         })
+    }
+
+    /// True when any step toggles `<rtp_echo>` (needs `-rtp_echo`).
+    #[must_use]
+    pub fn toggles_rtp_echo(&self) -> bool {
+        self.all_actions()
+            .any(|a| matches!(a, Action::RtpEchoState(_)))
     }
 
     /// Human-readable dump of the compiled IR (used by `--check`).

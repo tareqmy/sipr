@@ -99,6 +99,16 @@ pub struct Snapshot {
     pub rtp_packets_sent: u64,
     /// Payload bytes sent by media replays.
     pub rtp_bytes_sent: u64,
+    /// Bytes received on generated RTP streams' sockets.
+    pub rtp_bytes_received: u64,
+    /// `-rtp_echo` datagrams echoed, audio socket.
+    pub rtp_echo_packets: u64,
+    /// `-rtp_echo` datagrams echoed, video socket.
+    pub rtp_echo2_packets: u64,
+    /// RTP checks passed.
+    pub rtp_check_ok: u64,
+    /// RTP checks failed.
+    pub rtp_check_failed: u64,
     /// RTD summaries, sorted by name.
     pub rtds: Vec<RtdRow>,
     /// Call-length summary (count, mean ms, max ms).
@@ -134,6 +144,11 @@ impl crate::StatSet {
         snap.rtp_streams_started = self.rtp_streams_started;
         snap.rtp_packets_sent = self.rtp_packets_sent;
         snap.rtp_bytes_sent = self.rtp_bytes_sent;
+        snap.rtp_bytes_received = self.rtp_bytes_received;
+        snap.rtp_echo_packets = self.rtp_echo_packets;
+        snap.rtp_echo2_packets = self.rtp_echo2_packets;
+        snap.rtp_check_ok = self.rtp_check_ok;
+        snap.rtp_check_failed = self.rtp_check_failed;
         #[allow(clippy::cast_precision_loss)]
         {
             snap.rate_cumulative = self.created() as f64 / snap.elapsed.as_secs_f64().max(1e-9);

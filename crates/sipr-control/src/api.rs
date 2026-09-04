@@ -270,6 +270,11 @@ pub fn snapshot_json(s: &Snapshot) -> Json {
         ("rtp_streams_started", num_u64(s.rtp_streams_started)),
         ("rtp_packets_sent", num_u64(s.rtp_packets_sent)),
         ("rtp_bytes_sent", num_u64(s.rtp_bytes_sent)),
+        ("rtp_bytes_received", num_u64(s.rtp_bytes_received)),
+        ("rtp_echo_packets", num_u64(s.rtp_echo_packets)),
+        ("rtp_echo2_packets", num_u64(s.rtp_echo2_packets)),
+        ("rtp_check_ok", num_u64(s.rtp_check_ok)),
+        ("rtp_check_failed", num_u64(s.rtp_check_failed)),
         ("rtd", Json::Array(rtds)),
         (
             "call_length",

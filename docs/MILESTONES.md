@@ -468,7 +468,47 @@ controls were avoided). Spec in `docs/CONTROL_API.md`.
 - [x] Deferred: `set hide`/`display` semantics in the TUI, a streaming
       endpoint, scenario hot-replace, Prometheus.
 
+## M18 — RTP echo and the RTP check ✅
+
+Behavioral oracle: `sipp.cpp` `rtp_echo_thread` / `setup_media_sockets` /
+`bind_rtp_sockets` / `sipp_exit`, `rtpstream.cpp` `rtpstream_playrtptask`
+(post-send recv + compare) and the thread-exit verdict, `call.cpp`
+`E_AT_RTP_ECHO`, `scenario.cpp` `<rtp_echo>`. Divergences in SIPP_COMPAT §6.
+
+- [x] `-rtp_echo` / `-mb`: `sipr-media::echo` binds the media port and
+      `+2` (probing upward in steps of two, like SIPp, and the port that
+      bound is what `[media_port]` renders), two threads with SIPp's 100 ms
+      receive timeout echo every datagram to its sender; counters
+      `rtp_echo_packets` / `rtp_echo2_packets` (SIPp's 1st/2nd stream) on
+      the TUI, `-bg` line, and `/stats`.
+- [x] `<rtp_echo value="0|1"/>` action → `Action::RtpEchoState`: flips the
+      process-wide switch (SIPp `rtp_echo_state`); a scenario using it
+      without `-rtp_echo` gets a startup warning. `variable=` is rejected.
+- [x] The RTP check: generated streams' sockets are non-blocking and after
+      every send the scheduler drains what came back, comparing the last
+      datagram's payload to the one just sent (SIPp's semantics — an echo
+      lags a packet, so only constant-payload patterns pass); tallies per
+      stream travel as `MediaEvent::CheckResult` when the stream ends.
+      `-audiotolerance` / `-videotolerance` (0.0..=1.0): `failed/sent ≥
+      tolerance` fails the check. `rtp_check_ok` / `rtp_check_failed` /
+      `rtp_bytes_received` stats; a failed check makes the exit code 253
+      (SIPp's `EXIT_RTPCHECK_FAILED` = -3 as the shell sees it) and the
+      summary says `rtpcheck N/M failed`. Tallies of streams ending with
+      their calls are collected at shutdown before the report.
+- [x] Deliberate divergence: sipr judges a stream **only when a tolerance
+      flag was given**. SIPp judges always with a default of 1.0, so any
+      `rtp_stream` run against a peer that does not echo exits -3.
+- [x] Tests: echo unit tests (both sockets, counters, the toggle, probing
+      past a taken port), a scheduler test proving the check passes against
+      an echo peer, e2e sipr-vs-sipr `rtp_echo_uas_makes_the_uac_rtpcheck_pass`,
+      the silent-peer 253 case (and its non-judged 0 twin), the missing
+      `-rtp_echo` warning, interop `rtpcheck_against_real_sipp_echo`
+      (`sipp -rtp_echo` echoes, sipr passes 1/1).
+- [x] Deferred: `exec rtp_echo=startaudio|…` (SIPp's per-call SRTP echo
+      threads — SRTP is out of scope), `-rtpcheck_debug` hex dumps.
+
 ## Post-v1 backlog (ordered)
 
-RTP echo/rtpcheck → AUTS resync / `-auth_uri` / rendered `aka_*` params →
-`-rate_increase`/`-rate_max`/`-rate_quit` ramps → TUI `hide`/`display`.
+AUTS resync / `-auth_uri` / rendered `aka_*` params →
+`-rate_increase`/`-rate_max`/`-rate_quit` ramps → TUI `hide`/`display` →
+SRTP.

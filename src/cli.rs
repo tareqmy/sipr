@@ -75,6 +75,14 @@ pub struct Cli {
     pub rtp_payload: Option<u8>,
     /// `-random_base_ssrc`: randomize the SSRC base instead of `0xCA110000`.
     pub random_base_ssrc: bool,
+    /// `-rtp_echo`: echo RTP received on the media port (and +2) back.
+    pub rtp_echo: bool,
+    /// `-mb`: RTP echo buffer size (default 2048).
+    pub media_bufsize: Option<usize>,
+    /// `-audiotolerance`: RTP-check failure ratio that fails the run (audio).
+    pub audio_tolerance: Option<f64>,
+    /// `-videotolerance`: same for video streams.
+    pub video_tolerance: Option<f64>,
     /// `-cp`: control socket port (`0` disables; default probes 8888..8947).
     pub control_port: Option<u16>,
     /// `-ci`: control socket bind address (default loopback).
@@ -157,6 +165,10 @@ impl Default for Cli {
             max_rtp_port: None,
             rtp_payload: None,
             random_base_ssrc: false,
+            rtp_echo: false,
+            media_bufsize: None,
+            audio_tolerance: None,
+            video_tolerance: None,
             control_port: None,
             control_ip: None,
             http: None,
@@ -275,6 +287,25 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         false,
         "",
         "Random SSRC base for rtp_stream instead of 0xCA110000",
+    ),
+    (
+        "rtp_echo",
+        false,
+        "",
+        "Echo RTP/UDP received on the media port (and media port + 2) back to the sender",
+    ),
+    ("mb", true, "BYTES", "RTP echo buffer size [default: 2048]"),
+    (
+        "audiotolerance",
+        true,
+        "RATIO",
+        "Fail the run (exit 253, SIPp's -3) when this share of an audio rtp_stream's packets fail the echo check (0.0-1.0)",
+    ),
+    (
+        "videotolerance",
+        true,
+        "RATIO",
+        "Same as -audiotolerance for video streams",
     ),
     (
         "cp",
@@ -535,6 +566,21 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
             cli.rtp_payload = Some(pt);
         }
         "random_base_ssrc" => cli.random_base_ssrc = true,
+        "rtp_echo" => cli.rtp_echo = true,
+        "mb" => cli.media_bufsize = Some(parse_num(flag, &val(value))?),
+        "audiotolerance" | "videotolerance" => {
+            let ratio: f64 = parse_num(flag, &val(value))?;
+            if !(0.0..=1.0).contains(&ratio) {
+                return Err(format!(
+                    "invalid value '{ratio}' for option '-{flag}' (0.0..=1.0)"
+                ));
+            }
+            if flag == "audiotolerance" {
+                cli.audio_tolerance = Some(ratio);
+            } else {
+                cli.video_tolerance = Some(ratio);
+            }
+        }
         "cp" => cli.control_port = Some(parse_num(flag, &val(value))?),
         "ci" => cli.control_ip = Some(parse_num(flag, &val(value))?),
         "sipr-http" => cli.http = Some(val(value)),
@@ -780,6 +826,25 @@ mod tests {
         assert_eq!(c.rtp_payload, Some(0));
         assert!(c.random_base_ssrc);
         assert!(run(&["-rtp_payload", "200", "x"]).is_err());
+    }
+
+    #[test]
+    fn echo_and_rtpcheck_flags_parse() {
+        let c = cli(&[
+            "-rtp_echo",
+            "-mb",
+            "4096",
+            "-audiotolerance",
+            "0.5",
+            "-videotolerance",
+            "1",
+            "x",
+        ]);
+        assert!(c.rtp_echo);
+        assert_eq!(c.media_bufsize, Some(4096));
+        assert_eq!(c.audio_tolerance, Some(0.5));
+        assert_eq!(c.video_tolerance, Some(1.0));
+        assert!(run(&["-audiotolerance", "1.5", "x"]).is_err());
     }
 
     #[test]

@@ -61,6 +61,16 @@ pub struct StatSet {
     pub rtp_packets_sent: u64,
     /// Payload bytes sent by media replays.
     pub rtp_bytes_sent: u64,
+    /// Bytes received on generated RTP streams' sockets (echoes).
+    pub rtp_bytes_received: u64,
+    /// `-rtp_echo`: datagrams echoed on the audio socket (SIPp "1st stream").
+    pub rtp_echo_packets: u64,
+    /// `-rtp_echo`: datagrams echoed on the video socket ("2nd stream").
+    pub rtp_echo2_packets: u64,
+    /// RTP checks that passed (streams judged against a tolerance).
+    pub rtp_check_ok: u64,
+    /// RTP checks that failed (SIPp: exit code -3).
+    pub rtp_check_failed: u64,
     /// Response-time stopwatches by RTD name (`"1"`, `"2"`, ...).
     pub rtd: HashMap<String, Histogram>,
     /// Call duration histogram (created → ended).
@@ -108,6 +118,11 @@ impl StatSet {
             rtp_streams_started: 0,
             rtp_packets_sent: 0,
             rtp_bytes_sent: 0,
+            rtp_bytes_received: 0,
+            rtp_echo_packets: 0,
+            rtp_echo2_packets: 0,
+            rtp_check_ok: 0,
+            rtp_check_failed: 0,
             rtd: HashMap::new(),
             call_length: Histogram::new(),
             response_repartition: Repartition::new(response_bounds),
@@ -176,7 +191,7 @@ impl StatSet {
                 h.percentile_ms(99.0)
             )
         });
-        let rtp_part = if self.rtp_streams_started > 0 {
+        let mut rtp_part = if self.rtp_streams_started > 0 {
             format!(
                 " | rtp {} streams {} pkts",
                 self.rtp_streams_started, self.rtp_packets_sent
@@ -184,6 +199,19 @@ impl StatSet {
         } else {
             String::new()
         };
+        if self.rtp_check_ok + self.rtp_check_failed > 0 {
+            rtp_part.push_str(&format!(
+                " rtpcheck {}/{} failed",
+                self.rtp_check_failed,
+                self.rtp_check_ok + self.rtp_check_failed
+            ));
+        }
+        if self.rtp_echo_packets + self.rtp_echo2_packets > 0 {
+            rtp_part.push_str(&format!(
+                " echo {}/{} pkts",
+                self.rtp_echo_packets, self.rtp_echo2_packets
+            ));
+        }
         format!(
             "live {live} created {} ok {} failed {} | sent {} matched {} \
              retrans {}/{} unexpected {} garbage {}{rtd_part}{rtp_part}",

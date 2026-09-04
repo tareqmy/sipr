@@ -131,6 +131,8 @@ pub enum ActionOutcome {
     RtpStream(sipr_scenario::model::RtpStreamCmd),
     /// `exec play_dtmf=`: the rendered `digits[,tone_ms]` value. Not terminal.
     PlayDtmf(String),
+    /// `<rtp_echo value=>`: switch global echoing. Not terminal.
+    RtpEcho(bool),
 }
 
 /// Run every action in order, mutating the store and collecting outcomes.
@@ -172,6 +174,7 @@ fn run_actions_impl(
                 | ActionOutcome::PlayPcap { .. }
                 | ActionOutcome::RtpStream(_)
                 | ActionOutcome::PlayDtmf(_)
+                | ActionOutcome::RtpEcho(_)
         );
         out.push(outcome);
         if terminal {
@@ -352,6 +355,7 @@ fn run_one(
         },
         Action::RtpStream(cmd) => ActionOutcome::RtpStream(cmd.clone()),
         Action::PlayDtmf(t) => ActionOutcome::PlayDtmf(render_with_store(t, store, base_ctx)),
+        Action::RtpEchoState(on) => ActionOutcome::RtpEcho(*on),
         Action::ExecInt(cmd) => match cmd {
             sipr_scenario::model::IntCmd::StopCall => {
                 ActionOutcome::FailCall("exec stop_call".into())

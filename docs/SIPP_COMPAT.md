@@ -93,7 +93,8 @@ SIPp defaults `cacert.pem`/`cakey.pem`).
 Media: `-mi <ip>` (media address; default local IP) `-mp <port>` (base media
 port, default 6000; `-min_rtp_port` is SIPp's alias — note SIPp's `-mp` is
 *that* alias too, not a fixed port) `-max_rtp_port` `-rtp_payload <pt>`
-(default 8) `-random_base_ssrc`.
+(default 8) `-random_base_ssrc` `-rtp_echo` `-mb <bytes>` `-audiotolerance`
+`-videotolerance` (M18).
 Auth: `-au`/`-ap` (username/password defaults for `[authentication]`).
 Control (M17): `-cp <port>` `-ci <ip>` (SIPp's UDP control socket; `-cp 0`
 disables — sipr addition) and sipr's `--sipr-http [HOST:]PORT` /
@@ -114,8 +115,9 @@ quit (drain), `Q` hard quit. Match SIPp muscle memory exactly.
 ## 5. Exit codes
 
 0 = all calls successful; 1 = at least one call failed; 97 = exit on internal
-command / user abort; 99 = aborted, no calls processed; -1/255 = fatal error.
-Verify exact SIPp table before closing M3 and update this line.
+command / user abort; 99 = aborted, no calls processed; -1/255 = fatal error;
+-3/253 = an RTP echo check failed (`EXIT_RTPCHECK_FAILED`, M18; wins over the
+call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
 
 ## 6. Behavior notes (folklore learned from docs/C++ — append as discovered)
 
@@ -443,5 +445,31 @@ Verify exact SIPp table before closing M3 and update this line.
   that they are unsupported instead of silently succeeding; (6) `set
   limit` in sipr simply sets `-l` (sipr never auto-sizes the cap from the
   rate). The HTTP API is a sipr addition with no SIPp counterpart.
+- RTP echo and the RTP check (M18; verified in `sipp.cpp` `rtp_echo_thread`
+  (~l.650), `setup_media_sockets` (~l.1292), `sipp_exit` (~l.1146),
+  `rtpstream.cpp` the post-send `select`/`recv`/compare block (~l.754) and
+  the exit verdict (~l.1300), `call.cpp` `E_AT_RTP_ECHO` (~l.6253)):
+  `-rtp_echo` binds *global* sockets on `media_port` and `media_port+2`
+  (probing in steps of two only when `-rtp_echo` is on — otherwise
+  `media_port` never moves), each thread `recvfrom`s with a 100 ms timeout
+  and `sendto`s the bytes back unless the process-wide `rtp_echo_state`
+  (default true, toggled by the `<rtp_echo value=>` action from *any*
+  call) is false; counters `rtp_pckts`/`rtp_bytes` (1st stream) and
+  `rtp2_*` (2nd). The RTP check lives inside the `rtp_stream` sender:
+  after every successful send it `select`s + `recv`s on the same socket
+  and `memcmp`s the payload of what arrived with the payload just sent; a
+  mismatch **or nothing received** counts as a failure; at thread exit
+  each task with packets sent is judged `failed/sent >= tolerance`
+  (`-audiotolerance`/`-videotolerance`, default 1.0) and a failure sets a
+  bit in `rtpresult`, which makes `sipp_exit` return
+  `EXIT_RTPCHECK_FAILED` (-3, shell 253) ahead of the call-failure code.
+  Consequence: with the defaults, an `rtp_stream` run against a peer that
+  does not echo exits -3. `exec rtp_echo=startaudio|…` is a different
+  feature (per-call SRTP echo threads with process-global state). sipr
+  matches the echo sockets, probing, counters, toggle action, compare
+  semantics, and exit code, with these divergences: (1) a stream is
+  judged **only when `-audiotolerance`/`-videotolerance` was given**;
+  (2) `exec rtp_echo=` (SRTP) is rejected with a pointer to `-rtp_echo`;
+  (3) `<rtp_echo variable=>` is rejected (value only).
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

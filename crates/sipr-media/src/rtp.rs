@@ -222,6 +222,12 @@ impl RtpSource {
         self.paused
     }
 
+    /// Whether this is a video stream (H264 payload).
+    #[must_use]
+    pub fn is_video(&self) -> bool {
+        self.params.video
+    }
+
     /// Advance one interval: build the next packet (or skip it while
     /// paused). The timestamp advances either way.
     pub fn next_packet(&mut self) -> RtpStep<'_> {

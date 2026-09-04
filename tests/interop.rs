@@ -24,6 +24,20 @@ fn sipp_bin() -> Option<PathBuf> {
         .find(|c| c.is_file())
 }
 
+/// A free *even* UDP port with its `+2` also free (RTP conventions; SIPp's
+/// echo binds both).
+fn free_even_port() -> u16 {
+    for _ in 0..100 {
+        let base = (free_port().max(20_000)) & !1;
+        let a = UdpSocket::bind(("127.0.0.1", base));
+        let b = UdpSocket::bind(("127.0.0.1", base + 2));
+        if a.is_ok() && b.is_ok() {
+            return base;
+        }
+    }
+    panic!("no free even port pair");
+}
+
 /// A free UDP port on loopback (bind-then-drop; racy in theory, fine here).
 fn free_port() -> u16 {
     let s = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -468,7 +482,7 @@ fn uac_pcap_against_real_sipp_uas() {
     };
     let port = free_port();
     // sipp's echo binds media_port and media_port+2: pick an even base.
-    let sipp_media = free_port() & !1;
+    let sipp_media = free_even_port();
     let sipr_media = free_port();
     let dir = std::env::temp_dir();
     let pid = std::process::id();
@@ -623,7 +637,7 @@ fn uac_rtp_stream_against_real_sipp_uas() {
         return;
     };
     let port = free_port();
-    let sipp_media = free_port() & !1;
+    let sipp_media = free_even_port();
     let sipr_media = free_port();
     let dir = std::env::temp_dir();
     let pid = std::process::id();
@@ -765,5 +779,149 @@ fn uac_rtp_stream_against_real_sipp_uas() {
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
     assert!((30..=50).contains(&sent), "rtp-sent {sent}:\n{stderr}");
+    let _ = wait_with_timeout(&mut sipp_proc.0, Duration::from_secs(10));
+}
+
+/// The RTP check against real sipp: `sipp -sn uas -rtp_echo` echoes sipr's
+/// pattern stream back, and with a tolerance sipr judges it — exit 0 with
+/// every check passed.
+#[test]
+fn rtpcheck_against_real_sipp_echo() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::rtpcheck_against_real_sipp_echo — no sipp binary found. \
+             Set SIPP_BIN=/path/to/sipp or put sipp on PATH (docs/TESTING.md §4)."
+        );
+        return;
+    };
+    let port = free_port();
+    let sipp_media = free_even_port();
+    let sipr_media = free_even_port();
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let scenario_path = dir.join(format!("sipr-interop-check-{pid}.xml"));
+    std::fs::write(
+        &scenario_path,
+        r#"<scenario name="uac-rtpcheck-interop">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]c[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+    s=-
+    c=IN IP[media_ip_type] [media_ip]
+    t=0 0
+    m=audio [media_port] RTP/AVP 8
+    a=rtpmap:8 PCMA/8000
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]c[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <nop><action><exec rtp_stream="apattern,1,8"/></action></nop>
+  <pause milliseconds="500"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]c[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#,
+    )
+    .expect("write scenario");
+    let mut sipp_proc = Reaper(
+        Command::new(&sipp)
+            .args([
+                "-sn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-mi",
+                "127.0.0.1",
+                "-mp",
+                &sipp_media.to_string(),
+                "-rtp_echo",
+                "-m",
+                "1",
+                "-timeout",
+                "30s",
+                "-bg",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uas"),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let mut sipr_proc = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .args([
+                "-sf",
+                scenario_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-mp",
+                &sipr_media.to_string(),
+                "-audiotolerance",
+                "0.5",
+                "-cp",
+                "0",
+                "-m",
+                "1",
+                "-timeout",
+                "20",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sipr"),
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_proc.0, Duration::from_secs(25));
+    let _ = std::fs::remove_file(&scenario_path);
+    let stderr = sipr_proc
+        .0
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    assert_eq!(sipr_code, Some(0), "sipr must exit 0; stderr:\n{stderr}");
+    assert!(stderr.contains("successful 1 failed 0"), "{stderr}");
+    assert!(stderr.contains("rtpcheck 0/1 failed"), "{stderr}");
     let _ = wait_with_timeout(&mut sipp_proc.0, Duration::from_secs(10));
 }
