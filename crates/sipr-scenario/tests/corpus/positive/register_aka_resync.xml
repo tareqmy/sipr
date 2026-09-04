@@ -1,0 +1,39 @@
+<scenario name="IMS REGISTER with AKAv1-MD5 resynchronisation (AUTS)">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>;tag=[pid]SIPpTag00[call_number]
+    To: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <!-- aka_sqn: the UE's SQN_MS — a challenge at or below it answers with auts= -->
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>;tag=[pid]SIPpTag00[call_number]
+    To: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    Authorization: [authentication username=001010123456789@ims.mnc001.mcc001.3gppnetwork.org aka_OP=0xCDC202D5123E20F62B6D676AC72CB318 aka_K=0x465B5CE8B199B49FAA5F0A2EE238A6BC aka_sqn=0xFFFFFFFFFFFF]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <!-- aka_resync=1 forces AUTS on every challenge, to test the server's path -->
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>;tag=[pid]SIPpTag00[call_number]
+    To: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>
+    Call-ID: [call_id]
+    CSeq: 3 REGISTER
+    Authorization: [authentication username=001010123456789@ims.mnc001.mcc001.3gppnetwork.org aka_OPc=0xCD63CB71954A9F4E48A5994E37A02BAF aka_K=0x465B5CE8B199B49FAA5F0A2EE238A6BC aka_resync=1]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>

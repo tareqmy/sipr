@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **AKA resynchronisation (AUTS)** — `[authentication … aka_sqn=0x…]`
+  gives the client's SQN_MS; a challenge whose SQN is not above it (or any
+  challenge with `aka_resync=1`) is answered with `auts=` and an
+  empty-password digest per RFC 3310 §3.2 / TS 33.102 §6.3.3, then the
+  server's fresh challenge is answered normally. SIPp's resync code is
+  unreachable, so this is new ground for SIPp scenarios.
+
 ## [0.7.0] — 2026-09-04
 
 ### Added

@@ -507,8 +507,34 @@ Behavioral oracle: `sipp.cpp` `rtp_echo_thread` / `setup_media_sockets` /
 - [x] Deferred: `exec rtp_echo=startaudio|…` (SIPp's per-call SRTP echo
       threads — SRTP is out of scope), `-rtpcheck_debug` hex dumps.
 
+## M19 — AKA resynchronisation (AUTS) ✅
+
+Behavioral oracle: RFC 3310 §3.2 and 3GPP TS 33.102 §6.3.3 — SIPp's own
+resync branch is dead code (`auth.cpp` `if (1/*…*/)`), so this is the real
+flow SIPp only sketched. Divergences (all additions) in SIPP_COMPAT §6.
+
+- [x] `sipr-auth`: `AkaKeys` gains `sqn_ms` (the client's highest accepted
+      SQN) and `force_resync`; `aka_challenge_response` still verifies
+      MAC-A first, then — when the challenge's SQN is not above SQN_MS, or
+      when forced — computes `AUTS = (SQN_MS ⊕ AK*) ‖ MAC-S` with
+      `AK* = f5*(RAND)` and `MAC-S = f1*(K, RAND, SQN_MS, AMF* = 0x0000)`.
+      `authorization_header` then carries `auts="base64(AUTS)"` and a
+      digest computed with the **empty password**, as RFC 3310 requires.
+      A forced resync without `sqn_ms` echoes the challenge's own SQN.
+- [x] Keyword params (sipr additions): `aka_sqn=0x<12 hex>` (SQN_MS) and
+      `aka_resync=1` (force AUTS on every challenge, to exercise a server's
+      resync path). Corpus `positive/register_aka_resync.xml`.
+- [x] Tests: unit (AUTS bytes verified against f5*/f1* over Test Set 1,
+      empty-password response, forced resync), e2e
+      `aka_resynchronisation_round_trips` — a registrar at the client's
+      SQN_MS rejects nothing but gets AUTS, verifies it (SQN_MS recovered
+      with AK*, MAC-S with AMF* = 0, empty-password digest), re-challenges
+      at SQN_MS + 1, and accepts the RES digest.
+- [x] Deferred: a full TS 33.102 Annex C window (Δ, wrap-around; sipr uses
+      "must be greater than SQN_MS"), keyword-rendered `aka_*` values,
+      `-auth_uri`.
+
 ## Post-v1 backlog (ordered)
 
-AUTS resync / `-auth_uri` / rendered `aka_*` params →
-`-rate_increase`/`-rate_max`/`-rate_quit` ramps → TUI `hide`/`display` →
-SRTP.
+`-rate_increase`/`-rate_max`/`-rate_quit` ramps → `-auth_uri` / rendered
+`aka_*` params → TUI `hide`/`display` → SRTP.

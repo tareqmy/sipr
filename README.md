@@ -90,7 +90,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   flags with SIPp's verification semantics.
 - UDP retransmission (T1→T2), recv-window matching verified against SIPp's C++.
 - Digest authentication (MD5 + SHA-256, `qop=auth`, proxy 407) and IMS AKA
-  (`AKAv1-MD5` with in-tree Milenage: `[authentication aka_K=0x… aka_OP=0x…]`).
+  (`AKAv1-MD5` with in-tree Milenage: `[authentication aka_K=0x… aka_OP=0x…]`),
+  including AUTS resynchronisation (`aka_sqn=`, `aka_resync=1`).
 - pcap replay: `<exec play_pcap_audio="file.pcap"/>` streams a capture's RTP
   to the peer's SDP endpoint from `-mi`/`-mp` (`[media_port]`,
   `[auto_media_port]`) — ordinary UDP sockets, so no root needed.
@@ -118,7 +119,7 @@ transport — no system libraries (no OpenSSL, no libpcap), no root for media.
 
 ## Not yet (post-v1 roadmap)
 
-SRTP, AKA resynchronisation (AUTS), and SIPp's `-rate_increase` ramps.
+SRTP and SIPp's `-rate_increase` ramps.
 
 ## Brand
 

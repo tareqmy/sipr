@@ -57,6 +57,13 @@ pub struct AkaKeys {
     /// The AMF to compute XMAC with; `None` = the AMF carried in AUTN.
     /// SIPp always uses its configured `aka_AMF` and ignores AUTN's.
     pub amf: Option<[u8; 2]>,
+    /// The client's highest accepted sequence number SQN_MS (`aka_sqn=`).
+    /// When set, a challenge whose SQN is not greater triggers
+    /// resynchronisation (TS 33.102 §6.3.3); `None` accepts any SQN.
+    pub sqn_ms: Option<[u8; 6]>,
+    /// `aka_resync=1`: resynchronise on every challenge regardless of SQN,
+    /// to exercise a server's AUTS handling.
+    pub force_resync: bool,
 }
 
 /// Why an authorization header could not be produced.
@@ -103,6 +110,10 @@ pub struct AkaResult {
     pub sqn: [u8; 6],
     /// The AMF carried in AUTN.
     pub amf: [u8; 2],
+    /// Set when the client must resynchronise (RFC 3310 §3.2): the 14-byte
+    /// AUTS = (SQN_MS ⊕ AK*) ‖ MAC-S, to send base64 in `auts=` with an
+    /// empty-password digest.
+    pub auts: Option<[u8; 14]>,
 }
 
 /// Run AKA over the challenge nonce: decode RAND‖AUTN, compute RES/CK/IK/AK,
@@ -134,7 +145,35 @@ pub fn aka_challenge_response(nonce: &str, keys: &AkaKeys) -> Result<AkaResult, 
     if xmac != mac {
         return Err(AuthError::AkaMacMismatch);
     }
-    Ok(AkaResult { vector, sqn, amf })
+    // Sequence-number check (TS 33.102 §6.3.3, simplified to "must be
+    // greater than SQN_MS"): out of range, or forced, → AUTS.
+    let sqn_ms = keys.sqn_ms;
+    let out_of_range = sqn_ms.is_some_and(|ms| sqn_value(&sqn) <= sqn_value(&ms));
+    let auts = if keys.force_resync || out_of_range {
+        let ms = sqn_ms.unwrap_or(sqn);
+        let ak_star = milenage::f5_star(&keys.k, &keys.opc, &rand);
+        // AMF* is all zeros for resynchronisation (TS 33.102 §6.3.3).
+        let mac_s = milenage::f1_star(&keys.k, &keys.opc, &rand, &ms, &[0, 0]);
+        let mut auts = [0u8; 14];
+        for i in 0..6 {
+            auts[i] = ms[i] ^ ak_star[i];
+        }
+        auts[6..14].copy_from_slice(&mac_s);
+        Some(auts)
+    } else {
+        None
+    };
+    Ok(AkaResult {
+        vector,
+        sqn,
+        amf,
+        auts,
+    })
+}
+
+/// A 48-bit SQN as an integer, for ordering.
+fn sqn_value(sqn: &[u8; 6]) -> u64 {
+    sqn.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
 }
 
 /// A parsed `WWW-Authenticate` / `Proxy-Authenticate` digest challenge.
@@ -259,21 +298,38 @@ pub struct Credentials<'a> {
 /// [`AuthError`] for an `AKAv1-MD5` challenge whose keys are missing, whose
 /// nonce is malformed, or whose MAC does not verify.
 pub fn digest_response(ch: &Challenge, cred: &Credentials<'_>) -> Result<String, AuthError> {
-    // The password: the configured string, or for AKA the raw RES bytes
-    // (RFC 3310 §3; SIPp passes RESLEN=8 explicitly so NUL bytes survive).
-    let password: Vec<u8> = if ch.algorithm == Algorithm::AkaV1Md5 {
-        let keys = cred.aka.as_ref().ok_or(AuthError::AkaKeysMissing)?;
-        aka_challenge_response(&ch.nonce, keys)?.vector.res.to_vec()
-    } else {
-        cred.password.as_bytes().to_vec()
-    };
+    let (password, _auts) = resolve_password(ch, cred)?;
+    Ok(response_for(ch, cred, &password))
+}
+
+/// The digest password: the configured string, or for AKA the raw RES
+/// bytes (RFC 3310 §3; SIPp passes RESLEN=8 explicitly so NUL bytes
+/// survive) — or an empty password plus the base64 AUTS when the client
+/// must resynchronise (RFC 3310 §3.2).
+fn resolve_password(
+    ch: &Challenge,
+    cred: &Credentials<'_>,
+) -> Result<(Vec<u8>, Option<String>), AuthError> {
+    if ch.algorithm != Algorithm::AkaV1Md5 {
+        return Ok((cred.password.as_bytes().to_vec(), None));
+    }
+    let keys = cred.aka.as_ref().ok_or(AuthError::AkaKeysMissing)?;
+    let result = aka_challenge_response(&ch.nonce, keys)?;
+    Ok(match result.auts {
+        Some(auts) => (Vec::new(), Some(base64::encode(&auts))),
+        None => (result.vector.res.to_vec(), None),
+    })
+}
+
+/// The `response` value for a given password.
+fn response_for(ch: &Challenge, cred: &Credentials<'_>, password: &[u8]) -> String {
     let mut a1 = format!("{}:{}:", cred.username, ch.realm).into_bytes();
-    a1.extend_from_slice(&password);
+    a1.extend_from_slice(password);
     let ha1 = ch.algorithm.hash(&a1);
     let ha2 = ch
         .algorithm
         .hash(format!("{}:{}", cred.method, cred.uri).as_bytes());
-    Ok(if ch.qop_auth {
+    if ch.qop_auth {
         ch.algorithm.hash(
             format!(
                 "{ha1}:{}:{:08x}:{}:auth:{ha2}",
@@ -284,7 +340,7 @@ pub fn digest_response(ch: &Challenge, cred: &Credentials<'_>) -> Result<String,
     } else {
         ch.algorithm
             .hash(format!("{ha1}:{}:{ha2}", ch.nonce).as_bytes())
-    })
+    }
 }
 
 /// Build the complete authorization header LINE (name + value, no CRLF):
@@ -294,7 +350,8 @@ pub fn digest_response(ch: &Challenge, cred: &Credentials<'_>) -> Result<String,
 ///
 /// As [`digest_response`].
 pub fn authorization_header(ch: &Challenge, cred: &Credentials<'_>) -> Result<String, AuthError> {
-    let response = digest_response(ch, cred)?;
+    let (password, auts) = resolve_password(ch, cred)?;
+    let response = response_for(ch, cred, &password);
     let name = if ch.proxy {
         "Proxy-Authorization"
     } else {
@@ -317,6 +374,9 @@ pub fn authorization_header(ch: &Challenge, cred: &Credentials<'_>) -> Result<St
     }
     if let Some(opaque) = &ch.opaque {
         v.push_str(&format!(", opaque=\"{opaque}\""));
+    }
+    if let Some(auts) = auts {
+        v.push_str(&format!(", auts=\"{auts}\""));
     }
     Ok(v)
 }
@@ -447,6 +507,8 @@ mod tests {
             k,
             opc: milenage::opc(&k, &op),
             amf: None,
+            sqn_ms: None,
+            force_resync: false,
         };
         let rand = hex::<16>("23553cbe9637a89d218ae64dae47bf35");
         let sqn = hex::<6>("ff9bb4d0b607");
@@ -516,6 +578,94 @@ mod tests {
             digest_response(&ch, &no_keys),
             Err(AuthError::AkaKeysMissing)
         );
+    }
+
+    /// Resynchronisation (RFC 3310 §3.2 / TS 33.102 §6.3.3): a challenge
+    /// whose SQN is not above the client's SQN_MS yields AUTS and an
+    /// empty-password digest; a forced resync does so regardless.
+    #[test]
+    fn akav1_resync_emits_auts_with_an_empty_password() {
+        fn hex<const N: usize>(s: &str) -> [u8; N] {
+            let mut out = [0u8; N];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+            }
+            out
+        }
+        let k = hex::<16>("465b5ce8b199b49faa5f0a2ee238a6bc");
+        let opc = milenage::opc(&k, &hex::<16>("cdc202d5123e20f62b6d676ac72cb318"));
+        let rand = hex::<16>("23553cbe9637a89d218ae64dae47bf35");
+        let sqn = hex::<6>("ff9bb4d0b607");
+        let amf = hex::<2>("b9b9");
+        let ak = hex::<6>("aa689c648370");
+        let mut nonce_bytes = rand.to_vec();
+        nonce_bytes.extend(sqn.iter().zip(&ak).map(|(s, a)| s ^ a));
+        nonce_bytes.extend_from_slice(&amf);
+        nonce_bytes.extend_from_slice(&hex::<8>("4a9ffac354dfafb3"));
+        let nonce = base64::encode(&nonce_bytes);
+        let base = AkaKeys {
+            k,
+            opc,
+            amf: None,
+            sqn_ms: None,
+            force_resync: false,
+        };
+        // SQN_MS below the challenge's SQN: accepted, no AUTS.
+        let ok = AkaKeys {
+            sqn_ms: Some(hex::<6>("ff9bb4d0b600")),
+            ..base.clone()
+        };
+        assert!(aka_challenge_response(&nonce, &ok).unwrap().auts.is_none());
+        // SQN_MS equal to it: out of range → AUTS.
+        let stale = AkaKeys {
+            sqn_ms: Some(sqn),
+            ..base.clone()
+        };
+        let r = aka_challenge_response(&nonce, &stale).unwrap();
+        let auts = r.auts.expect("resync");
+        let ak_star = hex::<6>("451e8beca43b");
+        for i in 0..6 {
+            assert_eq!(auts[i] ^ ak_star[i], sqn[i], "SQN_MS ⊕ AK* at {i}");
+        }
+        assert_eq!(
+            &auts[6..14],
+            &milenage::f1_star(&k, &opc, &rand, &sqn, &[0, 0])
+        );
+        // Header: auts present, response computed with an empty password.
+        let ch = parse_challenge(
+            &format!(r#"Digest realm="ims", nonce="{nonce}", algorithm=AKAv1-MD5, qop="auth""#),
+            false,
+        )
+        .unwrap();
+        let cred = Credentials {
+            username: "u",
+            password: "ignored",
+            method: "REGISTER",
+            uri: "sip:ims",
+            cnonce: "c",
+            nc: 1,
+            aka: Some(stale),
+        };
+        let header = authorization_header(&ch, &cred).unwrap();
+        assert!(
+            header.contains(&format!("auts=\"{}\"", base64::encode(&auts))),
+            "{header}"
+        );
+        let ha1 = md5_hex(b"u:ims:");
+        let ha2 = md5_hex(b"REGISTER:sip:ims");
+        let expected = md5_hex(format!("{ha1}:{nonce}:00000001:c:auth:{ha2}").as_bytes());
+        assert!(
+            header.contains(&format!("response=\"{expected}\"")),
+            "{header}"
+        );
+        // Forced resync without an SQN_MS uses the challenge's own SQN.
+        let forced = AkaKeys {
+            force_resync: true,
+            ..base
+        };
+        let r = aka_challenge_response(&nonce, &forced).unwrap();
+        assert!(r.auts.is_some());
+        assert_eq!(&r.auts.unwrap()[0..6], &auts[0..6]);
     }
 
     #[test]

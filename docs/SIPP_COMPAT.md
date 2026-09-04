@@ -70,8 +70,9 @@ Media keywords (M14): `[media_ip]` (`-mi`, default the local IP),
 every call — as in SIPp), `[auto_media_port]` (per-call 4-port block:
 `base + 4*(call_number-1) % 10000`, SIPp's undocumented keyword), and the
 `+N` offset forms `[media_port+1]` / `[auto_media_port+2]` (RTCP, video).
-`[authentication]` params (M16): `username=` `password=` `aka_K=` `aka_OP=`
-`aka_AMF=` (SIPp), `aka_OPc=` (sipr addition); `0x`-prefixed hex or raw bytes.
+`[authentication]` params (M16/M19): `username=` `password=` `aka_K=` `aka_OP=`
+`aka_AMF=` (SIPp), `aka_OPc=` `aka_sqn=` `aka_resync=` (sipr additions);
+`0x`-prefixed hex or raw bytes.
 `[rtpstream_audio_port]` / `[rtpstream_video_port]` (M15): a port allocated
 to the call from `-mp`..`-max_rtp_port` in steps of two the first time it
 renders; `+N` forms never allocate (`a=rtcp:[rtpstream_audio_port+1]`).
@@ -471,5 +472,17 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   judged **only when `-audiotolerance`/`-videotolerance` was given**;
   (2) `exec rtp_echo=` (SRTP) is rejected with a pointer to `-rtp_echo`;
   (3) `<rtp_echo variable=>` is rejected (value only).
+- AKA resynchronisation (M19): SIPp's `auth.cpp` has an AUTS branch guarded
+  by `if (1/*sqn[5] > sqn_he[5]*/)` (~l.676) whose real condition is
+  commented out, so the always-taken branch stores one SQN byte into a
+  write-only global and **SIPp never emits `auts=`**; had it run, it would
+  have used the configured AMF instead of AMF* = 0 and an uninitialised
+  SQN_MS. sipr implements the standard flow (RFC 3310 §3.2, TS 33.102
+  §6.3.3): with `aka_sqn=` the challenge's SQN must be greater than
+  SQN_MS, otherwise (or with `aka_resync=1`) the response carries
+  `auts="base64((SQN_MS ⊕ f5*(RAND)) ‖ f1*(K, RAND, SQN_MS, 0x0000))"` and
+  a digest over the empty password; the scenario then expects the
+  server's fresh 401 (`<recv response="401" auth="true"/>` again). Pure
+  addition — no SIPp behavior to match.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

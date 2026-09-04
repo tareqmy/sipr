@@ -38,6 +38,21 @@ fn free_even_port() -> u16 {
     panic!("no free even port pair");
 }
 
+/// A base port with `base..base+span` all free, for `[auto_media_port]`
+/// scenarios that spread calls over 4-port blocks.
+fn free_port_block(span: u16) -> u16 {
+    for _ in 0..100 {
+        let base = free_port().max(20_000) & !1;
+        let held: Vec<_> = (0..span)
+            .map(|i| UdpSocket::bind(("127.0.0.1", base + i)))
+            .collect();
+        if held.iter().all(Result::is_ok) {
+            return base;
+        }
+    }
+    panic!("no free port block of {span}");
+}
+
 /// A free UDP port on loopback (bind-then-drop; racy in theory, fine here).
 fn free_port() -> u16 {
     let s = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -483,7 +498,7 @@ fn uac_pcap_against_real_sipp_uas() {
     let port = free_port();
     // sipp's echo binds media_port and media_port+2: pick an even base.
     let sipp_media = free_even_port();
-    let sipr_media = free_port();
+    let sipr_media = free_port_block(12);
     let dir = std::env::temp_dir();
     let pid = std::process::id();
     let pcap_path = dir.join(format!("sipr-interop-{pid}.pcap"));

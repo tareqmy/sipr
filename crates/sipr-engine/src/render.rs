@@ -402,9 +402,10 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
     Ok(())
 }
 
-/// The AKA secrets from `[authentication aka_K= aka_OP=|aka_OPc= aka_AMF=]`
-/// (SIPp's parameter names; `aka_OPc` is a sipr addition — SIPp only takes
-/// OP). Values are `0x`-prefixed hex of exactly the right length, or raw
+/// The AKA secrets from `[authentication aka_K= aka_OP=|aka_OPc= aka_AMF=
+/// aka_sqn= aka_resync=]` (SIPp's parameter names; `aka_OPc`, `aka_sqn`
+/// (the client's SQN_MS, 6 bytes) and `aka_resync` (force AUTS) are sipr
+/// additions — SIPp only takes OP and never resynchronises). Values are `0x`-prefixed hex of exactly the right length, or raw
 /// bytes of that length. Without `aka_K`, SIPp uses the password's first
 /// 16 bytes as K (documented); that fallback is honoured when the password
 /// is long enough, otherwise it is an error rather than a read past the end.
@@ -450,7 +451,30 @@ fn aka_keys(
         Some(v) => Some(parse_secret(v, "aka_AMF")?),
         None => None,
     };
-    Ok(sipr_auth::AkaKeys { k, opc, amf })
+    // sipr additions for resynchronisation testing (SIPp never sends AUTS).
+    let sqn_ms: Option<[u8; 6]> = match get("aka_sqn") {
+        Some(v) => Some(parse_secret(v, "aka_sqn")?),
+        None => None,
+    };
+    let force_resync = match get("aka_resync") {
+        None => false,
+        Some(v) => match v.trim() {
+            "1" | "true" | "yes" => true,
+            "0" | "false" | "no" => false,
+            other => {
+                return Err(RenderError(format!(
+                    "[authentication]: aka_resync= must be 0/1 (got '{other}')"
+                )));
+            }
+        },
+    };
+    Ok(sipr_auth::AkaKeys {
+        k,
+        opc,
+        amf,
+        sqn_ms,
+        force_resync,
+    })
 }
 
 /// `0x`-prefixed hex of exactly `N` bytes, or `N` raw bytes.

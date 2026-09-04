@@ -2200,6 +2200,23 @@ fn spawn_aka_registrar(
     realm: &'static str,
     user: &'static str,
 ) -> (SocketAddr, std::thread::JoinHandle<bool>) {
+    let (addr, h) = spawn_aka_registrar_with_sqn(realm, user, [0xff, 0x9b, 0xb4, 0xd0, 0xb6, 0x07]);
+    let h2 = std::thread::spawn(move || h.join().expect("registrar").0);
+    (addr, h2)
+}
+
+/// A registrar that challenges with `AKAv1-MD5` using 3GPP TS 35.208 Test
+/// Set 1 keys and RAND, at sequence number `sqn`; verifies RES-password
+/// digests, and handles `auts=` resynchronisation (RFC 3310 §3.2): the
+/// AUTS is checked (SQN_MS recovered with AK*, MAC-S with AMF* = 0), the
+/// digest must use the empty password, and a fresh challenge at SQN_MS + 1
+/// follows. Returns `(authenticated, resynchronised)`.
+#[allow(clippy::too_many_lines)]
+fn spawn_aka_registrar_with_sqn(
+    realm: &'static str,
+    user: &'static str,
+    sqn: [u8; 6],
+) -> (SocketAddr, std::thread::JoinHandle<(bool, bool)>) {
     fn hex<const N: usize>(s: &str) -> [u8; N] {
         let mut out = [0u8; N];
         for (i, b) in out.iter_mut().enumerate() {
@@ -2211,16 +2228,17 @@ fn spawn_aka_registrar(
     let op = hex::<16>("cdc202d5123e20f62b6d676ac72cb318");
     let opc = sipr_auth::milenage::opc(&k, &op);
     let rand = hex::<16>("23553cbe9637a89d218ae64dae47bf35");
-    let sqn = hex::<6>("ff9bb4d0b607");
     let amf = hex::<2>("b9b9");
     let v = sipr_auth::milenage::f2345(&k, &opc, &rand);
-    let mac = sipr_auth::milenage::f1(&k, &opc, &rand, &sqn, &amf);
-    let mut nonce_bytes = rand.to_vec();
-    nonce_bytes.extend(sqn.iter().zip(&v.ak).map(|(s, a)| s ^ a));
-    nonce_bytes.extend_from_slice(&amf);
-    nonce_bytes.extend_from_slice(&mac);
-    let nonce = sipr_auth::base64::encode(&nonce_bytes);
     let res = v.res;
+    let nonce_for = move |sqn: [u8; 6]| -> String {
+        let mac = sipr_auth::milenage::f1(&k, &opc, &rand, &sqn, &amf);
+        let mut bytes = rand.to_vec();
+        bytes.extend(sqn.iter().zip(&v.ak).map(|(s, a)| s ^ a));
+        bytes.extend_from_slice(&amf);
+        bytes.extend_from_slice(&mac);
+        sipr_auth::base64::encode(&bytes)
+    };
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind registrar");
     let addr = sock.local_addr().expect("addr");
     sock.set_read_timeout(Some(Duration::from_secs(5)))
@@ -2228,6 +2246,23 @@ fn spawn_aka_registrar(
     let handle = std::thread::spawn(move || {
         let mut buf = [0u8; 65_535];
         let mut authenticated = false;
+        let mut resynced = false;
+        let mut sqn = sqn;
+        let mut nonce = nonce_for(sqn);
+        let challenge = |msg: &Inbound, nonce: &str| -> String {
+            let mut r = String::from("SIP/2.0 401 Unauthorized\r\n");
+            for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
+                for l in msg.header_lines(name) {
+                    r.push_str(l);
+                    r.push_str("\r\n");
+                }
+            }
+            r.push_str(&format!(
+                "WWW-Authenticate: Digest realm=\"{realm}\", nonce=\"{nonce}\", \
+                 algorithm=AKAv1-MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n"
+            ));
+            r
+        };
         while let Ok((n, from)) = sock.recv_from(&mut buf) {
             let Ok(msg) = Inbound::parse(&buf[..n]) else {
                 continue;
@@ -2235,49 +2270,52 @@ fn spawn_aka_registrar(
             if msg.method() != Some("REGISTER") {
                 continue;
             }
-            let mut r;
-            match msg.header("Authorization") {
-                None => {
-                    r = String::from("SIP/2.0 401 Unauthorized\r\n");
-                    for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
-                        for l in msg.header_lines(name) {
-                            r.push_str(l);
-                            r.push_str("\r\n");
-                        }
+            let Some(auth) = msg.header("Authorization") else {
+                let _ = sock.send_to(challenge(&msg, &nonce).as_bytes(), from);
+                continue;
+            };
+            let field = |k: &str| -> Option<String> {
+                auth.split(',').find_map(|p| {
+                    let p = p.trim();
+                    p.strip_prefix(&format!("{k}="))
+                        .map(|v| v.trim_matches('"').to_owned())
+                })
+            };
+            let uri = field("uri").unwrap_or_default();
+            let cnonce = field("cnonce").unwrap_or_default();
+            let nc = field("nc").unwrap_or_default();
+            let expected_with = |password: &[u8]| -> String {
+                let mut a1 = format!("{user}:{realm}:").into_bytes();
+                a1.extend_from_slice(password);
+                let ha1 = sipr_auth::md5_hex(&a1);
+                let ha2 = sipr_auth::md5_hex(format!("REGISTER:{uri}").as_bytes());
+                sipr_auth::md5_hex(format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}").as_bytes())
+            };
+            let got = field("response").unwrap_or_default();
+            if let Some(auts_b64) = field("auts") {
+                // Resynchronisation: verify AUTS, then re-challenge.
+                let auts = sipr_auth::base64::decode(&auts_b64).unwrap_or_default();
+                let ak_star = sipr_auth::milenage::f5_star(&k, &opc, &rand);
+                let mut sqn_ms = [0u8; 6];
+                let valid = auts.len() == 14 && {
+                    for i in 0..6 {
+                        sqn_ms[i] = auts[i] ^ ak_star[i];
                     }
-                    r.push_str(&format!(
-                        "WWW-Authenticate: Digest realm=\"{realm}\", nonce=\"{nonce}\", \
-                         algorithm=AKAv1-MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n"
-                    ));
-                }
-                Some(auth) => {
-                    let field = |k: &str| -> Option<String> {
-                        auth.split(',').find_map(|p| {
-                            let p = p.trim();
-                            p.strip_prefix(&format!("{k}="))
-                                .map(|v| v.trim_matches('"').to_owned())
-                        })
-                    };
-                    let uri = field("uri").unwrap_or_default();
-                    let cnonce = field("cnonce").unwrap_or_default();
-                    let nc = field("nc").unwrap_or_default();
-                    let mut a1 = format!("{user}:{realm}:").into_bytes();
-                    a1.extend_from_slice(&res);
-                    let ha1 = sipr_auth::md5_hex(&a1);
-                    let ha2 = sipr_auth::md5_hex(format!("REGISTER:{uri}").as_bytes());
-                    let expected = sipr_auth::md5_hex(
-                        format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}").as_bytes(),
-                    );
-                    authenticated = field("response").unwrap_or_default() == expected
-                        && field("algorithm").as_deref() == Some("AKAv1-MD5");
-                    r = format!(
-                        "SIP/2.0 {}\r\n",
-                        if authenticated {
-                            "200 OK"
-                        } else {
-                            "403 Forbidden"
-                        }
-                    );
+                    let mac_s = sipr_auth::milenage::f1_star(&k, &opc, &rand, &sqn_ms, &[0, 0]);
+                    auts[6..14] == mac_s && got == expected_with(b"")
+                };
+                if valid {
+                    resynced = true;
+                    // SQN_HE := SQN_MS + 1 (big-endian 48-bit).
+                    let mut n = sqn_ms.iter().fold(0u64, |a, b| (a << 8) | u64::from(*b)) + 1;
+                    for i in (0..6).rev() {
+                        sqn[i] = (n & 0xff) as u8;
+                        n >>= 8;
+                    }
+                    nonce = nonce_for(sqn);
+                    let _ = sock.send_to(challenge(&msg, &nonce).as_bytes(), from);
+                } else {
+                    let mut r = String::from("SIP/2.0 403 Forbidden\r\n");
                     for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
                         for l in msg.header_lines(name) {
                             r.push_str(l);
@@ -2285,14 +2323,33 @@ fn spawn_aka_registrar(
                         }
                     }
                     r.push_str("Content-Length: 0\r\n\r\n");
+                    let _ = sock.send_to(r.as_bytes(), from);
+                }
+                continue;
+            }
+            authenticated =
+                got == expected_with(&res) && field("algorithm").as_deref() == Some("AKAv1-MD5");
+            let mut r = format!(
+                "SIP/2.0 {}\r\n",
+                if authenticated {
+                    "200 OK"
+                } else {
+                    "403 Forbidden"
+                }
+            );
+            for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
+                for l in msg.header_lines(name) {
+                    r.push_str(l);
+                    r.push_str("\r\n");
                 }
             }
+            r.push_str("Content-Length: 0\r\n\r\n");
             let _ = sock.send_to(r.as_bytes(), from);
             if authenticated {
                 break;
             }
         }
-        authenticated
+        (authenticated, resynced)
     });
     (addr, handle)
 }
@@ -2779,5 +2836,75 @@ fn rtp_echo_action_toggles_the_global_echo() {
     assert!(
         err.contains("uses <rtp_echo> but -rtp_echo was not given"),
         "{err}"
+    );
+}
+
+fn aka_resync_scenario(auth_params: &str) -> String {
+    // REGISTER → 401 → REGISTER(auts) → 401 → REGISTER → 200
+    let register = |cseq: u32, auth: &str| {
+        format!(
+            r#"  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:ims@[remote_ip]>;tag=[pid]a[call_number]
+    To: <sip:ims@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: {cseq} REGISTER
+    Contact: <sip:ims@[local_ip]:[local_port]>
+{auth}    Max-Forwards: 70
+    Expires: 3600
+    Content-Length: 0
+
+  ]]></send>
+"#
+        )
+    };
+    let auth_line = format!("    Authorization: [authentication {auth_params}]\n");
+    format!(
+        "<scenario name=\"register-aka-resync\">\n{}  <recv response=\"401\" auth=\"true\"/>\n{}  <recv response=\"401\" auth=\"true\"/>\n{}  <recv response=\"200\"/>\n</scenario>",
+        register(1, ""),
+        register(2, &auth_line),
+        register(3, &auth_line)
+    )
+}
+
+#[test]
+fn aka_resynchronisation_round_trips() {
+    // The registrar is at SQN ff9bb4d0b607; the client claims SQN_MS equal
+    // to it, so the first challenge is out of range → AUTS → re-challenge
+    // at SQN_MS + 1 → accepted.
+    let (addr, registrar) =
+        spawn_aka_registrar_with_sqn("ims.example", "ims", [0xff, 0x9b, 0xb4, 0xd0, 0xb6, 0x07]);
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("sipr-aka-resync-{}.xml", std::process::id()));
+    std::fs::write(
+        &path,
+        aka_resync_scenario(
+            "username=ims aka_K=0x465B5CE8B199B49FAA5F0A2EE238A6BC \
+             aka_OP=0xCDC202D5123E20F62B6D676AC72CB318 aka_sqn=0xFF9BB4D0B607",
+        ),
+    )
+    .expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-cp",
+        "0",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "sipr stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    let (authenticated, resynced) = registrar.join().expect("registrar");
+    assert!(resynced, "registrar never saw a valid AUTS");
+    assert!(
+        authenticated,
+        "registrar must accept the post-resync response"
     );
 }
