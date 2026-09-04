@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-04
+
 ### Added
 
 - **AKA resynchronisation (AUTS)** — `[authentication … aka_sqn=0x…]`
@@ -208,7 +210,8 @@ library — no external crates.
   leftmost-longest — identical on the patterns real scenarios use; see
   `docs/SIPP_COMPAT.md` §6.
 
-[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/tareqmy/sipr/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/tareqmy/sipr/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/tareqmy/sipr/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/tareqmy/sipr/compare/v0.4.0...v0.5.0
