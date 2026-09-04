@@ -70,6 +70,9 @@ pub struct StreamSpec {
     pub local_port: u16,
     /// Peer endpoint learned from its SDP.
     pub remote: SocketAddr,
+    /// SRTP `(send, receive)` contexts when the call negotiated SDES keys;
+    /// generated streams only (pcap replays go out as captured).
+    pub srtp: Option<(crate::srtp::SrtpContext, crate::srtp::SrtpContext)>,
 }
 
 /// What the media thread reports back to the engine.
@@ -418,10 +421,11 @@ fn pump_rtp(active: &mut Active, now: Instant, packets: &AtomicU64, bytes: &Atom
     let Some((_, sock, remote)) = active.sockets.first() else {
         return Pump::Failed("no media socket".into());
     };
+    let started = active.started;
+    let srtp = &mut active.spec.srtp;
     let Source::Rtp(rtp) = &mut active.spec.source else {
         return Pump::Failed("not an RTP source".into());
     };
-    let started = active.started;
     let mut recv_buf = [0u8; 2048];
     loop {
         let at = started + rtp.interval() * u32::try_from(rtp.ticks()).unwrap_or(u32::MAX);
@@ -431,7 +435,12 @@ fn pump_rtp(active: &mut Active, now: Instant, packets: &AtomicU64, bytes: &Atom
         match rtp.next_packet() {
             RtpStep::Done => return Pump::Finished,
             RtpStep::Silent => {}
-            RtpStep::Packet(p) => match sock.send_to(p, remote) {
+            RtpStep::Packet(p) => match sock.send_to(
+                srtp.as_mut()
+                    .map_or_else(|| p.to_vec(), |(tx, _)| tx.protect(p))
+                    .as_slice(),
+                remote,
+            ) {
                 Ok(_) => {
                     packets.fetch_add(1, Ordering::Relaxed);
                     bytes.fetch_add(p.len() as u64, Ordering::Relaxed);
@@ -445,8 +454,14 @@ fn pump_rtp(active: &mut Active, now: Instant, packets: &AtomicU64, bytes: &Atom
                         active.bytes_in += n as u64;
                         echoed = Some(n);
                     }
-                    let matches = echoed
-                        .is_some_and(|n| n > 12 && p.len() > 12 && recv_buf[12..n] == p[12..]);
+                    // SRTP: unprotect the echo (peer's key) before comparing
+                    // plaintext payloads; an auth failure counts as a miss.
+                    let matches = echoed.is_some_and(|n| match srtp.as_mut() {
+                        Some((_, rx)) => rx.unprotect(&recv_buf[..n]).is_ok_and(|clear| {
+                            clear.len() > 12 && p.len() > 12 && clear[12..] == p[12..]
+                        }),
+                        None => n > 12 && p.len() > 12 && recv_buf[12..n] == p[12..],
+                    });
                     if !matches {
                         active.check_failed += 1;
                     }
@@ -531,6 +546,7 @@ mod tests {
             local_ip: "127.0.0.1".parse().unwrap(),
             local_port: 0,
             remote,
+            srtp: None,
         }
     }
 
@@ -693,6 +709,7 @@ mod tests {
                 local_ip: "127.0.0.1".parse().unwrap(),
                 local_port: 0,
                 remote,
+                srtp: None,
             })
             .unwrap();
         let mut buf = [0u8; 64];
@@ -741,6 +758,7 @@ mod tests {
                 local_ip: "127.0.0.1".parse().unwrap(),
                 local_port: 0,
                 remote,
+                srtp: None,
             })
             .unwrap();
         rx_sock.recv_from(&mut buf).unwrap();
@@ -790,6 +808,7 @@ mod tests {
                 local_ip: "127.0.0.1".parse().unwrap(),
                 local_port: 0,
                 remote,
+                srtp: None,
             })
             .unwrap();
         let check = ev_rx.recv_timeout(Duration::from_secs(3)).unwrap();

@@ -77,6 +77,21 @@ pub enum Keyword {
     },
     /// `[media_ip_type]` — `4` or `6` for the media address.
     MediaIpType,
+    /// SIPp's SRTP/SDES keywords: `[cryptotag1audio]`,
+    /// `[cryptosuiteaescm128sha1801audio]`, `[cryptokeyparams1audio]`,
+    /// `[ueaescm128sha1801audio]` and the `2` (secondary) / `video` forms,
+    /// with SIPp's `[keyword-N]` offset (a negative offset on `keyparams`
+    /// reuses the call's existing key instead of generating a new one).
+    Crypto {
+        /// What the keyword renders.
+        kw: CryptoKw,
+        /// `1` = primary `a=crypto` line, `2` = secondary.
+        slot: u8,
+        /// `video` vs `audio`.
+        video: bool,
+        /// The `+N`/`-N` suffix, 0 when absent.
+        offset: i32,
+    },
     /// `[rtpstream_audio_port]` / `[rtpstream_video_port]` (+`N`): a port
     /// allocated to this call from the `-mp`..`-max_rtp_port` range in
     /// steps of two when first rendered; `+N` never allocates (RTCP).
@@ -106,6 +121,19 @@ pub enum Keyword {
     },
     /// Unrecognized keyword: emitted verbatim (including brackets).
     Unknown(String),
+}
+
+/// What an SRTP keyword renders (`docs/SIPP_COMPAT.md` §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CryptoKw {
+    /// `cryptotagN…`: the tag digit.
+    Tag,
+    /// `cryptosuite<suite>N…`: the suite name (also selects it locally).
+    Suite(String),
+    /// `cryptokeyparamsN…`: base64 master key ‖ salt.
+    KeyParams,
+    /// `ue<suite>N…`: `UNENCRYPTED_SRTP`, and locally: authenticate only.
+    Unencrypted(String),
 }
 
 /// The `line=` selector of a `[fieldN]` keyword. SIPp renders this as a
@@ -284,11 +312,70 @@ fn classify(body: &str) -> Classified {
         "media_ip" => simple(Keyword::MediaIp),
         "media_ip_type" => simple(Keyword::MediaIpType),
         "authentication" => Classified::Keyword(Keyword::Authentication(parse_params(params))),
-        _ => match classify_media_port(name) {
+        _ => match classify_media_port(name).or_else(|| classify_crypto(name)) {
             Some(kw) => simple(kw),
             None => classify_field(name, params),
         },
     }
+}
+
+/// SIPp's SRTP keyword names: `crypto(tag|suite<s>|keyparams)(1|2)(audio|video)`
+/// and `ue<s>(1|2)(audio|video)`, `<s>` one of `aescm128sha180`,
+/// `aescm128sha132`, `nullsha180`, `nullsha132`, plus a `[+-]N` offset.
+fn classify_crypto(name: &str) -> Option<Keyword> {
+    // Split a trailing offset.
+    let (base, offset) = match name.rfind(['+', '-']) {
+        Some(i) if name[i + 1..].chars().all(|c| c.is_ascii_digit()) && i + 1 < name.len() => {
+            let n: i32 = name[i + 1..].parse().ok()?;
+            (&name[..i], if name.as_bytes()[i] == b'-' { -n } else { n })
+        }
+        _ => (name, 0),
+    };
+    let (base, video) = if let Some(b) = base.strip_suffix("audio") {
+        (b, false)
+    } else if let Some(b) = base.strip_suffix("video") {
+        (b, true)
+    } else {
+        return None;
+    };
+    let (base, slot) = match base.as_bytes().last() {
+        Some(b'1') => (&base[..base.len() - 1], 1),
+        Some(b'2') => (&base[..base.len() - 1], 2),
+        _ => return None,
+    };
+    let suite = |short: &str| -> Option<String> {
+        Some(
+            match short {
+                "aescm128sha180" => "AES_CM_128_HMAC_SHA1_80",
+                "aescm128sha132" => "AES_CM_128_HMAC_SHA1_32",
+                "nullsha180" => "NULL_HMAC_SHA1_80",
+                "nullsha132" => "NULL_HMAC_SHA1_32",
+                _ => return None,
+            }
+            .to_owned(),
+        )
+    };
+    let kw = if base == "cryptotag" {
+        CryptoKw::Tag
+    } else if base == "cryptokeyparams" {
+        CryptoKw::KeyParams
+    } else if let Some(s) = base.strip_prefix("cryptosuite") {
+        CryptoKw::Suite(suite(s)?)
+    } else if let Some(s) = base.strip_prefix("ue") {
+        // Only the AES suites have `ue` forms in SIPp.
+        if !s.starts_with("aescm128") {
+            return None;
+        }
+        CryptoKw::Unencrypted(suite(s)?)
+    } else {
+        return None;
+    };
+    Some(Keyword::Crypto {
+        kw,
+        slot,
+        video,
+        offset,
+    })
 }
 
 /// `[media_port]`, `[auto_media_port]`, `[rtpstream_audio_port]`,
@@ -523,6 +610,73 @@ mod tests {
         // A malformed offset is not a keyword: verbatim + warning.
         let (_, warns) = tok("[media_port+x]");
         assert_eq!(warns.len(), 1, "{warns:?}");
+    }
+
+    #[test]
+    fn srtp_keywords_follow_sipp_names() {
+        let (t, warns) = tok(
+            "a=crypto:[cryptotag1audio] [cryptosuiteaescm128sha1801audio] inline:[cryptokeyparams1audio]\r\n\
+             a=crypto:[cryptotag2video] [cryptosuitenullsha1322video] inline:[cryptokeyparams2video-9] [ueaescm128sha1321audio]\r\n",
+        );
+        assert!(warns.is_empty(), "{warns:?}");
+        let kws: Vec<&Keyword> = t.keywords().collect();
+        assert_eq!(
+            kws[0],
+            &Keyword::Crypto {
+                kw: CryptoKw::Tag,
+                slot: 1,
+                video: false,
+                offset: 0
+            }
+        );
+        assert_eq!(
+            kws[1],
+            &Keyword::Crypto {
+                kw: CryptoKw::Suite("AES_CM_128_HMAC_SHA1_80".into()),
+                slot: 1,
+                video: false,
+                offset: 0
+            }
+        );
+        assert_eq!(
+            kws[2],
+            &Keyword::Crypto {
+                kw: CryptoKw::KeyParams,
+                slot: 1,
+                video: false,
+                offset: 0
+            }
+        );
+        assert_eq!(
+            kws[4],
+            &Keyword::Crypto {
+                kw: CryptoKw::Suite("NULL_HMAC_SHA1_32".into()),
+                slot: 2,
+                video: true,
+                offset: 0
+            }
+        );
+        assert_eq!(
+            kws[5],
+            &Keyword::Crypto {
+                kw: CryptoKw::KeyParams,
+                slot: 2,
+                video: true,
+                offset: -9
+            }
+        );
+        assert_eq!(
+            kws[6],
+            &Keyword::Crypto {
+                kw: CryptoKw::Unencrypted("AES_CM_128_HMAC_SHA1_32".into()),
+                slot: 1,
+                video: false,
+                offset: 0
+            }
+        );
+        // Unknown suite / no ue for NULL: verbatim with a warning.
+        let (_, warns) = tok("[cryptosuitefoo1audio] [uenullsha1801audio]");
+        assert_eq!(warns.len(), 2, "{warns:?}");
     }
 
     #[test]

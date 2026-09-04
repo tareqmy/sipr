@@ -73,6 +73,11 @@ every call — as in SIPp), `[auto_media_port]` (per-call 4-port block:
 `[authentication]` params (M16/M19): `username=` `password=` `aka_K=` `aka_OP=`
 `aka_AMF=` (SIPp), `aka_OPc=` `aka_sqn=` `aka_resync=` (sipr additions);
 `0x`-prefixed hex or raw bytes.
+SRTP/SDES (M23): `[cryptotag{1,2}{audio,video}]`,
+`[cryptosuite<suite>{1,2}{audio,video}]`, `[cryptokeyparams{1,2}{audio,video}]`
+(`-N` offset = reuse the key), `[ue<suite>{1,2}{audio,video}]`
+(`UNENCRYPTED_SRTP`), `<suite>` ∈ `aescm128sha180 aescm128sha132 nullsha180
+nullsha132`.
 `[rtpstream_audio_port]` / `[rtpstream_video_port]` (M15): a port allocated
 to the call from `-mp`..`-max_rtp_port` in steps of two the first time it
 renders; `+N` forms never allocate (`a=rtcp:[rtpstream_audio_port+1]`).
@@ -146,9 +151,12 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
     as in SIPp. (`optional="global"` would bypass contig; sipr rejects that
     value until implemented.)
   - *CSeq-method guard*: beyond index 0, a response only matches a recv if
-    its CSeq method equals the nearest preceding request send's method
-    (`recv_response_for_cseq_method_list`) — a late 200/INVITE cannot match
-    the BYE's 200.
+    its CSeq method occurs in the list of **all** request methods sent so
+    far (`recv_response_for_cseq_method_list`, built by concatenating each
+    send's method in `scenario.cpp` and tested with `strstr`) — so after
+    INVITE and PRACK both 200s match the following recvs, while a response
+    to a method never sent cannot. (Until M23 sipr kept only the nearest
+    preceding method, which rejected the INVITE's 200 after a PRACK.)
 - A matched recv cancels the pending retransmission of the last send
   (`next_retrans = 0`) — including a matched *provisional*. SIPp's own code
   carries a TODO admitting this can erroneously stop retransmission (e.g.
@@ -524,5 +532,42 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   (default true, `set hide true|false`) holds. sipr matches this. Screen
   keys: sipr maps `1`/`2`/`3` like SIPp and ignores `4`..`9` (no
   variables/TDM screens; secondary repartitions are not drawn separately).
+- SRTP (M23; verified in `jlsrtp.cpp` — `pseudorandomFunction` ~l.66,
+  `computePacketIV` ~l.416, `issueAuthenticationTag` ~l.639,
+  `processOutgoingPacket` ~l.2055 / `processIncomingPacket` ~l.2158,
+  `encodeMasterKeySalt` ~l.2518; `call.cpp` keyword handlers ~l.2860-3300,
+  `extract_srtp_remote_info` ~l.564; `rtpstream.cpp` echo ~l.2519):
+  JLSRTP is AES-CM-128 or NULL cipher × HMAC-SHA1 80/32, master key 16 +
+  salt 14 always, kdr 0 (key ids `label || 0`), no MKI, no replay list,
+  no SRTCP, a fixed 12-byte header and a *configured* payload length.
+  `[cryptokeyparams…]` generates a fresh `RAND_bytes` key on **every**
+  render (negative offset = reuse); `[cryptosuite…]` selects the local
+  suite; `[ue…]` renders `UNENCRYPTED_SRTP` and switches the local cipher
+  to NULL while still advertising the AES suite. Received SDP: the first
+  `a=crypto:` in the media section is PRIMARY, the second SECONDARY (at
+  most two, `sscanf`-parsed); only the primary attribute is ever active —
+  `selectActiveCrypto` is never called — and `swapCrypto` swaps the two
+  when the answer's primary suite is the offer's secondary. The sender's
+  echo check decrypts the echo under the peer's key and compares
+  payloads; the per-call echo re-encrypts under its own key with the
+  *caller's* SSRC and sequence numbers. **Bug**: the auth tag is computed
+  with the stale `_ROC` (updated after the tag is issued), so after
+  sequence 65535 SIPp's packets are rejected by conforming stacks (two
+  SIPps still agree). sipr matches the suites, sizes, KDF, SDES encoding,
+  keyword names and side effects, two-line parse, swap rule, and check
+  semantics, with these divergences: (1) the tag uses the packet's own
+  estimated ROC (RFC 3711 §4.2) — interop with SIPp only diverges after
+  a rollover; (2) master keys come from sipr's seeded RNG (reproducible
+  across runs with the same seed) rather than `RAND_bytes`; (3) an
+  unsupported peer suite or undecodable key logs and falls back to plain
+  RTP instead of `rejectCall()`; (4) `exec rtp_echo=start…` (SIPp as an
+  SRTP echo server) is not implemented; (5) payload length is taken from
+  the datagram, not configured. Interop verified with sipp's own
+  `-srtpcheck_debug` log: it authenticates and decrypts sipr's packets
+  (`processIncomingPacket() rc == 0`). Also found: sipp's per-call SRTP
+  echo does `sendto()` with an explicit address on a socket it has
+  `connect()`ed, which macOS rejects with EISCONN (errno 56) — on macOS a
+  sipp SRTP echo server never answers (Linux allows it). Same family as
+  the stream-client bind limitation.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

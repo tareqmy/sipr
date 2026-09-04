@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sipr_control::{ControlCmd, ControlLink, ControlRequest, ControlState, Quitting};
+use sipr_media::sdp::CryptoAttr;
 use sipr_media::{MediaEvent, MediaPlayer, PcapStream, Source, StreamSpec};
 use sipr_net::timer::TimerId;
 use sipr_net::{
@@ -30,7 +31,7 @@ use sipr_scenario::model::{
     Action, Expect, MediaKind, PauseSpec, RecvStep, Role, RtpSource, RtpStreamCmd, Scenario, Step,
     StepCommon,
 };
-use sipr_scenario::template::{Keyword, MsgTemplate, Span};
+use sipr_scenario::template::{CryptoKw, Keyword, MsgTemplate, Span};
 
 use crate::render::{RenderCtx, render};
 
@@ -349,6 +350,8 @@ struct CallState {
     remote_media: [Option<SocketAddr>; 3],
     /// `[rtpstream_audio_port]` / `[rtpstream_video_port]` once allocated.
     rtpstream_ports: [Option<u16>; 2],
+    /// SRTP: what this call offered/answered and what the peer sent.
+    crypto: crate::render::CallCrypto,
     /// Next `play_dtmf` sequence number (SIPp: from 1200, advanced per burst).
     dtmf_seq: u16,
     /// (branch, cseq-line, start-line-ish) key for inbound retrans dedupe.
@@ -1554,6 +1557,7 @@ impl<'s> Engine<'s> {
                     let is_req = first != "SIP/2.0";
                     let method_is_new_txn = is_req && first != "ACK" && first != "CANCEL";
                     self.allocate_rtpstream_ports(call_id, &send.template);
+                    self.prepare_crypto(call_id, &send.template);
                     let (buf, remote) = {
                         let Some(call) = self.calls.get(call_id) else {
                             return;
@@ -1579,6 +1583,7 @@ impl<'s> Engine<'s> {
                             media_ip: &self.media_ip_str,
                             media_port: self.media_port,
                             rtpstream_ports: rtpstream_ports(call),
+                            crypto: Some(&call.crypto),
                             transport: self.transport_token,
                             call_id,
                             call_number: call.number,
@@ -2094,6 +2099,7 @@ impl<'s> Engine<'s> {
                 media_ip: &self.media_ip_str,
                 media_port: self.media_port,
                 rtpstream_ports: rtpstream_ports(call),
+                crypto: Some(&call.crypto),
                 transport: self.transport_token,
                 call_id,
                 call_number: call.number,
@@ -2191,6 +2197,55 @@ impl<'s> Engine<'s> {
                     _ => self.media_port,
                 };
                 call.rtpstream_ports[i] = Some(port);
+            }
+        }
+    }
+
+    /// SIPp's crypto keywords have side effects at render time (`call.cpp`
+    /// ~l.2860-3300): a suite keyword selects the local suite for that
+    /// slot, `ue…` switches it to authenticate-only, and `cryptokeyparams`
+    /// generates a fresh master key — unless its offset is negative, which
+    /// reuses the existing key (the `[cryptokeyparams1audio-9]` idiom in
+    /// SIPp's renegotiation scenarios). Done before rendering so the
+    /// renderer stays pure.
+    fn prepare_crypto(&mut self, call_id: &str, template: &MsgTemplate) {
+        let mut fresh: Vec<(bool, u8)> = Vec::new();
+        {
+            let Some(call) = self.calls.get_mut(call_id) else {
+                return;
+            };
+            for kw in template.keywords() {
+                let Keyword::Crypto {
+                    kw,
+                    slot,
+                    video,
+                    offset,
+                } = kw
+                else {
+                    continue;
+                };
+                let local = call.crypto.local_mut(*video, *slot);
+                match kw {
+                    CryptoKw::Tag => {}
+                    CryptoKw::Suite(suite) => local.suite = Some(suite.clone()),
+                    CryptoKw::Unencrypted(suite) => {
+                        local.suite.get_or_insert_with(|| suite.clone());
+                        local.unencrypted = true;
+                    }
+                    CryptoKw::KeyParams => {
+                        if !(*offset < 0 && local.key.is_some()) {
+                            fresh.push((*video, *slot));
+                        }
+                    }
+                }
+            }
+        }
+        for (video, slot) in fresh {
+            let mut raw = [0u8; 30];
+            self.rng.fill(&mut raw);
+            if let Some(call) = self.calls.get_mut(call_id) {
+                call.crypto.local_mut(video, slot).key =
+                    Some(sipr_media::MasterKey::from_bytes(&raw));
             }
         }
     }
@@ -2295,6 +2350,24 @@ impl<'s> Engine<'s> {
             u32::try_from(self.stats.started.elapsed().as_millis() % u128::from(u32::MAX))
                 .unwrap_or(0)
                 .wrapping_mul(params.ticks_per_ms());
+        let srtp = match call.crypto.negotiate(params.video) {
+            Ok(pair) => {
+                if let Some((tx, rx)) = &pair {
+                    self.log_err(&format!(
+                        "call {call_id}: rtp_stream: SRTP negotiated — send {} receive {}",
+                        tx.suite().as_str(),
+                        rx.suite().as_str()
+                    ));
+                }
+                pair
+            }
+            Err(why) => {
+                self.log_err(&format!(
+                    "call {call_id}: rtp_stream: SRTP: {why} — streaming plain RTP"
+                ));
+                None
+            }
+        };
         let spec = StreamSpec {
             call_id: call_id.to_owned(),
             tag: tag.to_owned(),
@@ -2304,6 +2377,7 @@ impl<'s> Engine<'s> {
             local_ip: self.media_ip,
             local_port,
             remote,
+            srtp,
         };
         let Some(media) = self.media.as_ref() else {
             return;
@@ -2367,6 +2441,7 @@ impl<'s> Engine<'s> {
             local_ip: self.media_ip,
             local_port,
             remote,
+            srtp: None,
         };
         let Some(media) = self.media.as_ref() else {
             return;
@@ -2419,6 +2494,7 @@ impl<'s> Engine<'s> {
             local_ip: self.media_ip,
             local_port,
             remote,
+            srtp: None,
         };
         let Some(media) = self.media.as_ref() else {
             return;
@@ -2466,7 +2542,7 @@ impl<'s> Engine<'s> {
                         self.stats.rtp_check_failed += 1;
                         self.log_err(&format!(
                             "call {call_id}: {tag}: RTP check FAILED — {failed}/{sent} packets \
-                             ({ratio:.2} ≥ tolerance {tol})"
+                             ({ratio:.2} ≥ tolerance {tol}); {bytes_in} bytes received"
                         ));
                     } else {
                         self.stats.rtp_check_ok += 1;
@@ -2517,6 +2593,7 @@ impl<'s> Engine<'s> {
             media_ip: &self.media_ip_str,
             media_port: self.media_port,
             rtpstream_ports: rtpstream_ports(call),
+            crypto: Some(&call.crypto),
             transport: self.transport_token,
             call_id,
             call_number: call.number,
@@ -2906,6 +2983,7 @@ fn new_call(
         last_recv: None,
         remote_media: [None; 3],
         rtpstream_ports: [None; 2],
+        crypto: crate::render::CallCrypto::default(),
         dtmf_seq: DTMF_FIRST_SEQ,
         last_recv_key: None,
         retrans: None,
@@ -3028,7 +3106,8 @@ fn recv_matches(
                 return true;
             }
             match expected_method.and_then(Option::as_deref) {
-                Some(expected) => msg.cseq().is_some_and(|(_, m)| m == expected),
+                // strstr, as SIPp: the method must occur in the sent-so-far list.
+                Some(expected) => msg.cseq().is_some_and(|(_, m)| expected.contains(m)),
                 None => true,
             }
         }
@@ -3036,18 +3115,22 @@ fn recv_matches(
 }
 
 /// For every step, the method of the nearest preceding request `<send>`.
+/// SIPp's `recv_response_for_cseq_method_list` (`scenario.cpp` ~l.893): the
+/// methods of **every** request sent so far, concatenated; a response
+/// matches a recv when its CSeq method occurs in that list (`strstr`). So
+/// after `INVITE … PRACK`, both the PRACK's 200 and the INVITE's 200 match
+/// the following `recv response="200"` steps.
 fn precompute_cseq_methods(scenario: &Scenario) -> Vec<Option<String>> {
     let mut out = Vec::with_capacity(scenario.steps.len());
-    let mut last: Option<String> = None;
+    let mut list: Option<String> = None;
     for step in &scenario.steps {
-        if let Step::Send(s) = step {
-            if let Some(word) = template_first_word(&s.template) {
-                if word != "SIP/2.0" {
-                    last = Some(word);
-                }
-            }
+        if let Step::Send(s) = step
+            && let Some(word) = template_first_word(&s.template)
+            && word != "SIP/2.0"
+        {
+            list.get_or_insert_with(String::new).push_str(&word);
         }
-        out.push(last.clone());
+        out.push(list.clone());
     }
     out
 }
@@ -3075,6 +3158,12 @@ fn learn_remote_media(call: &mut CallState, msg: &Inbound) {
     for kind in MediaKind::ALL {
         if let Some(addr) = sipr_media::sdp::remote_endpoint(body, kind.as_str()) {
             call.remote_media[kind.index()] = Some(addr);
+        }
+        if kind != MediaKind::Image {
+            let attrs: Vec<CryptoAttr> = sipr_media::sdp::crypto_attributes(body, kind.as_str());
+            if !attrs.is_empty() {
+                call.crypto.set_remote(kind == MediaKind::Video, attrs);
+            }
         }
     }
 }
@@ -3365,20 +3454,24 @@ mod tests {
     }
 
     #[test]
-    fn cseq_method_guard_blocks_stale_finals() {
+    fn cseq_method_guard_follows_sipps_sent_method_list() {
         let sc = uac();
         let methods = precompute_cseq_methods(&sc);
-        // Window at step 8 (recv 200 after BYE): a late 200 for the INVITE
-        // must NOT match forward; it is absorbed... by nothing behind (the
-        // steps behind 8 are send/pause), so it is unexpected.
+        // Window at step 8 (recv 200 after BYE). SIPp's guard is a strstr
+        // over every method sent so far ("INVITEACKBYE"): a late 200 for
+        // the INVITE still matches, and so does the BYE's 200 …
         assert!(matches!(
             scan_for_match(&sc, &methods, 8, true, &response(200, "INVITE", true)),
-            Scan::NoMatch
+            Scan::Forward(8)
         ));
-        // The right 200 (CSeq BYE) matches.
         assert!(matches!(
             scan_for_match(&sc, &methods, 8, true, &response(200, "BYE", true)),
             Scan::Forward(8)
+        ));
+        // … but a response to a method never sent cannot.
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 8, true, &response(200, "OPTIONS", true)),
+            Scan::NoMatch
         ));
     }
 
@@ -3427,7 +3520,8 @@ mod tests {
         let m = precompute_cseq_methods(&sc);
         assert_eq!(m[1].as_deref(), Some("INVITE")); // recv 100
         assert_eq!(m[4].as_deref(), Some("INVITE")); // recv 200
-        assert_eq!(m[8].as_deref(), Some("BYE")); // final recv 200
+        // SIPp concatenates every request method sent so far.
+        assert_eq!(m[8].as_deref(), Some("INVITEACKBYE")); // final recv 200
     }
 
     #[test]

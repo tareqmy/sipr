@@ -607,6 +607,60 @@ scenario screen), `socket.cpp` `process_key` (`1`..`9` screens).
 - [x] Deferred: `set display ooc|rx` (no out-of-call / rx scenarios in
       sipr), `-hide` CLI default.
 
+## M23 — SRTP (SDES) ✅
+
+Behavioral oracle: `jlsrtp.cpp`/`jlsrtp.hpp` (JLSRTP: AES-CM-128 or NULL
+cipher, HMAC-SHA1 80/32, kdr 0, no MKI, no replay list, no SRTCP, 12-byte
+header), `call.cpp` (crypto keywords ~l.2860-3300, `extract_srtp_remote_info`
+~l.564-886, session state machine, `swapCrypto` on answer), `message.cpp`
+keyword table, `rtpstream.cpp` (SRTP in the sender's echo check and the
+per-call echo), SIPp's `pfca_*crypto*` scenarios. Divergences in SIPP_COMPAT §6.
+
+- [x] Crypto in-tree, no new dependency: SHA-1 + HMAC-SHA1 (FIPS / RFC 2202
+      vectors), AES-CM keystream and the RFC 3711 §4.3 KDF (Appendix B
+      vectors) in `sipr-auth::srtp_kdf`; `sipr-media::srtp` — the four
+      suites, SDES `inline:` encode/decode (40 base64 chars, `|lifetime|MKI`
+      ignored), `SrtpContext::protect`/`unprotect` with RFC 3711 §3.3.1 ROC
+      estimation, `UNENCRYPTED_SRTP` (authenticate only). `sipr-media` now
+      depends on `sipr-auth`.
+- [x] SIPp's keywords verbatim: `[cryptotag{1,2}{audio,video}]`,
+      `[cryptosuite{aescm128sha180,aescm128sha132,nullsha180,nullsha132}{1,2}{audio,video}]`,
+      `[cryptokeyparams{1,2}{audio,video}]` (+ the `-N` offset that reuses
+      the key on re-INVITE), `[ue{aescm128sha180,aescm128sha132}{1,2}{audio,video}]`
+      → `UNENCRYPTED_SRTP`. Keys are generated before rendering (a
+      `prepare_crypto` pass, like rtpstream ports), from the seeded RNG.
+- [x] SDP: the first two `a=crypto:` lines of the live `m=` section are the
+      peer's primary/secondary (`sdp::crypto_attributes`). Negotiation at
+      stream start: send under the local slot whose suite the peer's
+      primary names (slot 2 only if slot 1 does not match — SIPp's swap),
+      receive under the peer's primary; no peer line → plain RTP; an
+      unsupported suite or undecodable key logs and falls back to plain.
+- [x] Media thread: generated streams are protected on send and the echo
+      check unprotects with the peer's key before comparing plaintext (an
+      auth failure counts as a miss). pcap replays stay as captured.
+- [x] `-srtpcheck_debug` / `-rtpcheck_debug` accepted as no-ops.
+- [x] Tests: KDF/keystream/HMAC vectors, transform round trips for every
+      suite incl. rollover and tampering, SDP crypto parsing, keyword
+      tokenizing, corpus `positive/srtp_sdes.xml` (two suites, pattern
+      stream, reuse on re-INVITE), e2e
+      `srtp_stream_passes_the_echo_check_against_an_srtp_echo_peer` (a
+      scripted peer that re-keys the echo, as SIPp's does), interop
+      `srtp_against_real_sipp_echo` (sipr's SDES offer + PRACK against
+      `pfca_uas_audio_crypto_simple.xml`; self-skips without the SIPp tree).
+- [x] Interop finding: sipp's `-srtpcheck_debug` log proves it accepts
+      sipr's SRTP (`rc == 0` on every packet), but its echo `sendto` fails
+      with EISCONN on macOS (connected socket + explicit address), so the
+      interop test asserts SIPp's acceptance and notes the missing echo;
+      the e2e SRTP echo peer covers the round trip.
+- [x] Found by the interop run: the CSeq-method guard kept only the last
+      sent method, so the INVITE's 200 after a PRACK was "unexpected";
+      it now concatenates every sent method like SIPp's
+      `recv_response_for_cseq_method_list` (SIPP_COMPAT §6 corrected).
+- [x] Deferred: `exec rtp_echo=start…` (sipr as an SRTP echo *server*),
+      SRTCP, MKI, per-call video crypto beyond the keywords, SRTP on pcap
+      replays.
+
 ## Post-v1 backlog (ordered)
 
-SRTP → `[authentication]` from injection fields.
+`[authentication]` from injection fields → SRTP echo server
+(`exec rtp_echo=`).

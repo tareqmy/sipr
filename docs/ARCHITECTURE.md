@@ -24,7 +24,8 @@ Dependency direction (must stay acyclic):
 `sipr-tui` → `sipr-stats` → (nothing internal);
 `sipr-engine` → `sipr-scenario`, `sipr-net`, `sipr-auth`, `sipr-stats`, `sipr-media`,
 `sipr-control`; `sipr-control` → `sipr-stats`;
-`sipr-scenario`, `sipr-net`, `sipr-auth`, `sipr-media` depend on no internal crate.
+`sipr-media` → `sipr-auth` (AES/HMAC/KDF for SRTP);
+`sipr-scenario`, `sipr-net`, `sipr-auth` depend on no internal crate.
 The control front ends (UDP socket, HTTP server) are threads that only send
 `ControlRequest`s into the engine's channel and read the shared once-a-second
 snapshot — the same rule as the TUI: nothing outside the loop touches a call.

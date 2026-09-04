@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **SRTP with SDES keying** — SIPp's crypto keywords (`[cryptotag1audio]`,
+  `[cryptosuiteaescm128sha1801audio]`, `[cryptokeyparams1audio]`, the
+  `ue…` unencrypted forms, secondary and video variants) render offers
+  and answers; the peer's `a=crypto:` lines are parsed; `rtp_stream`
+  packets are protected with AES-CM-128 or the NULL cipher and HMAC-SHA1
+  80/32, and the echo check unprotects the echo before comparing. All
+  cryptography is in-tree and verified against RFC 3711's vectors. Unlike
+  SIPp, the authentication tag uses the packet's own rollover counter, so
+  streams stay valid past sequence 65535.
+
+### Fixed
+
+- The CSeq-method guard on `recv response=` now follows SIPp exactly: a
+  response matches when its CSeq method is any request method sent so
+  far, not only the most recent one. A 200 to the INVITE arriving after a
+  PRACK was wrongly treated as unexpected.
+
 ## [0.11.0] — 2026-09-04
 
 ### Added

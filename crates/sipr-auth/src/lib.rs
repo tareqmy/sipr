@@ -15,7 +15,9 @@ pub mod base64;
 mod hash;
 pub mod milenage;
 
-pub use hash::{md5_hex, sha256_hex};
+pub use hash::{hmac_sha1, md5_hex, sha1, sha256_hex};
+pub mod srtp_kdf;
+pub use aes::encrypt_block as aes128_encrypt_block;
 
 /// Which digest algorithm the challenge requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

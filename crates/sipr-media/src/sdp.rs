@@ -45,6 +45,69 @@ pub fn remote_endpoint(body: &[u8], kind: &str) -> Option<SocketAddr> {
     finish(current, session_addr)
 }
 
+/// One `a=crypto:` line (RFC 4568), as SIPp's `extract_srtp_remote_info`
+/// reads it: tag, suite, the `inline:` key material, and whether the
+/// session parameters carry `UNENCRYPTED_SRTP`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CryptoAttr {
+    /// The `a=crypto:<tag>` number.
+    pub tag: u32,
+    /// Suite name, e.g. `AES_CM_128_HMAC_SHA1_80`.
+    pub suite: String,
+    /// Everything after `inline:` up to the next space (key‖salt base64,
+    /// possibly `|lifetime|MKI` suffixed).
+    pub key_params: String,
+    /// `UNENCRYPTED_SRTP` among the session parameters.
+    pub unencrypted_srtp: bool,
+}
+
+/// The `a=crypto:` lines of the first live `m=<kind>` section, in order —
+/// SIPp takes the first as PRIMARY and the second as SECONDARY and reads at
+/// most two. Empty when the section has none.
+#[must_use]
+pub fn crypto_attributes(body: &[u8], kind: &str) -> Vec<CryptoAttr> {
+    let text = String::from_utf8_lossy(body);
+    let mut in_section = false;
+    let mut out = Vec::new();
+    for raw in text.split('\n') {
+        let line = raw.trim_end_matches('\r').trim();
+        if let Some(rest) = line.strip_prefix("m=") {
+            if in_section {
+                break; // left the matched section
+            }
+            in_section = parse_media(rest, kind).is_some();
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("a=crypto:")
+            && let Some(attr) = parse_crypto(rest)
+        {
+            out.push(attr);
+            if out.len() == 2 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `<tag> <suite> inline:<key-params> [session-params…]`.
+fn parse_crypto(rest: &str) -> Option<CryptoAttr> {
+    let mut parts = rest.split_whitespace();
+    let tag: u32 = parts.next()?.parse().ok()?;
+    let suite = parts.next()?.to_owned();
+    let key_params = parts.next()?.strip_prefix("inline:")?.to_owned();
+    let unencrypted_srtp = parts.any(|p| p == "UNENCRYPTED_SRTP");
+    Some(CryptoAttr {
+        tag,
+        suite,
+        key_params,
+        unencrypted_srtp,
+    })
+}
+
 /// A matched `m=` section with its best connection address, if complete.
 fn finish(current: Option<(u16, Option<IpAddr>)>, session: Option<IpAddr>) -> Option<SocketAddr> {
     let (port, media_addr) = current?;
@@ -143,6 +206,39 @@ mod tests {
         assert_eq!(
             remote_endpoint(ttl.as_bytes(), "audio"),
             Some("224.0.0.1:6000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn crypto_lines_are_read_per_section_two_at_most() {
+        let sdp = "v=0\r\nc=IN IP4 1.2.3.4\r\n\
+            m=audio 4000 RTP/AVP 0\r\n\
+            a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|2^20|1:4\r\n\
+            a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB UNENCRYPTED_SRTP\r\n\
+            a=crypto:3 NULL_HMAC_SHA1_80 inline:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\r\n\
+            m=video 4002 RTP/AVP 96\r\n\
+            a=crypto:1 NULL_HMAC_SHA1_32 inline:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\r\n";
+        let audio = crypto_attributes(sdp.as_bytes(), "audio");
+        assert_eq!(audio.len(), 2, "{audio:?}");
+        assert_eq!(audio[0].tag, 1);
+        assert_eq!(audio[0].suite, "AES_CM_128_HMAC_SHA1_80");
+        assert_eq!(
+            audio[0].key_params,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA|2^20|1:4"
+        );
+        assert!(!audio[0].unencrypted_srtp);
+        assert_eq!(audio[1].tag, 2);
+        assert!(audio[1].unencrypted_srtp);
+        let video = crypto_attributes(sdp.as_bytes(), "video");
+        assert_eq!(video.len(), 1);
+        assert_eq!(video[0].suite, "NULL_HMAC_SHA1_32");
+        assert!(crypto_attributes(sdp.as_bytes(), "image").is_empty());
+        assert!(
+            crypto_attributes(
+                b"m=audio 4000 RTP/AVP 0\r\na=crypto:x y inline:z\r\n",
+                "audio"
+            )
+            .is_empty()
         );
     }
 

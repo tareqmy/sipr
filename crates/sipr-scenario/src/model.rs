@@ -710,6 +710,26 @@ fn keyword_name(k: &Keyword) -> String {
                 format!("[{base}]")
             };
         }
+        Keyword::Crypto {
+            kw,
+            slot,
+            video,
+            offset,
+        } => {
+            let media = if *video { "video" } else { "audio" };
+            let base = match kw {
+                crate::template::CryptoKw::Tag => "cryptotag".to_owned(),
+                crate::template::CryptoKw::KeyParams => "cryptokeyparams".to_owned(),
+                crate::template::CryptoKw::Suite(s) => format!("cryptosuite{}", short_suite(s)),
+                crate::template::CryptoKw::Unencrypted(s) => format!("ue{}", short_suite(s)),
+            };
+            let off = match offset {
+                0 => String::new(),
+                n if *n > 0 => format!("+{n}"),
+                n => n.to_string(),
+            };
+            return format!("[{base}{slot}{media}{off}]");
+        }
         Keyword::MediaPort { auto, offset } => {
             let base = if *auto {
                 "auto_media_port"
@@ -746,4 +766,15 @@ fn keyword_name(k: &Keyword) -> String {
         Keyword::MediaIpType => "media_ip_type",
     };
     format!("[{simple}]")
+}
+
+/// SIPp's short suite spelling used in keyword names.
+fn short_suite(suite: &str) -> &'static str {
+    match suite {
+        "AES_CM_128_HMAC_SHA1_80" => "aescm128sha180",
+        "AES_CM_128_HMAC_SHA1_32" => "aescm128sha132",
+        "NULL_HMAC_SHA1_80" => "nullsha180",
+        "NULL_HMAC_SHA1_32" => "nullsha132",
+        _ => "unknown",
+    }
 }

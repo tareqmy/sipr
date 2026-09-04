@@ -3249,3 +3249,168 @@ fn hidden_steps_and_display_labels_reach_the_stats_api() {
     let _ = stderr.join();
     let _ = std::fs::remove_file(&path);
 }
+
+// ---- SRTP -----------------------------------------------------------------------
+
+/// An SRTP echo peer, doing what SIPp's `exec rtp_echo=startaudio` does:
+/// answer the offer with its own SDES key, then unprotect each packet under
+/// the caller's key and re-protect it under its own before echoing.
+/// Returns (signaling addr, uas thread → BYEs seen, echo thread → packets
+/// echoed).
+#[allow(clippy::type_complexity)]
+fn spawn_srtp_echo_uas(
+    idle: Duration,
+) -> (
+    SocketAddr,
+    std::thread::JoinHandle<u64>,
+    std::thread::JoinHandle<u64>,
+) {
+    use sipr_media::{MasterKey, SrtpContext, Suite};
+    use std::sync::{Arc, Mutex};
+    let media_sock = UdpSocket::bind("127.0.0.1:0").expect("bind media");
+    let media = media_sock.local_addr().expect("addr");
+    media_sock.set_read_timeout(Some(idle)).expect("timeout");
+    // Keys: ours (random-ish), the caller's (learned from the INVITE).
+    let mut ours = [0u8; 30];
+    for (i, b) in ours.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(53).wrapping_add(7);
+    }
+    let our_key = MasterKey::from_bytes(&ours);
+    let contexts: Arc<Mutex<Option<(SrtpContext, SrtpContext)>>> = Arc::new(Mutex::new(None));
+    let echo_ctx = Arc::clone(&contexts);
+    let echo = std::thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        let mut echoed = 0u64;
+        while let Ok((n, from)) = media_sock.recv_from(&mut buf) {
+            let mut guard = echo_ctx.lock().expect("lock");
+            let Some((rx, tx)) = guard.as_mut() else {
+                continue;
+            };
+            let Ok(clear) = rx.unprotect(&buf[..n]) else {
+                continue;
+            };
+            let wire = tx.protect(&clear);
+            if media_sock.send_to(&wire, from).is_ok() {
+                echoed += 1;
+            }
+        }
+        echoed
+    });
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(idle)).expect("timeout");
+    let our_sdes = our_key.to_sdes();
+    let uas = std::thread::spawn(move || {
+        let mut byes = 0u64;
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    // Learn the caller's primary key and suite.
+                    let attrs = sipr_media::sdp::crypto_attributes(msg.body(), "audio");
+                    if let Some(a) = attrs.first()
+                        && let (Some(suite), Some(key)) =
+                            (Suite::parse(&a.suite), MasterKey::from_sdes(&a.key_params))
+                    {
+                        let rx = SrtpContext::new(suite, &key, a.unencrypted_srtp);
+                        let tx = SrtpContext::new(suite, &our_key, false);
+                        *contexts.lock().expect("lock") = Some((rx, tx));
+                        let body = format!(
+                            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                             m=audio {} RTP/AVP 0\r\na=crypto:{} {} inline:{our_sdes}\r\n",
+                            media.port(),
+                            a.tag,
+                            a.suite
+                        );
+                        let mut r =
+                            String::from_utf8(mirror_response(&msg, "200 OK", true)).expect("utf8");
+                        r = r.replace(
+                            "Content-Length: 0\r\n\r\n",
+                            &format!(
+                                "Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n",
+                                body.len()
+                            ),
+                        );
+                        r.push_str(&body);
+                        let _ = sock.send_to(r.as_bytes(), from);
+                    } else {
+                        let _ = sock.send_to(
+                            &mirror_response(&msg, "488 Not Acceptable Here", true),
+                            from,
+                        );
+                    }
+                }
+                Some("BYE") => {
+                    byes += 1;
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        byes
+    });
+    (addr, uas, echo)
+}
+
+/// sipr offers two SDES suites, streams a pattern under SRTP, and its echo
+/// check passes against an SRTP echo peer that re-keys the echo.
+#[test]
+fn srtp_stream_passes_the_echo_check_against_an_srtp_echo_peer() {
+    let (addr, uas, echo) = spawn_srtp_echo_uas(Duration::from_secs(2));
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let scenario_path = dir.join(format!("sipr-e2e-srtp-{pid}.xml"));
+    let corpus = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sipr-scenario/tests/corpus/positive/srtp_sdes.xml"
+    );
+    // The corpus golden has a re-INVITE; this run only needs the first leg.
+    let xml = std::fs::read_to_string(corpus).expect("corpus");
+    let cut = xml.find("  <!-- re-INVITE").expect("marker");
+    let mut scenario = xml[..cut].to_owned();
+    scenario.push_str(
+        r#"  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#,
+    );
+    std::fs::write(&scenario_path, scenario).expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        scenario_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-mp",
+        &free_port_block(4).to_string(),
+        "-audiotolerance",
+        "0.5",
+        "-cp",
+        "0",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&scenario_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(err.contains("rtpcheck 0/1 failed"), "{err}");
+    assert_eq!(uas.join().expect("uas"), 1);
+    let echoed = echo.join().expect("echo");
+    assert!(echoed >= 20, "echoed only {echoed} SRTP packets");
+}

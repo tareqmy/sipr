@@ -357,6 +357,18 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "Same as -audiotolerance for video streams",
     ),
     (
+        "rtpcheck_debug",
+        false,
+        "",
+        "Accepted for SIPp compatibility (sipr writes no RTP-check debug files)",
+    ),
+    (
+        "srtpcheck_debug",
+        false,
+        "",
+        "Accepted for SIPp compatibility (sipr writes no SRTP debug files)",
+    ),
+    (
         "cp",
         true,
         "PORT",
@@ -641,6 +653,7 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
                 cli.video_tolerance = Some(ratio);
             }
         }
+        "srtpcheck_debug" | "rtpcheck_debug" => {}
         "cp" => cli.control_port = Some(parse_num(flag, &val(value))?),
         "ci" => cli.control_ip = Some(parse_num(flag, &val(value))?),
         "sipr-http" => cli.http = Some(val(value)),

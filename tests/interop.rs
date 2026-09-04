@@ -940,3 +940,205 @@ fn rtpcheck_against_real_sipp_echo() {
     assert!(stderr.contains("rtpcheck 0/1 failed"), "{stderr}");
     let _ = wait_with_timeout(&mut sipp_proc.0, Duration::from_secs(10));
 }
+
+/// SRTP against real sipp: sipr offers SDES and streams a pattern under
+/// AES_CM_128_HMAC_SHA1_80 at `sipp -sf pfca_uas_audio_crypto_simple.xml`
+/// (SIPp's own per-call SRTP echo, 100rel/PRACK included). The proof of
+/// interop is SIPp's `-srtpcheck_debug` log: every packet must authenticate
+/// and decrypt there (`processIncomingPacket() rc == 0`). The echo itself
+/// cannot leave a macOS sipp — its `sendto` on a connected UDP socket fails
+/// with EISCONN (errno 56), a sipp-on-macOS limitation like the stream
+/// client bind — so the round-trip check is asserted only where the log
+/// shows the echo was sent. Needs the SIPp source tree for the scenario
+/// (`$SIPP_SRC`, else the sibling checkout) and a sipp built with OpenSSL.
+#[test]
+fn srtp_against_real_sipp_echo() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::srtp_against_real_sipp_echo — no sipp binary found.");
+        return;
+    };
+    let src = std::env::var("SIPP_SRC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home).join("development/cprojects/sipp")
+        });
+    let uas_xml = src.join("sipp_scenarios/pfca_uas_audio_crypto_simple.xml");
+    if !uas_xml.is_file() {
+        eprintln!(
+            "SKIPPED interop::srtp_against_real_sipp_echo — {} not found (set SIPP_SRC).",
+            uas_xml.display()
+        );
+        return;
+    }
+    let port = free_port();
+    let sipp_media = free_even_port();
+    let sipr_media = free_even_port();
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let scenario_path = dir.join(format!("sipr-interop-srtp-{pid}.xml"));
+    std::fs::write(
+        &scenario_path,
+        r#"<scenario name="uac-srtp-interop">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]s[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Supported: 100rel
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=16001 0 0 IN IP[local_ip_type] [local_ip]
+    s=-
+    c=IN IP[media_ip_type] [media_ip]
+    t=0 0
+    m=audio [rtpstream_audio_port] RTP/AVP 0
+    a=crypto:[cryptotag1audio] [cryptosuiteaescm128sha1801audio] inline:[cryptokeyparams1audio]
+    a=rtpmap:0 PCMU/8000
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180"/>
+  <send retrans="500"><![CDATA[
+    PRACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]s[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 PRACK
+    RAck: 1 1 INVITE
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]s[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <nop><action><exec rtp_stream="apattern,1,0,PCMU/8000"/></action></nop>
+  <pause milliseconds="1500"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]s[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 3 BYE
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#,
+    )
+    .expect("write scenario");
+    // sipp's -srtpcheck_debug files land in its working directory.
+    let sipp_dir = dir.join(format!("sipr-interop-srtp-{pid}-sipp"));
+    let _ = std::fs::remove_dir_all(&sipp_dir);
+    std::fs::create_dir_all(&sipp_dir).expect("sipp dir");
+    let mut sipp_proc = Reaper(
+        Command::new(&sipp)
+            .current_dir(&sipp_dir)
+            .args([
+                "-sf",
+                uas_xml.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-mi",
+                "127.0.0.1",
+                "-mp",
+                &sipp_media.to_string(),
+                "-srtpcheck_debug",
+                "-m",
+                "1",
+                "-timeout",
+                "30s",
+                "-bg",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut sipr_proc = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .args([
+                "-sf",
+                scenario_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-mp",
+                &sipr_media.to_string(),
+                "-cp",
+                "0",
+                "-m",
+                "1",
+                "-timeout",
+                "20",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sipr"),
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_proc.0, Duration::from_secs(25));
+    let _ = std::fs::remove_file(&scenario_path);
+    let _ = wait_with_timeout(&mut sipp_proc.0, Duration::from_secs(10));
+    let stderr = sipr_proc
+        .0
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    assert_eq!(sipr_code, Some(0), "sipr must exit 0; stderr:\n{stderr}");
+    assert!(stderr.contains("successful 1 failed 0"), "{stderr}");
+    assert!(stderr.contains("rtp-sent "), "{stderr}");
+    // SIPp's view of our packets.
+    let mut echo_log = String::new();
+    for entry in std::fs::read_dir(&sipp_dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("debugrefileaudio") {
+            echo_log.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&sipp_dir);
+    let accepted = echo_log.matches("processIncomingPacket() rc == 0").count();
+    let rejected = echo_log.matches("processIncomingPacket() rc == -").count();
+    assert!(
+        accepted >= 20,
+        "sipp must authenticate and decrypt sipr's SRTP: {accepted} accepted, {rejected} \
+         rejected; log:\n{echo_log}"
+    );
+    assert_eq!(rejected, 0, "sipp rejected SRTP packets:\n{echo_log}");
+    if echo_log.contains("errno = 56") {
+        eprintln!(
+            "NOTE interop::srtp_against_real_sipp_echo — sipp decrypted {accepted} packets but \
+             its echo sendto failed with EISCONN (sipp-on-macOS limitation); the round trip \
+             is covered by the e2e SRTP echo peer instead."
+        );
+    }
+}

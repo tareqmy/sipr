@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+sipr-auth = { workspace = true }
 
 [lints]
 workspace = true

@@ -102,6 +102,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
 - RTP echo (`-rtp_echo`) and the echo check (`-audiotolerance`): a pattern
   stream against an echoing peer is verified packet by packet, exit 253 on
   failure as in SIPp.
+- SRTP (SDES): SIPp's `[cryptotag1audio]`/`[cryptosuite…]`/`[cryptokeyparams…]`
+  keywords, AES-CM-128 + HMAC-SHA1 80/32, all in-tree — no OpenSSL.
 - Runtime control: SIPp's UDP control socket (`-cp`) and an HTTP/JSON API
   (`--sipr-http 8080`: `/stats`, `/control`, `/quit`, `/command`; see
   `docs/CONTROL_API.md`).
@@ -109,7 +111,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   files, RTDs and repartition tables.
 
 Everything is built on the Rust standard library, plus `rustls` for the TLS
-transport — no system libraries (no OpenSSL, no libpcap), no root for media.
+transport — no system libraries (no OpenSSL even for SRTP, no libpcap), no
+root for media.
 
 ## Documentation
 
@@ -120,7 +123,8 @@ transport — no system libraries (no OpenSSL, no libpcap), no root for media.
 
 ## Not yet (post-v1 roadmap)
 
-SRTP and a whole `[authentication]` keyword arriving from an injection field.
+A whole `[authentication]` keyword arriving from an injection field, and
+sipr as an SRTP echo server (`exec rtp_echo=`).
 
 ## Brand
 
