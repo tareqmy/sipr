@@ -69,6 +69,12 @@ pub struct Cli {
     pub media_ip: Option<IpAddr>,
     /// `-mp` / `-min_rtp_port`: base media port for `[media_port]`.
     pub media_port: Option<u16>,
+    /// `-max_rtp_port`: top of the `[rtpstream_*_port]` allocation range.
+    pub max_rtp_port: Option<u16>,
+    /// `-rtp_payload`: default payload type for `rtp_stream` (SIPp: 8).
+    pub rtp_payload: Option<u8>,
+    /// `-random_base_ssrc`: randomize the SSRC base instead of `0xCA110000`.
+    pub random_base_ssrc: bool,
     /// `-t`: transport mode.
     pub transport: Transport,
     /// `-s`: service / called user part, substituted for `[service]`.
@@ -140,6 +146,9 @@ impl Default for Cli {
             local_ip: None,
             media_ip: None,
             media_port: None,
+            max_rtp_port: None,
+            rtp_payload: None,
+            random_base_ssrc: false,
             transport: Transport::UdpMono,
             service: "service".to_owned(),
             auth_user: None,
@@ -237,6 +246,24 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "Base media port for [media_port] / [auto_media_port] [default: 6000]",
     ),
     ("min_rtp_port", true, "PORT", "Same as -mp (SIPp alias)"),
+    (
+        "max_rtp_port",
+        true,
+        "PORT",
+        "Top of the [rtpstream_audio_port]/[rtpstream_video_port] range [default: 65535]",
+    ),
+    (
+        "rtp_payload",
+        true,
+        "PT",
+        "Default payload type for exec rtp_stream= [default: 8 (PCMA)]",
+    ),
+    (
+        "random_base_ssrc",
+        false,
+        "",
+        "Random SSRC base for rtp_stream instead of 0xCA110000",
+    ),
     (
         "t",
         true,
@@ -461,6 +488,17 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "i" => cli.local_ip = Some(parse_num(flag, &val(value))?),
         "mi" => cli.media_ip = Some(parse_num(flag, &val(value))?),
         "mp" | "min_rtp_port" => cli.media_port = Some(parse_num(flag, &val(value))?),
+        "max_rtp_port" => cli.max_rtp_port = Some(parse_num(flag, &val(value))?),
+        "rtp_payload" => {
+            let pt: u8 = parse_num(flag, &val(value))?;
+            if pt > 127 {
+                return Err(format!(
+                    "invalid value '{pt}' for option '-rtp_payload' (0..=127)"
+                ));
+            }
+            cli.rtp_payload = Some(pt);
+        }
+        "random_base_ssrc" => cli.random_base_ssrc = true,
         "t" => cli.transport = parse_transport(&val(value))?,
         "s" => cli.service = val(value),
         "au" => cli.auth_user = Some(val(value)),
@@ -690,6 +728,18 @@ mod tests {
         let c = cli(&["127.0.0.1"]);
         assert_eq!(c.media_ip, None);
         assert_eq!(c.media_port, None);
+        let c = cli(&[
+            "-max_rtp_port",
+            "7000",
+            "-rtp_payload",
+            "0",
+            "-random_base_ssrc",
+            "x",
+        ]);
+        assert_eq!(c.max_rtp_port, Some(7000));
+        assert_eq!(c.rtp_payload, Some(0));
+        assert!(c.random_base_ssrc);
+        assert!(run(&["-rtp_payload", "200", "x"]).is_err());
     }
 
     #[test]

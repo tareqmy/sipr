@@ -77,6 +77,15 @@ pub enum Keyword {
     },
     /// `[media_ip_type]` — `4` or `6` for the media address.
     MediaIpType,
+    /// `[rtpstream_audio_port]` / `[rtpstream_video_port]` (+`N`): a port
+    /// allocated to this call from the `-mp`..`-max_rtp_port` range in
+    /// steps of two when first rendered; `+N` never allocates (RTCP).
+    RtpStreamPort {
+        /// Video vs audio port.
+        video: bool,
+        /// The `+N` suffix, 0 when absent.
+        offset: u16,
+    },
     /// `[last_Name:]` — verbatim copy of header(s) from the last received
     /// message. The stored string is the header name without the colon.
     Last(String),
@@ -282,12 +291,41 @@ fn classify(body: &str) -> Classified {
     }
 }
 
-/// `[media_port]`, `[auto_media_port]`, and their `+N` offset forms.
+/// `[media_port]`, `[auto_media_port]`, `[rtpstream_audio_port]`,
+/// `[rtpstream_video_port]`, and their `+N` offset forms.
 fn classify_media_port(name: &str) -> Option<Keyword> {
-    let (auto, rest) = if let Some(r) = name.strip_prefix("auto_media_port") {
-        (true, r)
+    let (kw, rest) = if let Some(r) = name.strip_prefix("auto_media_port") {
+        (
+            Keyword::MediaPort {
+                auto: true,
+                offset: 0,
+            },
+            r,
+        )
     } else if let Some(r) = name.strip_prefix("media_port") {
-        (false, r)
+        (
+            Keyword::MediaPort {
+                auto: false,
+                offset: 0,
+            },
+            r,
+        )
+    } else if let Some(r) = name.strip_prefix("rtpstream_audio_port") {
+        (
+            Keyword::RtpStreamPort {
+                video: false,
+                offset: 0,
+            },
+            r,
+        )
+    } else if let Some(r) = name.strip_prefix("rtpstream_video_port") {
+        (
+            Keyword::RtpStreamPort {
+                video: true,
+                offset: 0,
+            },
+            r,
+        )
     } else {
         return None;
     };
@@ -296,7 +334,11 @@ fn classify_media_port(name: &str) -> Option<Keyword> {
     } else {
         rest.strip_prefix('+')?.parse::<u16>().ok()?
     };
-    Some(Keyword::MediaPort { auto, offset })
+    Some(match kw {
+        Keyword::MediaPort { auto, .. } => Keyword::MediaPort { auto, offset },
+        Keyword::RtpStreamPort { video, .. } => Keyword::RtpStreamPort { video, offset },
+        other => other,
+    })
 }
 
 /// `[fieldN]`, `[fieldN file=NAME]`, `[fieldN line=M|[$var]]` — an
@@ -456,6 +498,31 @@ mod tests {
             tok("c=IN IP[media_ip_type] [media_ip]\r\nm=audio [media_port] RTP/AVP 0\r\n");
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(t.keywords().count(), 3);
+        let (t, warns) = tok(
+            "m=audio [rtpstream_audio_port] RTP/AVP 0\r\na=rtcp:[rtpstream_audio_port+1]\r\nm=video [rtpstream_video_port+0] RTP/AVP 96\r\n",
+        );
+        assert!(warns.is_empty(), "{warns:?}");
+        let kws: Vec<&Keyword> = t.keywords().collect();
+        assert_eq!(
+            kws,
+            vec![
+                &Keyword::RtpStreamPort {
+                    video: false,
+                    offset: 0
+                },
+                &Keyword::RtpStreamPort {
+                    video: false,
+                    offset: 1
+                },
+                &Keyword::RtpStreamPort {
+                    video: true,
+                    offset: 0
+                },
+            ]
+        );
+        // A malformed offset is not a keyword: verbatim + warning.
+        let (_, warns) = tok("[media_port+x]");
+        assert_eq!(warns.len(), 1, "{warns:?}");
     }
 
     #[test]

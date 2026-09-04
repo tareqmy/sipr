@@ -32,17 +32,38 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use crate::pcap::PcapStream;
+use crate::rtp::{RtpSource, RtpStep};
 
-/// Everything needed to replay one capture for one call.
-#[derive(Debug, Clone)]
+/// What a stream sends.
+#[derive(Debug)]
+pub enum Source {
+    /// A parsed capture (shared across calls), replayed verbatim.
+    Pcap(Arc<PcapStream>),
+    /// A generated RTP stream (`rtp_stream`).
+    Rtp(RtpSource),
+}
+
+impl Source {
+    /// Distinct destination-port offsets this source sends to.
+    fn port_offsets(&self) -> Vec<u16> {
+        match self {
+            Self::Pcap(p) => p.port_offsets(),
+            Self::Rtp(_) => vec![0],
+        }
+    }
+}
+
+/// Everything needed to replay one stream for one call.
+#[derive(Debug)]
 pub struct StreamSpec {
     /// Owning call; [`MediaPlayer::stop`] keys on it.
     pub call_id: String,
-    /// Stream tag within the call (`"audio"`, `"video"`, `"image"`). Playing
-    /// a new stream with the same call and tag replaces the old one.
+    /// Stream tag within the call (`"audio"`, `"video"`, `"image"`,
+    /// `"rtp-audio"`, `"rtp-video"`). Playing a new stream with the same
+    /// call and tag replaces the old one.
     pub tag: String,
-    /// The parsed capture, shared across calls.
-    pub stream: Arc<PcapStream>,
+    /// What to send.
+    pub source: Source,
     /// Local media address (`-mi`).
     pub local_ip: IpAddr,
     /// Local media port for this stream (`[media_port]` as advertised).
@@ -78,6 +99,12 @@ enum Cmd {
     Stop {
         call_id: String,
         tag: Option<String>,
+    },
+    /// Pause/resume the generated RTP streams of a call (all, or one tag).
+    Pause {
+        call_id: String,
+        tag: Option<String>,
+        paused: bool,
     },
     Shutdown,
 }
@@ -143,7 +170,7 @@ impl MediaPlayer {
             ));
         }
         let mut sockets = Vec::new();
-        for offset in spec.stream.port_offsets() {
+        for offset in spec.source.port_offsets() {
             let local = SocketAddr::new(spec.local_ip, spec.local_port.wrapping_add(offset));
             let remote = SocketAddr::new(spec.remote.ip(), spec.remote.port().wrapping_add(offset));
             let sock = UdpSocket::bind(local)?;
@@ -168,6 +195,16 @@ impl MediaPlayer {
         let _ = self.tx.send(Cmd::Stop {
             call_id: call_id.to_owned(),
             tag: tag.map(ToOwned::to_owned),
+        });
+    }
+
+    /// Pause or resume the generated RTP streams of `call_id` (all of them,
+    /// or only the `tag` one). Pcap replays are unaffected, as in SIPp.
+    pub fn set_paused(&self, call_id: &str, tag: Option<&str>, paused: bool) {
+        let _ = self.tx.send(Cmd::Pause {
+            call_id: call_id.to_owned(),
+            tag: tag.map(ToOwned::to_owned),
+            paused,
         });
     }
 
@@ -273,6 +310,19 @@ fn apply(
                 a.spec.call_id != call_id || tag.as_ref().is_some_and(|t| *t != a.spec.tag)
             });
         }
+        Cmd::Pause {
+            call_id,
+            tag,
+            paused,
+        } => {
+            for a in streams.values_mut() {
+                let selected =
+                    a.spec.call_id == call_id && tag.as_ref().is_none_or(|t| *t == a.spec.tag);
+                if let (true, Source::Rtp(r)) = (selected, &mut a.spec.source) {
+                    r.set_paused(paused);
+                }
+            }
+        }
         Cmd::Shutdown => return false,
     }
     true
@@ -284,9 +334,55 @@ enum Pump {
     Failed(String),
 }
 
-/// Send every frame that is due, then report when the next one is.
+/// Send everything that is due, then report when the next packet is.
 fn pump(active: &mut Active, now: Instant, packets: &AtomicU64, bytes: &AtomicU64) -> Pump {
-    let stream = &active.spec.stream;
+    match &active.spec.source {
+        Source::Pcap(stream) => {
+            let stream = Arc::clone(stream);
+            pump_pcap(active, &stream, now, packets, bytes)
+        }
+        Source::Rtp(_) => pump_rtp(active, now, packets, bytes),
+    }
+}
+
+/// Generated RTP: packet `n` is due at `start + n * interval`, so a stall
+/// catches up in a burst and cadence never drifts.
+fn pump_rtp(active: &mut Active, now: Instant, packets: &AtomicU64, bytes: &AtomicU64) -> Pump {
+    let Some((_, sock, remote)) = active.sockets.first() else {
+        return Pump::Failed("no media socket".into());
+    };
+    let Source::Rtp(rtp) = &mut active.spec.source else {
+        return Pump::Failed("not an RTP source".into());
+    };
+    loop {
+        let at = active.started + rtp.interval() * u32::try_from(rtp.ticks()).unwrap_or(u32::MAX);
+        if at > now {
+            return Pump::Next(at);
+        }
+        match rtp.next_packet() {
+            RtpStep::Done => return Pump::Finished,
+            RtpStep::Silent => {}
+            RtpStep::Packet(p) => match sock.send_to(p, remote) {
+                Ok(_) => {
+                    packets.fetch_add(1, Ordering::Relaxed);
+                    bytes.fetch_add(p.len() as u64, Ordering::Relaxed);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Pump::Next(now + Duration::from_millis(2));
+                }
+                Err(e) => return Pump::Failed(e.to_string()),
+            },
+        }
+    }
+}
+
+fn pump_pcap(
+    active: &mut Active,
+    stream: &PcapStream,
+    now: Instant,
+    packets: &AtomicU64,
+    bytes: &AtomicU64,
+) -> Pump {
     while let Some(frame) = stream.frames.get(active.next_frame) {
         let at = active.started + frame.offset;
         if at > now {
@@ -347,7 +443,7 @@ mod tests {
         StreamSpec {
             call_id: call.into(),
             tag: "audio".into(),
-            stream,
+            source: Source::Pcap(stream),
             local_ip: "127.0.0.1".parse().unwrap(),
             local_port: 0,
             remote,
@@ -487,6 +583,81 @@ mod tests {
         s.local_port = taken_addr.port();
         assert!(player.play(s).is_err());
         drop(taken);
+    }
+
+    #[test]
+    fn rtp_stream_paces_pauses_and_finishes() {
+        use crate::rtp::{RtpParams, RtpSource};
+        let (rx_sock, remote) = listener();
+        let params = RtpParams {
+            payload_type: 8,
+            bytes_per_packet: 4,
+            ms_per_packet: 20,
+            ticks_per_packet: 160,
+            video: false,
+        };
+        // 8 bytes, 4-byte packets, 3 loops → 6 packets over ~100 ms.
+        let src = RtpSource::new(Arc::from(&b"abcdefgh"[..]), params, 3, 7, 0);
+        let (ev_tx, ev_rx) = channel();
+        let player = MediaPlayer::start(ev_tx);
+        let t0 = Instant::now();
+        player
+            .play(StreamSpec {
+                call_id: "r1".into(),
+                tag: "rtp-audio".into(),
+                source: Source::Rtp(src),
+                local_ip: "127.0.0.1".parse().unwrap(),
+                local_port: 0,
+                remote,
+            })
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            let (n, _) = rx_sock.recv_from(&mut buf).unwrap();
+            got.push(buf[..n].to_vec());
+        }
+        let elapsed = t0.elapsed();
+        assert!(elapsed >= Duration::from_millis(95), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+        assert_eq!(&got[0][12..], b"abcd");
+        assert_eq!(&got[1][12..], b"efgh");
+        assert_eq!(&got[5][12..], b"efgh");
+        let seqs: Vec<u16> = got
+            .iter()
+            .map(|p| u16::from_be_bytes([p[2], p[3]]))
+            .collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5]);
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            MediaEvent::Finished { .. }
+        ));
+        // Pause: an infinite stream goes quiet, then resumes.
+        let src = RtpSource::new(Arc::from(&b"abcdefgh"[..]), params, -1, 7, 0);
+        player
+            .play(StreamSpec {
+                call_id: "r2".into(),
+                tag: "rtp-audio".into(),
+                source: Source::Rtp(src),
+                local_ip: "127.0.0.1".parse().unwrap(),
+                local_port: 0,
+                remote,
+            })
+            .unwrap();
+        rx_sock.recv_from(&mut buf).unwrap();
+        player.set_paused("r2", None, true);
+        std::thread::sleep(Duration::from_millis(60));
+        rx_sock
+            .set_read_timeout(Some(Duration::from_millis(80)))
+            .unwrap();
+        while rx_sock.recv_from(&mut buf).is_ok() {}
+        assert!(
+            rx_sock.recv_from(&mut buf).is_err(),
+            "paused stream kept sending"
+        );
+        player.set_paused("r2", Some("rtp-audio"), false);
+        assert!(rx_sock.recv_from(&mut buf).is_ok(), "resume sent nothing");
+        player.stop("r2", None);
     }
 
     #[test]

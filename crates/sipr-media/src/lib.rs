@@ -9,15 +9,21 @@
 //!   (`c=` + `m=<kind> <port>`), the same crude scan SIPp does.
 //! - [`replay`] — the media thread: one scheduler for every active stream,
 //!   sending each stream's frames on the capture's absolute timeline.
+//! - [`rtp`] — generated RTP streams from raw codec files or test patterns
+//!   (`exec rtp_stream=`), and [`dtmf`] — RFC 4733 event bursts
+//!   (`exec play_dtmf=`), both scheduled by the same thread.
 //!
 //! Behavioral oracle: SIPp's `prepare_pcap.c` / `send_packets.c`
 //! (`exec play_pcap_*`). Deliberate divergences are recorded in
 //! `docs/SIPP_COMPAT.md` §6 — chiefly that sipr sends through ordinary UDP
 //! sockets bound to the media port (no raw socket, so no root needed).
 
+pub mod dtmf;
 pub mod pcap;
 pub mod replay;
+pub mod rtp;
 pub mod sdp;
 
 pub use pcap::{Frame, PcapError, PcapStream};
-pub use replay::{MediaEvent, MediaPlayer, StreamSpec};
+pub use replay::{MediaEvent, MediaPlayer, Source, StreamSpec};
+pub use rtp::{RtpParams, RtpSource};

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-use sipr_media::{MediaEvent, MediaPlayer, PcapStream, StreamSpec};
+use sipr_media::{MediaEvent, MediaPlayer, PcapStream, Source, StreamSpec};
 use sipr_net::timer::TimerId;
 use sipr_net::{
     Inbound, NetEvent, RetransSchedule, TcpTransport, TimerService, TlsTransport, TransportConfig,
@@ -26,7 +26,8 @@ use sipr_net::{
 };
 use sipr_scenario::inject::{InjectMode, InjectionFile};
 use sipr_scenario::model::{
-    Action, Expect, MediaKind, PauseSpec, RecvStep, Role, Scenario, Step, StepCommon,
+    Action, Expect, MediaKind, PauseSpec, RecvStep, Role, RtpSource, RtpStreamCmd, Scenario, Step,
+    StepCommon,
 };
 use sipr_scenario::template::{Keyword, MsgTemplate, Span};
 
@@ -101,6 +102,12 @@ pub struct EngineConfig {
     pub media_ip: Option<IpAddr>,
     /// `-mp` / `-min_rtp_port`: base port for `[media_port]` (default 6000).
     pub media_port: Option<u16>,
+    /// `-max_rtp_port`: top of the `[rtpstream_*_port]` range (default 65535).
+    pub max_rtp_port: Option<u16>,
+    /// `-rtp_payload`: default payload type for `rtp_stream` (default 8).
+    pub rtp_payload: Option<u8>,
+    /// `-random_base_ssrc`: seed the SSRC base randomly (SIPp: `0xCA110000`).
+    pub random_base_ssrc: bool,
     /// Directory of the `-sf` file: pcap paths resolve there first, then in
     /// the working directory (SIPp `find_file`).
     pub scenario_dir: Option<std::path::PathBuf>,
@@ -108,6 +115,10 @@ pub struct EngineConfig {
 
 /// SIPp's `DEFAULT_MEDIA_PORT`.
 const DEFAULT_MEDIA_PORT: u16 = 6000;
+/// SIPp's `rtp_default_payload` (PCMA).
+const DEFAULT_RTP_PAYLOAD: u8 = 8;
+/// SIPp's initial `play_args_a.last_seq_no` for `play_dtmf`.
+const DTMF_FIRST_SEQ: u16 = 1200;
 
 /// Transport selection (`-t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -282,6 +293,10 @@ struct CallState {
     /// Remote media endpoints learned from received SDP, by [`MediaKind`]
     /// index. Stale values persist when a later SDP omits a stream (SIPp).
     remote_media: [Option<SocketAddr>; 3],
+    /// `[rtpstream_audio_port]` / `[rtpstream_video_port]` once allocated.
+    rtpstream_ports: [Option<u16>; 2],
+    /// Next `play_dtmf` sequence number (SIPp: from 1200, advanced per burst).
+    dtmf_seq: u16,
     /// (branch, cseq-line, start-line-ish) key for inbound retrans dedupe.
     last_recv_key: Option<(String, String, String)>,
     retrans: Option<RetransCtx>,
@@ -448,6 +463,17 @@ struct Engine<'s> {
     /// Per [`MediaKind`]: which `[media_port]` form (auto, +offset) the SDP
     /// uses on that `m=` line — the local port a replay must send from.
     port_layout: [(bool, u16); 3],
+    /// `rtp_stream` file bytes by the scenario's file attribute (WAV header
+    /// already skipped), loaded once.
+    rtp_files: HashMap<String, Arc<[u8]>>,
+    /// Cursor for `[rtpstream_*_port]` allocation (SIPp `next_rtp_port`).
+    next_rtp_port: u16,
+    max_rtp_port: u16,
+    rtp_payload: u8,
+    /// SSRC base; a call's audio/video streams take `base + 2*(n-1) + {0,1}`.
+    ssrc_base: u32,
+    /// Counter for `play_dtmf` SSRCs (SIPp: a fresh SSRC per burst).
+    dtmf_ssrc_counter: u32,
 }
 
 impl<'s> Engine<'s> {
@@ -575,7 +601,8 @@ impl<'s> Engine<'s> {
         // Media: captures are parsed once here (SIPp: at scenario parse) and
         // the media thread exists only when something will be played.
         let pcaps = load_pcaps(scenario, config)?;
-        let media = if pcaps.is_empty() {
+        let rtp_files = load_rtp_files(scenario, config)?;
+        let media = if !scenario.has_media() {
             None
         } else {
             let (media_tx, media_rx) = channel::<MediaEvent>();
@@ -742,6 +769,19 @@ impl<'s> Engine<'s> {
                 .to_string(),
             media_port: config.media_port.unwrap_or(DEFAULT_MEDIA_PORT),
             port_layout: media_port_layout(scenario),
+            rtp_files,
+            next_rtp_port: config.media_port.unwrap_or(DEFAULT_MEDIA_PORT),
+            max_rtp_port: config.max_rtp_port.unwrap_or(u16::MAX),
+            rtp_payload: config.rtp_payload.unwrap_or(DEFAULT_RTP_PAYLOAD),
+            ssrc_base: if config.random_base_ssrc {
+                // Any seed-derived base; SIPp uses rand().
+                #[allow(clippy::cast_possible_truncation)]
+                let r = sipr_net::rng::Rng::new(config.seed ^ 0x55C0_0001).next_u64() as u32;
+                r
+            } else {
+                sipr_media::rtp::BASE_SSRC
+            },
+            dtmf_ssrc_counter: 0,
         })
     }
 
@@ -1036,6 +1076,7 @@ impl<'s> Engine<'s> {
                     let first = template_first_word(&send.template).unwrap_or_default();
                     let is_req = first != "SIP/2.0";
                     let method_is_new_txn = is_req && first != "ACK" && first != "CANCEL";
+                    self.allocate_rtpstream_ports(call_id, &send.template);
                     let (buf, remote) = {
                         let Some(call) = self.calls.get(call_id) else {
                             return;
@@ -1065,6 +1106,7 @@ impl<'s> Engine<'s> {
                             local_port: self.transport.local_addr().port(),
                             media_ip: &self.media_ip_str,
                             media_port: self.media_port,
+                            rtpstream_ports: rtpstream_ports(call),
                             transport: self.transport_token,
                             call_id,
                             call_number: call.number,
@@ -1584,6 +1626,7 @@ impl<'s> Engine<'s> {
                 local_port: self.transport.local_addr().port(),
                 media_ip: &self.media_ip_str,
                 media_port: self.media_port,
+                rtpstream_ports: rtpstream_ports(call),
                 transport: self.transport_token,
                 call_id,
                 call_number: call.number,
@@ -1639,9 +1682,235 @@ impl<'s> Engine<'s> {
                 crate::actions::ActionOutcome::PlayPcap { kind, file } => {
                     self.start_pcap(call_id, kind, &file);
                 }
+                crate::actions::ActionOutcome::RtpStream(cmd) => {
+                    self.on_rtp_stream(call_id, &cmd);
+                }
+                crate::actions::ActionOutcome::PlayDtmf(value) => {
+                    self.start_dtmf(call_id, &value);
+                }
             }
         }
         false
+    }
+
+    /// `[rtpstream_audio_port]` / `[rtpstream_video_port]`: give the call a
+    /// port from the `-mp`..`-max_rtp_port` range (steps of two, wrapping)
+    /// the first time a template renders the keyword — SIPp
+    /// `rtpstream_get_localport`, minus the trial bind (the bind happens
+    /// when the stream starts and fails loudly then).
+    fn allocate_rtpstream_ports(&mut self, call_id: &str, template: &MsgTemplate) {
+        let mut wanted = [false; 2];
+        for kw in template.keywords() {
+            if let Keyword::RtpStreamPort { video, offset: 0 } = kw {
+                wanted[usize::from(*video)] = true;
+            }
+        }
+        if !wanted.iter().any(|w| *w) {
+            return;
+        }
+        let Some(call) = self.calls.get_mut(call_id) else {
+            return;
+        };
+        for (i, want) in wanted.iter().enumerate() {
+            if *want && call.rtpstream_ports[i].is_none() {
+                let port = self.next_rtp_port;
+                self.next_rtp_port = match self.next_rtp_port.checked_add(2) {
+                    Some(p) if p <= self.max_rtp_port.saturating_sub(1) => p,
+                    _ => self.media_port,
+                };
+                call.rtpstream_ports[i] = Some(port);
+            }
+        }
+    }
+
+    /// `exec rtp_stream=`: start a generated stream, or pause/resume.
+    fn on_rtp_stream(&mut self, call_id: &str, cmd: &RtpStreamCmd) {
+        match cmd {
+            RtpStreamCmd::Pause { video } => self.set_rtp_paused(call_id, *video, true),
+            RtpStreamCmd::Resume { video } => self.set_rtp_paused(call_id, *video, false),
+            RtpStreamCmd::Play {
+                source,
+                loops,
+                payload_type,
+                payload_name,
+            } => self.start_rtp_stream(
+                call_id,
+                source,
+                *loops,
+                *payload_type,
+                payload_name.as_deref(),
+            ),
+        }
+    }
+
+    fn set_rtp_paused(&self, call_id: &str, video: Option<bool>, paused: bool) {
+        if let Some(m) = self.media.as_ref() {
+            let tag = video.map(|v| if v { "rtp-video" } else { "rtp-audio" });
+            m.set_paused(call_id, tag, paused);
+        }
+    }
+
+    fn start_rtp_stream(
+        &mut self,
+        call_id: &str,
+        source: &RtpSource,
+        loops: i64,
+        payload_type: Option<u8>,
+        payload_name: Option<&str>,
+    ) {
+        let pt = payload_type.unwrap_or(self.rtp_payload);
+        let params = match sipr_media::RtpParams::resolve(pt, payload_name) {
+            Ok(p) => p,
+            Err(e) => {
+                // Validated at startup; only reachable if a default changed.
+                self.log_err(&format!("call {call_id}: rtp_stream: {e}"));
+                return;
+            }
+        };
+        let data = match source {
+            RtpSource::File(name) => match self.rtp_files.get(name) {
+                Some(d) => Arc::clone(d),
+                None => {
+                    self.log_err(&format!(
+                        "call {call_id}: rtp_stream: '{name}' was not loaded"
+                    ));
+                    return;
+                }
+            },
+            RtpSource::Pattern { id, .. } => {
+                match sipr_media::rtp::pattern_bytes(*id, params.bytes_per_packet) {
+                    Some(d) => d,
+                    None => return,
+                }
+            }
+        };
+        let kind = if params.video {
+            MediaKind::Video
+        } else {
+            MediaKind::Audio
+        };
+        let tag = if params.video {
+            "rtp-video"
+        } else {
+            "rtp-audio"
+        };
+        let Some(call) = self.calls.get(call_id) else {
+            return;
+        };
+        let number = call.number;
+        let Some(remote) = call.remote_media[kind.index()] else {
+            self.log_err(&format!(
+                "call {call_id}: rtp_stream: no remote {} endpoint yet (no SDP with a live \
+                 m={} line received) — not streaming",
+                kind.as_str(),
+                kind.as_str()
+            ));
+            return;
+        };
+        // Send from the port the SDP advertised: the allocated
+        // [rtpstream_*_port] when the scenario used it, else the
+        // [media_port] form on that m= line.
+        let local_port = call.rtpstream_ports[usize::from(params.video)].unwrap_or_else(|| {
+            let (auto, offset) = self.port_layout[kind.index()];
+            crate::render::media_port_value(self.media_port, auto, offset, number)
+        });
+        let ssrc = self
+            .ssrc_base
+            .wrapping_add(u32::try_from(2 * number.saturating_sub(1)).unwrap_or(0))
+            .wrapping_add(u32::from(params.video));
+        // SIPp derives the initial timestamp from the wall clock in ticks.
+        let initial_ts =
+            u32::try_from(self.stats.started.elapsed().as_millis() % u128::from(u32::MAX))
+                .unwrap_or(0)
+                .wrapping_mul(params.ticks_per_ms());
+        let spec = StreamSpec {
+            call_id: call_id.to_owned(),
+            tag: tag.to_owned(),
+            source: Source::Rtp(sipr_media::RtpSource::new(
+                data, params, loops, ssrc, initial_ts,
+            )),
+            local_ip: self.media_ip,
+            local_port,
+            remote,
+        };
+        let Some(media) = self.media.as_ref() else {
+            return;
+        };
+        match media.play(spec) {
+            Ok(()) => self.stats.rtp_streams_started += 1,
+            Err(e) => {
+                let line = format!(
+                    "call {call_id}: rtp_stream: cannot open media socket {}:{local_port} → \
+                     {remote}: {e}",
+                    self.media_ip
+                );
+                eprintln!("sipr: warning: {line}");
+                self.log_err(&line);
+            }
+        }
+    }
+
+    /// `exec play_dtmf=`: generate the RFC 4733 burst and replay it on the
+    /// audio stream (SIPp: same `play_args_a` path as `play_pcap_audio`).
+    fn start_dtmf(&mut self, call_id: &str, value: &str) {
+        let Some(call) = self.calls.get_mut(call_id) else {
+            return;
+        };
+        self.dtmf_ssrc_counter = self.dtmf_ssrc_counter.wrapping_add(1);
+        let ssrc = 0xD7F0_0000u32
+            .wrapping_add(
+                u32::try_from(call.number)
+                    .unwrap_or(0)
+                    .wrapping_mul(0x10000),
+            )
+            .wrapping_add(self.dtmf_ssrc_counter);
+        let req = sipr_media::dtmf::DtmfRequest::parse(
+            value,
+            sipr_media::dtmf::DEFAULT_PAYLOAD_TYPE,
+            ssrc,
+            call.dtmf_seq,
+        );
+        let (stream, count) = sipr_media::dtmf::generate(&req);
+        call.dtmf_seq = call.dtmf_seq.wrapping_add(count);
+        let number = call.number;
+        let remote = call.remote_media[MediaKind::Audio.index()];
+        if stream.is_empty() {
+            self.log_err(&format!(
+                "call {call_id}: play_dtmf=\"{value}\": no valid digits — nothing sent"
+            ));
+            return;
+        }
+        let Some(remote) = remote else {
+            self.log_err(&format!(
+                "call {call_id}: play_dtmf: no remote audio endpoint yet — not playing"
+            ));
+            return;
+        };
+        let (auto, offset) = self.port_layout[MediaKind::Audio.index()];
+        let local_port = crate::render::media_port_value(self.media_port, auto, offset, number);
+        let spec = StreamSpec {
+            call_id: call_id.to_owned(),
+            tag: MediaKind::Audio.as_str().to_owned(),
+            source: Source::Pcap(Arc::new(stream)),
+            local_ip: self.media_ip,
+            local_port,
+            remote,
+        };
+        let Some(media) = self.media.as_ref() else {
+            return;
+        };
+        match media.play(spec) {
+            Ok(()) => self.stats.rtp_streams_started += 1,
+            Err(e) => {
+                let line = format!(
+                    "call {call_id}: play_dtmf: cannot open media socket {}:{local_port} → \
+                     {remote}: {e}",
+                    self.media_ip
+                );
+                eprintln!("sipr: warning: {line}");
+                self.log_err(&line);
+            }
+        }
     }
 
     // ---- media ---------------------------------------------------------
@@ -1674,7 +1943,7 @@ impl<'s> Engine<'s> {
         let spec = StreamSpec {
             call_id: call_id.to_owned(),
             tag: tag.to_owned(),
-            stream,
+            source: Source::Pcap(stream),
             local_ip: self.media_ip,
             local_port,
             remote,
@@ -1747,6 +2016,7 @@ impl<'s> Engine<'s> {
             local_port: self.transport.local_addr().port(),
             media_ip: &self.media_ip_str,
             media_port: self.media_port,
+            rtpstream_ports: rtpstream_ports(call),
             transport: self.transport_token,
             call_id,
             call_number: call.number,
@@ -2129,6 +2399,8 @@ fn new_call(
         routes: Vec::new(),
         last_recv: None,
         remote_media: [None; 3],
+        rtpstream_ports: [None; 2],
+        dtmf_seq: DTMF_FIRST_SEQ,
         last_recv_key: None,
         retrans: None,
         timer: None,
@@ -2337,6 +2609,76 @@ fn media_port_layout(scenario: &Scenario) -> [(bool, u16); 3] {
         }
     }
     layout
+}
+
+/// The call's allocated rtpstream ports for rendering (0 = none yet).
+fn rtpstream_ports(call: &CallState) -> [u16; 2] {
+    [
+        call.rtpstream_ports[0].unwrap_or(0),
+        call.rtpstream_ports[1].unwrap_or(0),
+    ]
+}
+
+/// Load every `rtp_stream` file once (WAV header skipped, like SIPp's
+/// `rtpstream_cache_file`) and validate every play command's codec
+/// parameters, so a bad scenario fails before any call starts.
+fn load_rtp_files(
+    scenario: &Scenario,
+    config: &EngineConfig,
+) -> Result<HashMap<String, Arc<[u8]>>, EngineError> {
+    let default_pt = config.rtp_payload.unwrap_or(DEFAULT_RTP_PAYLOAD);
+    let mut files: HashMap<String, Arc<[u8]>> = HashMap::new();
+    for cmd in scenario.rtp_stream_plays() {
+        let RtpStreamCmd::Play {
+            source,
+            payload_type,
+            payload_name,
+            ..
+        } = cmd
+        else {
+            continue;
+        };
+        let params = sipr_media::RtpParams::resolve(
+            payload_type.unwrap_or(default_pt),
+            payload_name.as_deref(),
+        )
+        .map_err(|e| EngineError(format!("exec rtp_stream=: {e}")))?;
+        match source {
+            RtpSource::Pattern { video, id } => {
+                if *video != params.video {
+                    eprintln!(
+                        "sipr: warning: rtp_stream {}pattern {id} with an {} payload type — \
+                         the payload decides the stream (SIPp does the same)",
+                        if *video { "v" } else { "a" },
+                        if params.video { "video" } else { "audio" }
+                    );
+                }
+            }
+            RtpSource::File(name) => {
+                if files.contains_key(name) {
+                    continue;
+                }
+                let path = resolve_media_file(name, config.scenario_dir.as_deref());
+                let bytes = std::fs::read(&path).map_err(|e| {
+                    EngineError(format!(
+                        "exec rtp_stream=: cannot read '{name}' ({}): {e}",
+                        path.display()
+                    ))
+                })?;
+                let data = sipr_media::rtp::stream_bytes(&bytes);
+                if data.len() < params.bytes_per_packet {
+                    eprintln!(
+                        "sipr: warning: rtp_stream '{name}' is shorter than one packet ({} < {} \
+                         bytes)",
+                        data.len(),
+                        params.bytes_per_packet
+                    );
+                }
+                files.insert(name.clone(), data);
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// Resolve and parse every `play_pcap_*` file once. A missing or malformed

@@ -1990,3 +1990,188 @@ fn play_pcap_with_a_missing_file_is_fatal_at_startup() {
     assert!(err.contains("play_pcap_audio"), "{err}");
     assert!(err.contains("does-not-exist.pcap"), "{err}");
 }
+
+/// An `rtp_stream` + `play_dtmf` UAC: SDP advertises `[rtpstream_audio_port]`,
+/// streams a raw file twice, then sends one DTMF digit.
+fn rtp_stream_uac_scenario(file: &str) -> String {
+    format!(
+        r#"<scenario name="uac-rtp-stream">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]s[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+    s=-
+    c=IN IP[media_ip_type] [media_ip]
+    t=0 0
+    m=audio [rtpstream_audio_port] RTP/AVP 8 96
+    a=rtcp:[rtpstream_audio_port+1]
+    a=rtpmap:8 PCMA/8000
+    a=rtpmap:96 telephone-event/8000
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]s[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <nop><action><exec rtp_stream="{file},2,8,PCMA/8000"/></action></nop>
+  <pause milliseconds="300"/>
+  <nop><action><exec play_dtmf="1,50"/></action></nop>
+  <pause milliseconds="800"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]s[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#
+    )
+}
+
+#[test]
+fn rtp_stream_and_play_dtmf_send_generated_rtp() {
+    let (addr, _media, uas, sink) = spawn_media_uas(Duration::from_secs(2));
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    // 320 bytes of "audio" = two 160-byte PCMA packets per loop.
+    let audio: Vec<u8> = (0..320u32).map(|i| (i % 251) as u8).collect();
+    let audio_path = dir.join(format!("sipr-e2e-{pid}.g711a"));
+    std::fs::write(&audio_path, &audio).expect("write audio");
+    let scenario_path = dir.join(format!("sipr-e2e-rtp-{pid}.xml"));
+    std::fs::write(
+        &scenario_path,
+        rtp_stream_uac_scenario(audio_path.to_str().expect("utf8")),
+    )
+    .expect("write scenario");
+    let media_base = free_port();
+    let out = run_sipr(&[
+        "-sf",
+        scenario_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-mp",
+        &media_base.to_string(),
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&audio_path);
+    let _ = std::fs::remove_file(&scenario_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    // 4 stream packets + a 1-digit DTMF burst of 20 noop + 3 start + 3 end.
+    assert!(err.contains("rtp-sent 30"), "{err}");
+    assert_eq!(uas.join().expect("uas").byes, 1);
+    let got = sink.join().expect("sink");
+    assert_eq!(got.len(), 30, "received {}", got.len());
+    // Everything comes from the allocated [rtpstream_audio_port] = -mp base
+    // (first allocation), which is also the plain [media_port] for DTMF.
+    assert!(
+        got.iter().all(|(from, _)| from.port() == media_base),
+        "{got:?}"
+    );
+    let stream: Vec<&Vec<u8>> = got
+        .iter()
+        .map(|(_, p)| p)
+        .filter(|p| p[1] & 0x7f == 8)
+        .collect();
+    assert_eq!(stream.len(), 4);
+    for (i, p) in stream.iter().enumerate() {
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), i as u16);
+        assert_eq!(&p[8..12], &(0xCA11_0000u32).to_be_bytes(), "SSRC of call 1");
+        let expected = if i % 2 == 0 {
+            &audio[..160]
+        } else {
+            &audio[160..]
+        };
+        assert_eq!(&p[12..], expected, "packet {i} payload");
+    }
+    let noops = got.iter().filter(|(_, p)| p[1] & 0x7f == 97).count();
+    let events: Vec<&Vec<u8>> = got
+        .iter()
+        .map(|(_, p)| p)
+        .filter(|p| p[1] & 0x7f == 96)
+        .collect();
+    assert_eq!(noops, 20);
+    assert_eq!(events.len(), 6);
+    assert_eq!(
+        events[0][1] & 0x80,
+        0x80,
+        "marker on the first event packet"
+    );
+    assert_eq!(&events[0][12..], &[1, 10, 0, 0]);
+    assert_eq!(
+        &events[5][12..],
+        &[1, 0x8a, 0x01, 0x90],
+        "end packet: digit 1, 50 ms"
+    );
+    let seqs: Vec<u16> = got
+        .iter()
+        .map(|(_, p)| p)
+        .filter(|p| p[1] & 0x7f != 8)
+        .map(|p| u16::from_be_bytes([p[2], p[3]]))
+        .collect();
+    assert_eq!(
+        seqs,
+        (1200..1226).collect::<Vec<u16>>(),
+        "DTMF sequence from 1200"
+    );
+}
+
+#[test]
+fn rtp_stream_with_a_bad_payload_is_fatal_at_startup() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let scenario_path = dir.join(format!("sipr-e2e-badrtp-{pid}.xml"));
+    std::fs::write(
+        &scenario_path,
+        rtp_stream_uac_scenario("x.raw").replace("x.raw,2,8,PCMA/8000", "x.raw,1,100"),
+    )
+    .expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        scenario_path.to_str().expect("utf8"),
+        "-m",
+        "1",
+        "-timeout",
+        "5",
+        "-bg",
+        "127.0.0.1:5",
+    ]);
+    let _ = std::fs::remove_file(&scenario_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("Missing mandatory payload_name"), "{err}");
+}

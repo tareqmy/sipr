@@ -335,6 +335,59 @@ divergences in SIPP_COMPAT §6.
       `play_dtmf` (RFC 4733 generation), `rtp_echo`, `-rtpcheck`, `-key`
       lookups in `play_pcap_*` values, `~` expansion in media paths.
 
+## M15 — RTP streaming and DTMF (`exec rtp_stream=`, `exec play_dtmf=`) ✅
+
+Behavioral oracle: `rtpstream.cpp` (`rtpstream_playrtptask`,
+`rtpstream_get_localport`, `rtpstream_cache_file`), `actions.cpp`
+`setRTPStreamActInfo` (the payload table), `prepare_pcap.c` `prepare_dtmf`,
+`call.cpp` `E_Message_RTPStream_*_Port`. Divergences in SIPP_COMPAT §6.
+
+- [x] `sipr-media::rtp`: SIPp's payload table verbatim (0/8/9 → 160 B/20 ms,
+      13 → 1 B/150 ms, 18 → 20 B/20 ms, dynamic `H264/90000` → 1280 B/160 ms
+      video, `iLBC/8000` → 50 B/30 ms; missing/mismatched names error with
+      SIPp's wording), RIFF/WAVE header skip (not a decoder — as SIPp),
+      `apattern`/`vpattern` 1..=6 fills, and `RtpSource`: 12-byte header
+      (V=2, no marker, seq from 0, wall-clock-derived timestamp advancing by
+      `ticks_per_packet`, SSRC `0xCA110000 + 2*(call-1) + video`), payload
+      spliced across the file end when looping, loop count `-1` = forever,
+      pause fast-forwards the clock (SIPp `TI_PAUSERTP`).
+- [x] `sipr-media::dtmf`: RFC 4733 bursts with SIPp's exact shapes/timing
+      (20 warm-up PT 97 packets 20 ms apart, per-digit starts every 20 ms at
+      `400 + (k+1)*2*tone + cur` with marker on the first and `duration =
+      cur*8`, three end packets 1 ms apart, one RTP timestamp per event,
+      digits `0-9*#A-D`, tone clamped to 50..=2000 else 200). Generated as a
+      synthetic `PcapStream` and replayed on the audio stream, as SIPp does.
+      Fixed on purpose: sequence numbers are consecutive (SIPp's warm-up
+      steps by two).
+- [x] Scheduler: `Source::{Pcap, Rtp}`; generated packet `n` is due at
+      `start + n*interval` (burst catch-up, no drift); `pause`/`resume`
+      commands per call or per `rtp-audio`/`rtp-video` tag.
+- [x] Scenario: `rtp_stream="file|apattern|vpattern|pause|resume|
+      pause[av]pattern|resume[av]pattern[,loops|id[,pt[,name]]]"` →
+      `Action::RtpStream`, `play_dtmf="digits[,tone]"` → `Action::PlayDtmf`
+      (a template — keywords render, as SIPp), `[rtpstream_audio_port]` /
+      `[rtpstream_video_port]` (+`N`) keywords. `rtp_echo=` stays a clear
+      error. Corpus `positive/rtp_stream.xml`, `negative/media_rtp_echo.xml`.
+- [x] Engine/CLI: `-rtp_payload` (default 8), `-max_rtp_port`,
+      `-random_base_ssrc`; files loaded and codec parameters validated at
+      startup (fatal, like SIPp); `[rtpstream_*_port]` allocated per call
+      from `-mp` in steps of two when first rendered (SIPp's cursor, minus
+      the trial bind); a stream sends **from the port the SDP advertised**
+      (the allocated rtpstream port, else the `[media_port]` form on that
+      `m=` line) — SIPp binds a fresh unrelated port; DTMF sequence per
+      call from 1200; streams stop with the call.
+- [x] Tests: 12 new unit tests (payload table, WAV skip, patterns, splice/
+      loop/pause/timestamp math, DTMF shapes, scheduler pacing + pause),
+      compiler tests for the whole grammar, e2e
+      `rtp_stream_and_play_dtmf_send_generated_rtp` (every packet checked:
+      PT, seq, SSRC, payload, DTMF bodies) and a fatal bad-payload case,
+      interop `uac_rtp_stream_against_real_sipp_uas` (endless stream vs
+      `sipp -rtp_echo`, stops with the call).
+- [x] Deferred: `exec rtp_echo=` SRTP echo control and `-rtp_echo`'s global
+      echo sockets, `-rtpcheck`/`-audiotolerance` (RTP check verdicts, exit
+      -3), SRTP (`a=crypto`), `-key` lookups and `~` expansion in media
+      paths, `-rtp_threadtasks` (meaningless for one scheduler).
+
 ## Post-v1 backlog (ordered)
 
-RTP streaming + DTMF + echo (M15) → AKA auth → HTTP control API.
+AKA auth → HTTP control API → RTP echo/rtpcheck (M16, if wanted).

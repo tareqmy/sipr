@@ -47,11 +47,12 @@ not from a scenario action. Extended 3PCC (`-master`/`-slave`/`-slave_cfg` with
 `-inf` injection + `[fieldN]` and `lookup`/`insert`/`replace` shipped in M7,
 classic 3PCC (`sendCmd`/`recvCmd`) in M10 (see §6).
 
-### Media (M14+)
+### Media (M14–M15)
 
-Shipped in M14: `exec play_pcap_audio|video|image=` and `<recv ignoresdp>`
-(see §6). Still later: `exec rtp_stream`, `exec play_dtmf`, `rtp_echo`
-(M15), `verifyauth`, `closecon`, `pauserestore`.
+Shipped: `exec play_pcap_audio|video|image=` and `<recv ignoresdp>` (M14),
+`exec rtp_stream=` (file/pattern/pause/resume) and `exec play_dtmf=` (M15) —
+see §6. Still later: `exec rtp_echo=`, `-rtp_echo` global echo, rtpcheck,
+SRTP, `verifyauth`, `closecon`, `pauserestore`.
 
 ## 2. Keywords (v1)
 
@@ -69,6 +70,9 @@ Media keywords (M14): `[media_ip]` (`-mi`, default the local IP),
 every call — as in SIPp), `[auto_media_port]` (per-call 4-port block:
 `base + 4*(call_number-1) % 10000`, SIPp's undocumented keyword), and the
 `+N` offset forms `[media_port+1]` / `[auto_media_port+2]` (RTCP, video).
+`[rtpstream_audio_port]` / `[rtpstream_video_port]` (M15): a port allocated
+to the call from `-mp`..`-max_rtp_port` in steps of two the first time it
+renders; `+N` forms never allocate (`a=rtcp:[rtpstream_audio_port+1]`).
 
 Keyword parameters use SIPp syntax `[keyword param=value]`. Unknown keywords:
 loud warning + left verbatim in the message (match SIPp behavior — verify in
@@ -86,7 +90,8 @@ mono-socket; `tn`/`ln` accepted as aliases) `-s <service>` (called number)
 SIPp defaults `cacert.pem`/`cakey.pem`).
 Media: `-mi <ip>` (media address; default local IP) `-mp <port>` (base media
 port, default 6000; `-min_rtp_port` is SIPp's alias — note SIPp's `-mp` is
-*that* alias too, not a fixed port).
+*that* alias too, not a fixed port) `-max_rtp_port` `-rtp_payload <pt>`
+(default 8) `-random_base_ssrc`.
 Auth: `-au`/`-ap` (username/password defaults for `[authentication]`).
 Tracing/output: `-trace_msg` `-trace_err` `-trace_stat` `-stf <file>`
 `-fd <interval s>` `-nd` (no defaults) `-timeout <s>` `-bg` (headless).
@@ -337,5 +342,42 @@ Verify exact SIPp table before closing M3 and update this line.
   (unsupported link type) — recapture on the wired side. `play_pcap=` (in
   the DTD, never implemented by SIPp) is an error pointing at
   `play_pcap_audio=`. Bracketed `-key` values are not supported yet.
+- `exec rtp_stream=` / `exec play_dtmf=` (M15; verified in `rtpstream.cpp`
+  `rtpstream_playrtptask` (~l.603), `rtpstream_get_localport` (~l.1789),
+  `rtpstream_cache_file` / `get_wav_header_size` (~l.1619/2240),
+  `actions.cpp` `setRTPStreamActInfo` (~l.677), `prepare_pcap.c`
+  `prepare_dtmf` (~l.556), `call.cpp` `E_Message_RTPStream_Audio_Port`
+  (~l.2827)): the value is `name,loops|pattern_id,payload_type,
+  payload_name`; files are raw codec bytes with only a RIFF/WAVE header
+  skipped ("Doesn't actually parse/convert anything!"), cached once at
+  parse; the payload table is fixed (0/8/9 → 160 B per 20 ms, 18 → 20 B,
+  13 → 1 B per 150 ms, dynamic `H264/90000` → 1280 B per 160 ms video,
+  `iLBC/8000` → 50 B per 30 ms) and a missing name is fatal except for
+  0/8/9/18; a mismatched name is a fatal "unknown payload type". Packets:
+  V=2, marker never set, seq from 0, timestamp = wall-clock ms ×
+  ticks-per-ms advancing by ticks-per-packet, SSRC `0xCA110000` + 2 per
+  call (`-random_base_ssrc` randomizes the base), payload spliced across
+  the file end when looping, `-1` loops forever. `pause` does NOT stop the
+  clock — the timestamp is fast-forwarded so the stream "appears up to
+  date" on resume. `[rtpstream_audio_port]` allocates a port from
+  `min_rtp_port` in steps of two (wrapping at `max_rtp_port`) with a trial
+  bind; `+N` never allocates. **SIPp streams from that allocated port even
+  when the SDP advertised `[media_port]`** (its own `pfca_uac.xml` does
+  this), and its RTCP socket is always destroyed by an inverted bind test.
+  `play_dtmf="digits[,tone]"`: 20 warm-up packets (PT 97, 4 zero bytes,
+  20 ms apart) then per digit start packets every 20 ms (marker on the
+  first, `duration = elapsed*8`) at `400 + (k+1)*2*tone` ms and three end
+  packets 1 ms apart; PT hard-coded 96 (the bundled scenario advertises
+  101); per-call sequence from 1200; a fresh SSRC per burst; digits outside
+  `0-9*#A-D` skipped; tone outside 50..=2000 → 200. sipr matches all of
+  that with these divergences: (1) a stream sends from the port the SDP
+  advertised — the allocated `[rtpstream_*_port]` when used, else the
+  `[media_port]` form on that `m=` line; (2) DTMF sequence numbers are
+  consecutive (SIPp's warm-up increments two counters and skips every
+  other number); (3) the SIPp sender's post-send recv+memcmp ("RTP check")
+  and the `-audiotolerance` verdict/exit −3 are not implemented; (4) the
+  packet grid is per stream (`start + n*interval`), not SIPp's global
+  wall-clock grid that fires every stream in the same millisecond; (5)
+  `-rtp_threadtasks` is not needed (one scheduler thread) and not accepted.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

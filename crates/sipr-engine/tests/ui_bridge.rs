@@ -42,6 +42,9 @@ fn uas_config() -> EngineConfig {
         tls: None,
         media_ip: None,
         media_port: None,
+        max_rtp_port: None,
+        rtp_payload: None,
+        random_base_ssrc: false,
         scenario_dir: None,
     }
 }

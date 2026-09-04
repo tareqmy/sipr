@@ -93,6 +93,9 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
 - pcap replay: `<exec play_pcap_audio="file.pcap"/>` streams a capture's RTP
   to the peer's SDP endpoint from `-mi`/`-mp` (`[media_port]`,
   `[auto_media_port]`) — ordinary UDP sockets, so no root needed.
+- RTP streaming and DTMF: `<exec rtp_stream="file.g711a,-1,8"/>` with
+  SIPp's codec table, patterns, `pause`/`resume`, `[rtpstream_audio_port]`;
+  `<exec play_dtmf="1234#"/>` sends RFC 4733 events.
 - Live TUI, `-bg` headless stat lines, `-trace_msg`/`-trace_err`/`-trace_stat`
   files, RTDs and repartition tables.
 
@@ -108,8 +111,7 @@ transport — no system libraries (no OpenSSL, no libpcap), no root for media.
 
 ## Not yet (post-v1 roadmap)
 
-RTP streaming/DTMF/echo (`rtp_stream`, `play_dtmf`), AKA authentication, and
-an HTTP control API.
+RTP echo / rtpcheck / SRTP, AKA authentication, and an HTTP control API.
 
 ## Brand
 

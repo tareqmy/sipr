@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use crate::diag::{Diagnostic, Diagnostics};
 use crate::model::{
     Action, ArithOp, CompareOp, Expect, IntCmd, MediaKind, Operand, PauseSpec, RecvStep, Role,
-    Scenario, SearchIn, SendStep, Step, StepCommon, StepIndex, VarId, VarTable,
+    RtpSource, RtpStreamCmd, Scenario, SearchIn, SendStep, Step, StepCommon, StepIndex, VarId,
+    VarTable,
 };
 use crate::template::{self, Keyword, MsgTemplate};
 use crate::xml::{self, Element, Node};
@@ -911,17 +912,43 @@ impl Compiler {
                         "rtp_echo",
                     ],
                 );
-                for later in ["rtp_stream", "rtp_echo", "play_dtmf"] {
-                    if el.attr(later).is_some() {
-                        self.diags.error(
-                            Some(line),
-                            format!(
-                                "exec {later}= is not supported yet — M15 (RTP streaming, \
-                                 DTMF, echo)"
-                            ),
-                        );
+                if el.attr("rtp_echo").is_some() {
+                    self.diags.error(
+                        Some(line),
+                        "exec rtp_echo= (SRTP echo control) is not supported yet — later \
+                         milestone",
+                    );
+                    return None;
+                }
+                let media_attrs = [
+                    "rtp_stream",
+                    "play_dtmf",
+                    "play_pcap_audio",
+                    "play_pcap_video",
+                    "play_pcap_image",
+                    "int_cmd",
+                    "command",
+                ]
+                .iter()
+                .filter(|a| el.attr(a).is_some())
+                .count();
+                if media_attrs > 1 {
+                    self.diags.error(
+                        Some(line),
+                        "exec: only one of rtp_stream=/play_dtmf=/play_pcap_*=/int_cmd=/\
+                         command= per action",
+                    );
+                    return None;
+                }
+                if let Some(v) = el.attr("rtp_stream") {
+                    return self.parse_rtp_stream(v, line).map(Action::RtpStream);
+                }
+                if let Some(v) = el.attr("play_dtmf") {
+                    if v.trim().is_empty() {
+                        self.diags.error(Some(line), "exec play_dtmf= needs digits");
                         return None;
                     }
+                    return Some(Action::PlayDtmf(self.templ(v, line)));
                 }
                 if el.attr("play_pcap").is_some() {
                     self.diags.error(
@@ -1011,6 +1038,96 @@ impl Compiler {
                 None
             }
         }
+    }
+
+    /// `exec rtp_stream="file|apattern|vpattern|pause|resume[,...]"` —
+    /// SIPp's `setRTPStreamActInfo` grammar: `name,loops|pattern_id,
+    /// payload_type,payload_name`. Codec parameters are resolved by the
+    /// engine (it knows the `-rtp_payload` default).
+    fn parse_rtp_stream(&mut self, value: &str, line: u32) -> Option<RtpStreamCmd> {
+        let value = value.trim();
+        let control = match value {
+            "pause" => Some(RtpStreamCmd::Pause { video: None }),
+            "resume" => Some(RtpStreamCmd::Resume { video: None }),
+            "pauseapattern" => Some(RtpStreamCmd::Pause { video: Some(false) }),
+            "resumeapattern" => Some(RtpStreamCmd::Resume { video: Some(false) }),
+            "pausevpattern" => Some(RtpStreamCmd::Pause { video: Some(true) }),
+            "resumevpattern" => Some(RtpStreamCmd::Resume { video: Some(true) }),
+            _ => None,
+        };
+        if control.is_some() {
+            return control;
+        }
+        let mut fields = value.split(',').map(str::trim);
+        let name = fields.next().unwrap_or_default();
+        if name.is_empty() {
+            self.diags
+                .error(Some(line), "exec rtp_stream= needs a file name or pattern");
+            return None;
+        }
+        let pattern = name
+            .strip_prefix("apattern")
+            .map(|_| false)
+            .or_else(|| name.strip_prefix("vpattern").map(|_| true));
+        let second = fields.next().filter(|f| !f.is_empty());
+        let payload_type = match fields.next().filter(|f| !f.is_empty()) {
+            None => None,
+            Some(raw) => match raw.parse::<u8>() {
+                Ok(pt) if pt <= 127 => Some(pt),
+                _ => {
+                    self.diags.error(
+                        Some(line),
+                        format!("exec rtp_stream=: invalid payload type '{raw}' (0..=127)"),
+                    );
+                    return None;
+                }
+            },
+        };
+        let payload_name = fields
+            .next()
+            .filter(|f| !f.is_empty())
+            .map(ToOwned::to_owned);
+        if fields.next().is_some() {
+            self.diags.warn(
+                Some(line),
+                "exec rtp_stream=: extra fields after payload_name are ignored",
+            );
+        }
+        let (source, loops) = match pattern {
+            Some(video) => {
+                // SIPp: pattern id from the 2nd field (default 1), loop forever.
+                let id = match second.map(str::parse::<u8>) {
+                    None => 1,
+                    Some(Ok(id)) if (1..=6).contains(&id) => id,
+                    Some(_) => {
+                        self.diags
+                            .error(Some(line), "exec rtp_stream=: pattern id must be 1..=6");
+                        return None;
+                    }
+                };
+                (RtpSource::Pattern { video, id }, -1)
+            }
+            None => {
+                let loops = match second.map(str::parse::<i64>) {
+                    None => 1,
+                    Some(Ok(n)) if n >= -1 => n,
+                    Some(_) => {
+                        self.diags.error(
+                            Some(line),
+                            "exec rtp_stream=: loop count must be -1 (forever) or >= 0",
+                        );
+                        return None;
+                    }
+                };
+                (RtpSource::File(name.to_owned()), loops)
+            }
+        };
+        Some(RtpStreamCmd::Play {
+            source,
+            loops,
+            payload_type,
+            payload_name,
+        })
     }
 
     /// `exec play_pcap_audio|video|image="file"`. `Some(None)` when the

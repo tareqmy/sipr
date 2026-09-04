@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **RTP streaming and DTMF (`exec rtp_stream=`, `exec play_dtmf=`)** —
+  SIPp's `rtpstream.cpp` semantics on the M14 scheduler: raw codec files or
+  `apattern`/`vpattern` fills with SIPp's fixed payload table, looping,
+  `pause`/`resume` (the clock keeps running, as in SIPp), SSRC
+  `0xCA110000`-based, plus RFC 4733 DTMF bursts with SIPp's exact timing.
+  `[rtpstream_audio_port]`/`[rtpstream_video_port]` keywords with per-call
+  allocation, `-rtp_payload`, `-max_rtp_port`, `-random_base_ssrc`. sipr
+  streams from the port the SDP advertised (SIPp binds an unrelated one)
+  and numbers DTMF packets consecutively (SIPp skips every other warm-up
+  number). Divergences in `docs/SIPP_COMPAT.md` §6.
+
 ## [0.3.0] — 2026-09-04
 
 ### Added

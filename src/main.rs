@@ -167,6 +167,9 @@ fn run(cli: &Cli) -> ExitCode {
         users: cli.users,
         media_ip: cli.media_ip,
         media_port: cli.media_port,
+        max_rtp_port: cli.max_rtp_port,
+        rtp_payload: cli.rtp_payload,
+        random_base_ssrc: cli.random_base_ssrc,
         // pcap paths resolve next to the scenario file first (SIPp find_file).
         scenario_dir: cli
             .sf

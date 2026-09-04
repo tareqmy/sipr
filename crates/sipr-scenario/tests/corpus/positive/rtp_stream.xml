@@ -1,0 +1,22 @@
+<scenario name="rtp_stream file, pattern, pause/resume, dtmf">
+  <send><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Call-ID: [call_id]
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    c=IN IP[media_ip_type] [media_ip]
+    m=audio [rtpstream_audio_port] RTP/AVP 0 8 101
+    a=rtcp:[rtpstream_audio_port+1]
+    m=video [rtpstream_video_port] RTP/AVP 96
+  ]]></send>
+  <recv response="200"/>
+  <nop><action><exec rtp_stream="audio/beep.g711a,-1,8,PCMA/8000"/></action></nop>
+  <nop><action><exec rtp_stream="pause"/></action></nop>
+  <nop><action><exec rtp_stream="resume"/></action></nop>
+  <nop><action><exec rtp_stream="apattern,2,0"/></action></nop>
+  <nop><action><exec rtp_stream="vpattern,1,96,H264/90000"/></action></nop>
+  <nop><action><exec play_dtmf="1234#,150"/></action></nop>
+  <nop><action><exec rtp_stream="pauseapattern"/></action></nop>
+</scenario>

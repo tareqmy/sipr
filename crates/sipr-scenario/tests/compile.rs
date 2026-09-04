@@ -200,9 +200,7 @@ fn play_pcap_exec_compiles_to_a_media_action() {
 #[test]
 fn unsupported_media_execs_are_clear_errors() {
     for attr in [
-        r#"rtp_stream="beep.wav""#,
         r#"rtp_echo="startaudio""#,
-        r#"play_dtmf="1234""#,
         r#"play_pcap="x.pcap""#,
         r#"play_pcap_audio="a.pcap" play_pcap_video="v.pcap""#,
         r#"play_pcap_audio="a.pcap" int_cmd="stop_call""#,
@@ -479,4 +477,98 @@ fn field_line_var_reads_the_selector_variable() {
     ));
     let out = compile("test", &xml);
     assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+}
+
+#[test]
+fn rtp_stream_exec_parses_sipp_grammar() {
+    use sipr_scenario::model::{RtpSource, RtpStreamCmd};
+    let cases: Vec<(&str, RtpStreamCmd)> = vec![
+        (
+            "beep.wav",
+            RtpStreamCmd::Play {
+                source: RtpSource::File("beep.wav".into()),
+                loops: 1,
+                payload_type: None,
+                payload_name: None,
+            },
+        ),
+        (
+            "coco.wav,-1,0,PCMU/8000",
+            RtpStreamCmd::Play {
+                source: RtpSource::File("coco.wav".into()),
+                loops: -1,
+                payload_type: Some(0),
+                payload_name: Some("PCMU/8000".into()),
+            },
+        ),
+        (
+            "apattern",
+            RtpStreamCmd::Play {
+                source: RtpSource::Pattern {
+                    video: false,
+                    id: 1,
+                },
+                loops: -1,
+                payload_type: None,
+                payload_name: None,
+            },
+        ),
+        (
+            "vpattern,3,96,H264/90000",
+            RtpStreamCmd::Play {
+                source: RtpSource::Pattern { video: true, id: 3 },
+                loops: -1,
+                payload_type: Some(96),
+                payload_name: Some("H264/90000".into()),
+            },
+        ),
+        ("pause", RtpStreamCmd::Pause { video: None }),
+        ("resumevpattern", RtpStreamCmd::Resume { video: Some(true) }),
+    ];
+    for (value, expected) in cases {
+        let xml = wrap(&format!(
+            r#"{invite}
+               <nop><action><exec rtp_stream="{value}"/></action></nop>"#,
+            invite = send_invite()
+        ));
+        let out = compile("test", &xml);
+        assert!(out.diagnostics.is_empty(), "{value}: {:?}", out.diagnostics);
+        let sc = out.scenario.expect("compiles");
+        let Step::Nop { actions, .. } = &sc.steps[1] else {
+            panic!("nop")
+        };
+        assert!(
+            matches!(&actions[0], Action::RtpStream(cmd) if *cmd == expected),
+            "{value}: {:?}",
+            actions[0]
+        );
+        assert!(sc.has_media());
+    }
+    for bad in [
+        r#"rtp_stream="""#,
+        r#"rtp_stream="f.wav,-2""#,
+        r#"rtp_stream="f.wav,1,200""#,
+        r#"rtp_stream="apattern,9""#,
+        r#"rtp_stream="f.wav" play_dtmf="1""#,
+        r#"play_dtmf="""#,
+    ] {
+        let xml = wrap(&format!(
+            r#"{invite}
+               <nop><action><exec {bad}/></action></nop>"#,
+            invite = send_invite()
+        ));
+        assert!(!errors(&xml).is_empty(), "{bad}: expected an error");
+    }
+    let xml = wrap(&format!(
+        r#"{invite}
+           <nop><action><exec play_dtmf="12#,[$tone]"/></action></nop>"#,
+        invite = send_invite()
+    ));
+    // [$tone] is read but never set → the compiler's usual error, proving the
+    // value is a real template.
+    assert!(
+        errors(&xml).iter().any(|e| e.contains("never set")),
+        "{:?}",
+        errors(&xml)
+    );
 }

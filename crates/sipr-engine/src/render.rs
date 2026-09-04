@@ -58,6 +58,9 @@ pub struct RenderCtx<'a> {
     pub media_ip: &'a str,
     /// Base media port (`-mp`, default 6000) for `[media_port]`.
     pub media_port: u16,
+    /// This call's allocated `[rtpstream_audio_port]` / `[rtpstream_video_port]`
+    /// (0 when never allocated — the engine allocates before rendering).
+    pub rtpstream_ports: [u16; 2],
     /// Transport token (`UDP` in v1).
     pub transport: &'a str,
     /// This call's Call-ID.
@@ -326,6 +329,10 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
             let _ = write!(out, "{port}");
         }
         Keyword::MediaIpType => out.push_str(ip_type(ctx.media_ip)),
+        Keyword::RtpStreamPort { video, offset } => {
+            let base = ctx.rtpstream_ports[usize::from(*video)];
+            let _ = write!(out, "{}", base.saturating_add(*offset));
+        }
         Keyword::Field { index, file, line } => {
             if let Some(fi) = ctx.fields.resolve_file(file.as_deref()) {
                 // No `line=` → the call's assigned line. With `line=`, an
@@ -475,6 +482,7 @@ mod tests {
             local_port: 5061,
             media_ip: "10.0.0.1",
             media_port: 6000,
+            rtpstream_ports: [0, 0],
             transport: "UDP",
             call_id: "1-99@10.0.0.1",
             call_number: 1,

@@ -126,6 +126,11 @@ pub enum ActionOutcome {
         /// The file as written in the scenario (the engine's pcap table key).
         file: String,
     },
+    /// `exec rtp_stream=`: start/pause/resume a generated RTP stream. Not
+    /// terminal.
+    RtpStream(sipr_scenario::model::RtpStreamCmd),
+    /// `exec play_dtmf=`: the rendered `digits[,tone_ms]` value. Not terminal.
+    PlayDtmf(String),
 }
 
 /// Run every action in order, mutating the store and collecting outcomes.
@@ -162,7 +167,11 @@ fn run_actions_impl(
         let outcome = run_one(action, store, last_msg, cmd_text, base_ctx);
         let terminal = !matches!(
             outcome,
-            ActionOutcome::Continue | ActionOutcome::Log(_) | ActionOutcome::PlayPcap { .. }
+            ActionOutcome::Continue
+                | ActionOutcome::Log(_)
+                | ActionOutcome::PlayPcap { .. }
+                | ActionOutcome::RtpStream(_)
+                | ActionOutcome::PlayDtmf(_)
         );
         out.push(outcome);
         if terminal {
@@ -341,6 +350,8 @@ fn run_one(
             kind: *kind,
             file: file.clone(),
         },
+        Action::RtpStream(cmd) => ActionOutcome::RtpStream(cmd.clone()),
+        Action::PlayDtmf(t) => ActionOutcome::PlayDtmf(render_with_store(t, store, base_ctx)),
         Action::ExecInt(cmd) => match cmd {
             sipr_scenario::model::IntCmd::StopCall => {
                 ActionOutcome::FailCall("exec stop_call".into())

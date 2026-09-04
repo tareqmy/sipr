@@ -303,6 +303,47 @@ impl MediaKind {
     }
 }
 
+/// What an `exec rtp_stream=` streams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RtpSource {
+    /// A raw codec file (a RIFF/WAVE header is skipped, not decoded).
+    File(String),
+    /// SIPp's `apattern`/`vpattern` test patterns, id 1..=6.
+    Pattern {
+        /// `vpattern` (video) vs `apattern` (audio).
+        video: bool,
+        /// Pattern id.
+        id: u8,
+    },
+}
+
+/// `exec rtp_stream="..."` — SIPp `rtpstream.cpp` semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RtpStreamCmd {
+    /// Start (or replace) a stream.
+    Play {
+        /// File or pattern.
+        source: RtpSource,
+        /// Loop count; `-1` = forever.
+        loops: i64,
+        /// Payload type; `None` = the `-rtp_payload` default (8).
+        payload_type: Option<u8>,
+        /// Payload name (`PCMU/8000`, ...); `None` = SIPp's default for the
+        /// static types 0/8/9/18.
+        payload_name: Option<String>,
+    },
+    /// `pause` / `pauseapattern` / `pausevpattern`.
+    Pause {
+        /// `None` = every stream of the call; `Some(video?)` = one kind.
+        video: Option<bool>,
+    },
+    /// `resume` / `resumeapattern` / `resumevpattern`.
+    Resume {
+        /// As for [`RtpStreamCmd::Pause`].
+        video: Option<bool>,
+    },
+}
+
 /// A v1 action (docs/SIPP_COMPAT.md §1).
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -416,6 +457,12 @@ pub enum Action {
         /// The pcap path as written in the scenario.
         file: String,
     },
+    /// `exec rtp_stream="..."`: generated RTP from a file or pattern, or a
+    /// pause/resume of the call's streams.
+    RtpStream(RtpStreamCmd),
+    /// `exec play_dtmf="digits[,tone_ms]"` (keywords allowed, as SIPp
+    /// renders the value): RFC 4733 events on the audio stream.
+    PlayDtmf(MsgTemplate),
     /// Look up a key in an indexed injection file; store the matched line
     /// number (or -1 on a miss) into a variable.
     Lookup {
@@ -480,11 +527,24 @@ impl Scenario {
         })
     }
 
+    /// Every `rtp_stream` play command.
+    pub fn rtp_stream_plays(&self) -> impl Iterator<Item = &RtpStreamCmd> {
+        self.all_actions().filter_map(|a| match a {
+            Action::RtpStream(cmd @ RtpStreamCmd::Play { .. }) => Some(cmd),
+            _ => None,
+        })
+    }
+
     /// True when any step plays media (SIPp's `hasMedia`): the engine then
     /// learns remote media endpoints from received SDP.
     #[must_use]
     pub fn has_media(&self) -> bool {
-        self.pcap_actions().next().is_some()
+        self.all_actions().any(|a| {
+            matches!(
+                a,
+                Action::PlayPcap { .. } | Action::RtpStream(_) | Action::PlayDtmf(_)
+            )
+        })
     }
 
     /// Human-readable dump of the compiled IR (used by `--check`).
@@ -620,6 +680,18 @@ fn keyword_name(k: &Keyword) -> String {
             return match file {
                 Some(f) => format!("[field{index} file={f}]"),
                 None => format!("[field{index}]"),
+            };
+        }
+        Keyword::RtpStreamPort { video, offset } => {
+            let base = if *video {
+                "rtpstream_video_port"
+            } else {
+                "rtpstream_audio_port"
+            };
+            return if *offset > 0 {
+                format!("[{base}+{offset}]")
+            } else {
+                format!("[{base}]")
             };
         }
         Keyword::MediaPort { auto, offset } => {
