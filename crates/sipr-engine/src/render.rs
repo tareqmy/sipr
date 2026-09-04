@@ -195,11 +195,11 @@ impl std::fmt::Display for RenderError {
 ///
 /// # Errors
 ///
-/// [`RenderError`] when the template uses a keyword the engine does not
-/// support yet (`[$var]`, `[authentication]` — M6). Engine pre-validation
-/// rejects such scenarios up front, so this is defense in depth.
+/// [`RenderError`] when a keyword cannot be produced — today only
+/// `[authentication]` against an `AKAv1-MD5` challenge: missing or malformed
+/// `aka_*` parameters, a malformed nonce, or a MAC that does not verify.
 pub fn render(template: &MsgTemplate, ctx: &RenderCtx<'_>) -> Result<Vec<u8>, RenderError> {
-    Ok(render_string(template, ctx).into_bytes())
+    Ok(render_string(template, ctx)?.into_bytes())
 }
 
 /// Render a template to a `String`. Used for message bodies and for
@@ -213,15 +213,17 @@ pub fn render_to_string(
 ) -> String {
     // The store already lives in ctx.var_ctx for the send path; `extra` is a
     // convenience for action expansion where ctx carries the same store.
-    render_string(template, ctx)
+    // Action templates never carry [authentication], so an error (the only
+    // fallible keyword) cannot occur here; render what we can regardless.
+    render_string(template, ctx).unwrap_or_default()
 }
 
-fn render_string(template: &MsgTemplate, ctx: &RenderCtx<'_>) -> String {
+fn render_string(template: &MsgTemplate, ctx: &RenderCtx<'_>) -> Result<String, RenderError> {
     let mut out = String::with_capacity(512);
     for span in &template.spans {
         match span {
             Span::Lit(l) => out.push_str(l),
-            Span::Kw(kw) => fill(kw, ctx, &mut out),
+            Span::Kw(kw) => fill(kw, ctx, &mut out)?,
         }
     }
     // Delete lines that substituted to nothing (SIPp: "all bytes until the
@@ -237,11 +239,11 @@ fn render_string(template: &MsgTemplate, ctx: &RenderCtx<'_>) -> String {
         let body_len = out.find("\r\n\r\n").map_or(0, |i| out.len() - (i + 4));
         out = out.replace(LEN_MARKER, &body_len.to_string());
     }
-    out
+    Ok(out)
 }
 
 #[allow(clippy::too_many_lines)] // one arm per keyword; splitting hurts
-fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
+fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), RenderError> {
     match kw {
         Keyword::Service => out.push_str(ctx.service),
         Keyword::RemoteIp => push_ip_for_uri(out, ctx.remote_ip),
@@ -367,6 +369,11 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
                 if let Some(ch) = vc.challenge {
                     let user = param_or(params, "username", vc.auth_user);
                     let pass = param_or(params, "password", vc.auth_password);
+                    let aka = if ch.algorithm == sipr_auth::Algorithm::AkaV1Md5 {
+                        Some(aka_keys(params, pass)?)
+                    } else {
+                        None
+                    };
                     let cred = sipr_auth::Credentials {
                         username: user,
                         password: pass,
@@ -374,11 +381,13 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
                         uri: vc.digest_uri,
                         cnonce: vc.cnonce,
                         nc: 1,
+                        aka,
                     };
                     // authorization_header returns "Name: Digest ..."; the
                     // scenario supplies the header name context, so emit only
                     // the value after the colon.
-                    let line = sipr_auth::authorization_header(ch, &cred);
+                    let line = sipr_auth::authorization_header(ch, &cred)
+                        .map_err(|e| RenderError(format!("[authentication]: {e}")))?;
                     let value = line.split_once(": ").map_or(line.as_str(), |(_, v)| v);
                     out.push_str(value);
                 }
@@ -390,6 +399,89 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) {
             let _ = write!(out, "[{u}]");
         }
     }
+    Ok(())
+}
+
+/// The AKA secrets from `[authentication aka_K= aka_OP=|aka_OPc= aka_AMF=]`
+/// (SIPp's parameter names; `aka_OPc` is a sipr addition — SIPp only takes
+/// OP). Values are `0x`-prefixed hex of exactly the right length, or raw
+/// bytes of that length. Without `aka_K`, SIPp uses the password's first
+/// 16 bytes as K (documented); that fallback is honoured when the password
+/// is long enough, otherwise it is an error rather than a read past the end.
+fn aka_keys(
+    params: &[(String, String)],
+    password: &str,
+) -> Result<sipr_auth::AkaKeys, RenderError> {
+    let get = |key: &str| {
+        params
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    let k: [u8; 16] = match get("aka_K") {
+        Some(v) => parse_secret(v, "aka_K")?,
+        None => {
+            let bytes = password.as_bytes();
+            if bytes.len() < 16 {
+                return Err(RenderError(
+                    "[authentication]: AKAv1-MD5 needs aka_K=0x<32 hex> (SIPp's fallback to \
+                     the password needs a password of at least 16 bytes)"
+                        .into(),
+                ));
+            }
+            let mut out = [0u8; 16];
+            out.copy_from_slice(&bytes[..16]);
+            out
+        }
+    };
+    let opc: [u8; 16] = match (get("aka_OPc"), get("aka_OP")) {
+        (Some(v), _) => parse_secret(v, "aka_OPc")?,
+        (None, Some(v)) => {
+            let op: [u8; 16] = parse_secret(v, "aka_OP")?;
+            sipr_auth::milenage::opc(&k, &op)
+        }
+        (None, None) => {
+            return Err(RenderError(
+                sipr_auth::AuthError::AkaKeysMissing.to_string(),
+            ));
+        }
+    };
+    let amf: Option<[u8; 2]> = match get("aka_AMF") {
+        Some(v) => Some(parse_secret(v, "aka_AMF")?),
+        None => None,
+    };
+    Ok(sipr_auth::AkaKeys { k, opc, amf })
+}
+
+/// `0x`-prefixed hex of exactly `N` bytes, or `N` raw bytes.
+fn parse_secret<const N: usize>(value: &str, name: &str) -> Result<[u8; N], RenderError> {
+    let mut out = [0u8; N];
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        if hex.len() != 2 * N || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(RenderError(format!(
+                "[authentication]: {name}= must be 0x followed by {} hex digits ({N} bytes), got \
+                 {} characters",
+                2 * N,
+                hex.len()
+            )));
+        }
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap_or(0);
+        }
+        return Ok(out);
+    }
+    if value.len() != N {
+        return Err(RenderError(format!(
+            "[authentication]: {name}= must be {N} raw bytes or 0x + {} hex digits, got {} bytes",
+            2 * N,
+            value.len()
+        )));
+    }
+    out.copy_from_slice(value.as_bytes());
+    Ok(out)
 }
 
 fn table_lookup(vars: &VarTable, name: &str) -> Option<usize> {

@@ -388,6 +388,41 @@ Behavioral oracle: `rtpstream.cpp` (`rtpstream_playrtptask`,
       -3), SRTP (`a=crypto`), `-key` lookups and `~` expansion in media
       paths, `-rtp_threadtasks` (meaningless for one scheduler).
 
+## M16 — IMS AKA authentication (`AKAv1-MD5`) ✅
+
+Behavioral oracle: `auth.cpp` (`createAuthHeader`, `createAuthHeaderAKAv1MD5`),
+`milenage.c`, `message.cpp` `parseAuthenticationKeyword`/`getHexStringParam`,
+`docs/scenarios/sipauth.rst`. Divergences in SIPP_COMPAT §6.
+
+- [x] In-tree primitives in `sipr-auth`: AES-128 block encryption (FIPS 197
+      Appendix B/C vectors), Milenage f1/f1*/f2345/f5* with OPc derivation
+      (3GPP TS 35.208 Test Sets 1 and 2, every output), base64 (RFC 4648
+      vectors, unpadded input tolerated). No new dependency.
+- [x] `Algorithm::AkaV1Md5` (case-insensitive prefix match on `algorithm=`,
+      as SIPp); `aka_challenge_response` decodes the nonce as base64(RAND ‖
+      SQN⊕AK ‖ AMF ‖ MAC-A), recovers SQN, verifies MAC-A against f1, and
+      yields RES/CK/IK; `digest_response` uses the 8 raw RES bytes as the
+      password (NUL bytes survive — SIPp passes RESLEN explicitly for the
+      same reason). `authorization_header` now returns `Result`.
+- [x] `[authentication ... aka_K= aka_OP= aka_AMF=]` with SIPp's `0x` hex
+      values (exact length enforced — SIPp never validates) or raw bytes;
+      `aka_OPc=` as a sipr addition (SIPp only takes OP); SIPp's documented
+      fallback of K = first 16 password bytes honoured when the password is
+      long enough; missing OP/OPc, a malformed nonce, or a MAC mismatch
+      **fails the call** with a clear reason — SIPp aborts the whole process.
+      XMAC uses `aka_AMF` when given (SIPp always) else AUTN's AMF.
+- [x] Tests: unit (AES, Milenage, base64, a full AKAv1-MD5 digest over Test
+      Set 1 incl. wrong-AMF/bad-nonce/no-keys errors), corpus
+      `positive/register_aka.xml` (SIPp's documented example), e2e
+      `aka_v1_md5_registration_round_trips` (a registrar built from Test
+      Set 1 verifies the response with RES) and
+      `aka_with_the_wrong_key_fails_the_call_not_the_process`.
+- [x] Deferred: AUTS resynchronisation (dead code in SIPp: `if (1/*…*/)`),
+      `AKAv2-MD5` (SIPp rejects it too), `-auth_uri`, keyword-rendered
+      `aka_*` values (SIPp renders them as sub-messages so `[field0]` works;
+      sipr takes them literally for now), AKA as a challenging server.
+
 ## Post-v1 backlog (ordered)
 
-AKA auth → HTTP control API → RTP echo/rtpcheck (M16, if wanted).
+HTTP control API → RTP echo/rtpcheck → AUTS resync / `-auth_uri` / rendered
+`aka_*` params.

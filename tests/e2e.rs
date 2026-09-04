@@ -2175,3 +2175,217 @@ fn rtp_stream_with_a_bad_payload_is_fatal_at_startup() {
     assert_ne!(out.status.code(), Some(0), "stderr:\n{err}");
     assert!(err.contains("Missing mandatory payload_name"), "{err}");
 }
+
+// ---- AKA -------------------------------------------------------------------
+
+/// A registrar that challenges with `AKAv1-MD5` using 3GPP TS 35.208 Test
+/// Set 1 (nonce = base64(RAND || SQN⊕AK || AMF || MAC-A)) and verifies the
+/// digest with RES as the password. Returns whether sipr authenticated.
+fn spawn_aka_registrar(
+    realm: &'static str,
+    user: &'static str,
+) -> (SocketAddr, std::thread::JoinHandle<bool>) {
+    fn hex<const N: usize>(s: &str) -> [u8; N] {
+        let mut out = [0u8; N];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex");
+        }
+        out
+    }
+    let k = hex::<16>("465b5ce8b199b49faa5f0a2ee238a6bc");
+    let op = hex::<16>("cdc202d5123e20f62b6d676ac72cb318");
+    let opc = sipr_auth::milenage::opc(&k, &op);
+    let rand = hex::<16>("23553cbe9637a89d218ae64dae47bf35");
+    let sqn = hex::<6>("ff9bb4d0b607");
+    let amf = hex::<2>("b9b9");
+    let v = sipr_auth::milenage::f2345(&k, &opc, &rand);
+    let mac = sipr_auth::milenage::f1(&k, &opc, &rand, &sqn, &amf);
+    let mut nonce_bytes = rand.to_vec();
+    nonce_bytes.extend(sqn.iter().zip(&v.ak).map(|(s, a)| s ^ a));
+    nonce_bytes.extend_from_slice(&amf);
+    nonce_bytes.extend_from_slice(&mac);
+    let nonce = sipr_auth::base64::encode(&nonce_bytes);
+    let res = v.res;
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind registrar");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let handle = std::thread::spawn(move || {
+        let mut buf = [0u8; 65_535];
+        let mut authenticated = false;
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            if msg.method() != Some("REGISTER") {
+                continue;
+            }
+            let mut r;
+            match msg.header("Authorization") {
+                None => {
+                    r = String::from("SIP/2.0 401 Unauthorized\r\n");
+                    for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
+                        for l in msg.header_lines(name) {
+                            r.push_str(l);
+                            r.push_str("\r\n");
+                        }
+                    }
+                    r.push_str(&format!(
+                        "WWW-Authenticate: Digest realm=\"{realm}\", nonce=\"{nonce}\", \
+                         algorithm=AKAv1-MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n"
+                    ));
+                }
+                Some(auth) => {
+                    let field = |k: &str| -> Option<String> {
+                        auth.split(',').find_map(|p| {
+                            let p = p.trim();
+                            p.strip_prefix(&format!("{k}="))
+                                .map(|v| v.trim_matches('"').to_owned())
+                        })
+                    };
+                    let uri = field("uri").unwrap_or_default();
+                    let cnonce = field("cnonce").unwrap_or_default();
+                    let nc = field("nc").unwrap_or_default();
+                    let mut a1 = format!("{user}:{realm}:").into_bytes();
+                    a1.extend_from_slice(&res);
+                    let ha1 = sipr_auth::md5_hex(&a1);
+                    let ha2 = sipr_auth::md5_hex(format!("REGISTER:{uri}").as_bytes());
+                    let expected = sipr_auth::md5_hex(
+                        format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}").as_bytes(),
+                    );
+                    authenticated = field("response").unwrap_or_default() == expected
+                        && field("algorithm").as_deref() == Some("AKAv1-MD5");
+                    r = format!(
+                        "SIP/2.0 {}\r\n",
+                        if authenticated {
+                            "200 OK"
+                        } else {
+                            "403 Forbidden"
+                        }
+                    );
+                    for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
+                        for l in msg.header_lines(name) {
+                            r.push_str(l);
+                            r.push_str("\r\n");
+                        }
+                    }
+                    r.push_str("Content-Length: 0\r\n\r\n");
+                }
+            }
+            let _ = sock.send_to(r.as_bytes(), from);
+            if authenticated {
+                break;
+            }
+        }
+        authenticated
+    });
+    (addr, handle)
+}
+
+fn aka_register_scenario(auth_params: &str) -> String {
+    format!(
+        r#"<scenario name="register-aka">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:ims@[remote_ip]>;tag=[pid]a[call_number]
+    To: <sip:ims@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Contact: <sip:ims@[local_ip]:[local_port]>
+    Max-Forwards: 70
+    Expires: 3600
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:ims@[remote_ip]>;tag=[pid]a[call_number]
+    To: <sip:ims@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    Contact: <sip:ims@[local_ip]:[local_port]>
+    Authorization: [authentication {auth_params}]
+    Max-Forwards: 70
+    Expires: 3600
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#
+    )
+}
+
+#[test]
+fn aka_v1_md5_registration_round_trips() {
+    let (addr, registrar) = spawn_aka_registrar("ims.example", "ims");
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("sipr-aka-{}.xml", std::process::id()));
+    std::fs::write(
+        &path,
+        aka_register_scenario(
+            "username=ims aka_K=0x465B5CE8B199B49FAA5F0A2EE238A6BC \
+             aka_OP=0xCDC202D5123E20F62B6D676AC72CB318 aka_AMF=0xB9B9",
+        ),
+    )
+    .expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "sipr stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(
+        registrar.join().expect("registrar"),
+        "registrar must accept sipr's AKA response"
+    );
+}
+
+#[test]
+fn aka_with_the_wrong_key_fails_the_call_not_the_process() {
+    let (addr, registrar) = spawn_aka_registrar("ims.example", "ims");
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("sipr-aka-bad-{}.xml", std::process::id()));
+    std::fs::write(
+        &path,
+        aka_register_scenario(
+            "username=ims aka_K=0x00000000000000000000000000000000 \
+             aka_OP=0xCDC202D5123E20F62B6D676AC72CB318",
+        ),
+    )
+    .expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-m",
+        "1",
+        "-timeout",
+        "5",
+        "-bg",
+        "-trace_err",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    // The call fails (MAC mismatch), the run completes and reports it.
+    assert_eq!(out.status.code(), Some(1), "sipr stderr:\n{err}");
+    assert!(err.contains("failed 1"), "{err}");
+    drop(registrar);
+    // Clean up the error trace sipr wrote in the CWD.
+    for entry in std::fs::read_dir(".").into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("sipr-aka-bad-") && name.ends_with("_errors.log") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}

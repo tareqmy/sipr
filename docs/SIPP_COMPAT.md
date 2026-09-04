@@ -70,6 +70,8 @@ Media keywords (M14): `[media_ip]` (`-mi`, default the local IP),
 every call — as in SIPp), `[auto_media_port]` (per-call 4-port block:
 `base + 4*(call_number-1) % 10000`, SIPp's undocumented keyword), and the
 `+N` offset forms `[media_port+1]` / `[auto_media_port+2]` (RTCP, video).
+`[authentication]` params (M16): `username=` `password=` `aka_K=` `aka_OP=`
+`aka_AMF=` (SIPp), `aka_OPc=` (sipr addition); `0x`-prefixed hex or raw bytes.
 `[rtpstream_audio_port]` / `[rtpstream_video_port]` (M15): a port allocated
 to the call from `-mp`..`-max_rtp_port` in steps of two the first time it
 renders; `+N` forms never allocate (`a=rtcp:[rtpstream_audio_port+1]`).
@@ -379,5 +381,35 @@ Verify exact SIPp table before closing M3 and update this line.
   packet grid is per stream (`start + n*interval`), not SIPp's global
   wall-clock grid that fires every stream in the same millisecond; (5)
   `-rtp_threadtasks` is not needed (one scheduler thread) and not accepted.
+- IMS AKA `AKAv1-MD5` (M16; verified in `auth.cpp` `createAuthHeader`
+  (~l.158) / `createAuthHeaderAKAv1MD5` (~l.600), `milenage.c`,
+  `message.cpp` `parseAuthenticationKeyword` (~l.547) /
+  `getHexStringParam` (~l.498), `docs/scenarios/sipauth.rst`): SIPp
+  matches `algorithm=` by case-insensitive **prefix** (`MD5-sess` → MD5;
+  `AKAv2-MD5` is rejected: "must use MD5, AKAv1-MD5 or SHA-256"), decodes
+  the nonce as base64(RAND(16) ‖ SQN⊕AK(6) ‖ AMF(2) ‖ MAC-A(8)) — extra
+  server bytes ignored, unpadded base64 rejected, and an off-by-one that
+  accepts 31 decoded bytes — computes f2345 then SQN = (SQN⊕AK)⊕AK, then
+  XMAC = f1 with the **configured `aka_AMF`** (AUTN's AMF is read and
+  discarded), and on MAC ≠ XMAC calls `ERROR()`, which **aborts the whole
+  process**. RES (8 raw bytes, never hex) is the digest password with the
+  length passed explicitly so NUL bytes survive; CK/IK are computed and
+  discarded; `algorithm=AKAv1-MD5` is echoed. OP only, OPc derived as
+  `E_K(OP)⊕OP` on every call; no OPc input. AUTS/resync is dead code
+  (`if (1/*…*/)`) — SIPp never emits `auts=`. Keyword params: `aka_K`,
+  `aka_OP`, `aka_AMF` as `0x` hex (nibble pairs, **no length validation,
+  not NUL-terminated**) or quoted/bare strings; `aka_K` absent → the first
+  16 bytes of the password (documented), `aka_OP`/`aka_AMF` absent → reads
+  past a 1-byte buffer. No AKA CLI flags; no AKA test vectors in the tree.
+  sipr matches the wire behavior (same nonce layout, RES-as-password,
+  header shape, prefix matching, configured-AMF precedence) with these
+  divergences: (1) a MAC mismatch, a malformed nonce, or missing keys
+  **fails the call** with the reason in the error trace — the process
+  continues; (2) hex values must be exactly 32/32/4 digits; (3) `aka_OPc=`
+  is accepted directly; (4) when `aka_AMF` is absent, AUTN's AMF is used
+  (SIPp would read garbage); (5) the password-as-K fallback requires a
+  16+ byte password; (6) unpadded base64 is accepted. `aka_*` values are
+  taken literally (SIPp renders them, so `[field0]` works there) — a
+  follow-up.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

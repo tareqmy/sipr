@@ -1,0 +1,31 @@
+<scenario name="IMS REGISTER with AKAv1-MD5">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>;tag=[pid]SIPpTag00[call_number]
+    To: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Contact: <sip:001010123456789@[local_ip]:[local_port]>
+    Max-Forwards: 70
+    Expires: 600000
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>;tag=[pid]SIPpTag00[call_number]
+    To: <sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    Contact: <sip:001010123456789@[local_ip]:[local_port]>
+    Authorization: [authentication username=001010123456789@ims.mnc001.mcc001.3gppnetwork.org aka_OP=0xCDC202D5123E20F62B6D676AC72CB318 aka_K=0x465B5CE8B199B49FAA5F0A2EE238A6BC aka_AMF=0xB9B9]
+    Max-Forwards: 70
+    Expires: 600000
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>

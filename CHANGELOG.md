@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **IMS AKA authentication (`AKAv1-MD5`, RFC 3310)** — `[authentication
+  aka_K=0x… aka_OP=0x… aka_AMF=0x…]` (SIPp's parameters, plus `aka_OPc=`)
+  against an `algorithm=AKAv1-MD5` challenge: the nonce's RAND/AUTN go
+  through an in-tree Milenage (AES-128, verified on 3GPP TS 35.208 test
+  sets), the MAC is checked, and RES becomes the digest password. A MAC
+  mismatch fails the call with a clear reason where SIPp aborts the whole
+  process. No new dependency.
+
 ## [0.4.0] — 2026-09-04
 
 ### Added
