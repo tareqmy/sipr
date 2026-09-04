@@ -108,7 +108,7 @@ impl Compiler {
     fn templ(&mut self, text: &str, line: u32) -> MsgTemplate {
         let t = template::tokenize(text, line, &mut self.diags);
         // `[$v]` reads, and `[fieldN line=[$v]]` reads its selector variable.
-        let vars: Vec<String> = t
+        let mut vars: Vec<String> = t
             .keywords()
             .filter_map(|k| match k {
                 Keyword::Var(v) => Some(v.clone()),
@@ -119,6 +119,21 @@ impl Compiler {
                 _ => None,
             })
             .collect();
+        // `[authentication username=[$u] aka_K=[field2]]`: SIPp renders each
+        // parameter as a sub-message, so their `[$var]` reads count too.
+        for k in t.keywords() {
+            if let Keyword::Authentication(params) = k {
+                for (_, value) in params {
+                    if value.contains('[') {
+                        let sub = template::tokenize(value, line, &mut self.diags);
+                        vars.extend(sub.keywords().filter_map(|k| match k {
+                            Keyword::Var(v) => Some(v.clone()),
+                            _ => None,
+                        }));
+                    }
+                }
+            }
+        }
         for v in vars {
             self.var_reads(&v);
         }

@@ -642,7 +642,8 @@ fn digest_uri_matches_what_the_server_verifies() {
     // or the registrar's recomputation (which reads uri= from the header)
     // would still pass while a real proxy keying on the request-URI fails.
     // Covered structurally by digest_authentication_round_trips; this is a
-    // focused guard that the [service] default resolves into the URI.
+    // focused guard that the default URI (SIPp's `sip:remote_ip:remote_port`)
+    // is signed and sent consistently.
     let (addr, registrar) = spawn_digest_registrar("r", "u", "p");
     let scenario = r#"<scenario name="reg">
   <send retrans="500"><![CDATA[
@@ -3015,4 +3016,143 @@ fn rate_max_quits_when_exceeded_unless_no_rate_quit() {
     assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
     assert!(err.contains("successful 30 failed 0"), "{err}");
     assert!(!err.contains("quitting"), "{err}");
+}
+
+// ---- -auth_uri and rendered [authentication] parameters --------------------
+
+/// `[authentication username=[field0] password=[field1]]`: SIPp renders each
+/// parameter as a sub-message, so credentials can come from an -inf file.
+#[test]
+fn authentication_params_render_keywords() {
+    let (addr, registrar) = spawn_digest_registrar("sip.example.com", "alice", "secret");
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let inf = dir.join(format!("sipr-authinf-{pid}.csv"));
+    std::fs::write(&inf, "SEQUENTIAL\nalice;secret\n").expect("write inf");
+    let scenario = r#"<scenario name="register-auth-inf">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:[field0]@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:[field0]@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    Authorization: [authentication username=[field0] password=[field1]]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+    let path = dir.join(format!("sipr-authinf-{pid}.xml"));
+    std::fs::write(&path, scenario).expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-inf",
+        inf.to_str().expect("utf8"),
+        "-cp",
+        "0",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&inf);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "sipr stderr:\n{err}");
+    assert!(
+        registrar.join().expect("registrar"),
+        "credentials from [field0]/[field1] must verify"
+    );
+}
+
+/// `-auth_uri`: the digest uri= is `sip:` + the value (SIPp), and by default
+/// `sip:remote_ip:remote_port` — checked in the message trace.
+#[test]
+fn auth_uri_flag_and_default_follow_sipp() {
+    fn uri_in_trace(extra: &[&str], expected_suffix: &str, addr: SocketAddr) {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let scenario = r#"<scenario name="reg-uri">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:u@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:u@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:u@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:u@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    Authorization: [authentication username=u password=p]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+        let stem = format!("sipr-authuri-{pid}-{}", expected_suffix.len());
+        let path = dir.join(format!("{stem}.xml"));
+        std::fs::write(&path, scenario).expect("write");
+        let mut args = vec![
+            "-sf",
+            path.to_str().expect("utf8"),
+            "-cp",
+            "0",
+            "-m",
+            "1",
+            "-timeout",
+            "15",
+            "-bg",
+            "-trace_msg",
+        ];
+        args.extend_from_slice(extra);
+        let target = addr.to_string();
+        args.push(&target);
+        let out = run_sipr(&args);
+        let _ = std::fs::remove_file(&path);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+        // The trace lands in the CWD as <stem>_<sipr pid>_messages.log.
+        let mut found = None;
+        for entry in std::fs::read_dir(".").into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&stem) && name.ends_with("_messages.log") {
+                found = Some(std::fs::read_to_string(entry.path()).unwrap_or_default());
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let log = found.expect("message trace written");
+        assert!(
+            log.contains(&format!("uri=\"sip:{expected_suffix}\"")),
+            "expected uri=\"sip:{expected_suffix}\" in:\n{log}"
+        );
+    }
+    let (addr, registrar) = spawn_digest_registrar("r", "u", "p");
+    uri_in_trace(&[], &addr.to_string(), addr);
+    assert!(registrar.join().expect("registrar"));
+    let (addr, registrar) = spawn_digest_registrar("r", "u", "p");
+    uri_in_trace(&["-auth_uri", "ims.example.com"], "ims.example.com", addr);
+    assert!(registrar.join().expect("registrar"));
 }

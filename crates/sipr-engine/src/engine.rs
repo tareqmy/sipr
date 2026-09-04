@@ -75,6 +75,9 @@ pub struct EngineConfig {
     pub auth_user: Option<String>,
     /// `-ap`: default digest password for `[authentication]`.
     pub auth_password: Option<String>,
+    /// `-auth_uri`: the digest `uri=` after SIPp's `sip:` prefix (default
+    /// `remote_ip:remote_port`, as SIPp).
+    pub auth_uri: Option<String>,
     /// `-trace_msg` destination.
     pub trace_msg: Option<std::path::PathBuf>,
     /// `-trace_err` destination.
@@ -781,6 +784,14 @@ impl<'s> Engine<'s> {
             control_snapshot = Some(snapshot);
             http = Some(server);
         }
+        if let Some(uri) = &config.auth_uri
+            && (uri.starts_with("sip:") || uri.starts_with("sips:"))
+        {
+            eprintln!(
+                "sipr: warning: -auth_uri '{uri}' already has a scheme; SIPp (and sipr) \
+                 prepend 'sip:' regardless, so the digest uri= will be 'sip:{uri}'"
+            );
+        }
         let timers = TimerService::start(tx.clone());
         let control = EngineControl {
             rate_millis: Arc::new(AtomicU64::new(0)),
@@ -1111,6 +1122,17 @@ impl<'s> Engine<'s> {
         }
         if let Some(tx) = self.snapshot_tx.as_ref() {
             let _ = tx.send(snap); // UI gone → ignored; run continues headless
+        }
+    }
+
+    /// The digest `uri=` (SIPp `call.cpp` ~l.4159): literally `sip:` +
+    /// (`-auth_uri`, else `remote_ip:remote_port`) — with SIPp's quirk that a
+    /// value already carrying a scheme yields `sip:sip:…`, kept for
+    /// fidelity and warned about at startup.
+    fn digest_uri(&self, remote: SocketAddr) -> String {
+        match &self.config.auth_uri {
+            Some(uri) => format!("sip:{uri}"),
+            None => format!("sip:{}:{}", remote.ip(), remote.port()),
         }
     }
 
@@ -1515,12 +1537,7 @@ impl<'s> Engine<'s> {
                             return;
                         };
                         let remote_ip = call.remote.ip().to_string();
-                        let digest_uri = format!(
-                            "sip:{}@{}:{}",
-                            self.config.service,
-                            remote_ip,
-                            call.remote.port()
-                        );
+                        let digest_uri = self.digest_uri(call.remote);
                         let var_ctx = crate::render::VarCtx {
                             store: &call.store,
                             vars: &self.scenario.vars,
@@ -2031,12 +2048,7 @@ impl<'s> Engine<'s> {
             return true;
         };
         let remote_ip = call.remote.ip().to_string();
-        let digest_uri = format!(
-            "sip:{}@{}:{}",
-            self.config.service,
-            remote_ip,
-            call.remote.port()
-        );
+        let digest_uri = self.digest_uri(call.remote);
         let mut store = call.store.clone();
         let snapshot = call.store.clone(); // immutable copy for the base ctx
         let last = call.last_recv.clone();
@@ -2463,12 +2475,7 @@ impl<'s> Engine<'s> {
     ) -> Option<String> {
         let call = self.calls.get(call_id)?;
         let remote_ip = call.remote.ip().to_string();
-        let digest_uri = format!(
-            "sip:{}@{}:{}",
-            self.config.service,
-            remote_ip,
-            call.remote.port()
-        );
+        let digest_uri = self.digest_uri(call.remote);
         let var_ctx = crate::render::VarCtx {
             store: &call.store,
             vars: &self.scenario.vars,

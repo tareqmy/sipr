@@ -109,6 +109,9 @@ pub struct Cli {
     pub auth_user: Option<String>,
     /// `-ap`: password for `[authentication]`.
     pub auth_password: Option<String>,
+    /// `-auth_uri`: the digest `uri=` (SIPp prepends `sip:`; default
+    /// `remote_ip:remote_port`).
+    pub auth_uri: Option<String>,
     /// `-aa`: auto-answer in-dialog OPTIONS/INFO/UPDATE/NOTIFY with 200.
     pub auto_answer: bool,
     /// `-nd`: disable scenario default behaviors.
@@ -192,6 +195,7 @@ impl Default for Cli {
             service: "service".to_owned(),
             auth_user: None,
             auth_password: None,
+            auth_uri: None,
             auto_answer: false,
             no_defaults: false,
             no_retrans: false,
@@ -390,6 +394,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
     ),
     ("au", true, "USER", "Username for [authentication]"),
     ("ap", true, "PASS", "Password for [authentication]"),
+    (
+        "auth_uri",
+        true,
+        "URI",
+        "Digest uri= value; sip: is prepended as SIPp does [default: remote_ip:remote_port]",
+    ),
     (
         "aa",
         false,
@@ -639,6 +649,7 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "s" => cli.service = val(value),
         "au" => cli.auth_user = Some(val(value)),
         "ap" => cli.auth_password = Some(val(value)),
+        "auth_uri" => cli.auth_uri = Some(val(value)),
         "aa" => cli.auto_answer = true,
         "nd" => cli.no_defaults = true,
         "nr" => cli.no_retrans = true,

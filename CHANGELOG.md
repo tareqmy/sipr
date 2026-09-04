@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`-auth_uri`** — SIPp's flag for the digest `uri=`; the value gets a
+  `sip:` prefix exactly as SIPp does.
+- **Keywords inside `[authentication]` parameters** — `username=[field0]`,
+  `password=[$p]`, `aka_K=[field2]` and friends are rendered before use,
+  as SIPp renders them, so credentials can come from injection files.
+
+### Changed
+
+- The default digest `uri=` is now SIPp's `sip:remote_ip:remote_port`
+  (no user part) instead of `sip:service@remote_ip:remote_port`. Servers
+  verify against the header's own `uri=`, so runs are unaffected; the
+  wire form now matches SIPp byte for byte.
+
 ## [0.9.0] — 2026-09-04
 
 ### Added

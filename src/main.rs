@@ -138,6 +138,7 @@ fn run(cli: &Cli) -> ExitCode {
         auto_answer: cli.auto_answer,
         auth_user: cli.auth_user.clone(),
         auth_password: cli.auth_password.clone(),
+        auth_uri: cli.auth_uri.clone(),
         trace_msg: cli
             .trace_msg
             .then(|| std::path::PathBuf::from(format!("{base}_{pid}_messages.log"))),

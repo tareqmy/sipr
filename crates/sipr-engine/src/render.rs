@@ -364,9 +364,13 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
                 }
             }
         }
-        Keyword::Authentication(params) => {
+        Keyword::Authentication(raw_params) => {
             if let Some(vc) = &ctx.var_ctx {
                 if let Some(ch) = vc.challenge {
+                    // SIPp renders every parameter as a sub-message, so
+                    // `username=[field0]` or `aka_K=[$k]` work.
+                    let rendered = render_auth_params(raw_params, ctx);
+                    let params = &rendered;
                     let user = param_or(params, "username", vc.auth_user);
                     let pass = param_or(params, "password", vc.auth_password);
                     let aka = if ch.algorithm == sipr_auth::Algorithm::AkaV1Md5 {
@@ -530,6 +534,23 @@ fn resolve_line_expr(expr: &LineExpr, ctx: &RenderCtx<'_>) -> Option<usize> {
             }
         }
     }
+}
+
+/// Expand keywords inside `[authentication]` parameter values (SIPp renders
+/// each as a sub-message). Values without `[` pass through untouched; a
+/// nested `[authentication]` is not expanded.
+fn render_auth_params(params: &[(String, String)], ctx: &RenderCtx<'_>) -> Vec<(String, String)> {
+    params
+        .iter()
+        .map(|(k, v)| {
+            if !v.contains('[') || v.contains("[authentication") {
+                return (k.clone(), v.clone());
+            }
+            let mut scratch = sipr_scenario::diag::Diagnostics::new("authentication");
+            let sub = sipr_scenario::template::tokenize(v, 0, &mut scratch);
+            (k.clone(), render_to_string(&sub, ctx, None))
+        })
+        .collect()
 }
 
 fn param_or<'a>(params: &'a [(String, String)], key: &str, default: &'a str) -> &'a str {

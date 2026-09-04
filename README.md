@@ -120,7 +120,7 @@ transport — no system libraries (no OpenSSL, no libpcap), no root for media.
 
 ## Not yet (post-v1 roadmap)
 
-SRTP, `-auth_uri`, and keyword-rendered `aka_*` values.
+SRTP and the TUI's `hide`/`display` controls.
 
 ## Brand
 

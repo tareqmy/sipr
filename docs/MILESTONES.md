@@ -556,6 +556,30 @@ table (`SIPP_OPTION_TIME_SEC`), `include/sipp.hpp` defaults.
       second; SIPp's `-fd` default is 60 s. Give `-rate_interval` explicitly
       for scripts shared between the two.
 
+## M21 — `-auth_uri` and rendered `[authentication]` parameters ✅
+
+Behavioral oracle: `call.cpp` (~l.4149-4170: the `sip:` + `-auth_uri` /
+`remote_ip:remote_port` digest uri, and the per-parameter
+`createSendingMessage` rendering), `message.cpp` `parseAuthenticationKeyword`,
+`sipp.cpp` option table.
+
+- [x] The digest `uri=` now follows SIPp exactly: `sip:` + (`-auth_uri`,
+      else `remote_ip:remote_port`). sipr used to sign `sip:service@ip:port`
+      — a visible-on-the-wire difference, now gone. SIPp's `sip:sip:…`
+      quirk for a value that already carries a scheme is kept for fidelity
+      and warned about at startup.
+- [x] Every `[authentication]` parameter value is rendered as a sub-message
+      before use (`username=[field0] password=[field1]`, `aka_K=[$k]`,
+      `aka_sqn=[field3]`…), as SIPp does; the compiler registers the
+      `[$var]` reads inside them so read-never-set diagnostics still fire.
+- [x] Tests: e2e `authentication_params_render_keywords` (credentials from
+      an `-inf` file verify against the digest registrar),
+      `auth_uri_flag_and_default_follow_sipp` (the message trace shows
+      `uri="sip:ip:port"` by default and `uri="sip:ims.example.com"` with
+      the flag).
+- [x] Deferred: a whole `[authentication …]` keyword arriving from an
+      injection field (SIPp re-parses rendered text at runtime).
+
 ## Post-v1 backlog (ordered)
 
-`-auth_uri` / rendered `aka_*` params → TUI `hide`/`display` → SRTP.
+TUI `hide`/`display` → SRTP → `[authentication]` from injection fields.

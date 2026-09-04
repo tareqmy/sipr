@@ -30,6 +30,7 @@ fn uas_config() -> EngineConfig {
         auto_answer: false,
         auth_user: None,
         auth_password: None,
+        auth_uri: None,
         trace_msg: None,
         trace_err: None,
         trace_stat: None,

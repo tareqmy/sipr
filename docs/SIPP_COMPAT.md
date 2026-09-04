@@ -98,7 +98,9 @@ port, default 6000; `-min_rtp_port` is SIPp's alias — note SIPp's `-mp` is
 *that* alias too, not a fixed port) `-max_rtp_port` `-rtp_payload <pt>`
 (default 8) `-random_base_ssrc` `-rtp_echo` `-mb <bytes>` `-audiotolerance`
 `-videotolerance` (M18).
-Auth: `-au`/`-ap` (username/password defaults for `[authentication]`).
+Auth: `-au`/`-ap` (username/password defaults for `[authentication]`)
+`-auth_uri` (digest `uri=` after SIPp's `sip:` prefix; default
+`remote_ip:remote_port`, M21).
 Control (M17): `-cp <port>` `-ci <ip>` (SIPp's UDP control socket; `-cp 0`
 disables — sipr addition) and sipr's `--sipr-http [HOST:]PORT` /
 `--sipr-http-token` (docs/CONTROL_API.md).
@@ -497,5 +499,16 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `quitting >= 10`. It calls `set_rate`, which users mode ignores.
   sipr matches this; the only difference is the default interval, since
   sipr's `-fd` defaults to 1 s (recorded in M4).
+- Digest `uri=` and rendered auth parameters (M21; verified in `call.cpp`
+  ~l.4149-4170 and `message.cpp` ~l.547-585): SIPp's digest URI is
+  literally `"sip:" + (auth_uri ? auth_uri : remote_ip ":" remote_port)`
+  — no user part — so `-auth_uri sip:x` produces `uri="sip:sip:x"` (its
+  own gtest expects that). Each `[authentication]` parameter is stored as
+  a `SendingMessage` and rendered at send time, so keywords work inside
+  them. sipr matched the wire form from M21 on (it previously signed
+  `sip:service@ip:port`, which servers accepted since they verify against
+  the header's own `uri=`, but which differed on the wire) and renders
+  the parameters the same way; the `sip:sip:` quirk is kept, with a
+  startup warning.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)
