@@ -15,14 +15,19 @@ sipr/
 │   ├── sipr-auth/        # digest auth (RFC 2617/7616) for [authentication]
 │   ├── sipr-stats/       # counters, RTD histograms, repartitions, CSV export
 │   ├── sipr-media/       # pcap reader, SDP endpoint scan, RTP replay scheduler (M14)
+│   ├── sipr-control/     # SIPp's UDP control socket + the HTTP/JSON API (M17)
 │   └── sipr-tui/         # terminal screens, key handling
 └── src/main.rs           # bin: SIPp-style CLI → assemble and run
 ```
 
 Dependency direction (must stay acyclic):
 `sipr-tui` → `sipr-stats` → (nothing internal);
-`sipr-engine` → `sipr-scenario`, `sipr-net`, `sipr-auth`, `sipr-stats`, `sipr-media`;
+`sipr-engine` → `sipr-scenario`, `sipr-net`, `sipr-auth`, `sipr-stats`, `sipr-media`,
+`sipr-control`; `sipr-control` → `sipr-stats`;
 `sipr-scenario`, `sipr-net`, `sipr-auth`, `sipr-media` depend on no internal crate.
+The control front ends (UDP socket, HTTP server) are threads that only send
+`ControlRequest`s into the engine's channel and read the shared once-a-second
+snapshot — the same rule as the TUI: nothing outside the loop touches a call.
 The media thread (`sipr-media::replay`) follows the same rule as every other
 thread: it owns its sockets, receives owned stream specs over a channel, and
 reports back with events — it never touches engine state.

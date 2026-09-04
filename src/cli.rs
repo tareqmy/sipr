@@ -75,6 +75,14 @@ pub struct Cli {
     pub rtp_payload: Option<u8>,
     /// `-random_base_ssrc`: randomize the SSRC base instead of `0xCA110000`.
     pub random_base_ssrc: bool,
+    /// `-cp`: control socket port (`0` disables; default probes 8888..8947).
+    pub control_port: Option<u16>,
+    /// `-ci`: control socket bind address (default loopback).
+    pub control_ip: Option<IpAddr>,
+    /// `--sipr-http`: HTTP control API bind, `PORT` or `HOST:PORT`.
+    pub http: Option<String>,
+    /// `--sipr-http-token`: bearer token for the HTTP API.
+    pub http_token: Option<String>,
     /// `-t`: transport mode.
     pub transport: Transport,
     /// `-s`: service / called user part, substituted for `[service]`.
@@ -149,6 +157,10 @@ impl Default for Cli {
             max_rtp_port: None,
             rtp_payload: None,
             random_base_ssrc: false,
+            control_port: None,
+            control_ip: None,
+            http: None,
+            http_token: None,
             transport: Transport::UdpMono,
             service: "service".to_owned(),
             auth_user: None,
@@ -263,6 +275,30 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         false,
         "",
         "Random SSRC base for rtp_stream instead of 0xCA110000",
+    ),
+    (
+        "cp",
+        true,
+        "PORT",
+        "Control socket port (SIPp protocol) [default: first free of 8888..8947; 0 disables]",
+    ),
+    (
+        "ci",
+        true,
+        "IP",
+        "Control socket bind address [default: 127.0.0.1]",
+    ),
+    (
+        "sipr-http",
+        true,
+        "[HOST:]PORT",
+        "HTTP/JSON control API (sipr addition; docs/CONTROL_API.md) [default: off]",
+    ),
+    (
+        "sipr-http-token",
+        true,
+        "TOKEN",
+        "Bearer token for the HTTP API (required off loopback)",
     ),
     (
         "t",
@@ -499,6 +535,10 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
             cli.rtp_payload = Some(pt);
         }
         "random_base_ssrc" => cli.random_base_ssrc = true,
+        "cp" => cli.control_port = Some(parse_num(flag, &val(value))?),
+        "ci" => cli.control_ip = Some(parse_num(flag, &val(value))?),
+        "sipr-http" => cli.http = Some(val(value)),
+        "sipr-http-token" => cli.http_token = Some(val(value)),
         "t" => cli.transport = parse_transport(&val(value))?,
         "s" => cli.service = val(value),
         "au" => cli.auth_user = Some(val(value)),
@@ -740,6 +780,28 @@ mod tests {
         assert_eq!(c.rtp_payload, Some(0));
         assert!(c.random_base_ssrc);
         assert!(run(&["-rtp_payload", "200", "x"]).is_err());
+    }
+
+    #[test]
+    fn control_flags_parse() {
+        let c = cli(&[
+            "-cp",
+            "9000",
+            "-ci",
+            "0.0.0.0",
+            "--sipr-http",
+            "8080",
+            "--sipr-http-token",
+            "t",
+            "x",
+        ]);
+        assert_eq!(c.control_port, Some(9000));
+        assert_eq!(c.control_ip, Some("0.0.0.0".parse().unwrap()));
+        assert_eq!(c.http.as_deref(), Some("8080"));
+        assert_eq!(c.http_token.as_deref(), Some("t"));
+        let c = cli(&["-cp", "0", "x"]);
+        assert_eq!(c.control_port, Some(0));
+        assert!(run(&["-cp", "x", "y"]).is_err());
     }
 
     #[test]

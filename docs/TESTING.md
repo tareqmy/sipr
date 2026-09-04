@@ -16,6 +16,9 @@ Colocated `#[cfg(test)]` modules. Required coverage by crate:
   bookkeeping (tags, CSeq, route set from `rrs`).
 - `sipr-auth`: RFC 7616 test vectors (MD5, SHA-256, qop=auth), stale-nonce path.
 - `sipr-stats`: counter aggregation, repartition bucketing, CSV column goldens.
+- `sipr-control`: SIPp command grammar (with its warning texts), JSON round
+  trips, HTTP request parsing, UDP datagram → request, every API route
+  against a fake engine.
 
 ## 2. Golden corpus tests
 

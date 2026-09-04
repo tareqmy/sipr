@@ -422,7 +422,53 @@ Behavioral oracle: `auth.cpp` (`createAuthHeader`, `createAuthHeaderAKAv1MD5`),
       `aka_*` values (SIPp renders them as sub-messages so `[field0]` works;
       sipr takes them literally for now), AKA as a challenging server.
 
+## M17 — Runtime control: SIPp's control socket + the HTTP API ✅
+
+Behavioral oracle: `socket.cpp` `setup_ctrl_socket` / `handle_ctrl_socket` /
+`process_command` / `process_set` / `process_trace` / `process_key`,
+`docs/controlling.rst`. gossipper's HTTP API studied for shape (its single
+`Summary` struct for live + final stats, partial-update control POST, and
+token-via-query for browsers were copied; its three `/stats` shapes,
+unitless nanosecond durations, open-by-default bind, and missing quit/limit
+controls were avoided). Spec in `docs/CONTROL_API.md`.
+
+- [x] New std-only crate `sipr-control`: SIPp's command grammar with SIPp's
+      warning texts (`command.rs`: byte-0 hot key vs `c` + `set rate|
+      rate-scale|users|limit|display|hide` / `trace error|messages|logs|
+      shortmessages on|off` / `dump tasks|variables` / `reset stats`,
+      first-space tokenization, `strtol` base-0 numbers), the UDP socket
+      (`udp.rs`: `-cp` tried once and fatal, else 8888..8947 probed and a
+      warning; fire-and-forget), a tiny HTTP/1.1 server (`http.rs`), a
+      minimal JSON reader/writer (`json.rs`), and the API routes (`api.rs`).
+- [x] Engine: `Event::Control`; every command runs on the event-loop thread
+      and answers over a reply channel (HTTP) or not at all (UDP, as SIPp).
+      Hot keys now follow SIPp: rate keys step by `rate-scale` and act on
+      the user count in `-users` mode, `q` twice = `Q`. `set users` grows
+      the id pool or lets excess calls finish; `set limit` updates the cap;
+      `trace messages|error on|off` opens/closes trace files at runtime
+      with SIPp's names; `dump tasks` lists active calls in the error trace;
+      `reset stats` zeroes counters and histograms (new `StatSet::reset`).
+      Mode-dependent refusals use SIPp's exact wording.
+- [x] HTTP API (`--sipr-http [HOST:]PORT`, `--sipr-http-token`): `/health`,
+      `/stats` (the once-a-second snapshot the TUI renders, SIPp counter
+      names, `_ms` durations), `/control` GET/POST (partial update),
+      `/quit` (drain or force), `/command` (any control-socket line),
+      `/scenario`. Bearer or `?token=` with constant-time compare; a
+      non-loopback bind without a token is refused at startup.
+- [x] Divergences (SIPP_COMPAT §6): control socket defaults to loopback
+      (SIPp: every interface), `-cp 0` disables it, the chosen port is
+      printed, screen digits are ignored, `set display ooc|rx` and
+      `trace logs|shortmessages` warn instead of silently doing nothing.
+- [x] Tests: unit (grammar with SIPp's errors, JSON round trips, HTTP
+      parsing, UDP datagrams → requests + warnings, every API route against
+      a fake engine incl. auth/405/404), e2e
+      `control_socket_speaks_sipp_protocol` (a `cset rate` datagram finishes
+      a slow run, `q` drains early, a bad command warns),
+      `http_api_reports_stats_and_controls_the_run`, and the token gate.
+- [x] Deferred: `set hide`/`display` semantics in the TUI, a streaming
+      endpoint, scenario hot-replace, Prometheus.
+
 ## Post-v1 backlog (ordered)
 
-HTTP control API → RTP echo/rtpcheck → AUTS resync / `-auth_uri` / rendered
-`aka_*` params.
+RTP echo/rtpcheck → AUTS resync / `-auth_uri` / rendered `aka_*` params →
+`-rate_increase`/`-rate_max`/`-rate_quit` ramps → TUI `hide`/`display`.

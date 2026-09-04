@@ -154,6 +154,12 @@ impl Repartition {
         }
     }
 
+    /// The configured bounds (ms).
+    #[must_use]
+    pub fn bounds(&self) -> Vec<u64> {
+        self.bounds.clone()
+    }
+
     /// True when the scenario configured no bounds.
     #[must_use]
     pub fn is_inert(&self) -> bool {

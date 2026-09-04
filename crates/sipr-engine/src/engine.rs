@@ -13,11 +13,12 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sipr_control::{ControlCmd, ControlLink, ControlRequest, ControlState, Quitting};
 use sipr_media::{MediaEvent, MediaPlayer, PcapStream, Source, StreamSpec};
 use sipr_net::timer::TimerId;
 use sipr_net::{
@@ -111,6 +112,20 @@ pub struct EngineConfig {
     /// Directory of the `-sf` file: pcap paths resolve there first, then in
     /// the working directory (SIPp `find_file`).
     pub scenario_dir: Option<std::path::PathBuf>,
+    /// `-cp`: SIPp's UDP control port. `None` probes 8888..8947 (SIPp's
+    /// default), `Some(0)` disables the socket (sipr addition).
+    pub control_port: Option<u16>,
+    /// `-ci`: control socket bind address (default loopback — SIPp binds
+    /// every interface).
+    pub control_ip: Option<IpAddr>,
+    /// `--sipr-http`: HTTP/JSON control API bind address.
+    pub http_addr: Option<SocketAddr>,
+    /// `--sipr-http-token`: bearer token for the HTTP API (required when
+    /// `http_addr` is not loopback).
+    pub http_token: Option<String>,
+    /// `<scenario>_<pid>`: the stem for trace files opened at runtime by
+    /// `trace messages|error on` (SIPp's naming).
+    pub trace_name_base: Option<String>,
 }
 
 /// SIPp's `DEFAULT_MEDIA_PORT`.
@@ -246,6 +261,8 @@ enum Event {
     TwinCmd(String),
     /// The media thread finished or abandoned a replay.
     Media(MediaEvent),
+    /// A runtime control command (UDP control socket or HTTP API).
+    Control(ControlRequest),
 }
 
 struct RetransCtx {
@@ -474,6 +491,12 @@ struct Engine<'s> {
     ssrc_base: u32,
     /// Counter for `play_dtmf` SSRCs (SIPp: a fresh SSRC per burst).
     dtmf_ssrc_counter: u32,
+    /// Latest snapshot for the HTTP API, when it is enabled.
+    control_snapshot: Option<Arc<Mutex<sipr_stats::Snapshot>>>,
+    /// Keeps the HTTP listener alive for the run.
+    _http: Option<sipr_control::http::HttpServer>,
+    /// `set rate-scale`: the step multiplier for the rate keys.
+    rate_scale: f64,
 }
 
 impl<'s> Engine<'s> {
@@ -619,6 +642,80 @@ impl<'s> Engine<'s> {
                 .ok();
             Some(MediaPlayer::start(media_tx))
         };
+        // Runtime control: SIPp's UDP control socket and the HTTP API both
+        // feed Event::Control through one bridge.
+        let (ctrl_tx, ctrl_rx) = channel::<ControlRequest>();
+        let bridge_tx = tx.clone();
+        std::thread::Builder::new()
+            .name("sipr-ctrl-bridge".into())
+            .spawn(move || {
+                while let Ok(req) = ctrl_rx.recv() {
+                    if bridge_tx.send(Event::Control(req)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .ok();
+        if config.control_port != Some(0) {
+            match sipr_control::udp::bind(config.control_ip, config.control_port) {
+                Ok(sock) => {
+                    if let Ok(addr) = sock.local_addr() {
+                        eprintln!("sipr: control socket (UDP, SIPp -cp protocol) on {addr}");
+                    }
+                    sipr_control::udp::serve(sock, ctrl_tx.clone(), |w| {
+                        eprintln!("sipr: warning: {w}");
+                    })
+                    .map_err(|e| EngineError(format!("cannot start the control socket: {e}")))?;
+                }
+                Err(e) if config.control_port.is_some() => {
+                    return Err(EngineError(format!(
+                        "cannot bind the control socket (-cp {}): {e}",
+                        config.control_port.unwrap_or_default()
+                    )));
+                }
+                Err(e) => eprintln!(
+                    "sipr: warning: no free control port in 8888..8947 ({e}); running without a \
+                     control socket (pass -cp PORT to choose one, -cp 0 to silence this)"
+                ),
+            }
+        }
+        let mut control_snapshot = None;
+        let mut http = None;
+        if let Some(addr) = config.http_addr {
+            if !addr.ip().is_loopback() && config.http_token.is_none() {
+                return Err(EngineError(format!(
+                    "--sipr-http {addr} is not a loopback address: the API can stop the run and \
+                     change its load, so a --sipr-http-token is required there"
+                )));
+            }
+            let snapshot = Arc::new(Mutex::new(sipr_stats::Snapshot::default()));
+            let steps: Vec<String> = scenario
+                .dump()
+                .lines()
+                .skip(1)
+                .map(ToOwned::to_owned)
+                .collect();
+            let link = ControlLink {
+                requests: ctrl_tx.clone(),
+                snapshot: Arc::clone(&snapshot),
+                scenario_name: scenario.name.clone(),
+                role: if scenario.role == Role::Uas {
+                    "UAS"
+                } else {
+                    "UAC"
+                },
+                steps,
+                version: env!("CARGO_PKG_VERSION"),
+            };
+            let server = sipr_control::http::HttpServer::start(
+                addr,
+                sipr_control::api::handler(link, config.http_token.clone()),
+            )
+            .map_err(|e| EngineError(format!("cannot bind --sipr-http {addr}: {e}")))?;
+            eprintln!("sipr: HTTP control API on http://{}/", server.local_addr());
+            control_snapshot = Some(snapshot);
+            http = Some(server);
+        }
         let timers = TimerService::start(tx.clone());
         let control = EngineControl {
             rate_millis: Arc::new(AtomicU64::new(0)),
@@ -782,6 +879,9 @@ impl<'s> Engine<'s> {
                 sipr_media::rtp::BASE_SSRC
             },
             dtmf_ssrc_counter: 0,
+            control_snapshot,
+            _http: http,
+            rate_scale: 1.0,
         })
     }
 
@@ -816,23 +916,8 @@ impl<'s> Engine<'s> {
                     self.soft_stopping = true;
                     self.control.stop_pacer.store(true, Ordering::Relaxed);
                 }
-                Ok(Event::Stdin(c)) => match c {
-                    'q' => {
-                        self.soft_stopping = true;
-                        self.control.stop_pacer.store(true, Ordering::Relaxed);
-                    }
-                    'Q' => {
-                        self.fail_all("hard quit");
-                        self.hard_stop = true;
-                    }
-                    // SIPp rate keys: +/- by 1, */÷ by 10.
-                    '+' => self.control.set_rate(self.control.rate() + 1.0),
-                    '-' => self.control.set_rate((self.control.rate() - 1.0).max(0.0)),
-                    '*' => self.control.set_rate(self.control.rate() + 10.0),
-                    '/' => self.control.set_rate((self.control.rate() - 10.0).max(0.0)),
-                    'p' => self.paused = !self.paused,
-                    _ => {}
-                },
+                Ok(Event::Stdin(c)) => self.apply_key(c),
+                Ok(Event::Control(req)) => self.on_control(req),
                 Ok(Event::TwinCmd(cmd)) => self.on_twin_cmd(cmd),
                 Ok(Event::Media(ev)) => self.on_media_event(ev),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -902,9 +987,9 @@ impl<'s> Engine<'s> {
     }
 
     fn publish_snapshot(&mut self) {
-        let Some(tx) = self.snapshot_tx.as_ref() else {
+        if self.snapshot_tx.is_none() && self.control_snapshot.is_none() {
             return;
-        };
+        }
         let mut snap = sipr_stats::Snapshot {
             scenario: self.scenario.name.clone(),
             uas: self.scenario.role == Role::Uas,
@@ -921,7 +1006,223 @@ impl<'s> Engine<'s> {
                 / now.duration_since(last_at).as_secs_f64().max(1e-9);
         }
         self.last_snapshot = (now, self.stats.created());
-        let _ = tx.send(snap); // UI gone → ignored; run continues headless
+        if let Some(shared) = self.control_snapshot.as_ref()
+            && let Ok(mut slot) = shared.lock()
+        {
+            *slot = snap.clone();
+        }
+        if let Some(tx) = self.snapshot_tx.as_ref() {
+            let _ = tx.send(snap); // UI gone → ignored; run continues headless
+        }
+    }
+
+    // ---- runtime control -----------------------------------------------
+
+    /// SIPp's hot keys (`socket.cpp` `process_key`): the rate keys step by
+    /// `rate-scale`, and act on the user count in `-users` mode; `q` drains,
+    /// a second `q` (or `Q`) aborts.
+    fn apply_key(&mut self, c: char) {
+        match c {
+            'q' => {
+                if self.soft_stopping {
+                    self.hard_quit();
+                } else {
+                    self.soft_quit();
+                }
+            }
+            'Q' => self.hard_quit(),
+            '+' => self.bump_load(1.0),
+            '-' => self.bump_load(-1.0),
+            '*' => self.bump_load(10.0),
+            '/' => self.bump_load(-10.0),
+            'p' => self.paused = !self.paused,
+            _ => {}
+        }
+    }
+
+    fn bump_load(&mut self, step: f64) {
+        let delta = step * self.rate_scale;
+        if let Some(users) = self.config.users {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let target = (users as f64 + delta).max(0.0).round() as usize;
+            self.set_users(target);
+        } else {
+            self.control
+                .set_rate((self.control.rate() + delta).max(0.0));
+        }
+    }
+
+    fn soft_quit(&mut self) {
+        self.soft_stopping = true;
+        self.control.stop_pacer.store(true, Ordering::Relaxed);
+    }
+
+    fn hard_quit(&mut self) {
+        self.fail_all("hard quit");
+        self.soft_stopping = true;
+        self.hard_stop = true;
+    }
+
+    /// `set users N` at runtime (SIPp `CallGenerationTask::set_users`): new
+    /// ids join the free pool, a smaller target lets excess calls finish
+    /// without replacement, and traffic is un-paused.
+    fn set_users(&mut self, target: usize) {
+        let current = self.config.users.unwrap_or(0);
+        for id in current + 1..=target {
+            self.free_users.push_back(id);
+        }
+        self.free_users.retain(|id| *id <= target);
+        self.config.users = Some(target);
+        self.paused = false;
+        self.refill_users();
+    }
+
+    fn control_state(&self) -> ControlState {
+        ControlState {
+            rate: self.control.rate(),
+            rate_scale: self.rate_scale,
+            paused: self.paused,
+            users: self.config.users.map(|u| u as u64),
+            limit: self.config.limit,
+            quitting: if self.hard_stop {
+                Quitting::Hard
+            } else if self.soft_stopping {
+                Quitting::Soft
+            } else {
+                Quitting::No
+            },
+        }
+    }
+
+    fn on_control(&mut self, req: ControlRequest) {
+        let result = self.apply_control(&req.cmd);
+        match req.reply {
+            Some(reply) => {
+                let _ = reply.send(result.map(|()| self.control_state()));
+            }
+            None => {
+                if let Err(e) = result {
+                    eprintln!("sipr: warning: {e}");
+                    self.log_err(&e);
+                }
+            }
+        }
+    }
+
+    /// Execute one control command; `Err` carries SIPp's warning text.
+    fn apply_control(&mut self, cmd: &ControlCmd) -> Result<(), String> {
+        match cmd {
+            ControlCmd::Key(c) => self.apply_key(*c),
+            ControlCmd::SetRate(v) => {
+                if self.config.users.is_some() {
+                    return Err("Rates can not be set in a user-based benchmark.".into());
+                }
+                self.control.set_rate(v.max(0.0));
+            }
+            ControlCmd::SetRateScale(v) => self.rate_scale = *v,
+            ControlCmd::SetUsers(n) => {
+                if self.config.users.is_none() {
+                    return Err(
+                        "Users can not be changed at run time for a rate-based benchmark.".into(),
+                    );
+                }
+                self.set_users(usize::try_from(*n).unwrap_or(usize::MAX));
+            }
+            ControlCmd::SetLimit(n) => {
+                if self.config.users.is_some() {
+                    return Err("Limits can not be set in a user-based benchmark.".into());
+                }
+                self.config.limit = Some(*n);
+            }
+            ControlCmd::SetDisplay(which) => {
+                if which != "main" {
+                    return Err(format!(
+                        "set display {which}: sipr has no {which} scenario screen"
+                    ));
+                }
+            }
+            ControlCmd::SetHide(_) => {} // TUI matter; sipr has no hide attribute yet
+            ControlCmd::Trace { log, on } => self.set_trace(log, *on)?,
+            ControlCmd::Dump(what) => {
+                if what != "tasks" {
+                    return Err(format!("dump {what} is not supported by sipr"));
+                }
+                let mut lines: Vec<String> = self
+                    .calls
+                    .iter()
+                    .map(|(id, c)| format!("call {id}: number {} at step {}", c.number, c.index))
+                    .collect();
+                lines.sort();
+                self.log_err(&format!("---- {} Active Tasks ----", lines.len()));
+                for l in lines {
+                    self.log_err(&l);
+                }
+            }
+            ControlCmd::ResetStats => {
+                self.stats.reset();
+                self.last_snapshot = (Instant::now(), 0);
+            }
+            ControlCmd::SetPaused(p) => self.paused = *p,
+            ControlCmd::Quit { force } => {
+                if *force {
+                    self.hard_quit();
+                } else {
+                    self.soft_quit();
+                }
+            }
+            ControlCmd::Query => {}
+        }
+        Ok(())
+    }
+
+    /// `trace messages|error on|off`: open (SIPp's file naming) or close a
+    /// trace file at runtime.
+    fn set_trace(&mut self, log: &str, on: bool) -> Result<(), String> {
+        let (slot, configured, suffix, label) = match log {
+            "messages" => (
+                &mut self.trace_msg,
+                self.config.trace_msg.clone(),
+                "messages",
+                "message trace",
+            ),
+            "error" => (
+                &mut self.trace_err,
+                self.config.trace_err.clone(),
+                "errors",
+                "error trace",
+            ),
+            other => return Err(format!("trace {other} is not supported by sipr")),
+        };
+        if !on {
+            if let Some(f) = slot.as_mut() {
+                f.flush();
+            }
+            *slot = None;
+            return Ok(());
+        }
+        if slot.is_some() {
+            return Ok(());
+        }
+        let path = configured.or_else(|| {
+            self.config
+                .trace_name_base
+                .as_ref()
+                .map(|b| std::path::PathBuf::from(format!("{b}_{suffix}.log")))
+        });
+        let Some(path) = path else {
+            return Err(format!(
+                "trace {log} on: no file name known for the {label}"
+            ));
+        };
+        *slot = Some(
+            sipr_stats::TraceFile::create(&path)
+                .map_err(|e| format!("cannot open {label} {}: {e}", path.display()))?,
+        );
+        Ok(())
     }
 
     fn done_creating(&self) -> bool {
@@ -2279,7 +2580,9 @@ impl<'s> Engine<'s> {
     /// Return a finished call's user id to the free pool (`-users` mode), so a
     /// replacement call can reuse it.
     fn return_user(&mut self, call: &CallState) {
-        if let Some(uid) = call.user_id {
+        if let Some(uid) = call.user_id
+            && self.config.users.is_some_and(|target| uid <= target)
+        {
             self.free_users.push_back(uid);
         }
     }

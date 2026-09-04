@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Runtime control** — SIPp's UDP control socket (`-cp`, `-ci`: hot keys
+  and `c`-prefixed `set/trace/dump/reset` commands with SIPp's grammar and
+  warning texts; default bind is loopback and `-cp 0` disables it) and a
+  new HTTP/JSON API (`--sipr-http [HOST:]PORT`, `--sipr-http-token`):
+  `/health`, `/stats`, `/control`, `/quit`, `/command`, `/scenario`.
+  See `docs/CONTROL_API.md`. New std-only crate `sipr-control`.
+- Hot keys now follow SIPp exactly: `set rate-scale` steps, user-count
+  keys in `-users` mode, and a second `q` aborts like `Q`.
+
 ## [0.5.0] — 2026-09-04
 
 ### Added

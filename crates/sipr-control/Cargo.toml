@@ -1,6 +1,6 @@
 [package]
-name = "sipr-engine"
-description = "sipr: the per-call state machine, call table, pacer, and dialog bookkeeping"
+name = "sipr-control"
+description = "sipr: runtime control — SIPp's UDP control socket (-cp) and the HTTP/JSON control API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,12 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-sipr-scenario = { workspace = true }
-sipr-net = { workspace = true }
-sipr-auth = { workspace = true }
 sipr-stats = { workspace = true }
-sipr-media = { workspace = true }
-sipr-control = { workspace = true }
 
 [lints]
 workspace = true

@@ -118,6 +118,16 @@ impl StatSet {
         }
     }
 
+    /// Zero every cumulative counter and histogram (SIPp `reset stats`,
+    /// `E_RESET_C_COUNTERS`). The run start and step labels are kept.
+    pub fn reset(&mut self) {
+        let labels = std::mem::take(&mut self.step_labels);
+        let response_bounds = self.response_repartition.bounds();
+        let call_length_bounds = self.call_length_repartition.bounds();
+        *self = Self::new(&response_bounds, &call_length_bounds);
+        self.init_steps(labels);
+    }
+
     /// Size the per-step table and install display labels (engine, once).
     pub fn init_steps(&mut self, labels: Vec<String>) {
         self.steps = vec![StepStats::default(); labels.len()];

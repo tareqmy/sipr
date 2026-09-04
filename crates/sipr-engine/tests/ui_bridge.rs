@@ -46,6 +46,11 @@ fn uas_config() -> EngineConfig {
         rtp_payload: None,
         random_base_ssrc: false,
         scenario_dir: None,
+        control_port: Some(0),
+        control_ip: None,
+        http_addr: None,
+        http_token: None,
+        trace_name_base: None,
     }
 }
 

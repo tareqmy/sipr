@@ -95,6 +95,9 @@ port, default 6000; `-min_rtp_port` is SIPp's alias — note SIPp's `-mp` is
 *that* alias too, not a fixed port) `-max_rtp_port` `-rtp_payload <pt>`
 (default 8) `-random_base_ssrc`.
 Auth: `-au`/`-ap` (username/password defaults for `[authentication]`).
+Control (M17): `-cp <port>` `-ci <ip>` (SIPp's UDP control socket; `-cp 0`
+disables — sipr addition) and sipr's `--sipr-http [HOST:]PORT` /
+`--sipr-http-token` (docs/CONTROL_API.md).
 Tracing/output: `-trace_msg` `-trace_err` `-trace_stat` `-stf <file>`
 `-fd <interval s>` `-nd` (no defaults) `-timeout <s>` `-bg` (headless).
 Behavior toggles: `-aa` (auto-answer OPTIONS/INFO/UPDATE/NOTIFY in-dialog),
@@ -411,5 +414,34 @@ Verify exact SIPp table before closing M3 and update this line.
   16+ byte password; (6) unpadded base64 is accepted. `aka_*` values are
   taken literally (SIPp renders them, so `[field0]` works there) — a
   follow-up.
+- Remote control (M17; verified in `socket.cpp` `setup_ctrl_socket` (~l.497),
+  `handle_ctrl_socket` (~l.472), `process_command`/`process_set`/
+  `process_trace`/`process_dump`/`process_reset` (~l.134–330),
+  `process_key` (~l.367), `docs/controlling.rst`): the control socket is
+  UDP, created unconditionally (no flag disables it), bound to `-cp` once
+  (failure fatal) or probing 8888..8947 (failure = warning, no socket) on
+  **every interface**, and the chosen port is never printed. One datagram =
+  one command: byte 0 is a hot key (`1`-`9` screens, `+ - * /` rate or —
+  in `-users` mode — user count, stepped by `rate-scale`; `p` pause; `q`
+  adds 10 to `quitting`, `Q` 20; ≥1 drains, ≥11 aborts, so `q q` = `Q`)
+  and the rest is discarded, unless byte 0 is `c`: then the rest is a
+  command line split on the **first space only** (tabs do not separate),
+  verbs `set|trace|dump|reset`, numbers via `strtol(…, 0)` (hex/octal
+  accepted) with strict trailing-garbage rejection, booleans `true|false`
+  for `set hide` but `on|off|true|false` for `trace`. **No reply is ever
+  sent** (`recv()` without a peer); errors go to the error log with the
+  wordings reproduced in `sipr-control::command`. `set rate`/`set limit`
+  are refused in users mode and `set users` in rate mode; `set limit`
+  latches the cap so later `set rate` stops auto-sizing it. `reset stats`,
+  `set display rx`, `dump variables` exist but are undocumented; the `s`
+  key is dead code (`screenf` is never set). No HTTP anything. sipr
+  matches the protocol, grammar, wordings, refusals and quit ladder, with
+  these divergences: (1) default bind is loopback, `-ci` opts into more;
+  (2) `-cp 0` disables the socket; (3) the bound address is printed;
+  (4) screen digits are ignored (sipr's TUI cycles with `s`); (5) `set
+  display ooc|rx`, `trace logs|shortmessages`, and `dump variables` warn
+  that they are unsupported instead of silently succeeding; (6) `set
+  limit` in sipr simply sets `-l` (sipr never auto-sizes the cap from the
+  rate). The HTTP API is a sipr addition with no SIPp counterpart.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

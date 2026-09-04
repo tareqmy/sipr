@@ -170,6 +170,17 @@ fn run(cli: &Cli) -> ExitCode {
         max_rtp_port: cli.max_rtp_port,
         rtp_payload: cli.rtp_payload,
         random_base_ssrc: cli.random_base_ssrc,
+        control_port: cli.control_port,
+        control_ip: cli.control_ip,
+        http_addr: match cli.http.as_deref() {
+            None => None,
+            Some(raw) => match resolve_http_addr(raw) {
+                Ok(a) => Some(a),
+                Err(e) => return fatal(&format!("--sipr-http: {e}")),
+            },
+        },
+        http_token: cli.http_token.clone(),
+        trace_name_base: Some(format!("{base}_{pid}")),
         // pcap paths resolve next to the scenario file first (SIPp find_file).
         scenario_dir: cli
             .sf
@@ -229,6 +240,25 @@ fn run(cli: &Cli) -> ExitCode {
 /// Resolve `host[:port]` to a socket address (port defaults to 5060).
 /// Accepts IPv4, hostnames, and IPv6 in bracketed (`[::1]`, `[2001:db8::1]:5060`)
 /// or bare-literal (`::1`) form.
+/// `--sipr-http PORT` binds loopback; `HOST:PORT` (or `[v6]:PORT`) binds there.
+fn resolve_http_addr(raw: &str) -> Result<std::net::SocketAddr, String> {
+    if let Ok(port) = raw.parse::<u16>() {
+        return Ok(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        ));
+    }
+    let has_port = raw
+        .rsplit(':')
+        .next()
+        .is_some_and(|p| p.parse::<u16>().is_ok())
+        && (raw.starts_with('[') || raw.matches(':').count() == 1);
+    if !has_port {
+        return Err(format!("'{raw}' needs a port (PORT or HOST:PORT)"));
+    }
+    resolve_target(raw)
+}
+
 fn resolve_target(raw: &str) -> Result<std::net::SocketAddr, String> {
     use std::net::{Ipv6Addr, ToSocketAddrs};
     let candidate = if raw.starts_with('[') {

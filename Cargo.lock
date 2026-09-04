@@ -270,6 +270,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "sipr-auth",
+ "sipr-control",
  "sipr-engine",
  "sipr-media",
  "sipr-net",
@@ -284,10 +285,18 @@ name = "sipr-auth"
 version = "0.5.0"
 
 [[package]]
+name = "sipr-control"
+version = "0.5.0"
+dependencies = [
+ "sipr-stats",
+]
+
+[[package]]
 name = "sipr-engine"
 version = "0.5.0"
 dependencies = [
  "sipr-auth",
+ "sipr-control",
  "sipr-media",
  "sipr-net",
  "sipr-scenario",

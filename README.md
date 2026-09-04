@@ -97,6 +97,9 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
 - RTP streaming and DTMF: `<exec rtp_stream="file.g711a,-1,8"/>` with
   SIPp's codec table, patterns, `pause`/`resume`, `[rtpstream_audio_port]`;
   `<exec play_dtmf="1234#"/>` sends RFC 4733 events.
+- Runtime control: SIPp's UDP control socket (`-cp`) and an HTTP/JSON API
+  (`--sipr-http 8080`: `/stats`, `/control`, `/quit`, `/command`; see
+  `docs/CONTROL_API.md`).
 - Live TUI, `-bg` headless stat lines, `-trace_msg`/`-trace_err`/`-trace_stat`
   files, RTDs and repartition tables.
 
@@ -112,8 +115,8 @@ transport — no system libraries (no OpenSSL, no libpcap), no root for media.
 
 ## Not yet (post-v1 roadmap)
 
-An HTTP control API, RTP echo / rtpcheck / SRTP, and AKA resynchronisation
-(AUTS).
+RTP echo / rtpcheck / SRTP, AKA resynchronisation (AUTS), and SIPp's
+`-rate_increase` ramps.
 
 ## Brand
 

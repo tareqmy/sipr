@@ -2389,3 +2389,216 @@ fn aka_with_the_wrong_key_fails_the_call_not_the_process() {
         }
     }
 }
+
+// ---- runtime control ---------------------------------------------------------
+
+/// Spawn sipr with `args` and a pipe for stderr, returning the child and a
+/// reader thread collecting stderr.
+fn spawn_sipr_bg(args: &[&str]) -> (std::process::Child, std::thread::JoinHandle<String>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .args(args)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sipr");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    (child, reader)
+}
+
+fn wait_exit(child: &mut std::process::Child, limit: Duration) -> Option<i32> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(Some(st)) = child.try_wait() {
+            return st.code();
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn control_socket_speaks_sipp_protocol() {
+    let (addr, uas) = spawn_uas(Duration::from_secs(3));
+    let cp = free_port();
+    // 1 cps for 40 calls would take 40 s; "set rate 200" over the control
+    // socket must finish it in a few, and "q" must drain rather than abort.
+    let (mut child, stderr) = spawn_sipr_bg(&[
+        "-sn",
+        "uac",
+        "-r",
+        "1",
+        "-m",
+        "40",
+        "-d",
+        "20",
+        "-cp",
+        &cp.to_string(),
+        "-timeout",
+        "30",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    let ctl = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let target = SocketAddr::from(([127, 0, 0, 1], cp));
+    ctl.send_to(b"cset rate 200\n", target).expect("send");
+    ctl.send_to(b"cset bogus 1\n", target).expect("send");
+    let code = wait_exit(&mut child, Duration::from_secs(15));
+    let err = stderr.join().expect("stderr");
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 40 failed 0"), "{err}");
+    assert!(
+        err.contains("control socket (UDP, SIPp -cp protocol) on 127.0.0.1:"),
+        "{err}"
+    );
+    assert!(err.contains("Unknown set attribute: bogus"), "{err}");
+    drop(uas);
+
+    // A hot key: 'q' drains — the calls already placed complete, exit 0.
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let cp = free_port();
+    let (mut child, stderr) = spawn_sipr_bg(&[
+        "-sn",
+        "uac",
+        "-r",
+        "5",
+        "-m",
+        "1000",
+        "-d",
+        "20",
+        "-cp",
+        &cp.to_string(),
+        "-timeout",
+        "30",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    std::thread::sleep(Duration::from_millis(700));
+    ctl.send_to(b"q\n", SocketAddr::from(([127, 0, 0, 1], cp)))
+        .expect("send");
+    let code = wait_exit(&mut child, Duration::from_secs(10));
+    let err = stderr.join().expect("stderr");
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    assert!(err.contains(" failed 0"), "{err}");
+    assert!(
+        !err.contains("successful 1000 "),
+        "should have stopped early:\n{err}"
+    );
+}
+
+/// Minimal HTTP client for the API tests.
+fn http(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
+    use std::net::TcpStream;
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).expect("write");
+    let mut out = String::new();
+    s.read_to_string(&mut out).expect("read");
+    let status: u16 = out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let body = out.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
+    (status, body)
+}
+
+#[test]
+fn http_api_reports_stats_and_controls_the_run() {
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let port = free_port();
+    let (mut child, stderr) = spawn_sipr_bg(&[
+        "-sn",
+        "uac",
+        "-r",
+        "2",
+        "-m",
+        "1000",
+        "-d",
+        "20",
+        "-cp",
+        "0",
+        "--sipr-http",
+        &port.to_string(),
+        "-timeout",
+        "30",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let api = SocketAddr::from(([127, 0, 0, 1], port));
+    // Wait for the listener.
+    let mut ready = false;
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(api).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "HTTP API never came up");
+    let (st, body) = http(api, "GET", "/health", "");
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"status\":\"ok\""), "{body}");
+    std::thread::sleep(Duration::from_millis(1500));
+    let (st, body) = http(api, "GET", "/stats", "");
+    assert_eq!(st, 200, "{body}");
+    assert!(
+        body.contains("\"scenario\":\"Basic Sipstone UAC\""),
+        "{body}"
+    );
+    assert!(body.contains("\"role\":\"UAC\""), "{body}");
+    assert!(body.contains("\"rate_target\":2"), "{body}");
+    assert!(body.contains("\"steps\":[{\"label\":"), "{body}");
+    let (st, body) = http(api, "POST", "/control", r#"{"rate": 150, "paused": false}"#);
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"rate\":150"), "{body}");
+    assert!(body.contains("\"quitting\":\"no\""), "{body}");
+    let (st, body) = http(api, "POST", "/control", r#"{"users": 3}"#);
+    assert_eq!(st, 400, "{body}");
+    assert!(body.contains("Users can not be changed"), "{body}");
+    let (st, body) = http(api, "POST", "/command", r#"{"command":"set rate 300"}"#);
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"rate\":300"), "{body}");
+    let (st, body) = http(api, "GET", "/scenario", "");
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("send"), "{body}");
+    let (st, body) = http(api, "POST", "/quit", r#"{"force": false}"#);
+    assert_eq!(st, 202, "{body}");
+    assert!(body.contains("\"quitting\":\"soft\""), "{body}");
+    let code = wait_exit(&mut child, Duration::from_secs(10));
+    let err = stderr.join().expect("stderr");
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    assert!(
+        err.contains("HTTP control API on http://127.0.0.1:"),
+        "{err}"
+    );
+    assert!(err.contains(" failed 0"), "{err}");
+}
+
+#[test]
+fn http_api_off_loopback_needs_a_token() {
+    let out = run_sipr(&[
+        "-sn",
+        "uas",
+        "-cp",
+        "0",
+        "--sipr-http",
+        "0.0.0.0:0",
+        "-m",
+        "1",
+        "-timeout",
+        "2",
+        "-bg",
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(err.contains("--sipr-http-token"), "{err}");
+}
