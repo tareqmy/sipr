@@ -86,7 +86,9 @@ C++ and record below).
 Scenario/mode: `-sf <file>` `-sn uac|uas` `-sd` (dump embedded) `--check` (sipr
 addition: lint scenario and exit).
 Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
-`-d <pause ms default>` `-users` (v1.x closed loop).
+`-d <pause ms default>` `-users` (v1.x closed loop) `-rate_increase <n>`
+`-rate_max <n>` `-rate_interval <time>` `-no_rate_quit` `-rate_scale <n>`
+(M20 ramps).
 Network: `-p <local port>` `-i <local ip>` `-t u1|t1|l1` (UDP / TCP / TLS
 mono-socket; `tn`/`ln` accepted as aliases) `-s <service>` (called number)
 `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version` (TLS material,
@@ -484,5 +486,16 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   a digest over the empty password; the scenario then expects the
   server's fresh 401 (`<recv response="401" auth="true"/>` again). Pure
   addition — no SIPp behavior to match.
+- Rate ramps (M20; verified in `ratetask.cpp` and the option table in
+  `sipp.cpp` ~l.347-356): the ramp task is created only when
+  `-rate_increase` is non-zero; it wakes every `rate_increase_freq`
+  (`-rate_interval`, a `SIPP_OPTION_TIME_SEC` value; when 0 it takes
+  `-fd`'s value, whose SIPp default is 60 s), does `rate += rate_increase`,
+  and if `rate_max` is set and the new rate **exceeds** it, clamps to
+  `rate_max` and — with `rate_quit` (default true; `-no_rate_quit`
+  clears it) — `quitting += 10` (drain). The task deletes itself once
+  `quitting >= 10`. It calls `set_rate`, which users mode ignores.
+  sipr matches this; the only difference is the default interval, since
+  sipr's `-fd` defaults to 1 s (recorded in M4).
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

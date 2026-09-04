@@ -75,6 +75,16 @@ pub struct Cli {
     pub rtp_payload: Option<u8>,
     /// `-random_base_ssrc`: randomize the SSRC base instead of `0xCA110000`.
     pub random_base_ssrc: bool,
+    /// `-rate_increase`: add this to the rate every `-rate_interval`.
+    pub rate_increase: Option<f64>,
+    /// `-rate_max`: cap for the ramp; reaching it soft-quits unless `-no_rate_quit`.
+    pub rate_max: Option<f64>,
+    /// `-rate_interval`: ramp period (default: the `-fd` interval).
+    pub rate_interval: Option<std::time::Duration>,
+    /// `-no_rate_quit`: keep running at `-rate_max` instead of quitting.
+    pub no_rate_quit: bool,
+    /// `-rate_scale`: the step for the `+ - * /` keys (default 1).
+    pub rate_scale: Option<f64>,
     /// `-rtp_echo`: echo RTP received on the media port (and +2) back.
     pub rtp_echo: bool,
     /// `-mb`: RTP echo buffer size (default 2048).
@@ -165,6 +175,11 @@ impl Default for Cli {
             max_rtp_port: None,
             rtp_payload: None,
             random_base_ssrc: false,
+            rate_increase: None,
+            rate_max: None,
+            rate_interval: None,
+            no_rate_quit: false,
+            rate_scale: None,
             rtp_echo: false,
             media_bufsize: None,
             audio_tolerance: None,
@@ -287,6 +302,36 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         false,
         "",
         "Random SSRC base for rtp_stream instead of 0xCA110000",
+    ),
+    (
+        "rate_increase",
+        true,
+        "N",
+        "Increase the call rate by N every -rate_interval (SIPp ramp)",
+    ),
+    (
+        "rate_max",
+        true,
+        "N",
+        "With -rate_increase: cap the rate at N and quit (drain) when it would be exceeded",
+    ),
+    (
+        "rate_interval",
+        true,
+        "TIME",
+        "Ramp period: seconds, or with a unit (500ms, 10s, 1m) [default: the -fd interval]",
+    ),
+    (
+        "no_rate_quit",
+        false,
+        "",
+        "With -rate_max: keep running at the cap instead of quitting",
+    ),
+    (
+        "rate_scale",
+        true,
+        "N",
+        "Step for the + - * / rate keys [default: 1]",
     ),
     (
         "rtp_echo",
@@ -566,6 +611,11 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
             cli.rtp_payload = Some(pt);
         }
         "random_base_ssrc" => cli.random_base_ssrc = true,
+        "rate_increase" => cli.rate_increase = Some(parse_num(flag, &val(value))?),
+        "rate_max" => cli.rate_max = Some(parse_num(flag, &val(value))?),
+        "rate_interval" => cli.rate_interval = Some(parse_time(flag, &val(value))?),
+        "no_rate_quit" => cli.no_rate_quit = true,
+        "rate_scale" => cli.rate_scale = Some(parse_num(flag, &val(value))?),
         "rtp_echo" => cli.rtp_echo = true,
         "mb" => cli.media_bufsize = Some(parse_num(flag, &val(value))?),
         "audiotolerance" | "videotolerance" => {
@@ -613,6 +663,34 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         other => return Err(format!("internal error: unhandled flag '-{other}'")),
     }
     Ok(())
+}
+
+/// SIPp's time values (`SIPP_OPTION_TIME_SEC`): a number of seconds, or a
+/// number with a unit — `ms`, `s`, `m`, `h`.
+fn parse_time(flag: &str, raw: &str) -> Result<std::time::Duration, String> {
+    let raw = raw.trim();
+    let split = raw
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(raw.len());
+    let (number, unit) = raw.split_at(split);
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("invalid time value '{raw}' for option '-{flag}'"))?;
+    let secs = match unit.trim() {
+        "" | "s" => value,
+        "ms" => value / 1000.0,
+        "m" => value * 60.0,
+        "h" => value * 3600.0,
+        other => {
+            return Err(format!(
+                "invalid time unit '{other}' in '{raw}' for option '-{flag}' (ms, s, m, h)"
+            ));
+        }
+    };
+    if !(secs.is_finite() && secs >= 0.0) {
+        return Err(format!("invalid time value '{raw}' for option '-{flag}'"));
+    }
+    Ok(std::time::Duration::from_secs_f64(secs))
 }
 
 fn parse_num<T: std::str::FromStr>(flag: &str, raw: &str) -> Result<T, String> {
@@ -826,6 +904,41 @@ mod tests {
         assert_eq!(c.rtp_payload, Some(0));
         assert!(c.random_base_ssrc);
         assert!(run(&["-rtp_payload", "200", "x"]).is_err());
+    }
+
+    #[test]
+    fn rate_ramp_flags_parse_with_time_units() {
+        let c = cli(&[
+            "-rate_increase",
+            "10",
+            "-rate_max",
+            "100",
+            "-rate_interval",
+            "10s",
+            "-no_rate_quit",
+            "-rate_scale",
+            "5",
+            "x",
+        ]);
+        assert_eq!(c.rate_increase, Some(10.0));
+        assert_eq!(c.rate_max, Some(100.0));
+        assert_eq!(c.rate_interval, Some(std::time::Duration::from_secs(10)));
+        assert!(c.no_rate_quit);
+        assert_eq!(c.rate_scale, Some(5.0));
+        assert_eq!(
+            cli(&["-rate_interval", "500ms", "x"]).rate_interval,
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert_eq!(
+            cli(&["-rate_interval", "2", "x"]).rate_interval,
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(
+            cli(&["-rate_interval", "1m", "x"]).rate_interval,
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert!(run(&["-rate_interval", "5d", "x"]).is_err());
+        assert!(run(&["-rate_interval", "abc", "x"]).is_err());
     }
 
     #[test]

@@ -2908,3 +2908,111 @@ fn aka_resynchronisation_round_trips() {
         "registrar must accept the post-resync response"
     );
 }
+
+// ---- rate ramps ------------------------------------------------------------------
+
+#[test]
+fn rate_increase_ramps_the_rate_up() {
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    // 1 cps would take 40 s for 40 calls; after one 1 s interval the ramp
+    // makes it 201 cps and the run finishes in a few seconds.
+    let start = std::time::Instant::now();
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-r",
+        "1",
+        "-rate_increase",
+        "200",
+        "-rate_interval",
+        "1",
+        "-m",
+        "40",
+        "-d",
+        "20",
+        "-cp",
+        "0",
+        "-timeout",
+        "30",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 40 failed 0"), "{err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(12),
+        "ramp did not fire: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn rate_max_quits_when_exceeded_unless_no_rate_quit() {
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    // r=5, +5 every 1 s, max 5: t=1 s → 10 > 5 → clamp to 5 and drain, with
+    // the first second's calls already placed (a run that placed nothing
+    // would exit 99, as in SIPp).
+    let start = std::time::Instant::now();
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-r",
+        "5",
+        "-rate_increase",
+        "5",
+        "-rate_max",
+        "5",
+        "-rate_interval",
+        "1",
+        "-m",
+        "100000",
+        "-d",
+        "20",
+        "-cp",
+        "0",
+        "-timeout",
+        "30",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("rate reached -rate_max 5; quitting"), "{err}");
+    assert!(err.contains(" failed 0"), "{err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // With -no_rate_quit the run keeps going at the cap until -m.
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-r",
+        "1",
+        "-rate_increase",
+        "50",
+        "-rate_max",
+        "50",
+        "-rate_interval",
+        "300ms",
+        "-no_rate_quit",
+        "-m",
+        "30",
+        "-d",
+        "20",
+        "-cp",
+        "0",
+        "-timeout",
+        "30",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 30 failed 0"), "{err}");
+    assert!(!err.contains("quitting"), "{err}");
+}

@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Rate ramps** — SIPp's `-rate_increase N`, `-rate_interval TIME`
+  (seconds or `ms`/`s`/`m`/`h`), `-rate_max N`, and `-no_rate_quit`:
+  the rate climbs every interval and, when it would pass the cap, is
+  clamped there and the run drains (unless told not to). Also
+  `-rate_scale` for the hot-key step.
+
 ## [0.8.0] — 2026-09-04
 
 ### Added

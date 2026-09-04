@@ -83,7 +83,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   injection (line = user id − 1).
 - IPv6 targets (`[::1]`, `[2001:db8::1]:5060`, bare `::1`) with automatic v6
   binding; `[local_ip]`/`[remote_ip]` are bracketed in URIs and Via.
-- UAC and UAS roles; open-loop pacing (`-r/-rp/-l/-m`) with rate smoothing.
+- UAC and UAS roles; open-loop pacing (`-r/-rp/-l/-m`) with rate smoothing
+  and SIPp's ramps (`-rate_increase`, `-rate_max`, `-rate_interval`).
 - UDP (`-t u1`), TCP (`-t t1`), and TLS (`-t l1`) transports; streams frame by
   Content-Length and carry no SIP retransmissions (reliable transports). TLS
   takes SIPp's `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version`
@@ -119,7 +120,7 @@ transport — no system libraries (no OpenSSL, no libpcap), no root for media.
 
 ## Not yet (post-v1 roadmap)
 
-SRTP and SIPp's `-rate_increase` ramps.
+SRTP, `-auth_uri`, and keyword-rendered `aka_*` values.
 
 ## Brand
 

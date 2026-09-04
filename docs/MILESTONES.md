@@ -534,7 +534,28 @@ flow SIPp only sketched. Divergences (all additions) in SIPP_COMPAT §6.
       "must be greater than SQN_MS"), keyword-rendered `aka_*` values,
       `-auth_uri`.
 
+## M20 — Rate ramps (`-rate_increase`, `-rate_max`, `-rate_interval`, `-no_rate_quit`) ✅
+
+Behavioral oracle: `ratetask.cpp` (`ratetask::run`/`wake`), `sipp.cpp` option
+table (`SIPP_OPTION_TIME_SEC`), `include/sipp.hpp` defaults.
+
+- [x] `-rate_increase N`: a ramp that exists only when set; every
+      `-rate_interval` (SIPp time values: seconds, or `ms`/`s`/`m`/`h`
+      suffixes; default the `-fd` interval) `rate += N`. `-rate_max N`: a
+      tick that would exceed it clamps the rate to N and, unless
+      `-no_rate_quit`, quits with a drain (SIPp `quitting += 10`).
+      Reaching the cap exactly does not quit — only the next tick does
+      (`ramp_step`, unit-tested against SIPp's arithmetic). The task dies
+      once quitting and is inert in `-users` mode, as in SIPp.
+      `-rate_scale N` (SIPp's CLI flag for the `+ - * /` step) added too.
+- [x] Tests: unit `ramp_step_follows_sipp_ratetask`, e2e
+      `rate_increase_ramps_the_rate_up` (a 1 cps run finishes 40 calls in
+      seconds after the ramp) and
+      `rate_max_quits_when_exceeded_unless_no_rate_quit` (both branches).
+- [x] Note: sipr's `-fd` default is 1 s, so an unqualified ramp ticks every
+      second; SIPp's `-fd` default is 60 s. Give `-rate_interval` explicitly
+      for scripts shared between the two.
+
 ## Post-v1 backlog (ordered)
 
-`-rate_increase`/`-rate_max`/`-rate_quit` ramps → `-auth_uri` / rendered
-`aka_*` params → TUI `hide`/`display` → SRTP.
+`-auth_uri` / rendered `aka_*` params → TUI `hide`/`display` → SRTP.

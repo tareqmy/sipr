@@ -109,6 +109,16 @@ pub struct EngineConfig {
     pub rtp_payload: Option<u8>,
     /// `-random_base_ssrc`: seed the SSRC base randomly (SIPp: `0xCA110000`).
     pub random_base_ssrc: bool,
+    /// `-rate_increase`: add this to the rate every `rate_interval`.
+    pub rate_increase: Option<f64>,
+    /// `-rate_max`: clamp the ramp here; exceeding it quits unless `!rate_quit`.
+    pub rate_max: Option<f64>,
+    /// `-rate_interval`: ramp period (`None` = `stat_interval`, SIPp's `-fd`).
+    pub rate_interval: Option<Duration>,
+    /// `-no_rate_quit` unsets this: quit (drain) when `rate_max` is exceeded.
+    pub rate_quit: bool,
+    /// `-rate_scale`: the step for the rate keys (default 1).
+    pub rate_scale: Option<f64>,
     /// `-rtp_echo`: echo RTP received on the media port (+2) back.
     pub rtp_echo: bool,
     /// `-mb`: echo receive buffer size (default 2048).
@@ -523,6 +533,8 @@ struct Engine<'s> {
     rate_scale: f64,
     /// `-rtp_echo`: the global echo sockets, when enabled.
     echo: Option<sipr_media::EchoServer>,
+    /// `-rate_increase`: when the ramp last fired (SIPp `ratetask`).
+    last_ramp: Instant,
 }
 
 impl<'s> Engine<'s> {
@@ -934,8 +946,9 @@ impl<'s> Engine<'s> {
             dtmf_ssrc_counter: 0,
             control_snapshot,
             _http: http,
-            rate_scale: 1.0,
+            rate_scale: config.rate_scale.unwrap_or(1.0),
             echo,
+            last_ramp: Instant::now(),
         })
     }
 
@@ -979,6 +992,7 @@ impl<'s> Engine<'s> {
             }
             // Closed-loop: replace any calls that just ended (no-op otherwise).
             self.refill_users();
+            self.run_rate_ramp();
             if last_line.elapsed() >= Duration::from_secs(1) {
                 last_line = Instant::now();
                 self.sample_media_counters();
@@ -1097,6 +1111,40 @@ impl<'s> Engine<'s> {
         }
         if let Some(tx) = self.snapshot_tx.as_ref() {
             let _ = tx.send(snap); // UI gone → ignored; run continues headless
+        }
+    }
+
+    // ---- rate ramp (-rate_increase) ------------------------------------
+
+    /// SIPp's `ratetask`: every `rate_interval`, `rate += rate_increase`;
+    /// past `rate_max` the rate is clamped there and, with `rate_quit`, the
+    /// run drains. The task dies once quitting (rate mode only — users
+    /// mode ignores the rate, as in SIPp).
+    fn run_rate_ramp(&mut self) {
+        let Some(increase) = self.config.rate_increase else {
+            return;
+        };
+        if self.soft_stopping || self.config.users.is_some() {
+            return;
+        }
+        let interval = self
+            .config
+            .rate_interval
+            .unwrap_or(self.config.stat_interval);
+        if self.last_ramp.elapsed() < interval {
+            return;
+        }
+        self.last_ramp = Instant::now();
+        let (rate, quit) = ramp_step(
+            self.control.rate(),
+            increase,
+            self.config.rate_max,
+            self.config.rate_quit,
+        );
+        self.control.set_rate(rate);
+        if quit {
+            eprintln!("sipr: rate reached -rate_max {rate}; quitting (drain)");
+            self.soft_quit();
         }
     }
 
@@ -3036,6 +3084,20 @@ fn media_port_layout(scenario: &Scenario) -> [(bool, u16); 3] {
     layout
 }
 
+/// One ramp tick (SIPp `ratetask::run`): the new rate, and whether the
+/// cap was exceeded and `rate_quit` asks to stop. Reaching the cap exactly
+/// does not quit; only the tick that would go past it does.
+fn ramp_step(rate: f64, increase: f64, max: Option<f64>, quit: bool) -> (f64, bool) {
+    let mut next = rate + increase;
+    match max {
+        Some(m) if next > m => {
+            next = m;
+            (next, quit)
+        }
+        _ => (next, false),
+    }
+}
+
 /// The call's allocated rtpstream ports for rendering (0 = none yet).
 fn rtpstream_ports(call: &CallState) -> [u16; 2] {
     [
@@ -3376,6 +3438,17 @@ mod tests {
         .scenario
         .unwrap();
         assert!(validate_for_engine(&bad_dist).is_err());
+    }
+
+    #[test]
+    fn ramp_step_follows_sipp_ratetask() {
+        assert_eq!(ramp_step(10.0, 5.0, None, true), (15.0, false));
+        assert_eq!(ramp_step(10.0, 5.0, Some(100.0), true), (15.0, false));
+        // Reaching the cap exactly: no quit yet.
+        assert_eq!(ramp_step(95.0, 5.0, Some(100.0), true), (100.0, false));
+        // Going past it: clamp and quit (unless -no_rate_quit).
+        assert_eq!(ramp_step(100.0, 5.0, Some(100.0), true), (100.0, true));
+        assert_eq!(ramp_step(100.0, 5.0, Some(100.0), false), (100.0, false));
     }
 
     #[test]
