@@ -18,6 +18,19 @@ pub enum Screen {
 }
 
 impl Screen {
+    /// SIPp's screen digits: `1` scenario, `2` statistics, `3` repartition.
+    /// (`4` variables and `5` TDM map have no sipr screen; `6`..`9` select
+    /// secondary repartitions sipr does not draw separately.)
+    #[must_use]
+    pub fn from_digit(d: u8) -> Option<Self> {
+        match d {
+            1 => Some(Self::Scenario),
+            2 => Some(Self::Main),
+            3 => Some(Self::Repartition),
+            _ => None,
+        }
+    }
+
     /// The next screen in the cycle.
     #[must_use]
     pub fn next(self) -> Self {
@@ -185,6 +198,9 @@ fn render_scenario(snap: &Snapshot, pal: &Palette) -> Vec<String> {
     ));
     out.push(pal.paint(pal.label, &format!("  {}", "-".repeat(WIDTH - 4))));
     for (i, row) in snap.steps.iter().enumerate() {
+        if row.hidden && snap.hide {
+            continue; // SIPp: `hide="true"` rows stay off while `set hide true`
+        }
         let s = &row.stats;
         out.push(format!(
             "  {i:>3}  {:<22} {:>9} {:>9} {:>8} {:>8} {:>8}",
@@ -272,6 +288,7 @@ mod tests {
             steps: vec![
                 StepRow {
                     label: "send INVITE".into(),
+                    hidden: false,
                     stats: StepStats {
                         sent: 1000,
                         retrans: 5,
@@ -280,6 +297,7 @@ mod tests {
                 },
                 StepRow {
                     label: "recv 200".into(),
+                    hidden: false,
                     stats: StepStats {
                         recv: 950,
                         timeouts: 30,
@@ -328,6 +346,26 @@ mod tests {
         let invite = lines.iter().find(|l| l.contains("send INVITE")).unwrap();
         assert!(invite.contains("1000"), "{invite}");
         assert!(invite.contains('5'), "{invite}");
+    }
+
+    #[test]
+    fn hidden_steps_follow_the_hide_switch() {
+        let mut s = snap();
+        s.steps.push(StepRow {
+            label: "nop (branch)".into(),
+            hidden: true,
+            stats: StepStats::default(),
+        });
+        s.hide = true;
+        let shown = render(&s, Screen::Scenario).join("\n");
+        assert!(!shown.contains("nop (branch)"), "{shown}");
+        s.hide = false;
+        let shown = render(&s, Screen::Scenario).join("\n");
+        assert!(shown.contains("nop (branch)"), "{shown}");
+        assert_eq!(Screen::from_digit(1), Some(Screen::Scenario));
+        assert_eq!(Screen::from_digit(2), Some(Screen::Main));
+        assert_eq!(Screen::from_digit(3), Some(Screen::Repartition));
+        assert_eq!(Screen::from_digit(4), None);
     }
 
     #[test]

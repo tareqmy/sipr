@@ -120,7 +120,7 @@ transport — no system libraries (no OpenSSL, no libpcap), no root for media.
 
 ## Not yet (post-v1 roadmap)
 
-SRTP and the TUI's `hide`/`display` controls.
+SRTP and a whole `[authentication]` keyword arriving from an injection field.
 
 ## Brand
 

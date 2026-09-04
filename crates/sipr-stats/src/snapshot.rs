@@ -25,6 +25,8 @@ pub struct StepStats {
 pub struct StepRow {
     /// Short human description ("send INVITE", "recv 200", "pause 3000ms").
     pub label: String,
+    /// `hide="true"` on the step: skipped while [`Snapshot::hide`] holds.
+    pub hidden: bool,
     /// The counters.
     pub stats: StepStats,
 }
@@ -119,6 +121,13 @@ pub struct Snapshot {
     pub call_length_rows: Vec<(String, u64)>,
     /// Per-step rows for the scenario screen.
     pub steps: Vec<StepRow>,
+    /// `set hide true|false` (SIPp `do_hide`, default true): whether
+    /// hidden steps stay off the scenario screen.
+    pub hide: bool,
+    /// A screen requested through the control socket's digit keys
+    /// (`1` scenario, `2` statistics, `3` repartition), with a sequence
+    /// number so the TUI applies each request once.
+    pub screen_request: Option<(u64, u8)>,
 }
 
 impl crate::StatSet {
@@ -186,6 +195,7 @@ impl crate::StatSet {
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("step {i}")),
+                hidden: self.step_hidden.get(i).copied().unwrap_or(false),
                 stats: s.clone(),
             })
             .collect();

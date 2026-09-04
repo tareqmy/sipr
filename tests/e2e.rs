@@ -2629,7 +2629,10 @@ fn http_api_reports_stats_and_controls_the_run() {
     );
     assert!(body.contains("\"role\":\"UAC\""), "{body}");
     assert!(body.contains("\"rate_target\":2"), "{body}");
-    assert!(body.contains("\"steps\":[{\"label\":"), "{body}");
+    assert!(
+        body.contains("\"steps\":[{\"hidden\":false,\"label\":"),
+        "{body}"
+    );
     let (st, body) = http(api, "POST", "/control", r#"{"rate": 150, "paused": false}"#);
     assert_eq!(st, 200, "{body}");
     assert!(body.contains("\"rate\":150"), "{body}");
@@ -3155,4 +3158,94 @@ fn auth_uri_flag_and_default_follow_sipp() {
     let (addr, registrar) = spawn_digest_registrar("r", "u", "p");
     uri_in_trace(&["-auth_uri", "ims.example.com"], "ims.example.com", addr);
     assert!(registrar.join().expect("registrar"));
+}
+
+// ---- hide / display ---------------------------------------------------------------
+
+#[test]
+fn hidden_steps_and_display_labels_reach_the_stats_api() {
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let path = dir.join(format!("sipr-e2e-hide-{pid}.xml"));
+    std::fs::write(
+        &path,
+        r#"<scenario name="hide">
+  <send retrans="500" display="place call"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]h[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="180" optional="true"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]h[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Content-Length: 0
+
+  ]]></send>
+  <nop hide="true"/>
+  <pause milliseconds="3000"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]h[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#,
+    )
+    .expect("write");
+    let port = free_port();
+    let (mut child, stderr) = spawn_sipr_bg(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-cp",
+        "0",
+        "--sipr-http",
+        &port.to_string(),
+        "-m",
+        "1",
+        "-timeout",
+        "20",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let api = SocketAddr::from(([127, 0, 0, 1], port));
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(api).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let (st, body) = http(api, "GET", "/stats", "");
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"label\":\"place call\""), "{body}");
+    assert!(body.contains("\"hidden\":true"), "{body}");
+    assert!(body.contains("\"hide\":true"), "{body}");
+    let (st, body) = http(api, "POST", "/command", r#"{"command":"set hide false"}"#);
+    assert_eq!(st, 200, "{body}");
+    std::thread::sleep(Duration::from_millis(1200));
+    let (_, body) = http(api, "GET", "/stats", "");
+    assert!(body.contains("\"hide\":false"), "{body}");
+    let _ = http(api, "POST", "/quit", r#"{"force": true}"#);
+    let _ = wait_exit(&mut child, Duration::from_secs(10));
+    let _ = stderr.join();
+    let _ = std::fs::remove_file(&path);
 }

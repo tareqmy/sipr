@@ -580,6 +580,33 @@ Behavioral oracle: `call.cpp` (~l.4149-4170: the `sip:` + `-auth_uri` /
 - [x] Deferred: a whole `[authentication …]` keyword arriving from an
       injection field (SIPp re-parses rendered text at runtime).
 
+## M22 — TUI `hide` / `display` and SIPp's screen keys ✅
+
+Behavioral oracle: `scenario.cpp` (~l.1852: `hide` bool and `display` text
+read for every message command, though the DTD lists `display` only on
+`nop`), `screen.cpp` (`do_hide`, default true; hidden rows skipped on the
+scenario screen), `socket.cpp` `process_key` (`1`..`9` screens).
+
+- [x] `hide="true"` and `display="…"` on any message command land in
+      `StepCommon`; `display` replaces the derived scenario-screen label,
+      `hide` marks the row. `set hide true|false` (control socket / HTTP
+      `/command`) now has its SIPp effect: hidden rows are skipped while it
+      is true (the default). Both flags reach `/stats` (`hidden` per step,
+      `hide` overall) so headless runs can see them too.
+- [x] Screen keys: `1` scenario, `2` statistics, `3` repartition work at
+      the TUI keyboard and over the control socket (forwarded through the
+      snapshot as a sequenced request); `4`/`5` (variables, TDM map) and
+      `6`..`9` (secondary repartitions) have no sipr screen and are ignored.
+      `s` still cycles.
+- [x] Tests: compiler (`hide`/`display` on recv, nop, pause; blank display
+      is none), TUI render (hidden rows follow the switch; digit mapping),
+      corpus `positive/hide_display.xml`, e2e
+      `hidden_steps_and_display_labels_reach_the_stats_api` (`display`
+      label and `hidden` flag in `/stats`; `set hide false` over `/command`
+      flips `hide`).
+- [x] Deferred: `set display ooc|rx` (no out-of-call / rx scenarios in
+      sipr), `-hide` CLI default.
+
 ## Post-v1 backlog (ordered)
 
-TUI `hide`/`display` → SRTP → `[authentication]` from injection fields.
+SRTP → `[authentication]` from injection fields.

@@ -83,6 +83,8 @@ pub struct StatSet {
     pub steps: Vec<StepStats>,
     /// Short per-step labels, set once by the engine.
     pub step_labels: Vec<String>,
+    /// Per-step `hide` flags, parallel to `step_labels`.
+    pub step_hidden: Vec<bool>,
     // Snapshot of cumulative values at the last CSV dump, for (P) columns.
     last_dump: PeriodSnapshot,
 }
@@ -129,6 +131,7 @@ impl StatSet {
             call_length_repartition: Repartition::new(call_length_bounds),
             steps: Vec::new(),
             step_labels: Vec::new(),
+            step_hidden: Vec::new(),
             last_dump: PeriodSnapshot::default(),
         }
     }
@@ -137,16 +140,24 @@ impl StatSet {
     /// `E_RESET_C_COUNTERS`). The run start and step labels are kept.
     pub fn reset(&mut self) {
         let labels = std::mem::take(&mut self.step_labels);
+        let hidden = std::mem::take(&mut self.step_hidden);
         let response_bounds = self.response_repartition.bounds();
         let call_length_bounds = self.call_length_repartition.bounds();
         *self = Self::new(&response_bounds, &call_length_bounds);
         self.init_steps(labels);
+        self.step_hidden = hidden;
     }
 
     /// Size the per-step table and install display labels (engine, once).
     pub fn init_steps(&mut self, labels: Vec<String>) {
         self.steps = vec![StepStats::default(); labels.len()];
+        self.step_hidden = vec![false; labels.len()];
         self.step_labels = labels;
+    }
+
+    /// Install per-step `hide` flags (parallel to the labels).
+    pub fn set_step_hidden(&mut self, hidden: Vec<bool>) {
+        self.step_hidden = hidden;
     }
 
     /// Per-step counter access; out-of-range indices are ignored safely.

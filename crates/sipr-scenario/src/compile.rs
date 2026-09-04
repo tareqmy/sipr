@@ -512,6 +512,8 @@ impl Compiler {
             "condexec",
             "condexec_inverse",
             "counter",
+            "hide",
+            "display",
         ];
         let allowed: Vec<&str> = COMMON.iter().chain(element_attrs).copied().collect();
         self.warn_unknown_attrs(el, &allowed);
@@ -562,6 +564,12 @@ impl Compiler {
                 .map(|v| self.var_reads(&v)),
             condexec_inverse: self.parse_bool_attr(el, "condexec_inverse"),
             counter: el.attr("counter").map(ToOwned::to_owned),
+            hide: self.parse_bool_attr(el, "hide"),
+            display: el
+                .attr("display")
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(ToOwned::to_owned),
             line: el.line,
         }
     }

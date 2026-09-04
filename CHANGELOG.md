@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`hide` and `display` attributes, and SIPp's screen keys** — `hide="true"`
+  keeps a step off the scenario screen while `set hide true` (the default)
+  holds; `display="…"` replaces its label. Both reach `/stats`. The `1`/`2`/`3`
+  keys switch screens at the keyboard and over the control socket.
+
 ## [0.10.0] — 2026-09-04
 
 ### Added

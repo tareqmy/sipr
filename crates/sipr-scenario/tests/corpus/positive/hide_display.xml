@@ -1,0 +1,16 @@
+<scenario name="hide and display attributes">
+  <recv request="INVITE"/>
+  <send display="answer 200"><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <nop hide="true" next="done"/>
+  <label id="done"/>
+  <recv request="BYE" crlf="true"/>
+</scenario>

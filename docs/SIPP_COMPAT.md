@@ -112,10 +112,16 @@ Behavior toggles: `-aa` (auto-answer OPTIONS/INFO/UPDATE/NOTIFY in-dialog),
 Where sipr needs a flag SIPp lacks, prefix long-form `--sipr-*` to keep the two
 namespaces distinct.
 
+`hide="true"` and `display="…"` on any message command (M22): the scenario
+screen skips hidden rows while `set hide true` (default) holds, and shows
+`display` text instead of the derived label.
+
 ## 4. Runtime key bindings (TUI)
 
 `+`/`-` rate ±1 (`*`,`/` ±10), `p` pause traffic, `s`..screens cycle, `q` soft
 quit (drain), `Q` hard quit. Match SIPp muscle memory exactly.
+SIPp's screen digits `1` (scenario) `2` (statistics) `3` (repartition) also
+work, at the keyboard and over the control socket (M22).
 
 ## 5. Exit codes
 
@@ -510,5 +516,13 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   the header's own `uri=`, but which differed on the wire) and renders
   the parameters the same way; the `sip:sip:` quirk is kept, with a
   startup warning.
+- `hide` / `display` (M22; verified in `scenario.cpp` ~l.1852 and
+  `screen.cpp` ~l.282/493): `hide` is a boolean on every message command
+  (`xp_get_bool("hide", …)`), `display` a free-text attribute read for
+  every command even though `sipp.dtd` declares it only on `nop`; the
+  scenario screen skips a hidden row only while the global `do_hide`
+  (default true, `set hide true|false`) holds. sipr matches this. Screen
+  keys: sipr maps `1`/`2`/`3` like SIPp and ignores `4`..`9` (no
+  variables/TDM screens; secondary repartitions are not drawn separately).
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

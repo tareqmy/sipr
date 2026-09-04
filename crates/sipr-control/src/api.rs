@@ -233,6 +233,7 @@ pub fn snapshot_json(s: &Snapshot) -> Json {
         .map(|st| {
             object([
                 ("label", text(st.label.clone())),
+                ("hidden", Json::Bool(st.hidden)),
                 ("sent", num_u64(st.stats.sent)),
                 ("recv", num_u64(st.stats.recv)),
                 ("retrans", num_u64(st.stats.retrans)),
@@ -253,6 +254,7 @@ pub fn snapshot_json(s: &Snapshot) -> Json {
         ("rate_period_cps", num(s.rate_period)),
         ("rate_cumulative_cps", num(s.rate_cumulative)),
         ("paused", Json::Bool(s.paused)),
+        ("hide", Json::Bool(s.hide)),
         ("created", num_u64(s.created)),
         ("successful", num_u64(s.successful)),
         ("failed", num_u64(s.failed)),

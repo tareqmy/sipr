@@ -572,3 +572,32 @@ fn rtp_stream_exec_parses_sipp_grammar() {
         errors(&xml)
     );
 }
+
+#[test]
+fn hide_and_display_attributes_land_in_step_common() {
+    let xml = wrap(&format!(
+        r#"{invite}
+           <recv response="200" hide="true"/>
+           <nop display="Extract Contact" hide="true"/>
+           <pause milliseconds="10" display=" "/>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let Step::Recv(r) = &sc.steps[1] else {
+        panic!("recv")
+    };
+    assert!(r.common.hide);
+    assert_eq!(r.common.display, None);
+    let Step::Nop { common, .. } = &sc.steps[2] else {
+        panic!("nop")
+    };
+    assert!(common.hide);
+    assert_eq!(common.display.as_deref(), Some("Extract Contact"));
+    let Step::Pause { common, .. } = &sc.steps[3] else {
+        panic!("pause")
+    };
+    assert!(!common.hide);
+    assert_eq!(common.display, None, "blank display is no display");
+}

@@ -123,14 +123,27 @@ pub fn run(snapshots: &Receiver<Snapshot>, keys_out: &Sender<char>) {
     };
     let mut screen = Screen::Main;
     let mut last: Option<Snapshot> = None;
+    // Control-socket screen requests carry a sequence number; apply each once.
+    let mut applied_request: u64 = 0;
     loop {
         // Drain any pending keys.
         while let Ok(key) = key_rx.try_recv() {
-            if key == 's' {
-                screen = screen.next();
+            // `s` cycles; SIPp's digits pick a screen directly.
+            let chosen = if key == 's' {
+                Some(screen.next())
+            } else {
+                key.to_digit(10)
+                    .and_then(|d| u8::try_from(d).ok())
+                    .and_then(Screen::from_digit)
+            };
+            if let Some(next) = chosen {
+                screen = next;
                 if let Some(snap) = &last {
                     draw(&render_with(snap, screen, &pal));
                 }
+            } else if key.is_ascii_digit() {
+                // A screen sipr does not have: swallow, as SIPp ignores `5`
+                // without a TDM map.
             } else if keys_out.send(key).is_err() {
                 return;
             }
@@ -138,6 +151,14 @@ pub fn run(snapshots: &Receiver<Snapshot>, keys_out: &Sender<char>) {
         // Wait briefly for the next snapshot; redraw when one arrives.
         match snapshots.recv_timeout(Duration::from_millis(100)) {
             Ok(snap) => {
+                if let Some((seq, digit)) = snap.screen_request
+                    && seq > applied_request
+                {
+                    applied_request = seq;
+                    if let Some(next) = Screen::from_digit(digit) {
+                        screen = next;
+                    }
+                }
                 draw(&render_with(&snap, screen, &pal));
                 last = Some(snap);
             }

@@ -538,6 +538,11 @@ struct Engine<'s> {
     echo: Option<sipr_media::EchoServer>,
     /// `-rate_increase`: when the ramp last fired (SIPp `ratetask`).
     last_ramp: Instant,
+    /// `set hide` (SIPp `do_hide`): hidden steps stay off the scenario screen.
+    hide: bool,
+    /// The last screen requested via a control-socket digit key, with a
+    /// sequence number (the TUI applies each once).
+    screen_request: Option<(u64, u8)>,
 }
 
 impl<'s> Engine<'s> {
@@ -865,6 +870,13 @@ impl<'s> Engine<'s> {
             &scenario.call_length_repartition,
         );
         stat_set.init_steps(scenario.steps.iter().map(step_label).collect());
+        stat_set.set_step_hidden(
+            scenario
+                .steps
+                .iter()
+                .map(|s| step_common(s).is_some_and(|c| c.hide))
+                .collect(),
+        );
         // Load -inf injection files up front (fail fast on bad files). SIPp
         // keys files by basename; keyword `file=` and `-infindex` match that.
         let mut inf_files = Vec::with_capacity(config.inf_files.len());
@@ -960,6 +972,8 @@ impl<'s> Engine<'s> {
             rate_scale: config.rate_scale.unwrap_or(1.0),
             echo,
             last_ramp: Instant::now(),
+            hide: true,
+            screen_request: None,
         })
     }
 
@@ -1104,6 +1118,8 @@ impl<'s> Engine<'s> {
             uas: self.scenario.role == Role::Uas,
             rate_target: self.control.rate(),
             paused: self.paused,
+            hide: self.hide,
+            screen_request: self.screen_request,
             ..Default::default()
         };
         self.stats.fill_snapshot(&mut snap, self.calls.len());
@@ -1190,6 +1206,12 @@ impl<'s> Engine<'s> {
             '*' => self.bump_load(10.0),
             '/' => self.bump_load(-10.0),
             'p' => self.paused = !self.paused,
+            // SIPp's screen keys: forwarded to the TUI through the snapshot.
+            '1'..='9' => {
+                let seq = self.screen_request.map_or(1, |(n, _)| n + 1);
+                self.screen_request = Some((seq, c as u8 - b'0'));
+                self.publish_snapshot();
+            }
             _ => {}
         }
     }
@@ -1299,7 +1321,7 @@ impl<'s> Engine<'s> {
                     ));
                 }
             }
-            ControlCmd::SetHide(_) => {} // TUI matter; sipr has no hide attribute yet
+            ControlCmd::SetHide(on) => self.hide = *on,
             ControlCmd::Trace { log, on } => self.set_trace(log, *on)?,
             ControlCmd::Dump(what) => {
                 if what != "tasks" {
@@ -2811,6 +2833,10 @@ fn test_truthy(v: &crate::actions::Value) -> bool {
 
 /// Short display label for a step (scenario screen rows).
 fn step_label(step: &Step) -> String {
+    // `display="…"` replaces the derived label (SIPp shows it verbatim).
+    if let Some(d) = step_common(step).and_then(|c| c.display.as_deref()) {
+        return d.to_owned();
+    }
     match step {
         Step::Send(s) => {
             let what = template_first_word(&s.template).unwrap_or_default();

@@ -77,6 +77,12 @@ pub struct StepCommon {
     pub condexec_inverse: bool,
     /// `counter`: increment this named counter when the step executes.
     pub counter: Option<String>,
+    /// `hide`: leave this step off the scenario screen while `set hide
+    /// true` (the default) holds.
+    pub hide: bool,
+    /// `display`: text shown on the scenario screen instead of the
+    /// derived label (SIPp reads it for every message command).
+    pub display: Option<String>,
     /// Source line of the element.
     pub line: u32,
 }

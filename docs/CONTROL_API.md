@@ -17,7 +17,8 @@ echo -n 'cset rate 50' | nc -u -w0 127.0.0.1 8888  # command: rate to 50 cps
 - **Byte 0 decides.** Anything but `c` is a hot key and the rest of the
   datagram is ignored: `+ - * /` step the rate (or the user count in
   `-users` mode) by `rate-scale`, `p` toggles pause, `q` drains and a
-  second `q` aborts, `Q` aborts. Screen digits (`1`..`9`) are ignored.
+  second `q` aborts, `Q` aborts, `1`/`2`/`3` switch the TUI to the
+  scenario / statistics / repartition screen (`4`..`9` are ignored).
 - **`c` + a command line**, split on the first space (tabs do not
   separate), exactly SIPp's grammar and warning texts:
 
@@ -28,7 +29,7 @@ echo -n 'cset rate 50' | nc -u -w0 127.0.0.1 8888  # command: rate to 50 cps
   | `set users N` | user count (`-users` mode only) |
   | `set limit N` | concurrent-call cap (rate mode only) |
   | `set display main` | accepted; `ooc`/`rx` have no sipr screen |
-  | `set hide true\|false` | accepted (no effect yet) |
+  | `set hide true\|false` | skip `hide="true"` steps on the scenario screen (default true) |
   | `trace messages\|error on\|off` | open/close the trace file at runtime (SIPp's file naming) |
   | `trace logs\|shortmessages on\|off` | not supported (warning) |
   | `dump tasks` | one line per active call into the error trace |
@@ -83,7 +84,7 @@ Statistics snapshot — SIPp's counter names, durations in `_ms`:
 
 ```json
 {"scenario":"uac","role":"UAC","elapsed_ms":12034,"live":3,
- "rate_target":10,"rate_period_cps":9.8,"rate_cumulative_cps":9.9,"paused":false,
+ "rate_target":10,"rate_period_cps":9.8,"rate_cumulative_cps":9.9,"paused":false,"hide":true,
  "created":120,"successful":117,"failed":0,
  "failed_unexpected":0,"failed_timeout":0,"failed_retrans":0,"failed_other":0,
  "messages_sent":360,"messages_matched":351,"retrans_sent":0,"retrans_recv":0,
@@ -94,7 +95,7 @@ Statistics snapshot — SIPp's counter names, durations in `_ms`:
  "call_length":{"count":117,"mean_ms":3010.2,"max_ms":3050},
  "response_time_repartition":[{"label":"<10","count":40}],
  "call_length_repartition":[],
- "steps":[{"label":"send INVITE","sent":120,"recv":0,"retrans":0,"timeouts":0,"unexpected":0}]}
+ "steps":[{"label":"send INVITE","hidden":false,"sent":120,"recv":0,"retrans":0,"timeouts":0,"unexpected":0}]}
 ```
 
 The snapshot is the same object the TUI renders and the `-bg` stat line
