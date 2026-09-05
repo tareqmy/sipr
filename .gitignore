@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .idea/
+# sipp/sipr trace files a stray test run may leave behind
+*_errors.log
+*_messages.log
+*_logs.log
