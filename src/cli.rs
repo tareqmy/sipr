@@ -112,6 +112,12 @@ pub struct Cli {
     pub max_socket: Option<usize>,
     /// `-rsa`: remote sending address `host[:port]`.
     pub remote_sending: Option<String>,
+    /// `-max_reconnect`: TCP/TLS reconnections allowed (-1 = unlimited).
+    pub max_reconnect: i64,
+    /// `-reconnect_close`: fail calls on a closed/reset connection.
+    pub reconnect_close: bool,
+    /// `-reconnect_sleep`: ms to wait before re-dialing.
+    pub reconnect_sleep_ms: u64,
     /// `-s`: service / called user part, substituted for `[service]`.
     pub service: String,
     /// `-au`: username for `[authentication]`.
@@ -203,6 +209,9 @@ impl Default for Cli {
             transport: Transport::UdpMono,
             max_socket: None,
             remote_sending: None,
+            max_reconnect: 0,
+            reconnect_close: true,
+            reconnect_sleep_ms: 1000,
             service: "service".to_owned(),
             auth_user: None,
             auth_password: None,
@@ -478,6 +487,24 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "Remote sending address: send every message there instead of to the target (UAC) or the request's source (UAS); default port 5060",
     ),
     (
+        "max_reconnect",
+        true,
+        "N",
+        "TCP/TLS reconnections allowed after a connection drops (default 0: none; -1: unlimited)",
+    ),
+    (
+        "reconnect_close",
+        true,
+        "true|false",
+        "Fail the calls on a connection that closed or reset (default true)",
+    ),
+    (
+        "reconnect_sleep",
+        true,
+        "MS",
+        "Milliseconds to wait before re-dialing a dropped connection (default 1000)",
+    ),
+    (
         "max_socket",
         true,
         "N",
@@ -703,6 +730,9 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "3pcc" => cli.three_pcc = Some(val(value)),
         "users" => cli.users = Some(parse_num(flag, &val(value))?),
         "rsa" => cli.remote_sending = Some(val(value)),
+        "max_reconnect" => cli.max_reconnect = parse_num(flag, &val(value))?,
+        "reconnect_close" => cli.reconnect_close = parse_bool_value(flag, &val(value))?,
+        "reconnect_sleep" => cli.reconnect_sleep_ms = parse_num(flag, &val(value))?,
         "max_socket" => {
             let n: usize = parse_num(flag, &val(value))?;
             if n == 0 {
@@ -751,6 +781,17 @@ fn parse_time(flag: &str, raw: &str) -> Result<std::time::Duration, String> {
 fn parse_num<T: std::str::FromStr>(flag: &str, raw: &str) -> Result<T, String> {
     raw.parse()
         .map_err(|_| format!("invalid value '{raw}' for option '-{flag}'"))
+}
+
+/// SIPp's `get_bool`: `true`/`false` (also `1`/`0`).
+fn parse_bool_value(flag: &str, raw: &str) -> Result<bool, String> {
+    match raw {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        other => Err(format!(
+            "invalid value '{other}' for option '-{flag}' (expected true or false)"
+        )),
+    }
 }
 
 fn parse_transport(s: &str) -> Result<Transport, String> {
@@ -940,6 +981,20 @@ mod tests {
                 .as_deref(),
             Some("10.0.0.9:5080")
         );
+        let c = cli(&[
+            "-max_reconnect",
+            "-1",
+            "-reconnect_close",
+            "false",
+            "-reconnect_sleep",
+            "250",
+            "host",
+        ]);
+        assert_eq!(c.max_reconnect, -1);
+        assert!(!c.reconnect_close);
+        assert_eq!(c.reconnect_sleep_ms, 250);
+        let err = run(&["-reconnect_close", "maybe", "host"]).unwrap_err();
+        assert!(err.contains("expected true or false"), "{err}");
         let err = run(&["-max_socket", "0", "host"]).unwrap_err();
         assert!(err.contains("at least 1"), "{err}");
         let err = run(&["-t", "ui"]).unwrap_err();

@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **TCP/TLS reconnection** — `-max_reconnect`, `-reconnect_close`,
+  `-reconnect_sleep`: when the mono TCP/TLS connection drops, the calls on
+  it fail (or, with `-reconnect_close false`, live on), the call whose send
+  finds it dead fails, and the connection is re-dialed within the budget
+  after the sleep — SIPp's reset, in SIPp's order; with no budget left the
+  run ends with exit 255 like SIPp's fatal error. Verified both ways
+  against real sipp.
+
 ## [0.18.0] — 2026-09-05
 
 ### Added

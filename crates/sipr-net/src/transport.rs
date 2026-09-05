@@ -47,6 +47,17 @@ pub enum NetEvent {
     },
     /// The socket died; the recv loop has exited.
     SocketError(std::io::ErrorKind),
+    /// A TCP/TLS connection ended: `clean` when the peer closed it in an
+    /// orderly way (FIN / close_notify), false on a reset or read error.
+    /// `local` identifies a per-call connection.
+    Disconnected {
+        /// The remote end.
+        peer: SocketAddr,
+        /// Our end.
+        local: SocketAddr,
+        /// Orderly close, as opposed to an error.
+        clean: bool,
+    },
 }
 
 /// Configuration for binding the transport.

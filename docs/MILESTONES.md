@@ -835,7 +835,47 @@ Behavioral oracle: `sipp.cpp` ~l.1827, `call_generation_task.cpp` ~l.152,
       `-rsa` → sipr, sipp UAS `-rsa` answering sipr from its extra socket).
 - [x] Deferred: `[remote_ip]` on a UAS follows SIPp's `remote_ip` global.
 
+## M30 — TCP/TLS reconnection: `-max_reconnect`, `-reconnect_close`, `-reconnect_sleep` ✅
+
+Behavioral oracle: `socket.cpp` `reconnect_allowed` ~l.2257,
+`reset_connection` ~l.2265, `close_calls`, the recv/send error paths
+~l.1866-1880 / ~l.1940-1970, `write_primitive` ~l.2098; `sipp.cpp` ~l.551,
+~l.635; `docs/transport.rst` "TCP reconnections".
+
+- [x] `sipr-net`: `NetEvent::Disconnected { peer, local, clean }` from every
+      TCP/TLS read loop (clean = FIN / close_notify), `TcpTransport::reconnect`
+      and `TlsTransport::reconnect` re-dialing the mono connection under the
+      same peer key.
+- [x] Engine: SIPp's reset in SIPp's order — a clean close invalidates the
+      mono connection and (under `-reconnect_close`) closes its calls; the
+      call whose send next hits it fails ("cannot send message"), then the
+      socket is re-dialed within the `-max_reconnect` budget after
+      `-reconnect_sleep`, or the run ends with exit 255 ("Max number of
+      reconnections reached"); an error close resets at once. The reader
+      only reports a connection's end and the engine forgets it when it
+      processes the event, so a queued ACK still leaves on the half-closed
+      socket as SIPp's does. Counters `failed_cannot_send` /
+      `failed_tcp_closed` / `failed_tcp_connect`; `RunReport::fatal`.
+      Servers close the affected calls only; per-call connections re-dial
+      lazily.
+- [x] CLI: `-max_reconnect <n>` (default 0, -1 unlimited),
+      `-reconnect_close true|false` (default true), `-reconnect_sleep <ms>`
+      (default 1000).
+- [x] Tests: net unit `disconnect_is_reported_and_reconnect_restores_sending`;
+      e2e against a hanging-up TCP UAS: `reconnect_between_calls_with_budget`
+      (the call that finds the socket dead fails, the next completes on the
+      new connection), `no_reconnect_budget_is_fatal_like_sipp` (exit 255),
+      `reconnect_close_fails_the_interrupted_call`,
+      `reconnect_close_false_keeps_the_interrupted_call` (its BYE goes out
+      on the connection another call's failure re-dialed); interop
+      `sipr_tcp_uac_reconnects_to_real_sipp` and
+      `real_sipp_tcp_uac_reconnects_to_sipr` (the UAS is restarted between
+      two calls).
+- [x] Deferred: budgeted re-dial of per-call connections; a start-up connect
+      failure consuming the budget; a UAS re-dialing its client.
+
 ## Post-v1 backlog (ordered)
 
-`-t ui`, the reconnect options (`-max_reconnect`, `-reconnect_close`,
-`-reconnect_sleep`), SCTP.
+`-t ui`, SCTP. Noticed while testing M30: with `-r 1 -rp 1000` sipr places
+its first call after one full period (~1 s) where SIPp places it at t=0 —
+check the pacer's first tick against `call_generation_task.cpp`.

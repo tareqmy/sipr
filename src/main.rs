@@ -162,6 +162,9 @@ fn run(cli: &Cli) -> ExitCode {
             crate::cli::Transport::TlsPerCall => sipr_engine::TransportKind::TlsPerCall,
         },
         max_socket: cli.max_socket.unwrap_or(50_000),
+        max_reconnect: cli.max_reconnect,
+        reconnect_close: cli.reconnect_close,
+        reconnect_sleep: std::time::Duration::from_millis(cli.reconnect_sleep_ms),
         remote_sending_addr: match &cli.remote_sending {
             Some(raw) => match resolve_target(raw) {
                 Ok(addr) => Some(addr),
@@ -255,6 +258,9 @@ fn run(cli: &Cli) -> ExitCode {
     };
     match result {
         Ok(report) => {
+            if let Some(msg) = &report.fatal {
+                eprintln!("sipr: error: {msg}");
+            }
             eprintln!("sipr: run complete: {}", report.summary());
             ExitCode::from(report.exit_code())
         }

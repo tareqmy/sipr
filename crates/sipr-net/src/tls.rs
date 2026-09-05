@@ -201,6 +201,36 @@ impl TlsTransport {
         })
     }
 
+    /// Drop the connection to `peer` from the table once the engine has
+    /// processed its `Disconnected` event.
+    pub fn forget(&self, peer: SocketAddr) {
+        if let Ok(mut map) = self.conns.lock() {
+            map.remove(&peer);
+        }
+    }
+
+    /// Re-dial and handshake the mono connection to `remote` after it
+    /// dropped (`-max_reconnect`), replacing it under the same peer key.
+    ///
+    /// # Errors
+    ///
+    /// Connection or handshake failures; a server-side transport has no
+    /// client configuration.
+    pub fn reconnect(&self, remote: SocketAddr) -> std::io::Result<()> {
+        let client_config = self.client.clone().ok_or_else(|| {
+            std::io::Error::other("reconnecting needs a TLS client configuration")
+        })?;
+        let mut sock = TcpStream::connect(remote)?;
+        let peer = sock.peer_addr()?;
+        let name = ServerName::from(peer.ip());
+        let mut tls = Connection::from(
+            ClientConnection::new(client_config, name).map_err(std::io::Error::other)?,
+        );
+        complete_handshake(&mut tls, &mut sock)
+            .map_err(|e| std::io::Error::other(format!("TLS handshake with {remote}: {e}")))?;
+        register(&self.conns, peer, sock, tls, &self.sink)
+    }
+
     /// Dial and handshake a per-call connection to `remote` (`-t ln`).
     ///
     /// # Errors
@@ -408,14 +438,11 @@ fn register(
     }
     let sink = sink.clone();
     let conns = conns.clone();
+    // As for TCP: the reader only reports the end; the engine `forget`s.
+    let _ = conns;
     std::thread::Builder::new()
         .name("sipr-tls-recv".into())
-        .spawn(move || {
-            read_loop(read_sock, &reader_tls, peer, &sink);
-            if let Ok(mut map) = conns.lock() {
-                map.remove(&peer);
-            }
-        })
+        .spawn(move || read_loop(read_sock, &reader_tls, peer, &sink))
         .ok();
     Ok(())
 }
@@ -430,6 +457,10 @@ fn read_loop(
     peer: SocketAddr,
     sink: &Sender<NetEvent>,
 ) {
+    let local = sock
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+    let mut clean = false;
     let mut framer = TcpFramer::new();
     let mut buf = vec![0u8; READ_CHUNK];
     let mut plain = vec![0u8; READ_CHUNK];
@@ -485,6 +516,7 @@ fn read_loop(
                 }
             }
             if closed {
+                clean = true;
                 break 'outer; // clean close_notify
             }
             if cipher.is_empty() {
@@ -492,12 +524,16 @@ fn read_loop(
             }
         }
         n = match sock.read(&mut buf) {
-            Ok(0) => break, // peer closed
+            Ok(0) => {
+                clean = true;
+                break; // peer closed
+            }
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
             Err(_) => break,
         };
     }
+    let _ = sink.send(NetEvent::Disconnected { peer, local, clean });
 }
 
 // ---------------------------------------------------------------------------

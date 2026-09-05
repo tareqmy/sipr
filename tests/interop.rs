@@ -2021,3 +2021,173 @@ fn rsa_both_ways_against_real_sipp() {
         "sipp uas -rsa"
     );
 }
+
+/// Run a UAS binary on `port` for the first call, kill it (its connection
+/// goes with it) between call one and call two, and start a second one
+/// while `uac_bin` places three calls over TCP a second apart with a
+/// reconnection budget; return the UAC's exit code and stderr. `cwd`
+/// receives sipp's trace files. `kill_when` is a UAC stderr substring that
+/// times the kill (sipr's live line after call one); `None` = fixed delay.
+fn tcp_reconnect_pair(
+    uas_bin: &std::path::Path,
+    uas_extra: &[&str],
+    uac_bin: &std::path::Path,
+    uac_extra: &[&str],
+    kill_when: Option<&str>,
+    cwd: &std::path::Path,
+) -> (Option<i32>, String) {
+    let port = free_port();
+    let spawn_uas = || {
+        let p = port.to_string();
+        let mut args = vec![
+            "-sn",
+            "uas",
+            "-t",
+            "t1",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &p,
+            "-m",
+            "1",
+            "-timeout",
+            "15",
+        ];
+        args.extend_from_slice(uas_extra);
+        Reaper(
+            Command::new(uas_bin)
+                .current_dir(cwd)
+                .args(&args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn uas"),
+        )
+    };
+    let mut first = spawn_uas();
+    std::thread::sleep(Duration::from_millis(400));
+    let target = format!("127.0.0.1:{port}");
+    let mut args = vec![
+        "-sn",
+        "uac",
+        "-t",
+        "t1",
+        "-i",
+        "127.0.0.1",
+        "-r",
+        "1",
+        "-m",
+        "3",
+        "-d",
+        "200",
+        "-timeout",
+        "15",
+        "-max_reconnect",
+        "5",
+        "-reconnect_sleep",
+        "300",
+    ];
+    args.extend_from_slice(uac_extra);
+    args.push(&target);
+    let mut uac = Reaper(
+        Command::new(uac_bin)
+            .current_dir(cwd)
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uac"),
+    );
+    let stderr_pipe = uac.0.stderr.take().expect("stderr");
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<()>();
+    let marker = kill_when.map(str::to_owned);
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr_pipe)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if marker.as_deref().is_some_and(|m| line.contains(m)) {
+                let _ = seen_tx.send(());
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+    // Kill the first UAS between call one and call two: when the UAC's
+    // stderr shows `kill_when` (sipr's live line after call one), else after
+    // a fixed delay (sipp, whose first call is at t=0 and the next at 1 s).
+    match kill_when {
+        Some(_) => {
+            let _ = seen_rx.recv_timeout(Duration::from_secs(8));
+        }
+        None => std::thread::sleep(Duration::from_millis(600)),
+    }
+    let _ = first.0.kill();
+    let _ = first.0.wait();
+    let mut second = spawn_uas();
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(20));
+    let stderr = reader.join().unwrap_or_default();
+    let _ = wait_with_timeout(&mut second.0, Duration::from_secs(10));
+    (code, stderr)
+}
+
+/// sipr's TCP UAC survives real sipp closing the connection: sipp's UAS
+/// exits after call one, a second sipp UAS comes up; sipr's second call
+/// finds the socket dead and fails (SIPp's order), the reset re-dials
+/// (`-max_reconnect`), and the third call completes.
+#[test]
+fn sipr_tcp_uac_reconnects_to_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::sipr_tcp_uac_reconnects_to_real_sipp — no sipp.");
+        return;
+    };
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (code, stderr) = tcp_reconnect_pair(
+        &sipp,
+        &[],
+        &sipr,
+        &["-bg", "-rp", "2000"],
+        Some(" ok 1 failed 0"),
+        dir.path(),
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "sipr uac stderr:
+{stderr}"
+    );
+    assert!(stderr.contains("successful 2 failed 1"), "{stderr}");
+    assert!(
+        stderr.contains("socket required a reconnection"),
+        "{stderr}"
+    );
+}
+
+/// The mirror: real sipp's TCP UAC with a reconnection budget across two
+/// sipr UAS lifetimes — its second call dies on the dead socket, the third
+/// completes on the re-dialed one (exit 1: one failed call, no fatal).
+#[test]
+fn real_sipp_tcp_uac_reconnects_to_sipr() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::real_sipp_tcp_uac_reconnects_to_sipr — no sipp.");
+        return;
+    };
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (code, _) = tcp_reconnect_pair(&sipr, &["-bg"], &sipp, &["-trace_err"], None, dir.path());
+    if code != Some(0) && sipp_stream_client_cannot_bind(dir.path()) {
+        eprintln!("SKIPPED interop::real_sipp_tcp_uac_reconnects_to_sipr — sipp bind limitation.");
+        return;
+    }
+    assert_eq!(
+        code,
+        Some(1),
+        "sipp uac: one call dies on the dead socket, the rest complete"
+    );
+}

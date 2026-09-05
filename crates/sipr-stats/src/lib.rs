@@ -41,6 +41,15 @@ pub struct StatSet {
     pub failed_retrans: u64,
     /// Failed: everything else (render errors, aborts, global timeout).
     pub failed_other: u64,
+    /// Failed: a TCP/TLS connection could not be (re)established
+    /// (SIPp `E_FAILED_TCP_CONNECT`).
+    pub failed_tcp_connect: u64,
+    /// Failed: the TCP/TLS connection closed under the call
+    /// (SIPp `E_FAILED_TCP_CLOSED`, `-reconnect_close`).
+    pub failed_tcp_closed: u64,
+    /// Failed: a message could not be sent — the call that finds the
+    /// connection dead (SIPp `E_FAILED_CANNOT_SEND_MSG`).
+    pub failed_cannot_send: u64,
     /// First transmissions sent.
     pub messages_sent: u64,
     /// Messages received and matched to a step.
@@ -110,6 +119,9 @@ impl StatSet {
             failed_timeout: 0,
             failed_retrans: 0,
             failed_other: 0,
+            failed_tcp_connect: 0,
+            failed_tcp_closed: 0,
+            failed_cannot_send: 0,
             messages_sent: 0,
             messages_matched: 0,
             retrans_sent: 0,
@@ -174,7 +186,13 @@ impl StatSet {
     /// Total failed calls.
     #[must_use]
     pub fn failed(&self) -> u64 {
-        self.failed_unexpected + self.failed_timeout + self.failed_retrans + self.failed_other
+        self.failed_unexpected
+            + self.failed_timeout
+            + self.failed_retrans
+            + self.failed_other
+            + self.failed_tcp_connect
+            + self.failed_tcp_closed
+            + self.failed_cannot_send
     }
 
     /// Record an RTD stop for `name`.

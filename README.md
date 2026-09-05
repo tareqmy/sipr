@@ -125,7 +125,7 @@ root for media.
 ## Not yet (post-v1 roadmap)
 
 The SIPp scenario surface is covered. Remaining SIPp corners are transport
-modes: `-t ui`, the reconnect options, SCTP.
+modes: `-t ui`, SCTP.
 
 ## Brand
 

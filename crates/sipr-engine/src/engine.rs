@@ -65,6 +65,14 @@ pub struct EngineConfig {
     /// (UAC) or back to the request's source (UAS); keywords keep rendering
     /// the nominal remote.
     pub remote_sending_addr: Option<SocketAddr>,
+    /// `-max_reconnect`: TCP/TLS reconnections allowed (0 = none, SIPp's
+    /// default; -1 = unlimited).
+    pub max_reconnect: i64,
+    /// `-reconnect_close`: fail the calls on a connection that closed or
+    /// reset (SIPp default true).
+    pub reconnect_close: bool,
+    /// `-reconnect_sleep`: pause before re-dialing (SIPp default 1 s).
+    pub reconnect_sleep: Duration,
     /// Disable retransmissions (`-nr`).
     pub no_retrans: bool,
     /// Global test timeout (`-timeout`).
@@ -201,6 +209,8 @@ pub struct RunReport {
     pub successful: u64,
     /// Calls that failed (unexpected message, timeout, retrans exhausted...).
     pub failed: u64,
+    /// The run was cut short by a fatal error (exit 255, SIPp's `ERROR`).
+    pub fatal: Option<String>,
     /// Messages sent (first transmissions).
     pub messages_sent: u64,
     /// Messages received and matched.
@@ -229,7 +239,9 @@ impl RunReport {
     /// which the shell sees as 253).
     #[must_use]
     pub fn exit_code(&self) -> u8 {
-        if self.rtp_check_failed > 0 {
+        if self.fatal.is_some() {
+            255
+        } else if self.rtp_check_failed > 0 {
             253
         } else if self.failed > 0 {
             1
@@ -552,6 +564,15 @@ impl Transport {
             Self::Tls(t) => t.send_to(data, to, lost_pct),
         }
     }
+
+    /// Forget a stream connection whose end the engine has processed.
+    fn forget(&self, peer: SocketAddr) {
+        match self {
+            Self::Udp(_) => {}
+            Self::Tcp(t) => t.forget(peer),
+            Self::Tls(t) => t.forget(peer),
+        }
+    }
 }
 
 struct Engine<'s> {
@@ -561,6 +582,17 @@ struct Engine<'s> {
     /// `[transport]` token and whether the transport is reliable (no retrans).
     transport_token: &'static str,
     reliable: bool,
+    /// `-max_reconnect` budget left (SIPp `reset_number`; -1 = unlimited).
+    reconnects_left: i64,
+    /// The mono client connection is gone (SIPp `ss_invalid`): the next send
+    /// re-dials or, with no budget left, ends the run.
+    mono_conn_invalid: bool,
+    /// A fatal condition that ends the run with exit 255 (SIPp `ERROR`).
+    fatal: Option<String>,
+    /// A send just hit the dead mono connection: reset it once the failed
+    /// call is gone (SIPp's `sockets_pending_reset`, drained by the main
+    /// loop after `send_raw` deleted the call).
+    pending_reset: Option<SocketAddr>,
     /// One socket per call (`un`/`tn`/`ln` as a client).
     per_call: bool,
     /// `-rsa` as a server: responses leave on a socket of their own aimed at
@@ -1045,6 +1077,10 @@ impl<'s> Engine<'s> {
             transport,
             transport_token,
             reliable,
+            reconnects_left: config.max_reconnect,
+            mono_conn_invalid: false,
+            fatal: None,
+            pending_reset: None,
             per_call,
             rsa_server,
             max_socket: config.max_socket.max(1),
@@ -1129,6 +1165,9 @@ impl<'s> Engine<'s> {
                     self.fail_all("socket error");
                     break;
                 }
+                Ok(Event::Net(NetEvent::Disconnected { peer, local, clean })) => {
+                    self.on_disconnected(peer, local, clean);
+                }
                 Ok(Event::CallTimer {
                     call_id,
                     generation,
@@ -1192,6 +1231,7 @@ impl<'s> Engine<'s> {
             created: self.stats.created(),
             successful: self.stats.successful,
             failed: self.stats.failed(),
+            fatal: self.fatal.take(),
             messages_sent: self.stats.messages_sent,
             messages_matched: self.stats.messages_matched,
             retrans_sent: self.stats.retrans_sent,
@@ -1786,9 +1826,14 @@ impl<'s> Engine<'s> {
                     {
                         return;
                     }
-                    let _ = self
-                        .send_for_call(call_id, &buf, remote, send.lost_pct)
-                        .unwrap_or(false); // simulated drops still count as "sent"
+                    // SIPp `send_raw`: a send that fails ends the call
+                    // (E_FAILED_CANNOT_SEND_MSG); a dead connection is then
+                    // reset for the calls that follow (-max_reconnect).
+                    // Simulated drops still count as "sent".
+                    if let Err(e) = self.send_for_call(call_id, &buf, remote, send.lost_pct) {
+                        self.after_send_failure(call_id, &e);
+                        return;
+                    }
                     self.stats.messages_sent += 1;
                     if let Some(s) = self.stats.step_mut(index) {
                         s.sent += 1;
@@ -3078,9 +3123,11 @@ impl<'s> Engine<'s> {
     }
 
     /// Send on the call's own socket when it has one, else the shared
-    /// transport.
+    /// transport. A send on a dropped mono client connection first goes
+    /// through SIPp's reset (`-max_reconnect`/`-reconnect_sleep`): re-dial
+    /// and retry, or end the run when the budget is spent.
     fn send_for_call(
-        &self,
+        &mut self,
         call_id: &str,
         data: &[u8],
         to: SocketAddr,
@@ -3088,10 +3135,199 @@ impl<'s> Engine<'s> {
     ) -> std::io::Result<bool> {
         let own = self.calls.get(call_id).and_then(|c| c.socket.as_ref());
         match (own, &self.transport) {
-            (Some(CallSocket::Udp(s)), Transport::Udp(u)) => u.send_via(s, data, to, lost_pct),
-            (Some(CallSocket::Tcp(c)), Transport::Tcp(t)) => t.send_via(c, data, lost_pct),
-            (Some(CallSocket::Tls(c)), Transport::Tls(t)) => t.send_via(c, data, lost_pct),
-            _ => self.transport.send_to(data, to, lost_pct),
+            (Some(CallSocket::Udp(s)), Transport::Udp(u)) => {
+                return u.send_via(s, data, to, lost_pct);
+            }
+            (Some(CallSocket::Tcp(c)), Transport::Tcp(t)) => {
+                return t.send_via(c, data, lost_pct);
+            }
+            (Some(CallSocket::Tls(c)), Transport::Tls(t)) => {
+                return t.send_via(c, data, lost_pct);
+            }
+            _ => {}
+        }
+        if !self.send_may_reconnect(to) {
+            return self.transport.send_to(data, to, lost_pct);
+        }
+        // SIPp: writing to an invalid socket is EPIPE — the call fails and
+        // the socket is queued for a reset; no retry for this send.
+        let result = if self.mono_conn_invalid {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "connection closed",
+            ))
+        } else {
+            self.transport.send_to(data, to, lost_pct)
+        };
+        if let Err(e) = &result
+            && matches!(
+                e.kind(),
+                std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            )
+        {
+            self.mono_conn_invalid = true;
+            self.pending_reset = Some(to);
+        }
+        result
+    }
+
+    /// SIPp `send_raw` after a failed write: the call fails
+    /// (`E_FAILED_CANNOT_SEND_MSG`), then the main loop resets the dead
+    /// connection for the calls that follow.
+    fn after_send_failure(&mut self, call_id: &str, e: &std::io::Error) {
+        if self.calls.contains_key(call_id) {
+            self.stats.failed_cannot_send += 1;
+            self.log_err(&format!("call {call_id} failed: cannot send message: {e}"));
+            self.remove_call(call_id);
+        }
+        if let Some(peer) = self.pending_reset.take() {
+            self.reset_mono_connection(peer);
+        }
+    }
+
+    /// The mono client TCP/TLS connection to `to` is the one `-max_reconnect`
+    /// manages (servers and per-call sockets are not re-dialed).
+    fn send_may_reconnect(&self, to: SocketAddr) -> bool {
+        !self.per_call
+            && self.scenario.role == Role::Uac
+            && !matches!(self.transport, Transport::Udp(_))
+            && self
+                .config
+                .target
+                .is_some_and(|t| self.config.remote_sending_addr.unwrap_or(t) == to)
+    }
+
+    fn reconnect_allowed(&self) -> bool {
+        self.reconnects_left == -1 || self.reconnects_left > 0
+    }
+
+    /// SIPp's `SIPpSocket::reset_connection`: spend one reconnection (or end
+    /// the run — "Max number of reconnections reached"), close the calls on
+    /// the connection when `-reconnect_close`, sleep `-reconnect_sleep`,
+    /// re-dial. Returns whether the connection is usable again.
+    fn reset_mono_connection(&mut self, peer: SocketAddr) -> bool {
+        if !self.reconnect_allowed() {
+            let msg = "Max number of reconnections reached".to_owned();
+            eprintln!("sipr: error: {msg}");
+            self.log_err(&msg);
+            self.fatal = Some(msg);
+            self.fail_all("connection lost");
+            self.hard_stop = true;
+            return false;
+        }
+        if self.reconnects_left > 0 {
+            self.reconnects_left -= 1;
+        }
+        if self.config.reconnect_close {
+            self.close_calls_to(peer);
+        }
+        std::thread::sleep(self.config.reconnect_sleep);
+        let result = match &self.transport {
+            Transport::Tcp(t) => t.reconnect(peer),
+            Transport::Tls(t) => t.reconnect(peer),
+            Transport::Udp(_) => Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                self.mono_conn_invalid = false;
+                self.log_err("Socket required a reconnection.");
+                eprintln!("sipr: warning: socket required a reconnection");
+                true
+            }
+            Err(e) => {
+                let line = format!("Could not reconnect TCP socket: {e}");
+                eprintln!("sipr: warning: {line}");
+                self.log_err(&line);
+                self.close_calls_to(peer);
+                false
+            }
+        }
+    }
+
+    /// SIPp's `close_calls()` for one connection: every call sending to
+    /// `peer` on the shared connection fails with `E_FAILED_TCP_CLOSED`.
+    fn close_calls_to(&mut self, peer: SocketAddr) {
+        let ids: Vec<String> = self
+            .calls
+            .iter()
+            .filter(|(_, c)| c.remote == peer && c.socket.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.close_calls(ids);
+    }
+
+    /// Fail `ids` because their connection went away — except calls already
+    /// past their last step: SIPp keeps those only "for handling final
+    /// retransmissions. If the connection closes, we do not mark it as
+    /// failed" (`call.cpp` timewait), so they complete instead.
+    fn close_calls(&mut self, ids: Vec<String>) {
+        let (done, live): (Vec<String>, Vec<String>) = ids
+            .into_iter()
+            .partition(|id| self.calls.get(id).is_some_and(|c| c.completing));
+        for id in done {
+            self.complete_call(&id);
+        }
+        if live.is_empty() {
+            return;
+        }
+        self.log_err("Closing calls, because of TCP reset or close!");
+        for id in live {
+            self.stats.failed_tcp_closed += 1;
+            self.log_err(&format!("call {id} failed: TCP connection closed"));
+            self.remove_call(&id);
+        }
+    }
+
+    /// A TCP/TLS connection ended (`NetEvent::Disconnected`). SIPp
+    /// (`socket.cpp` ~l.1940-1970): a clean close invalidates the socket and,
+    /// with `-reconnect_close`, closes its calls — the next send re-dials; an
+    /// error close additionally resets the connection right away. Per-call
+    /// connections drop the call's socket so its next send re-dials; a
+    /// server never re-dials (and, unlike SIPp, never dies) when a client
+    /// goes away.
+    fn on_disconnected(&mut self, peer: SocketAddr, local: SocketAddr, clean: bool) {
+        let what = if clean {
+            format!("TCP connection with {peer} closed by the peer")
+        } else {
+            format!("Error on TCP connection with {peer}, remote peer probably closed the socket")
+        };
+        self.log_err(&what);
+        if !self.per_call {
+            self.transport.forget(peer);
+        }
+        if self.per_call {
+            let ids: Vec<String> = self
+                .calls
+                .iter()
+                .filter(|(_, c)| {
+                    c.socket
+                        .as_ref()
+                        .is_some_and(|s| s.local_port() == local.port())
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if self.config.reconnect_close {
+                self.close_calls(ids);
+            } else {
+                for id in ids {
+                    if let Some(call) = self.calls.get_mut(&id) {
+                        call.socket = None; // the next send dials afresh
+                    }
+                }
+            }
+            return;
+        }
+        if self.config.reconnect_close {
+            self.close_calls_to(peer);
+        }
+        if self.send_may_reconnect(peer) {
+            self.mono_conn_invalid = true;
+            if !clean {
+                self.reset_mono_connection(peer);
+            }
         }
     }
 
@@ -3205,7 +3441,10 @@ impl<'s> Engine<'s> {
         let Some(remote) = self.calls.get(call_id).map(|c| c.remote) else {
             return;
         };
-        let _ = self.send_for_call(call_id, &buf, remote, lost);
+        if let Err(e) = self.send_for_call(call_id, &buf, remote, lost) {
+            self.after_send_failure(call_id, &e);
+            return;
+        }
         self.stats.retrans_sent += 1;
         self.trace_send(&buf, remote);
         match next {

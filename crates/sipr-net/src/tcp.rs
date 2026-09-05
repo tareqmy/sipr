@@ -201,6 +201,27 @@ impl TcpTransport {
         }
     }
 
+    /// Drop the connection to `peer` from the table once the engine has
+    /// processed its `Disconnected` event.
+    pub fn forget(&self, peer: SocketAddr) {
+        if let Ok(mut map) = self.conns.lock() {
+            map.remove(&peer);
+        }
+    }
+
+    /// Re-dial the mono connection to `remote` after it dropped
+    /// (`-max_reconnect`): the new stream replaces the old one under the
+    /// same peer key.
+    ///
+    /// # Errors
+    ///
+    /// Connection failures.
+    pub fn reconnect(&self, remote: SocketAddr) -> std::io::Result<()> {
+        let stream = TcpStream::connect(remote)?;
+        let peer = stream.peer_addr()?;
+        register(&self.conns, peer, stream, &self.sink)
+    }
+
     /// Dial a per-call connection to `remote` (`-t tn`, SIPp's
     /// `connect_socket_if_needed`) and start framing what comes back.
     ///
@@ -340,27 +361,31 @@ fn register(
     }
     let sink = sink.clone();
     let conns = conns.clone();
+    // The reader only reports the end of the connection; the engine calls
+    // `forget` when it processes that event, so a send it has already
+    // queued (an ACK for the 200 that came just before the FIN) still goes
+    // out on the half-closed socket, as SIPp's does.
+    let _ = conns;
     std::thread::Builder::new()
         .name("sipr-tcp-recv".into())
-        .spawn(move || {
-            read_loop(read_half, peer, &sink);
-            if let Ok(mut map) = conns.lock() {
-                map.remove(&peer);
-            }
-        })
+        .spawn(move || read_loop(read_half, peer, &sink))
         .ok();
     Ok(())
 }
 
-/// Frame everything arriving on one connection until it closes or errors. A
-/// per-connection failure never signals the engine — one client hanging up
-/// must not stop a server (timeouts handle stalls).
+/// Frame everything arriving on one connection until it closes or errors,
+/// then tell the engine how it ended (`Disconnected`): the engine decides
+/// whether calls die and whether to reconnect (`-reconnect_*`); a server
+/// never stops because one client hung up.
 fn read_loop(mut stream: TcpStream, peer: SocketAddr, sink: &Sender<NetEvent>) {
+    let local = stream
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
     let mut framer = TcpFramer::new();
     let mut buf = vec![0u8; READ_CHUNK];
-    loop {
+    let clean = loop {
         match stream.read(&mut buf) {
-            Ok(0) => break, // peer closed
+            Ok(0) => break true, // peer closed
             Ok(n) => {
                 framer.push(&buf[..n]);
                 while let Some(raw) = framer.next_message() {
@@ -379,9 +404,10 @@ fn read_loop(mut stream: TcpStream, peer: SocketAddr, sink: &Sender<NetEvent>) {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+            Err(_) => break false,
         }
-    }
+    };
+    let _ = sink.send(NetEvent::Disconnected { peer, local, clean });
 }
 
 #[cfg(test)]
@@ -392,6 +418,60 @@ mod tests {
 
     const MSG: &[u8] =
         b"OPTIONS sip:x SIP/2.0\r\nCall-ID: t-1\r\nCSeq: 9 OPTIONS\r\nContent-Length: 0\r\n\r\n";
+
+    /// A peer closing the mono connection is reported as a clean
+    /// `Disconnected`; after `forget`, sends fail until `reconnect` re-dials.
+    #[test]
+    fn disconnect_is_reported_and_reconnect_restores_sending() {
+        let (stx, srx) = mpsc::channel();
+        let cfg = TransportConfig {
+            local_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..TransportConfig::default()
+        };
+        let server = TcpTransport::listen(&cfg, stx).expect("listen");
+        let (ctx, crx) = mpsc::channel();
+        let client = TcpTransport::connect(&cfg, ctx, server.local_addr()).expect("connect");
+        assert!(
+            client
+                .send_to(MSG, server.local_addr(), None)
+                .expect("send")
+        );
+        let from = match srx.recv_timeout(Duration::from_secs(2)).expect("delivered") {
+            NetEvent::Packet(p) => p.from,
+            other => panic!("unexpected {other:?}"),
+        };
+        // The server drops the client's connection.
+        if let Ok(mut map) = server.conns.lock() {
+            let stream = map.remove(&from).expect("registered");
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        match crx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("disconnect reported")
+        {
+            NetEvent::Disconnected { peer, clean, .. } => {
+                assert_eq!(peer, server.local_addr());
+                assert!(clean, "orderly close");
+                client.forget(peer);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(client.send_to(MSG, server.local_addr(), None).is_err());
+        client.reconnect(server.local_addr()).expect("reconnect");
+        assert!(
+            client
+                .send_to(MSG, server.local_addr(), None)
+                .expect("send again")
+        );
+        // The server's sink also hears the old connection end; skip that.
+        loop {
+            match srx.recv_timeout(Duration::from_secs(2)).expect("delivered") {
+                NetEvent::Packet(_) => break,
+                NetEvent::Disconnected { .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
 
     /// `-t tn`: two per-call connections from one client pool reach the
     /// server as two peers; replies route back on each; drop closes it.
@@ -427,22 +507,32 @@ mod tests {
             crx.recv_timeout(Duration::from_secs(2)).expect("delivered"),
             NetEvent::Packet(_)
         ));
+        let a_addr = a.local_addr();
         drop(a);
-        // The server's reader deregisters the peer once the FIN arrives.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // The server hears the FIN as a Disconnected for that peer and, once
+        // it forgets the connection, can no longer send to it.
         loop {
-            let gone = server
-                .send_to(MSG, expected[0].min(expected[1]), None)
-                .is_err()
-                || server
-                    .send_to(MSG, expected[0].max(expected[1]), None)
-                    .is_err();
-            if gone || std::time::Instant::now() > deadline {
-                assert!(gone, "closed connection still registered");
-                break;
+            match srx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("disconnect reported")
+            {
+                NetEvent::Disconnected { peer, clean, .. } if peer == a_addr => {
+                    assert!(clean);
+                    server.forget(peer);
+                    break;
+                }
+                _ => {}
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(
+            server.send_to(MSG, a_addr, None).is_err(),
+            "forgotten connection"
+        );
+        assert!(
+            server
+                .send_to(MSG, b.local_addr(), None)
+                .expect("b still up")
+        );
     }
 
     #[test]

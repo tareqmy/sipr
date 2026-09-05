@@ -3875,6 +3875,200 @@ fn tls_per_call_connections_complete_calls() {
     assert!(uas_err.contains("successful 2 failed 0"), "{uas_err}");
 }
 
+// ---- TCP reconnection: -max_reconnect, -reconnect_close, -reconnect_sleep (M30) --
+
+/// When the fake TCP UAS hangs up on its client.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HangUp {
+    /// After answering the first call's BYE (between calls).
+    AfterFirstCall,
+    /// Right after the first 200 OK to an INVITE (mid-call); later
+    /// connections behave normally.
+    AfterFirstInvite,
+}
+
+/// A TCP UAS that answers INVITE/BYE with 200 and closes the connection
+/// once, per `policy`; returns the number of connections accepted after
+/// `calls` BYEs (or a timeout).
+fn spawn_hanging_up_tcp_uas(
+    policy: HangUp,
+    calls: usize,
+) -> (SocketAddr, std::thread::JoinHandle<usize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind uas");
+    let addr = listener.local_addr().expect("addr");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let handle = std::thread::spawn(move || {
+        let byes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hung_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut conns = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        while byes.load(std::sync::atomic::Ordering::Relaxed) < calls
+            && std::time::Instant::now() < deadline
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    conns += 1;
+                    let byes = byes.clone();
+                    let hung_up = hung_up.clone();
+                    std::thread::spawn(move || {
+                        let mut framer = sipr_net::TcpFramer::new();
+                        let mut buf = [0u8; 65_535];
+                        while let Ok(n) = stream.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            framer.push(&buf[..n]);
+                            while let Some(raw) = framer.next_message() {
+                                let Ok(msg) = sipr_net::Inbound::parse(&raw) else {
+                                    continue;
+                                };
+                                let Some(method) = msg.method() else { continue };
+                                if method == "ACK" {
+                                    continue;
+                                }
+                                let reply = ok_reply(&msg, method == "INVITE");
+                                let _ = stream.write_all(reply.as_bytes());
+                                let first = !hung_up.load(std::sync::atomic::Ordering::Relaxed);
+                                let hang = match (policy, method) {
+                                    (HangUp::AfterFirstInvite, "INVITE") => first,
+                                    (HangUp::AfterFirstCall, "BYE") => first,
+                                    _ => false,
+                                };
+                                if method == "BYE" {
+                                    byes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                if hang {
+                                    hung_up.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        conns
+    });
+    (addr, handle)
+}
+
+fn run_tcp_uac(
+    addr: SocketAddr,
+    extra: &[&str],
+    calls: &str,
+    pause_ms: &str,
+) -> std::process::Output {
+    let mut args = vec![
+        "-sn",
+        "uac",
+        "-t",
+        "t1",
+        "-i",
+        "127.0.0.1",
+        "-r",
+        "1",
+        "-m",
+        calls,
+        "-d",
+        pause_ms,
+        "-timeout",
+        "12",
+        "-bg",
+    ];
+    args.extend_from_slice(extra);
+    let target = addr.to_string();
+    args.push(&target);
+    run_sipr(&args)
+}
+
+/// The peer closes the connection between calls. SIPp's order: the call
+/// whose send finds the socket dead fails ("cannot send message"), the
+/// socket is reset within the `-max_reconnect` budget ("Socket required a
+/// reconnection."), and the calls after that complete on the new connection.
+#[test]
+fn reconnect_between_calls_with_budget() {
+    let (addr, uas) = spawn_hanging_up_tcp_uas(HangUp::AfterFirstCall, 2);
+    let out = run_tcp_uac(
+        addr,
+        &["-max_reconnect", "1", "-reconnect_sleep", "100"],
+        "3",
+        "200",
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{err}");
+    assert!(err.contains("successful 2 failed 1"), "{err}");
+    assert!(err.contains("socket required a reconnection"), "{err}");
+    assert_eq!(uas.join().expect("uas"), 2, "one connection per dial");
+}
+
+/// Without a budget (SIPp's default `-max_reconnect 0`), a send on the dead
+/// connection is fatal: "Max number of reconnections reached", exit 255.
+#[test]
+fn no_reconnect_budget_is_fatal_like_sipp() {
+    let (addr, uas) = spawn_hanging_up_tcp_uas(HangUp::AfterFirstCall, 2);
+    let out = run_tcp_uac(addr, &[], "2", "200");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(255), "stderr:\n{err}");
+    assert!(err.contains("Max number of reconnections reached"), "{err}");
+    let _ = uas.join();
+}
+
+/// `-reconnect_close true` (the default): a connection that closes under a
+/// live call fails that call at once ("Closing calls, because of TCP reset
+/// or close!"). Here call 1 is mid-pause when the peer hangs up, and call 2
+/// finds the socket dead: both fail.
+#[test]
+fn reconnect_close_fails_the_interrupted_call() {
+    let (addr, uas) = spawn_hanging_up_tcp_uas(HangUp::AfterFirstInvite, 1);
+    let out = run_tcp_uac(
+        addr,
+        &["-max_reconnect", "2", "-reconnect_sleep", "100"],
+        "2",
+        "1500",
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{err}");
+    assert!(err.contains("successful 0 failed 2"), "{err}");
+    let _ = uas.join();
+}
+
+/// `-reconnect_close false`: the interrupted call lives on, and once call 2's
+/// failed send has reset the connection, call 1's BYE goes out on the new
+/// one and is answered — SIPp's "resurrect the socket" comment.
+#[test]
+fn reconnect_close_false_keeps_the_interrupted_call() {
+    let (addr, uas) = spawn_hanging_up_tcp_uas(HangUp::AfterFirstInvite, 1);
+    let out = run_tcp_uac(
+        addr,
+        &[
+            "-max_reconnect",
+            "2",
+            "-reconnect_sleep",
+            "100",
+            "-reconnect_close",
+            "false",
+        ],
+        "2",
+        "1500",
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 1"), "{err}");
+    assert!(err.contains("socket required a reconnection"), "{err}");
+    assert_eq!(
+        uas.join().expect("uas"),
+        2,
+        "the BYE went out on the second connection"
+    );
+}
+
 // ---- -rsa: remote sending address (M29) -----------------------------------------
 
 /// `-rsa` as a UAC: every message goes to the sending address, while

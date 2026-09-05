@@ -98,7 +98,8 @@ Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 Network: `-p <local port>` `-i <local ip>` `-t u1|un|t1|tn|l1|ln` (UDP /
 TCP / TLS, one socket or one socket per call; `ui` not implemented)
 `-max_socket <n>` (per-call modes share sockets past n) `-rsa <host[:port]>`
-(remote sending address) `-s <service>` (called number)
+(remote sending address) `-max_reconnect <n>` `-reconnect_close <bool>`
+`-reconnect_sleep <ms>` (TCP/TLS reconnection) `-s <service>` (called number)
 `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version` (TLS material,
 SIPp defaults `cacert.pem`/`cakey.pem`).
 Media: `-mi <ip>` (media address; default local IP) `-mp <port>` (base media
@@ -270,8 +271,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   back on the connection the request arrived on (keyed by peer address, like
   SIPp routes by the socket the message came in on). Reliable transports carry
   NO SIP retransmissions (RFC 3261 §18.2), so `retrans=`/`-max_retrans` are
-  ignored under `t1`. Per-call connections (`tn`) are M28 below. Not yet:
-  connection re-dial after a drop, and `-t ui`.
+  ignored under `t1`. Per-call connections (`tn`) are M28 below,
+  reconnection after a drop M30. Not yet: `-t ui`.
 - Message framing fix surfaced by TCP: every SIP message must end with the
   header/body separator (`\r\n\r\n`) even with no body (RFC 3261 §7). sipr's
   CDATA normalization trimmed the trailing blank line for body-less messages
@@ -718,5 +719,45 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   renders its `remote_ip` global (the command-line remote host, if any).
   Verified against real sipp in both roles, including sipr accepting the
   responses a `-rsa` sipp UAS sends from its extra socket.
+- TCP/TLS reconnection `-max_reconnect`/`-reconnect_close`/`-reconnect_sleep`
+  (M30; verified in `socket.cpp` `reconnect_allowed` ~l.2257,
+  `reset_connection` ~l.2265, the recv/send error paths ~l.1866-1880 and
+  ~l.1940-1970, `write_primitive` ~l.2098, `sipp.cpp` ~l.551/~l.635 and
+  `docs/transport.rst`): `reset_number` (default **0**: no reconnection;
+  -1 unlimited) is a process-wide budget. A **clean** close (read returns
+  0) only `invalidate()`s the socket and, with `reset_close` (default
+  true), `close_calls()` — every call on it fails with
+  `E_FAILED_TCP_CLOSED` ("Closing calls, because of TCP reset or
+  close!"); nothing is re-dialed until a send needs the socket: writing to
+  an invalid socket is an `EPIPE`, which queues a `reset_connection` — if
+  no budget is left that is a fatal `ERROR("Max number of reconnections
+  reached")` (exit -1), else the budget is spent, calls are closed again
+  under `reset_close`, the main loop **sleeps** `reset_sleep` (default
+  1000 ms, blocking everything, `usleep`) and re-dials the same
+  destination ("Socket required a reconnection."); a failed re-dial closes
+  the calls and leaves the socket invalid for the next attempt. An
+  **error** close (`EPIPE` on send, a recv error) queues the reset
+  immediately. The **order** matters: `send_raw` deletes the call whose
+  write failed (`E_FAILED_CANNOT_SEND_MSG`) *before* the main loop resets
+  the socket, so the call that discovers the dead connection always dies;
+  `-reconnect_close false` only decides whether the *other* calls on the
+  socket live on — and they do send again once someone has re-dialed it
+  (the "resurrect the socket" comment). A write on a half-closed socket
+  (FIN received, no RST yet) still succeeds, so an ACK queued behind the
+  200 that preceded the FIN goes out. sipr matches all of this for the
+  mono client connection (`t1`/`l1` as UAC) — the reader only reports the
+  end of a connection and the engine forgets it when it processes that
+  event, keeping the same ordering — including the synchronous sleep, the
+  fatal exit 255, the counters `failed_cannot_send` / `failed_tcp_closed`
+  / `failed_tcp_connect`, and the log lines, with these divergences: a
+  **server** whose client resets the connection closes that client's calls
+  (under `-reconnect_close`) but never re-dials and never exits — SIPp's
+  UAS dies on a client's RST with the default budget; a dropped
+  **per-call** connection (`tn`/`ln`) fails its call under
+  `-reconnect_close` or, without it, simply re-dials at the call's next
+  send outside the budget; and a connection failure at start-up stays a
+  start-up error (SIPp decrements the budget and carries on without a
+  socket). Verified against real sipp both ways by restarting the UAS
+  between two calls.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)
