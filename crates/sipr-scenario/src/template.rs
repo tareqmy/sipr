@@ -33,6 +33,9 @@ pub enum Keyword {
     RemotePort,
     /// `[local_ip]`
     LocalIp,
+    /// `[server_ip]`: the IP of the socket this call's messages leave on
+    /// (`-t ui`: the socket the request arrived on; SIPp `getsockname`).
+    ServerIp,
     /// `[local_ip_type]` — `4` or `6`.
     LocalIpType,
     /// `[local_port]`
@@ -294,6 +297,7 @@ fn classify(body: &str) -> Classified {
         "remote_ip" => simple(Keyword::RemoteIp),
         "remote_port" => simple(Keyword::RemotePort),
         "local_ip" => simple(Keyword::LocalIp),
+        "server_ip" => simple(Keyword::ServerIp),
         "local_ip_type" => simple(Keyword::LocalIpType),
         "local_port" => simple(Keyword::LocalPort),
         "transport" => simple(Keyword::Transport),

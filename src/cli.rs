@@ -19,6 +19,8 @@ pub enum Transport {
     UdpMono,
     /// `un`: UDP with one socket per call.
     UdpPerCall,
+    /// `ui`: UDP with one socket per IP address from the injection file.
+    UdpPerIp,
     /// `t1`: TCP with one connection per peer (client dials, server accepts).
     TcpMono,
     /// `tn`: TCP with one connection per call.
@@ -112,6 +114,8 @@ pub struct Cli {
     pub max_socket: Option<usize>,
     /// `-rsa`: remote sending address `host[:port]`.
     pub remote_sending: Option<String>,
+    /// `-ip_field`: injection-file field holding the local IP under `-t ui`.
+    pub ip_field: usize,
     /// `-max_reconnect`: TCP/TLS reconnections allowed (-1 = unlimited).
     pub max_reconnect: i64,
     /// `-reconnect_close`: fail calls on a closed/reset connection.
@@ -209,6 +213,7 @@ impl Default for Cli {
             transport: Transport::UdpMono,
             max_socket: None,
             remote_sending: None,
+            ip_field: 0,
             max_reconnect: 0,
             reconnect_close: true,
             reconnect_sleep_ms: 1000,
@@ -416,7 +421,7 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "t",
         true,
         "MODE",
-        "Transport: u1 (UDP, default), un (UDP, one socket per call), t1 (TCP), tn (TCP, one connection per call), l1 (TLS), ln (TLS, one connection per call)",
+        "Transport: u1 (UDP, default), un (UDP, one socket per call), ui (UDP, one socket per injected IP; needs -inf and -ip_field), t1 (TCP), tn (TCP, one connection per call), l1 (TLS), ln (TLS, one connection per call)",
     ),
     (
         "s",
@@ -479,6 +484,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         true,
         "N",
         "Maximum UDP retransmissions per message",
+    ),
+    (
+        "ip_field",
+        true,
+        "N",
+        "Injection-file field holding the local IP each call sends from under -t ui (default 0)",
     ),
     (
         "rsa",
@@ -651,6 +662,9 @@ where
                 .to_owned(),
         );
     }
+    if cli.transport == Transport::UdpPerIp && cli.inf.is_empty() {
+        return Err("You must use the -inf option when using -t ui".into());
+    }
     Ok(Invocation::Run(Box::new(cli)))
 }
 
@@ -730,6 +744,7 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "3pcc" => cli.three_pcc = Some(val(value)),
         "users" => cli.users = Some(parse_num(flag, &val(value))?),
         "rsa" => cli.remote_sending = Some(val(value)),
+        "ip_field" => cli.ip_field = parse_num(flag, &val(value))?,
         "max_reconnect" => cli.max_reconnect = parse_num(flag, &val(value))?,
         "reconnect_close" => cli.reconnect_close = parse_bool_value(flag, &val(value))?,
         "reconnect_sleep" => cli.reconnect_sleep_ms = parse_num(flag, &val(value))?,
@@ -798,17 +813,13 @@ fn parse_transport(s: &str) -> Result<Transport, String> {
     match s {
         "u1" => Ok(Transport::UdpMono),
         "un" => Ok(Transport::UdpPerCall),
+        "ui" => Ok(Transport::UdpPerIp),
         "t1" => Ok(Transport::TcpMono),
         "tn" => Ok(Transport::TcpPerCall),
         "l1" => Ok(Transport::TlsMono),
         "ln" => Ok(Transport::TlsPerCall),
-        "ui" => Err(
-            "transport mode 'ui' (one UDP socket per injected IP) is not implemented — \
-             u1/un (UDP), t1/tn (TCP), and l1/ln (TLS) are supported"
-                .into(),
-        ),
         other => Err(format!(
-            "unknown transport mode '{other}' (expected u1, un, t1, tn, l1, or ln)"
+            "unknown transport mode '{other}' (expected u1, un, ui, t1, tn, l1, or ln)"
         )),
     }
 }
@@ -997,8 +1008,13 @@ mod tests {
         assert!(err.contains("expected true or false"), "{err}");
         let err = run(&["-max_socket", "0", "host"]).unwrap_err();
         assert!(err.contains("at least 1"), "{err}");
-        let err = run(&["-t", "ui"]).unwrap_err();
-        assert!(err.contains("not implemented"), "{err}");
+        assert_eq!(
+            cli(&["-t", "ui", "-inf", "ips.csv", "host"]).transport,
+            Transport::UdpPerIp
+        );
+        assert_eq!(cli(&["-ip_field", "2", "host"]).ip_field, 2);
+        let err = run(&["-t", "ui", "host"]).unwrap_err();
+        assert!(err.contains("-inf"), "{err}");
         let err = run(&["-t", "x9"]).unwrap_err();
         assert!(err.contains("unknown transport mode"), "{err}");
     }

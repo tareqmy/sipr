@@ -65,6 +65,9 @@ pub struct EngineConfig {
     /// (UAC) or back to the request's source (UAS); keywords keep rendering
     /// the nominal remote.
     pub remote_sending_addr: Option<SocketAddr>,
+    /// `-ip_field`: the field of the first `-inf` file holding the IP a call
+    /// uses under `-t ui` (SIPp default 0).
+    pub ip_field: usize,
     /// `-max_reconnect`: TCP/TLS reconnections allowed (0 = none, SIPp's
     /// default; -1 = unlimited).
     pub max_reconnect: i64,
@@ -182,6 +185,10 @@ pub enum TransportKind {
     /// `un`: UDP, one socket per call (client side; a server answers from
     /// the socket the call arrived on, as SIPp does).
     UdpPerCall,
+    /// `ui`: UDP, one socket per IP address from the injection file
+    /// (`-ip_field`): a client sends each call from its line's IP, a server
+    /// binds every listed IP and answers on the one the request hit.
+    UdpPerIp,
     /// `t1`: TCP, one connection per peer (client dials, server accepts).
     TcpMono,
     /// `tn`: TCP, one connection per call (client side).
@@ -407,6 +414,8 @@ struct CallState {
     /// nominal remote (target, or the request's source), which `-rsa` does
     /// not change (SIPp's `remote_ip`/`remote_port` globals).
     render_remote: SocketAddr,
+    /// `[server_ip]`: the IP of the socket this call's messages leave on.
+    server_ip: String,
 }
 
 /// Why the engine refused to run a scenario.
@@ -599,6 +608,9 @@ struct Engine<'s> {
     /// the sending address (SIPp's `call_remote_socket`), shared across
     /// calls unless the transport is per-call.
     rsa_server: bool,
+    /// `-t ui`: the sockets bound per injected IP (SIPp `map_perip_fd`),
+    /// persistent for the run; the main socket's own IP is not in here.
+    ip_sockets: HashMap<IpAddr, Arc<UdpCallSocket>>,
     /// `-max_socket`: share call sockets round-robin past this many.
     max_socket: usize,
     /// Every call socket opened and not yet closed, for sharing.
@@ -711,7 +723,41 @@ impl<'s> Engine<'s> {
                     }
                 }
             });
-        let tcfg = TransportConfig {
+        // Injection files first: `-t ui` binds sockets from their IP column.
+        let mut inf_files = Vec::with_capacity(config.inf_files.len());
+        for path in &config.inf_files {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                EngineError(format!(
+                    "cannot read injection file {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let file = InjectionFile::parse(&name, &text).map_err(EngineError)?;
+            if file.mode == InjectMode::User && config.users.is_none() {
+                eprintln!(
+                    "sipr: warning: injection file {name} uses USER mode but -users \
+                     was not given; its [fieldN] will render empty"
+                );
+            }
+            inf_files.push(std::cell::RefCell::new(file));
+        }
+        // Apply -infindex: build the lookup index on the named file's field.
+        for (file_name, field) in &config.inf_index {
+            let cell = inf_files
+                .iter()
+                .find(|c| c.borrow().name == *file_name)
+                .ok_or_else(|| {
+                    EngineError(format!("-infindex: no injection file named '{file_name}'"))
+                })?;
+            cell.borrow_mut().build_index(*field);
+        }
+        // Reject scenarios whose [fieldN file=…] names a file we did not load.
+        validate_field_files(scenario, &inf_files)?;
+        let mut tcfg = TransportConfig {
             local_ip: config.local_ip,
             port: config.port,
             send_loss_pct: 0.0,
@@ -719,9 +765,28 @@ impl<'s> Engine<'s> {
             loss_seed: config.seed,
         };
         let per_call = config.transport.per_call() && scenario.role == Role::Uac;
+        // `-t ui`: the main socket binds the first injected IP (SIPp: "on some
+        // machines it fails to bind to the self computed local IP").
+        let per_ip = config.transport == TransportKind::UdpPerIp;
+        if per_ip {
+            let first = inf_files
+                .first()
+                .and_then(|f| f.borrow().field(0, config.ip_field).map(ToOwned::to_owned))
+                .ok_or_else(|| {
+                    EngineError(
+                        "-t ui needs an -inf file with an IP in the -ip_field column".into(),
+                    )
+                })?;
+            let ip: IpAddr = first.trim().parse().map_err(|_| {
+                EngineError(format!(
+                    "-t ui: '{first}' (line 0, -ip_field) is not an IP address"
+                ))
+            })?;
+            tcfg.local_ip = Some(ip);
+        }
         let rsa_server = config.remote_sending_addr.is_some() && scenario.role == Role::Uas;
         let (transport, transport_token, reliable) = match config.transport {
-            TransportKind::UdpMono | TransportKind::UdpPerCall => {
+            TransportKind::UdpMono | TransportKind::UdpPerCall | TransportKind::UdpPerIp => {
                 let u = UdpTransport::bind(&tcfg, net_tx)
                     .map_err(|e| EngineError(format!("cannot bind UDP socket: {e}")))?;
                 (Transport::Udp(u), "UDP", false)
@@ -994,6 +1059,42 @@ impl<'s> Engine<'s> {
             timers.arm(t, Event::GlobalTimeout);
         }
         let local_addr = transport.local_addr();
+        // `-t ui` server: one socket per distinct injected IP, on the main
+        // socket's port (SIPp `open_connections`, MODE_SERVER).
+        let mut ip_sockets = HashMap::new();
+        if per_ip && scenario.role == Role::Uas {
+            let Transport::Udp(udp) = &transport else {
+                return Err(EngineError("-t ui is UDP only".into()));
+            };
+            let file = inf_files
+                .first()
+                .ok_or_else(|| EngineError("-t ui needs an -inf file".into()))?
+                .borrow();
+            for line in 0..file.len() {
+                let raw = file
+                    .field(line, config.ip_field)
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                let ip: IpAddr = raw.parse().map_err(|_| {
+                    EngineError(format!(
+                        "-t ui: '{raw}' (line {line}, -ip_field) is not an IP address"
+                    ))
+                })?;
+                if ip == local_addr.ip() || ip_sockets.contains_key(&ip) {
+                    continue;
+                }
+                let sock = udp
+                    .open_call_socket_at(SocketAddr::new(ip, local_addr.port()))
+                    .map_err(|e| {
+                        EngineError(format!(
+                            "-t ui: cannot bind {ip}:{}: {e}",
+                            local_addr.port()
+                        ))
+                    })?;
+                ip_sockets.insert(ip, Arc::new(sock));
+            }
+        }
         if per_call && !matches!(transport, Transport::Udp(_)) {
             eprintln!(
                 "sipr: one connection per call from {} (placing calls)",
@@ -1037,39 +1138,6 @@ impl<'s> Engine<'s> {
         );
         // Load -inf injection files up front (fail fast on bad files). SIPp
         // keys files by basename; keyword `file=` and `-infindex` match that.
-        let mut inf_files = Vec::with_capacity(config.inf_files.len());
-        for path in &config.inf_files {
-            let text = std::fs::read_to_string(path).map_err(|e| {
-                EngineError(format!(
-                    "cannot read injection file {}: {e}",
-                    path.display()
-                ))
-            })?;
-            let name = path.file_name().map_or_else(
-                || path.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            let file = InjectionFile::parse(&name, &text).map_err(EngineError)?;
-            if file.mode == InjectMode::User && config.users.is_none() {
-                eprintln!(
-                    "sipr: warning: injection file {name} uses USER mode but -users \
-                     was not given; its [fieldN] will render empty"
-                );
-            }
-            inf_files.push(std::cell::RefCell::new(file));
-        }
-        // Apply -infindex: build the lookup index on the named file's field.
-        for (file_name, field) in &config.inf_index {
-            let cell = inf_files
-                .iter()
-                .find(|c| c.borrow().name == *file_name)
-                .ok_or_else(|| {
-                    EngineError(format!("-infindex: no injection file named '{file_name}'"))
-                })?;
-            cell.borrow_mut().build_index(*field);
-        }
-        // Reject scenarios whose [fieldN file=…] names a file we did not load.
-        validate_field_files(scenario, &inf_files)?;
         let inf_len = inf_files.len();
         Ok(Self {
             scenario,
@@ -1083,6 +1151,7 @@ impl<'s> Engine<'s> {
             pending_reset: None,
             per_call,
             rsa_server,
+            ip_sockets,
             max_socket: config.max_socket.max(1),
             call_socket_pool: Vec::new(),
             next_shared_socket: 0,
@@ -1110,7 +1179,10 @@ impl<'s> Engine<'s> {
             last_snapshot: (Instant::now(), 0),
             soft_stopping: false,
             hard_stop: false,
-            local_ip_str: local_addr.ip().to_string(),
+            local_ip_str: config
+                .local_ip
+                .unwrap_or_else(|| local_addr.ip())
+                .to_string(),
             pid: std::process::id(),
             media,
             pcaps,
@@ -1790,6 +1862,7 @@ impl<'s> Engine<'s> {
                             remote_ip: &remote_ip,
                             remote_port: call.render_remote.port(),
                             local_ip: &self.local_ip_str,
+                            server_ip: self.server_ip_of(call),
                             local_port: self.call_local_port(call),
                             media_ip: &self.media_ip_str,
                             media_port: self.media_port,
@@ -2123,6 +2196,13 @@ impl<'s> Engine<'s> {
                         None,
                     ),
                 );
+                // The call answers from the socket the request hit (`-t ui`)
+                // and `[server_ip]` names that socket's IP (SIPp getsockname).
+                let received_on = self.ip_sockets.get(&packet.local.ip()).cloned();
+                if let Some(call) = self.calls.get_mut(&call_id) {
+                    call.server_ip = packet.local.ip().to_string();
+                    call.socket = received_on.map(CallSocket::Udp);
+                }
                 // Fall through to normal matching below (window at 0).
             } else {
                 self.stats.unexpected += 1;
@@ -2315,6 +2395,7 @@ impl<'s> Engine<'s> {
                 remote_ip: &remote_ip,
                 remote_port: call.render_remote.port(),
                 local_ip: &self.local_ip_str,
+                server_ip: self.server_ip_of(call),
                 local_port: self.call_local_port(call),
                 media_ip: &self.media_ip_str,
                 media_port: self.media_port,
@@ -2909,6 +2990,7 @@ impl<'s> Engine<'s> {
             remote_ip: &remote_ip,
             remote_port: call.render_remote.port(),
             local_ip: &self.local_ip_str,
+            server_ip: self.server_ip_of(call),
             local_port: self.call_local_port(call),
             media_ip: &self.media_ip_str,
             media_port: self.media_port,
@@ -3073,6 +3155,9 @@ impl<'s> Engine<'s> {
     /// per-call modes — SIPp's `connect_socket_if_needed` +
     /// `new_sipp_call_socket`. No-op elsewhere.
     fn ensure_call_socket(&mut self, call_id: &str) -> Result<(), String> {
+        if self.config.transport == TransportKind::UdpPerIp && self.scenario.role == Role::Uac {
+            return self.ensure_per_ip_socket(call_id);
+        }
         if !(self.per_call || self.rsa_server) {
             return Ok(());
         }
@@ -3118,6 +3203,63 @@ impl<'s> Engine<'s> {
         };
         if let Some(call) = self.calls.get_mut(call_id) {
             call.socket = Some(socket);
+        }
+        Ok(())
+    }
+
+    /// `-t ui` client (SIPp `connect_socket_if_needed`, `peripsocket`): the
+    /// call sends from the IP in its injection line's `-ip_field` column —
+    /// the main socket when that is its IP, else a socket bound to
+    /// `ip:port` that is created once and kept for the run (`map_perip_fd`).
+    /// An unbindable IP is fatal, as SIPp's "Unable to bind UDP socket".
+    fn ensure_per_ip_socket(&mut self, call_id: &str) -> Result<(), String> {
+        let Some(call) = self.calls.get(call_id) else {
+            return Ok(());
+        };
+        if call.socket.is_some() {
+            return Ok(());
+        }
+        let line = call.field_lines.first().copied().flatten();
+        let raw = self
+            .inf_files
+            .first()
+            .and_then(|f| {
+                f.borrow()
+                    .field(line?, self.config.ip_field)
+                    .map(|v| v.trim().to_owned())
+            })
+            .unwrap_or_default();
+        let ip: IpAddr = raw
+            .parse()
+            .map_err(|_| format!("-t ui: '{raw}' (-ip_field) is not an IP address"))?;
+        let main_addr = self.transport.local_addr();
+        let socket = if ip == main_addr.ip() {
+            None
+        } else if let Some(existing) = self.ip_sockets.get(&ip) {
+            Some(CallSocket::Udp(Arc::clone(existing)))
+        } else {
+            let Transport::Udp(udp) = &self.transport else {
+                return Err("-t ui is UDP only".into());
+            };
+            match udp.open_call_socket_at(SocketAddr::new(ip, main_addr.port())) {
+                Ok(sock) => {
+                    let sock = Arc::new(sock);
+                    self.ip_sockets.insert(ip, Arc::clone(&sock));
+                    Some(CallSocket::Udp(sock))
+                }
+                Err(e) => {
+                    let msg = format!("Unable to bind UDP socket {ip}:{}: {e}", main_addr.port());
+                    eprintln!("sipr: error: {msg}");
+                    self.log_err(&msg);
+                    self.fatal = Some(msg.clone());
+                    self.hard_stop = true;
+                    return Err(msg);
+                }
+            }
+        };
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.socket = socket;
+            call.server_ip = ip.to_string();
         }
         Ok(())
     }
@@ -3328,6 +3470,16 @@ impl<'s> Engine<'s> {
             if !clean {
                 self.reset_mono_connection(peer);
             }
+        }
+    }
+
+    /// `[server_ip]`: the IP this call's messages leave from — the per-IP
+    /// or receiving socket under `-t ui`, else the main socket's.
+    fn server_ip_of<'c>(&'c self, call: &'c CallState) -> &'c str {
+        if call.server_ip.is_empty() {
+            &self.local_ip_str
+        } else {
+            &call.server_ip
         }
     }
 
@@ -3649,6 +3801,7 @@ fn new_call(
         paused_until: None,
         socket: None,
         render_remote,
+        server_ip: String::new(),
     }
 }
 

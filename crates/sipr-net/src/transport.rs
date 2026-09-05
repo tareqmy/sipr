@@ -29,6 +29,8 @@ pub struct InboundPacket {
     pub raw: Vec<u8>,
     /// Sender address.
     pub from: SocketAddr,
+    /// The local address it arrived on (`[server_ip]`, `-t ui` routing).
+    pub local: SocketAddr,
     /// Arrival timestamp.
     pub received_at: Instant,
 }
@@ -132,6 +134,9 @@ fn recv_loop(
     mut recv_rng: Rng,
     stop: Option<&AtomicBool>,
 ) {
+    let local = socket
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
         match socket.recv_from(&mut buf) {
@@ -150,6 +155,7 @@ fn recv_loop(
                         message,
                         raw: buf[..n].to_vec(),
                         from,
+                        local,
                         received_at: Instant::now(),
                     }),
                     Err(reason) => NetEvent::Garbage { from, reason },
@@ -205,7 +211,18 @@ impl UdpTransport {
     ///
     /// Bind or thread-spawn failures.
     pub fn open_call_socket(&self) -> std::io::Result<UdpCallSocket> {
-        let socket = UdpSocket::bind(SocketAddr::new(self.local_addr.ip(), 0))?;
+        self.open_call_socket_at(SocketAddr::new(self.local_addr.ip(), 0))
+    }
+
+    /// Open a call socket bound to exactly `at` (`-t ui`: one socket per
+    /// injected IP, all on the main socket's port).
+    ///
+    /// # Errors
+    ///
+    /// Bind or thread-spawn failures (an IP that is not local, a port in
+    /// use).
+    pub fn open_call_socket_at(&self, at: SocketAddr) -> std::io::Result<UdpCallSocket> {
+        let socket = UdpSocket::bind(at)?;
         let local_addr = socket.local_addr()?;
         let recv_socket = socket.try_clone()?;
         let sink = self.sink.clone();
@@ -320,6 +337,28 @@ mod tests {
     }
 
     const OPTIONS: &[u8] = b"OPTIONS sip:x SIP/2.0\r\nCall-ID: t-1\r\nCSeq: 9 OPTIONS\r\n\r\n";
+
+    /// `-t ui`: a call socket bound at an explicit address, and every packet
+    /// names the local address it arrived on.
+    #[test]
+    fn call_socket_at_binds_the_given_address_and_packets_carry_local() {
+        let (a, _arx) = bind(&TransportConfig::default());
+        let (b, brx) = bind(&TransportConfig::default());
+        let want = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let call = a.open_call_socket_at(want).expect("bind at");
+        assert_eq!(call.local_addr().ip(), want.ip());
+        assert!(
+            a.send_via(&call, OPTIONS, b.local_addr(), None)
+                .expect("send")
+        );
+        match brx.recv_timeout(Duration::from_secs(2)).expect("delivered") {
+            NetEvent::Packet(p) => {
+                assert_eq!(p.from, call.local_addr());
+                assert_eq!(p.local, b.local_addr(), "arrived on b's socket");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 
     /// `-t un`: a per-call socket has its own port, delivers into the same
     /// sink, and closes (port released, thread reaped) on drop.

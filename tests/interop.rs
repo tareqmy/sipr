@@ -2191,3 +2191,166 @@ fn real_sipp_tcp_uac_reconnects_to_sipr() {
         "sipp uac: one call dies on the dead socket, the rest complete"
     );
 }
+
+/// A second local IPv4 address for the per-IP socket tests (`None` on a
+/// loopback-only host).
+fn second_local_ipv4() -> Option<std::net::Ipv4Addr> {
+    let probe = UdpSocket::bind("0.0.0.0:0").ok()?;
+    probe.connect("10.255.255.255:9").ok()?;
+    match probe.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => {
+            UdpSocket::bind((v4, 0)).ok().map(|_| v4)
+        }
+        _ => None,
+    }
+}
+
+/// `-t ui` against real sipp, both roles each way: an injection file with
+/// loopback and the LAN address; the `ui` side sends from / listens on
+/// both, the other side is a plain `u1` peer. Every call must complete.
+#[test]
+fn per_ip_sockets_both_ways_against_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::per_ip_sockets_both_ways_against_real_sipp — no sipp.");
+        return;
+    };
+    let Some(lan) = second_local_ipv4() else {
+        eprintln!(
+            "SKIPPED interop::per_ip_sockets_both_ways_against_real_sipp — no second local IPv4."
+        );
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let inf = dir.path().join("ips.csv");
+    std::fs::write(&inf, format!("SEQUENTIAL\n127.0.0.1\n{lan}\n")).expect("write inf");
+    let inf = inf.to_str().expect("utf8").to_owned();
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let spawn = |bin: &std::path::Path, args: &[&str]| {
+        Reaper(
+            Command::new(bin)
+                .current_dir(dir.path())
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn"),
+        )
+    };
+    let ui = |extra: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = vec![
+            "-t".into(),
+            "ui".into(),
+            "-inf".into(),
+            inf.clone(),
+            "-ip_field".into(),
+            "0".into(),
+        ];
+        v.extend(extra.iter().map(|s| (*s).to_owned()));
+        v
+    };
+    // 1. sipr ui UAC → sipp u1 UAS; 2. sipp ui UAC → sipr u1 UAS.
+    for (uac_bin, uas_bin, uac_bg, uas_bg) in
+        [(&sipr, &sipp, true, false), (&sipp, &sipr, false, true)]
+    {
+        let port = free_port();
+        let p = port.to_string();
+        let mut uas_args: Vec<&str> = vec![
+            "-sn",
+            "uas",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &p,
+            "-m",
+            "4",
+            "-timeout",
+            "20",
+        ];
+        if uas_bg {
+            uas_args.push("-bg");
+        }
+        let mut uas = spawn(uas_bin, &uas_args);
+        std::thread::sleep(Duration::from_millis(400));
+        let target = format!("127.0.0.1:{port}");
+        let mut uac_args = ui(&[
+            "-sn",
+            "uac",
+            "-i",
+            "127.0.0.1",
+            "-r",
+            "10",
+            "-m",
+            "4",
+            "-d",
+            "100",
+            "-timeout",
+            "10",
+        ]);
+        if uac_bg {
+            uac_args.push("-bg".into());
+        }
+        uac_args.push(target);
+        let uac_refs: Vec<&str> = uac_args.iter().map(String::as_str).collect();
+        let mut uac = spawn(uac_bin, &uac_refs);
+        assert_eq!(
+            wait_with_timeout(&mut uac.0, Duration::from_secs(15)),
+            Some(0),
+            "ui uac {}",
+            uac_bin.display()
+        );
+        assert_eq!(
+            wait_with_timeout(&mut uas.0, Duration::from_secs(10)),
+            Some(0),
+            "u1 uas {}",
+            uas_bin.display()
+        );
+    }
+    // 3. sipp ui UAS (bound on both IPs) ← sipr u1 UAC aimed at the LAN IP;
+    // 4. sipr ui UAS ← sipp u1 UAC aimed at the LAN IP.
+    for (uas_bin, uac_bin, uas_bg, uac_bg) in
+        [(&sipp, &sipr, false, true), (&sipr, &sipp, true, false)]
+    {
+        let port = free_port();
+        let p = port.to_string();
+        let mut uas_args = ui(&["-sn", "uas", "-p", &p, "-m", "2", "-timeout", "20"]);
+        if uas_bg {
+            uas_args.push("-bg".into());
+        }
+        let uas_refs: Vec<&str> = uas_args.iter().map(String::as_str).collect();
+        let mut uas = spawn(uas_bin, &uas_refs);
+        std::thread::sleep(Duration::from_millis(400));
+        let target = format!("{lan}:{port}");
+        let mut uac_args: Vec<&str> = vec![
+            "-sn",
+            "uac",
+            "-i",
+            "127.0.0.1",
+            "-r",
+            "10",
+            "-m",
+            "2",
+            "-d",
+            "100",
+            "-timeout",
+            "10",
+        ];
+        if uac_bg {
+            uac_args.push("-bg");
+        }
+        uac_args.push(&target);
+        let mut uac = spawn(uac_bin, &uac_args);
+        assert_eq!(
+            wait_with_timeout(&mut uac.0, Duration::from_secs(15)),
+            Some(0),
+            "u1 uac {} → ui uas on the LAN IP",
+            uac_bin.display()
+        );
+        assert_eq!(
+            wait_with_timeout(&mut uas.0, Duration::from_secs(10)),
+            Some(0),
+            "ui uas {}",
+            uas_bin.display()
+        );
+    }
+}

@@ -874,9 +874,33 @@ Behavioral oracle: `socket.cpp` `reconnect_allowed` ~l.2257,
 - [x] Deferred: budgeted re-dial of per-call connections; a start-up connect
       failure consuming the budget; a UAS re-dialing its client.
 
+## M31 — `-t ui`: one UDP socket per injected IP, `-ip_field`, `[server_ip]` ✅
+
+Behavioral oracle: `sipp.cpp` ~l.316/~l.1572/~l.1996, `socket.cpp`
+`open_connections` ~l.2466-2560, `call.cpp` `connect_socket_if_needed`
+~l.1430-1475 and `E_Message_Server_IP` ~l.2768, `docs/transport.rst`
+"UDP with one socket per IP address".
+
+- [x] `-t ui` (UDP only, needs `-inf`) and `-ip_field <n>` (default 0): the
+      main socket binds line 0's IP; a client call sends from the socket of
+      the IP in its own line (created once, kept for the run; unbindable →
+      fatal); a server binds every distinct listed IP on the same port and
+      answers on the socket a request arrived on.
+- [x] `[server_ip]`: the IP of the socket the call sends from
+      (`InboundPacket::local` carries the receiving address for every
+      transport).
+- [x] Tests: net unit `call_socket_at_binds_the_given_address_and_packets_carry_local`;
+      CLI parse; e2e `ui_client_sends_each_call_from_its_lines_ip` (source
+      IP alternates with the file, `[server_ip]` in the Via matches it) and
+      `ui_server_answers_on_the_ip_the_request_hit`; interop with real
+      sipp's `-t ui` in both roles (skipped when the host has no second
+      local IPv4 address).
+- [x] Deferred: host names in the IP column.
+
 ## Post-v1 backlog (ordered)
 
-`-t ui`, SCTP. (Checked after M30: the pacer's first call comes one
+SCTP (needs an OS SCTP stack and a socket API the std-only, no-`unsafe`
+rules cannot reach without a new dependency — a PLAN.md decision). (Checked after M30: the pacer's first call comes one
 inter-call interval after start-up in SIPp too — `call_generation_task.cpp`
 opens calls when `elapsed × rate / rate_period` reaches the count; no
 divergence, see SIPP_COMPAT §6.)

@@ -507,6 +507,7 @@ fn read_loop(
                         message,
                         raw,
                         from: peer,
+                        local,
                         received_at: Instant::now(),
                     }),
                     Err(reason) => NetEvent::Garbage { from: peer, reason },

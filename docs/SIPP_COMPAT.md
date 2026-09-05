@@ -57,7 +57,7 @@ Shipped: `exec play_pcap_audio|video|image=` and `<recv ignoresdp>` (M14),
 
 ## 2. Keywords (v1)
 
-`[service]` `[remote_ip]` `[remote_port]` `[local_ip]` `[local_ip_type]`
+`[service]` `[remote_ip]` `[remote_port]` `[server_ip]` (the IP this call sends from; `-t ui`) `[local_ip]` `[local_ip_type]`
 `[local_port]` `[transport]` `[call_id]` `[call_number]` `[userid]` `[users]`
 `[cseq]` `[branch]` `[msg_index]` `[pid]` `[routes]` `[next_url]` `[peer_tag_param]`
 `[last_*]` (verbatim copy of header(s) from last received message, e.g.
@@ -95,8 +95,9 @@ Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 `-d <pause ms default>` `-users` (v1.x closed loop) `-rate_increase <n>`
 `-rate_max <n>` `-rate_interval <time>` `-no_rate_quit` `-rate_scale <n>`
 (M20 ramps).
-Network: `-p <local port>` `-i <local ip>` `-t u1|un|t1|tn|l1|ln` (UDP /
-TCP / TLS, one socket or one socket per call; `ui` not implemented)
+Network: `-p <local port>` `-i <local ip>` `-t u1|un|ui|t1|tn|l1|ln` (UDP /
+TCP / TLS, one socket, one socket per call, or one UDP socket per injected
+IP) `-ip_field <n>` (the `-inf` column holding that IP)
 `-max_socket <n>` (per-call modes share sockets past n) `-rsa <host[:port]>`
 (remote sending address) `-max_reconnect <n>` `-reconnect_close <bool>`
 `-reconnect_sleep <ms>` (TCP/TLS reconnection) `-s <service>` (called number)
@@ -768,5 +769,25 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   pacer produces the same first-call time and the same steady-state
   spacing; it does not re-anchor on a rate change (the fractional carry
   survives), a sub-interval difference.
+- `-t ui` / `-ip_field` / `[server_ip]` (M31; verified in `sipp.cpp`
+  ~l.316 and ~l.1996 (`peripfield` default 0; `-inf` required; UDP only),
+  ~l.1572 (`ip_file` = the first `-inf`), `socket.cpp` `open_connections`
+  ~l.2466-2560 and `call.cpp` `connect_socket_if_needed` ~l.1430-1475,
+  `E_Message_Server_IP` ~l.2768, `docs/transport.rst`): the main socket is
+  bound to the IP in line 0's `-ip_field` column ("on some machines it
+  fails to bind to the self computed local IP"), and `map_perip_fd` maps
+  IP → socket. A **client** call, at its first send, looks up the IP in
+  *its* injection line and uses the mapped socket, creating one bound to
+  `ip:local_port` if absent — persistent for the run, never closed (an
+  unbindable IP is a fatal "Unable to bind UDP socket"). A **server**
+  binds one extra socket per distinct listed IP at start-up and answers
+  each request from the socket it arrived on. `[server_ip]` is
+  `getsockname` on the call's socket — the IP the call sends from —
+  which is how a `ui` scenario writes correct Via/Contact lines
+  (`[local_ip]` stays the `-i` / auto-detected address). sipr matches all
+  of this — the per-IP sockets share the main socket's port, calls attach
+  to the receiving socket on the server, `[server_ip]` renders the socket
+  IP, the errors are fatal at the same points — with one divergence: IPs
+  must be literal (SIPp resolves host names in the column).
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

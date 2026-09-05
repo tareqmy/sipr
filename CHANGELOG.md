@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`-t ui`** — one UDP socket per IP address from the injection file
+  (`-ip_field`): each client call sends from its line's IP, a server
+  binds every listed IP and answers on the one the request hit, and the
+  new `[server_ip]` keyword renders the IP a call sends from — SIPp's
+  per-IP mode for emulating many user agents.
+
 ## [0.19.0] — 2026-09-05
 
 ### Added

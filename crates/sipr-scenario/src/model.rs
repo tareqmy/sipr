@@ -829,6 +829,7 @@ fn keyword_name(k: &Keyword) -> String {
         Keyword::RemoteIp => "remote_ip",
         Keyword::RemotePort => "remote_port",
         Keyword::LocalIp => "local_ip",
+        Keyword::ServerIp => "server_ip",
         Keyword::LocalIpType => "local_ip_type",
         Keyword::LocalPort => "local_port",
         Keyword::Transport => "transport",

@@ -40,6 +40,7 @@ fn uas_config() -> EngineConfig {
         transport: sipr_engine::TransportKind::UdpMono,
         max_socket: 50_000,
         remote_sending_addr: None,
+        ip_field: 0,
         max_reconnect: 0,
         reconnect_close: true,
         reconnect_sleep: std::time::Duration::from_millis(1000),

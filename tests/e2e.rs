@@ -3586,9 +3586,36 @@ fn rtp_echo_with_an_unknown_codec_fails_at_load() {
 /// port the caller wrote in its Via (`[local_port]`).
 #[derive(Debug, Clone)]
 struct SeenInvite {
+    source_ip: std::net::IpAddr,
     source_port: u16,
+    via_ip: String,
     via_port: u16,
     request_line: String,
+}
+
+/// The host in a top Via's sent-by (`SIP/2.0/UDP HOST:port;...`).
+fn via_host(msg: &sipr_net::Inbound) -> String {
+    let via = msg.header("Via").unwrap_or_default();
+    let sent_by = via.split_whitespace().nth(1).unwrap_or_default();
+    let host_port = sent_by.split(';').next().unwrap_or_default();
+    host_port
+        .rsplit_once(':')
+        .map_or(host_port, |(h, _)| h)
+        .to_owned()
+}
+
+/// A second local IPv4 address (the primary interface's), for the per-IP
+/// socket tests; `None` on a host with only loopback.
+fn second_local_ipv4() -> Option<std::net::Ipv4Addr> {
+    let probe = UdpSocket::bind("0.0.0.0:0").ok()?;
+    probe.connect("10.255.255.255:9").ok()?;
+    match probe.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => {
+            // It must also be bindable (a VPN default route is not).
+            UdpSocket::bind((v4, 0)).ok().map(|_| v4)
+        }
+        _ => None,
+    }
 }
 
 /// The port in a top Via's sent-by (`SIP/2.0/UDP 127.0.0.1:PORT;...`).
@@ -3624,7 +3651,9 @@ fn spawn_recording_udp_uas(calls: usize) -> (SocketAddr, std::thread::JoinHandle
             let Some(method) = msg.method() else { continue };
             match method {
                 "INVITE" => seen.push(SeenInvite {
+                    source_ip: from.ip(),
                     source_port: from.port(),
+                    via_ip: via_host(&msg),
                     via_port: via_port(&msg),
                     request_line: msg.start_line().to_owned(),
                 }),
@@ -3873,6 +3902,220 @@ fn tls_per_call_connections_complete_calls() {
     assert!(uac_err.contains("one connection per call"), "{uac_err}");
     assert_eq!(uas_code, Some(0), "uas:\n{uas_err}");
     assert!(uas_err.contains("successful 2 failed 0"), "{uas_err}");
+}
+
+// ---- -t ui: one UDP socket per injected IP, -ip_field, [server_ip] (M31) --------
+
+const UI_UAC: &str = r#"<scenario name="ui-uac">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [server_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[server_ip]:[local_port]>;tag=[pid]u[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:sipr@[server_ip]:[local_port]>
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [server_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[server_ip]:[local_port]>;tag=[pid]u[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [server_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[server_ip]:[local_port]>;tag=[pid]u[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#;
+
+/// `-t ui` as a client: call N sends from the IP in its injection line
+/// (SEQUENTIAL: loopback, the LAN address, loopback, ...), and
+/// `[server_ip]` in its Via names that IP.
+#[test]
+fn ui_client_sends_each_call_from_its_lines_ip() {
+    let Some(lan) = second_local_ipv4() else {
+        eprintln!("SKIPPED ui_client_sends_each_call_from_its_lines_ip — no second local IPv4.");
+        return;
+    };
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let inf = dir.join(format!("sipr-e2e-ui-{pid}.csv"));
+    std::fs::write(&inf, format!("SEQUENTIAL\n127.0.0.1;a\n{lan};b\n")).expect("write inf");
+    let scenario = dir.join(format!("sipr-e2e-ui-{pid}.xml"));
+    std::fs::write(&scenario, UI_UAC).expect("write scenario");
+    let (addr, uas) = spawn_recording_udp_uas(4);
+    let out = run_sipr(&[
+        "-sf",
+        scenario.to_str().expect("utf8"),
+        "-t",
+        "ui",
+        "-inf",
+        inf.to_str().expect("utf8"),
+        "-ip_field",
+        "0",
+        "-r",
+        "10",
+        "-m",
+        "4",
+        "-timeout",
+        "10",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&inf);
+    let _ = std::fs::remove_file(&scenario);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    let seen = uas.join().expect("uas");
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    let ips: Vec<String> = seen.iter().map(|s| s.source_ip.to_string()).collect();
+    assert_eq!(
+        ips,
+        vec![
+            "127.0.0.1".to_owned(),
+            lan.to_string(),
+            "127.0.0.1".to_owned(),
+            lan.to_string()
+        ],
+        "{seen:?}"
+    );
+    for s in &seen {
+        assert_eq!(
+            s.via_ip,
+            s.source_ip.to_string(),
+            "[server_ip] must be the sending IP: {s:?}"
+        );
+        assert_eq!(
+            s.via_port, s.source_port,
+            "all per-IP sockets share the port: {s:?}"
+        );
+    }
+}
+
+/// `-t ui` as a server: bound on every listed IP, answering from the one
+/// a request hit, with `[server_ip]` naming it.
+#[test]
+fn ui_server_answers_on_the_ip_the_request_hit() {
+    let Some(lan) = second_local_ipv4() else {
+        eprintln!("SKIPPED ui_server_answers_on_the_ip_the_request_hit — no second local IPv4.");
+        return;
+    };
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let inf = dir.join(format!("sipr-e2e-ui-uas-{pid}.csv"));
+    std::fs::write(&inf, format!("SEQUENTIAL\n127.0.0.1\n{lan}\n")).expect("write inf");
+    let scenario = dir.join(format!("sipr-e2e-ui-uas-{pid}.xml"));
+    std::fs::write(
+        &scenario,
+        r#"<scenario name="ui-uas">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[server_ip]:[local_port]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+</scenario>
+"#,
+    )
+    .expect("write scenario");
+    let port = free_port();
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sf",
+        scenario.to_str().expect("utf8"),
+        "-t",
+        "ui",
+        "-inf",
+        inf.to_str().expect("utf8"),
+        "-ip_field",
+        "0",
+        "-p",
+        &port.to_string(),
+        "-m",
+        "2",
+        "-timeout",
+        "10",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    let caller = UdpSocket::bind("127.0.0.1:0").expect("bind caller");
+    caller
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let cp = caller.local_addr().expect("addr").port();
+    let mut buf = [0u8; 65_535];
+    for (n, ip) in [lan.to_string(), "127.0.0.1".to_owned()].iter().enumerate() {
+        let invite = format!(
+            "INVITE sip:s@{ip}:{port} SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{cp};branch=z9hG4bKui{n}\r\n\
+             From: <sip:a@x>;tag=1\r\nTo: <sip:s@x>\r\nCall-ID: ui-{n}\r\nCSeq: 1 INVITE\r\n\
+             Contact: <sip:a@127.0.0.1:{cp}>\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
+        );
+        let target: SocketAddr = format!("{ip}:{port}").parse().expect("addr");
+        // No retransmission timer in a raw caller: resend until answered
+        // (the UAS may still be starting); on silence, show the UAS's stderr.
+        caller
+            .set_read_timeout(Some(Duration::from_millis(700)))
+            .expect("timeout");
+        let mut got = None;
+        for _ in 0..8 {
+            caller
+                .send_to(invite.as_bytes(), target)
+                .expect("send invite");
+            if let Ok(x) = caller.recv_from(&mut buf) {
+                got = Some(x);
+                break;
+            }
+        }
+        let Some((len, from)) = got else {
+            let _ = uas.kill();
+            let err = uas_err.join().expect("uas stderr");
+            panic!("no 200 OK from {target}; uas stderr:\n{err}");
+        };
+        let text = String::from_utf8_lossy(&buf[..len]);
+        assert!(text.starts_with("SIP/2.0 200"), "{text}");
+        assert_eq!(from, target, "answered from the socket the request hit");
+        assert!(
+            text.contains(&format!("Contact: <sip:{ip}:{port}>")),
+            "[server_ip] must be that socket's IP:\n{text}"
+        );
+        let ack = format!(
+            "ACK sip:s@{ip}:{port} SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{cp};branch=z9hG4bKuia{n}\r\n\
+             From: <sip:a@x>;tag=1\r\nTo: <sip:s@x>;tag=1\r\nCall-ID: ui-{n}\r\nCSeq: 1 ACK\r\n\
+             Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
+        );
+        caller.send_to(ack.as_bytes(), target).expect("send ack");
+    }
+    let code = wait_exit(&mut uas, Duration::from_secs(10));
+    let err = uas_err.join().expect("uas stderr");
+    let _ = std::fs::remove_file(&inf);
+    let _ = std::fs::remove_file(&scenario);
+    assert_eq!(code, Some(0), "uas:\n{err}");
+    assert!(err.contains("successful 2 failed 0"), "{err}");
 }
 
 // ---- TCP reconnection: -max_reconnect, -reconnect_close, -reconnect_sleep (M30) --

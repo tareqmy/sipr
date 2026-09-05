@@ -135,6 +135,8 @@ pub struct RenderCtx<'a> {
     pub remote_port: u16,
     /// Local bound IP.
     pub local_ip: &'a str,
+    /// `[server_ip]`: the IP of the socket this call sends from.
+    pub server_ip: &'a str,
     /// Local bound port.
     pub local_port: u16,
     /// Media address (`-mi`, default local IP) for `[media_ip]`.
@@ -336,6 +338,7 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
             let _ = write!(out, "{}", ctx.remote_port);
         }
         Keyword::LocalIp => push_ip_for_uri(out, ctx.local_ip),
+        Keyword::ServerIp => push_ip_for_uri(out, ctx.server_ip),
         Keyword::LocalIpType => out.push_str(ip_type(ctx.local_ip)),
         Keyword::LocalPort => {
             let _ = write!(out, "{}", ctx.local_port);
@@ -767,6 +770,7 @@ mod tests {
             remote_ip: "10.0.0.2",
             remote_port: 5060,
             local_ip: "10.0.0.1",
+            server_ip: "10.0.0.1",
             local_port: 5061,
             media_ip: "10.0.0.1",
             media_port: 6000,

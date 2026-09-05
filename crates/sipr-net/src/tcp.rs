@@ -394,6 +394,7 @@ fn read_loop(mut stream: TcpStream, peer: SocketAddr, sink: &Sender<NetEvent>) {
                             message,
                             raw,
                             from: peer,
+                            local,
                             received_at: Instant::now(),
                         }),
                         Err(reason) => NetEvent::Garbage { from: peer, reason },
