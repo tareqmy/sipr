@@ -876,6 +876,7 @@ Behavioral oracle: `socket.cpp` `reconnect_allowed` ~l.2257,
 
 ## Post-v1 backlog (ordered)
 
-`-t ui`, SCTP. Noticed while testing M30: with `-r 1 -rp 1000` sipr places
-its first call after one full period (~1 s) where SIPp places it at t=0 —
-check the pacer's first tick against `call_generation_task.cpp`.
+`-t ui`, SCTP. (Checked after M30: the pacer's first call comes one
+inter-call interval after start-up in SIPp too — `call_generation_task.cpp`
+opens calls when `elapsed × rate / rate_period` reaches the count; no
+divergence, see SIPP_COMPAT §6.)

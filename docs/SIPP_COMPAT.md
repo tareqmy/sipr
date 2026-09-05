@@ -759,5 +759,14 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   start-up error (SIPp decrements the budget and carries on without a
   socket). Verified against real sipp both ways by restarting the UAS
   between two calls.
+- Pacing start (verified in `call_generation_task.cpp` `set_rate` ~l.228,
+  `run` ~l.90-110, `wake` ~l.60): SIPp anchors `last_rate_change_time` at
+  start-up and opens `elapsed × rate / rate_period − calls_since` calls per
+  run, so with `-r 1 -rp 1000` the **first call comes at t ≈ 1 s**, not at
+  t = 0 (`-r 10` → 100 ms, `-r 1 -rp 2000` → 2 s); each rate change (`+`/`-`,
+  the control socket) re-anchors the clock and the count. sipr's carry-based
+  pacer produces the same first-call time and the same steady-state
+  spacing; it does not re-anchor on a rate change (the fractional carry
+  survives), a sub-interval difference.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)
