@@ -136,6 +136,15 @@ mod tests {
         MasterKey::from_bytes(&raw)
     }
 
+    /// The echo thread counts after its send returns, so an echoed packet can
+    /// arrive before the counter moves (it does on Linux).
+    fn wait_for_packets(counters: &EchoCounters, n: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while counters.packets.load(Ordering::Relaxed) < n && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn rtp(seq: u16, payload: &[u8]) -> Vec<u8> {
         let mut p = vec![0x80, 0x00];
         p.extend_from_slice(&seq.to_be_bytes());
@@ -159,6 +168,7 @@ mod tests {
         let (n, from) = client.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello");
         assert_eq!(from, echo.local);
+        wait_for_packets(&counters, 1);
         assert_eq!(counters.packets.load(Ordering::Relaxed), 1);
     }
 
@@ -220,6 +230,7 @@ mod tests {
             client.recv_from(&mut buf).is_err(),
             "unauthenticated packet was echoed"
         );
+        wait_for_packets(&counters, 3);
         assert_eq!(counters.packets.load(Ordering::Relaxed), 3);
     }
 }
