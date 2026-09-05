@@ -12,7 +12,7 @@ jobs:
   gates:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -24,22 +24,31 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  # The interop oracle is SIPp 3.7 built from source (as on the development
+  # host); the distro package is 3.6 and lacks the TLS/PCAP/SCTP surface the
+  # suite exercises. SIPP_SRC points the scenario-based tests at its corpus.
   interop:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install real SIPp
-        run: sudo apt-get update && sudo apt-get install -y sip-tester
+      - name: Build real SIPp 3.7 with TLS, PCAP, and SCTP
+        run: |
+          sudo modprobe sctp || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libsctp-dev libpcap-dev libncurses-dev libssl-dev
+          git clone --depth 1 --branch v3.7.7 https://github.com/SIPp/sipp.git /tmp/sipp
+          cd /tmp/sipp && cmake . -DUSE_SCTP=1 -DUSE_PCAP=1 -DUSE_SSL=1 && make -j"$(nproc)"
+          /tmp/sipp/sipp -v | head -1
       - name: Interop against real SIPp
-        run: SIPP_BIN=$(command -v sipp) cargo test --test interop -- --nocapture
+        run: SIPP_BIN=/tmp/sipp/sipp SIPP_SRC=/tmp/sipp cargo test --test interop -- --nocapture
 
   # SCTP needs an OS stack and a sipp built with USE_SCTP; only Linux has both.
   sctp:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -50,7 +59,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake libsctp-dev libpcap-dev libncurses-dev libssl-dev
-          git clone --depth 1 https://github.com/SIPp/sipp.git /tmp/sipp
+          git clone --depth 1 --branch v3.7.7 https://github.com/SIPp/sipp.git /tmp/sipp
           cd /tmp/sipp && cmake . -DUSE_SCTP=1 -DUSE_PCAP=1 -DUSE_SSL=1 && make -j"$(nproc)"
           /tmp/sipp/sipp -v | head -1
       - name: Clippy (sctp feature)

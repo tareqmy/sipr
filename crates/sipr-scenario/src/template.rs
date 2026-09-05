@@ -337,10 +337,8 @@ fn classify_crypto(name: &str) -> Option<Keyword> {
     };
     let (base, video) = if let Some(b) = base.strip_suffix("audio") {
         (b, false)
-    } else if let Some(b) = base.strip_suffix("video") {
-        (b, true)
     } else {
-        return None;
+        (base.strip_suffix("video")?, true)
     };
     let (base, slot) = match base.as_bytes().last() {
         Some(b'1') => (&base[..base.len() - 1], 1),
@@ -365,14 +363,13 @@ fn classify_crypto(name: &str) -> Option<Keyword> {
         CryptoKw::KeyParams
     } else if let Some(s) = base.strip_prefix("cryptosuite") {
         CryptoKw::Suite(suite(s)?)
-    } else if let Some(s) = base.strip_prefix("ue") {
+    } else {
+        let s = base.strip_prefix("ue")?;
         // Only the AES suites have `ue` forms in SIPp.
         if !s.starts_with("aescm128") {
             return None;
         }
         CryptoKw::Unencrypted(suite(s)?)
-    } else {
-        return None;
     };
     Some(Keyword::Crypto {
         kw,
@@ -409,16 +406,14 @@ fn classify_media_port(name: &str) -> Option<Keyword> {
             },
             r,
         )
-    } else if let Some(r) = name.strip_prefix("rtpstream_video_port") {
+    } else {
         (
             Keyword::RtpStreamPort {
                 video: true,
                 offset: 0,
             },
-            r,
+            name.strip_prefix("rtpstream_video_port")?,
         )
-    } else {
-        return None;
     };
     let offset = if rest.is_empty() {
         0
