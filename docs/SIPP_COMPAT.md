@@ -97,8 +97,8 @@ Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 (M20 ramps).
 Network: `-p <local port>` `-i <local ip>` `-t u1|un|t1|tn|l1|ln` (UDP /
 TCP / TLS, one socket or one socket per call; `ui` not implemented)
-`-max_socket <n>` (per-call modes share sockets past n) `-s <service>`
-(called number)
+`-max_socket <n>` (per-call modes share sockets past n) `-rsa <host[:port]>`
+(remote sending address) `-s <service>` (called number)
 `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version` (TLS material,
 SIPp defaults `cacert.pem`/`cakey.pem`).
 Media: `-mi <ip>` (media address; default local IP) `-mp <port>` (base media
@@ -700,5 +700,23 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   per-call socket has its own receive thread rather than SIPp's single
   `poll` loop, so very large `-max_socket` values cost threads; `-t ui`
   (one socket per injected IP) is not implemented.
+- `-rsa host[:port]` (M29; verified in `sipp.cpp` ~l.1827 (parse, default
+  port 5060), `call_generation_task.cpp` ~l.152 and `socket.cpp` ~l.1146-1230
+  (the call's `call_peer`), `socket.cpp` ~l.2588 and `call.cpp` ~l.1489
+  (TCP dials it), `call.cpp` `send_raw` ~l.1570-1600 (`call_remote_socket`),
+  `E_Message_Remote_IP/Port` ~l.2741): the remote *sending* address replaces
+  where messages go, never what keywords say. A UAC's calls send to it
+  instead of the target (mono TCP/TLS dials it; per-call sockets connect to
+  it) while `[remote_ip]`/`[remote_port]` — and so the digest `uri=` — keep
+  the command-line target. A UAS's calls send to it instead of the
+  request's source, and do so from a **socket of their own**
+  (`new_sipp_socket`, connected for TCP/TLS, plain for UDP: responses leave
+  from an ephemeral port, not `-p`), one shared `main_remote_socket` unless
+  the transport is per-call. sipr matches all of this (the UAS-side socket
+  is a call socket shared with cap 1 in mono modes), with one divergence:
+  `[remote_ip]` on a UAS still renders the request's source, where SIPp
+  renders its `remote_ip` global (the command-line remote host, if any).
+  Verified against real sipp in both roles, including sipr accepting the
+  responses a `-rsa` sipp UAS sends from its extra socket.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

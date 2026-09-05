@@ -816,6 +816,26 @@ and the call-creation branches ~l.1148-1185.
 - [x] Deferred: `-t ui`, `-rsa`, `-max_reconnect`/`-reconnect_close`/
       `-reconnect_sleep`, SCTP.
 
+## M29 — `-rsa` remote sending address ✅
+
+Behavioral oracle: `sipp.cpp` ~l.1827, `call_generation_task.cpp` ~l.152,
+`socket.cpp` ~l.1146-1230 / ~l.2588, `call.cpp` ~l.1489 / `send_raw`
+~l.1570-1600 / `E_Message_Remote_IP` ~l.2741.
+
+- [x] `-rsa host[:port]` (default 5060) resolves like the target; a UAC's
+      calls send there (mono and per-call TCP/TLS dial it), a UAS's calls
+      answer there from a socket of their own (shared, or per call under
+      `un`/`tn`/`ln`), and `[remote_ip]`/`[remote_port]`/digest `uri=`
+      keep rendering the nominal remote (`CallState::render_remote`).
+- [x] Tests: CLI parse; e2e `rsa_uac_sends_to_the_sending_address_but_renders_the_target`,
+      `rsa_uas_answers_towards_the_sending_address` (responses reach the
+      rsa address from a non-`-p` port, the caller gets nothing),
+      `rsa_tcp_uas_dials_the_sending_address`; interop
+      `rsa_both_ways_against_real_sipp` (sipr UAC `-rsa` → sipp, sipp UAC
+      `-rsa` → sipr, sipp UAS `-rsa` answering sipr from its extra socket).
+- [x] Deferred: `[remote_ip]` on a UAS follows SIPp's `remote_ip` global.
+
 ## Post-v1 backlog (ordered)
 
-`-rsa` (remote sending address), `-t ui`, the reconnect options, SCTP.
+`-t ui`, the reconnect options (`-max_reconnect`, `-reconnect_close`,
+`-reconnect_sleep`), SCTP.

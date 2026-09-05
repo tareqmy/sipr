@@ -325,7 +325,8 @@ impl TlsTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0022)),
             send_loss_pct: config.send_loss_pct,
             sink,
-            client: None,
+            // A server still dials out under `-rsa`; the same identity serves.
+            client: client_config(tls_config).ok(),
             _accept: accept,
         })
     }

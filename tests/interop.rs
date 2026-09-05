@@ -1849,3 +1849,175 @@ fn real_sipp_per_call_uac_against_sipr_uas() {
         assert!(stderr.contains("successful 3 failed 0"), "{stderr}");
     }
 }
+
+/// `-rsa` against real sipp, three ways: sipr's UAC sends to sipp's UAS via
+/// `-rsa` with a dead nominal target; sipp's UAC does the same towards
+/// sipr's UAS; and sipp's UAS answers sipr's UAC through `-rsa` from a
+/// socket of its own, which sipr must accept.
+#[test]
+fn rsa_both_ways_against_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::rsa_both_ways_against_real_sipp — no sipp.");
+        return;
+    };
+    let dir = std::env::temp_dir();
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let spawn = |bin: &std::path::Path, args: &[&str]| {
+        Reaper(
+            Command::new(bin)
+                .current_dir(&dir)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn"),
+        )
+    };
+    // 1. sipr UAC -rsa → sipp UAS.
+    let sipp_port = free_port();
+    let dead = free_port();
+    let mut uas = spawn(
+        &sipp,
+        &[
+            "-sn",
+            "uas",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &sipp_port.to_string(),
+            "-m",
+            "2",
+            "-timeout",
+            "20",
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut uac = spawn(
+        &sipr,
+        &[
+            "-sn",
+            "uac",
+            "-rsa",
+            &format!("127.0.0.1:{sipp_port}"),
+            "-i",
+            "127.0.0.1",
+            "-m",
+            "2",
+            "-d",
+            "100",
+            "-timeout",
+            "10",
+            "-bg",
+            &format!("127.0.0.1:{dead}"),
+        ],
+    );
+    assert_eq!(
+        wait_with_timeout(&mut uac.0, Duration::from_secs(15)),
+        Some(0),
+        "sipr uac -rsa"
+    );
+    assert_eq!(
+        wait_with_timeout(&mut uas.0, Duration::from_secs(10)),
+        Some(0),
+        "sipp uas"
+    );
+    // 2. sipp UAC -rsa → sipr UAS.
+    let sipr_port = free_port();
+    let dead = free_port();
+    let mut uas = spawn(
+        &sipr,
+        &[
+            "-sn",
+            "uas",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &sipr_port.to_string(),
+            "-m",
+            "2",
+            "-timeout",
+            "20",
+            "-bg",
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut uac = spawn(
+        &sipp,
+        &[
+            "-sn",
+            "uac",
+            "-rsa",
+            &format!("127.0.0.1:{sipr_port}"),
+            "-i",
+            "127.0.0.1",
+            "-m",
+            "2",
+            "-d",
+            "100",
+            "-timeout",
+            "10",
+            &format!("127.0.0.1:{dead}"),
+        ],
+    );
+    assert_eq!(
+        wait_with_timeout(&mut uac.0, Duration::from_secs(15)),
+        Some(0),
+        "sipp uac -rsa"
+    );
+    assert_eq!(
+        wait_with_timeout(&mut uas.0, Duration::from_secs(10)),
+        Some(0),
+        "sipr uas"
+    );
+    // 3. sipp UAS -rsa (answers from its own socket towards sipr's port) ← sipr UAC.
+    let sipp_port = free_port();
+    let sipr_port = free_port();
+    let mut uas = spawn(
+        &sipp,
+        &[
+            "-sn",
+            "uas",
+            "-rsa",
+            &format!("127.0.0.1:{sipr_port}"),
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &sipp_port.to_string(),
+            "-m",
+            "2",
+            "-timeout",
+            "20",
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut uac = spawn(
+        &sipr,
+        &[
+            "-sn",
+            "uac",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &sipr_port.to_string(),
+            "-m",
+            "2",
+            "-d",
+            "100",
+            "-timeout",
+            "10",
+            "-bg",
+            &format!("127.0.0.1:{sipp_port}"),
+        ],
+    );
+    assert_eq!(
+        wait_with_timeout(&mut uac.0, Duration::from_secs(15)),
+        Some(0),
+        "sipr uac must accept sipp's rsa'd responses"
+    );
+    assert_eq!(
+        wait_with_timeout(&mut uas.0, Duration::from_secs(10)),
+        Some(0),
+        "sipp uas -rsa"
+    );
+}

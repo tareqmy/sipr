@@ -61,6 +61,10 @@ pub struct EngineConfig {
     /// `-max_socket`: per-call socket modes share sockets round-robin past
     /// this many open ones (SIPp default 50000).
     pub max_socket: usize,
+    /// `-rsa host[:port]`: send every message there instead of to the target
+    /// (UAC) or back to the request's source (UAS); keywords keep rendering
+    /// the nominal remote.
+    pub remote_sending_addr: Option<SocketAddr>,
     /// Disable retransmissions (`-nr`).
     pub no_retrans: bool,
     /// Global test timeout (`-timeout`).
@@ -387,6 +391,10 @@ struct CallState {
     /// This call's own socket in the per-call modes (opened at its first
     /// send, SIPp's `connect_socket_if_needed`); `None` = the shared one.
     socket: Option<CallSocket>,
+    /// What `[remote_ip]`/`[remote_port]` and the digest URI render: the
+    /// nominal remote (target, or the request's source), which `-rsa` does
+    /// not change (SIPp's `remote_ip`/`remote_port` globals).
+    render_remote: SocketAddr,
 }
 
 /// Why the engine refused to run a scenario.
@@ -555,6 +563,10 @@ struct Engine<'s> {
     reliable: bool,
     /// One socket per call (`un`/`tn`/`ln` as a client).
     per_call: bool,
+    /// `-rsa` as a server: responses leave on a socket of their own aimed at
+    /// the sending address (SIPp's `call_remote_socket`), shared across
+    /// calls unless the transport is per-call.
+    rsa_server: bool,
     /// `-max_socket`: share call sockets round-robin past this many.
     max_socket: usize,
     /// Every call socket opened and not yet closed, for sharing.
@@ -675,6 +687,7 @@ impl<'s> Engine<'s> {
             loss_seed: config.seed,
         };
         let per_call = config.transport.per_call() && scenario.role == Role::Uac;
+        let rsa_server = config.remote_sending_addr.is_some() && scenario.role == Role::Uas;
         let (transport, transport_token, reliable) = match config.transport {
             TransportKind::UdpMono | TransportKind::UdpPerCall => {
                 let u = UdpTransport::bind(&tcfg, net_tx)
@@ -690,6 +703,7 @@ impl<'s> Engine<'s> {
                         let remote = config
                             .target
                             .ok_or_else(|| EngineError("TCP UAC needs a remote target".into()))?;
+                        let remote = config.remote_sending_addr.unwrap_or(remote);
                         TcpTransport::connect(&tcfg, net_tx, remote).map_err(|e| {
                             EngineError(format!("cannot connect TCP to {remote}: {e}"))
                         })?
@@ -714,6 +728,7 @@ impl<'s> Engine<'s> {
                         let remote = config
                             .target
                             .ok_or_else(|| EngineError("TLS UAC needs a remote target".into()))?;
+                        let remote = config.remote_sending_addr.unwrap_or(remote);
                         TlsTransport::connect(&tcfg, tls_cfg, net_tx, remote).map_err(|e| {
                             EngineError(format!("cannot connect TLS to {remote}: {e}"))
                         })?
@@ -1031,6 +1046,7 @@ impl<'s> Engine<'s> {
             transport_token,
             reliable,
             per_call,
+            rsa_server,
             max_socket: config.max_socket.max(1),
             call_socket_pool: Vec::new(),
             next_shared_socket: 0,
@@ -1576,6 +1592,7 @@ impl<'s> Engine<'s> {
             call_id.clone(),
             new_call(
                 number,
+                self.config.remote_sending_addr.unwrap_or(target),
                 target,
                 self.config.base_cseq,
                 &self.scenario.vars,
@@ -1716,8 +1733,8 @@ impl<'s> Engine<'s> {
                         let Some(call) = self.calls.get(call_id) else {
                             return;
                         };
-                        let remote_ip = call.remote.ip().to_string();
-                        let digest_uri = self.digest_uri(call.remote);
+                        let remote_ip = call.render_remote.ip().to_string();
+                        let digest_uri = self.digest_uri(call.render_remote);
                         let var_ctx = crate::render::VarCtx {
                             store: &call.store,
                             vars: &self.scenario.vars,
@@ -1731,7 +1748,7 @@ impl<'s> Engine<'s> {
                         let ctx = RenderCtx {
                             service: &self.config.service,
                             remote_ip: &remote_ip,
-                            remote_port: call.remote.port(),
+                            remote_port: call.render_remote.port(),
                             local_ip: &self.local_ip_str,
                             local_port: self.call_local_port(call),
                             media_ip: &self.media_ip_str,
@@ -2052,6 +2069,7 @@ impl<'s> Engine<'s> {
                     call_id.clone(),
                     new_call(
                         number,
+                        self.config.remote_sending_addr.unwrap_or(packet.from),
                         packet.from,
                         self.config.base_cseq,
                         &self.scenario.vars,
@@ -2231,8 +2249,8 @@ impl<'s> Engine<'s> {
         let Some(call) = self.calls.get(call_id) else {
             return true;
         };
-        let remote_ip = call.remote.ip().to_string();
-        let digest_uri = self.digest_uri(call.remote);
+        let remote_ip = call.render_remote.ip().to_string();
+        let digest_uri = self.digest_uri(call.render_remote);
         let mut store = call.store.clone();
         let snapshot = call.store.clone(); // immutable copy for the base ctx
         let last = call.last_recv.clone();
@@ -2250,7 +2268,7 @@ impl<'s> Engine<'s> {
             let ctx = RenderCtx {
                 service: &self.config.service,
                 remote_ip: &remote_ip,
-                remote_port: call.remote.port(),
+                remote_port: call.render_remote.port(),
                 local_ip: &self.local_ip_str,
                 local_port: self.call_local_port(call),
                 media_ip: &self.media_ip_str,
@@ -2829,8 +2847,8 @@ impl<'s> Engine<'s> {
         template: &MsgTemplate,
     ) -> Option<String> {
         let call = self.calls.get(call_id)?;
-        let remote_ip = call.remote.ip().to_string();
-        let digest_uri = self.digest_uri(call.remote);
+        let remote_ip = call.render_remote.ip().to_string();
+        let digest_uri = self.digest_uri(call.render_remote);
         let var_ctx = crate::render::VarCtx {
             store: &call.store,
             vars: &self.scenario.vars,
@@ -2844,7 +2862,7 @@ impl<'s> Engine<'s> {
         let ctx = RenderCtx {
             service: &self.config.service,
             remote_ip: &remote_ip,
-            remote_port: call.remote.port(),
+            remote_port: call.render_remote.port(),
             local_ip: &self.local_ip_str,
             local_port: self.call_local_port(call),
             media_ip: &self.media_ip_str,
@@ -3010,7 +3028,7 @@ impl<'s> Engine<'s> {
     /// per-call modes — SIPp's `connect_socket_if_needed` +
     /// `new_sipp_call_socket`. No-op elsewhere.
     fn ensure_call_socket(&mut self, call_id: &str) -> Result<(), String> {
-        if !self.per_call {
+        if !(self.per_call || self.rsa_server) {
             return Ok(());
         }
         let Some(call) = self.calls.get(call_id) else {
@@ -3020,9 +3038,16 @@ impl<'s> Engine<'s> {
             return Ok(());
         }
         let remote = call.remote;
+        // SIPp: one `main_remote_socket` for every -rsa server call unless
+        // the transport is per-call.
+        let cap = if self.rsa_server && !self.config.transport.per_call() {
+            1
+        } else {
+            self.max_socket
+        };
         // Sockets whose last call ended are gone; the rest can be shared.
         self.call_socket_pool.retain(|w| w.upgrade().is_some());
-        let socket = if self.call_socket_pool.len() >= self.max_socket {
+        let socket = if self.call_socket_pool.len() >= cap {
             let i = self.next_shared_socket % self.call_socket_pool.len();
             self.next_shared_socket = self.next_shared_socket.wrapping_add(1);
             self.call_socket_pool[i]
@@ -3073,6 +3098,9 @@ impl<'s> Engine<'s> {
     /// `[local_port]`: the call's own socket in the per-call client modes
     /// (SIPp's `call_port`), else the transport's.
     fn call_local_port(&self, call: &CallState) -> u16 {
+        if !self.per_call {
+            return self.transport.local_addr().port(); // servers: `-p`, as SIPp
+        }
         call.socket.as_ref().map_or_else(
             || self.transport.local_addr().port(),
             CallSocket::local_port,
@@ -3339,9 +3367,11 @@ fn step_label(step: &Step) -> String {
 }
 
 /// Fresh call state.
+#[allow(clippy::too_many_arguments)]
 fn new_call(
     number: u64,
     remote: SocketAddr,
+    render_remote: SocketAddr,
     base_cseq: u32,
     vars: &sipr_scenario::model::VarTable,
     cnonce: String,
@@ -3379,6 +3409,7 @@ fn new_call(
         pause_deadline: None,
         paused_until: None,
         socket: None,
+        render_remote,
     }
 }
 

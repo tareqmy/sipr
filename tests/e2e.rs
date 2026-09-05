@@ -3588,6 +3588,7 @@ fn rtp_echo_with_an_unknown_codec_fails_at_load() {
 struct SeenInvite {
     source_port: u16,
     via_port: u16,
+    request_line: String,
 }
 
 /// The port in a top Via's sent-by (`SIP/2.0/UDP 127.0.0.1:PORT;...`).
@@ -3625,6 +3626,7 @@ fn spawn_recording_udp_uas(calls: usize) -> (SocketAddr, std::thread::JoinHandle
                 "INVITE" => seen.push(SeenInvite {
                     source_port: from.port(),
                     via_port: via_port(&msg),
+                    request_line: msg.start_line().to_owned(),
                 }),
                 "BYE" => byes += 1,
                 _ => continue,
@@ -3871,6 +3873,172 @@ fn tls_per_call_connections_complete_calls() {
     assert!(uac_err.contains("one connection per call"), "{uac_err}");
     assert_eq!(uas_code, Some(0), "uas:\n{uas_err}");
     assert!(uas_err.contains("successful 2 failed 0"), "{uas_err}");
+}
+
+// ---- -rsa: remote sending address (M29) -----------------------------------------
+
+/// `-rsa` as a UAC: every message goes to the sending address, while
+/// `[remote_ip]:[remote_port]` in the request line still name the nominal
+/// target (SIPp's `remote_ip`/`remote_port` globals).
+#[test]
+fn rsa_uac_sends_to_the_sending_address_but_renders_the_target() {
+    let (rsa_addr, uas) = spawn_recording_udp_uas(1);
+    let dead_target = free_port();
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-rsa",
+        &rsa_addr.to_string(),
+        "-i",
+        "127.0.0.1",
+        "-m",
+        "1",
+        "-d",
+        "100",
+        "-timeout",
+        "10",
+        "-bg",
+        &format!("127.0.0.1:{dead_target}"),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    let seen = uas.join().expect("uas");
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0]
+            .request_line
+            .contains(&format!("127.0.0.1:{dead_target} SIP/2.0")),
+        "request line must name the nominal target: {}",
+        seen[0].request_line
+    );
+}
+
+/// `-rsa` as a UAS: responses go to the sending address from a socket of
+/// their own (SIPp's `call_remote_socket`), not back to the request's source.
+#[test]
+fn rsa_uas_answers_towards_the_sending_address() {
+    let rsa_sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    rsa_sink
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let rsa_addr = rsa_sink.local_addr().expect("addr");
+    let port = free_port();
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sn",
+        "uas",
+        "-rsa",
+        &rsa_addr.to_string(),
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-m",
+        "1",
+        "-timeout",
+        "6",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(300));
+    let caller = UdpSocket::bind("127.0.0.1:0").expect("bind caller");
+    caller
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .expect("timeout");
+    let invite = format!(
+        "INVITE sip:s@127.0.0.1:{port} SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{cp};branch=z9hG4bKrsa1\r\n\
+         From: <sip:a@x>;tag=1\r\nTo: <sip:s@x>\r\nCall-ID: rsa-1\r\nCSeq: 1 INVITE\r\n\
+         Contact: <sip:a@127.0.0.1:{cp}>\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
+        cp = caller.local_addr().expect("addr").port()
+    );
+    // A raw caller has no retransmission timer: resend until the sending
+    // address hears a response (the UAS may still be starting).
+    rsa_sink
+        .set_read_timeout(Some(Duration::from_millis(700)))
+        .expect("timeout");
+    let mut buf = [0u8; 65_535];
+    let mut got = None;
+    for _ in 0..8 {
+        caller
+            .send_to(invite.as_bytes(), ("127.0.0.1", port))
+            .expect("send invite");
+        if let Ok(x) = rsa_sink.recv_from(&mut buf) {
+            got = Some(x);
+            break;
+        }
+    }
+    let (n, from) = got.expect("the 180/200 must reach the rsa address");
+    let text = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        text.starts_with("SIP/2.0 1") || text.starts_with("SIP/2.0 200"),
+        "{text}"
+    );
+    assert_ne!(
+        from.port(),
+        port,
+        "SIPp answers from a socket of its own, not -p"
+    );
+    assert!(
+        caller.recv_from(&mut buf).is_err(),
+        "the caller itself must receive nothing"
+    );
+    let _ = wait_exit(&mut uas, Duration::from_secs(10));
+    let _ = uas_err.join();
+}
+
+/// `-rsa` over TCP as a UAS: the server dials the sending address and writes
+/// its responses on that connection.
+#[test]
+fn rsa_tcp_uas_dials_the_sending_address() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rsa listener");
+    let rsa_addr = listener.local_addr().expect("addr");
+    let port = free_port();
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sn",
+        "uas",
+        "-t",
+        "t1",
+        "-rsa",
+        &rsa_addr.to_string(),
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-m",
+        "1",
+        "-timeout",
+        "6",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(300));
+    let mut caller = None;
+    for _ in 0..30 {
+        if let Ok(c) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            caller = Some(c);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut caller = caller.expect("connect uas");
+    let invite = format!(
+        "INVITE sip:s@127.0.0.1:{port} SIP/2.0\r\nVia: SIP/2.0/TCP 127.0.0.1:{cp};branch=z9hG4bKrsa2\r\n\
+         From: <sip:a@x>;tag=1\r\nTo: <sip:s@x>\r\nCall-ID: rsa-2\r\nCSeq: 1 INVITE\r\n\
+         Contact: <sip:a@127.0.0.1:{cp};transport=tcp>\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
+        cp = caller.local_addr().expect("addr").port()
+    );
+    caller.write_all(invite.as_bytes()).expect("send invite");
+    listener.set_nonblocking(false).expect("blocking");
+    let (mut conn, _) = listener.accept().expect("uas must dial the rsa address");
+    conn.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let mut buf = [0u8; 65_535];
+    let n = conn.read(&mut buf).expect("response on the rsa connection");
+    let text = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        text.starts_with("SIP/2.0 1") || text.starts_with("SIP/2.0 200"),
+        "{text}"
+    );
+    let _ = wait_exit(&mut uas, Duration::from_secs(10));
+    let _ = uas_err.join();
 }
 
 // ---- _unexp.main handler, pauserestore, jump variable=, closecon (M27) ---------

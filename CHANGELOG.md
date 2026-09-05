@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`-rsa host[:port]`** — the remote sending address: a UAC sends every
+  message there instead of to the target, a UAS answers there (from a
+  socket of its own) instead of to the request's source, and the keywords
+  keep naming the nominal remote, as in SIPp. Verified both ways against
+  real sipp.
+
 ## [0.17.0] — 2026-09-05
 
 ### Added

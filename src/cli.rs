@@ -110,6 +110,8 @@ pub struct Cli {
     pub transport: Transport,
     /// `-max_socket`: sockets to open before per-call modes start sharing.
     pub max_socket: Option<usize>,
+    /// `-rsa`: remote sending address `host[:port]`.
+    pub remote_sending: Option<String>,
     /// `-s`: service / called user part, substituted for `[service]`.
     pub service: String,
     /// `-au`: username for `[authentication]`.
@@ -200,6 +202,7 @@ impl Default for Cli {
             http_token: None,
             transport: Transport::UdpMono,
             max_socket: None,
+            remote_sending: None,
             service: "service".to_owned(),
             auth_user: None,
             auth_password: None,
@@ -469,6 +472,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "Maximum UDP retransmissions per message",
     ),
     (
+        "rsa",
+        true,
+        "HOST[:PORT]",
+        "Remote sending address: send every message there instead of to the target (UAC) or the request's source (UAS); default port 5060",
+    ),
+    (
         "max_socket",
         true,
         "N",
@@ -693,6 +702,7 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "inf" => cli.inf.push(std::path::PathBuf::from(val(value))),
         "3pcc" => cli.three_pcc = Some(val(value)),
         "users" => cli.users = Some(parse_num(flag, &val(value))?),
+        "rsa" => cli.remote_sending = Some(val(value)),
         "max_socket" => {
             let n: usize = parse_num(flag, &val(value))?;
             if n == 0 {
@@ -924,6 +934,12 @@ mod tests {
         assert_eq!(cli(&["-t", "tn", "host"]).transport, Transport::TcpPerCall);
         assert_eq!(cli(&["-t", "ln", "host"]).transport, Transport::TlsPerCall);
         assert_eq!(cli(&["-max_socket", "3", "host"]).max_socket, Some(3));
+        assert_eq!(
+            cli(&["-rsa", "10.0.0.9:5080", "host"])
+                .remote_sending
+                .as_deref(),
+            Some("10.0.0.9:5080")
+        );
         let err = run(&["-max_socket", "0", "host"]).unwrap_err();
         assert!(err.contains("at least 1"), "{err}");
         let err = run(&["-t", "ui"]).unwrap_err();

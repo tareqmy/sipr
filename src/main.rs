@@ -162,6 +162,13 @@ fn run(cli: &Cli) -> ExitCode {
             crate::cli::Transport::TlsPerCall => sipr_engine::TransportKind::TlsPerCall,
         },
         max_socket: cli.max_socket.unwrap_or(50_000),
+        remote_sending_addr: match &cli.remote_sending {
+            Some(raw) => match resolve_target(raw) {
+                Ok(addr) => Some(addr),
+                Err(e) => return fatal(&format!("-rsa: {e}")),
+            },
+            None => None,
+        },
         twin_addr: match &cli.three_pcc {
             Some(raw) => match resolve_target(raw) {
                 Ok(addr) => Some(addr),
