@@ -159,6 +159,13 @@ mod tests {
         client.send_to(b"video!", ("127.0.0.1", port + 2)).unwrap();
         let (n, _) = client.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"video!");
+        // The echo thread counts after its send returns, so the reply can
+        // arrive here first (it does on Linux): wait for the counters.
+        let settled = std::time::Instant::now() + Duration::from_secs(2);
+        while echo.video.packets.load(Ordering::Relaxed) < 1 && std::time::Instant::now() < settled
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(echo.audio.packets.load(Ordering::Relaxed), 1);
         assert_eq!(echo.audio.bytes.load(Ordering::Relaxed), 5);
         assert_eq!(echo.video.packets.load(Ordering::Relaxed), 1);

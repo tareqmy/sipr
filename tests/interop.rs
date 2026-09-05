@@ -90,13 +90,17 @@ fn sipp_supports_tls(sipp: &std::path::Path) -> bool {
 /// (sipp binds its connect socket onto its own listening port; macOS refuses
 /// with EADDRINUSE where Linux's SO_REUSEADDR semantics allow it).
 fn sipp_stream_client_cannot_bind(dir: &std::path::Path) -> bool {
+    sipp_error_log_contains(dir, "Unable to bind TCP socket")
+}
+
+/// Whether any sipp `*_errors.log` in `dir` mentions `needle`.
+fn sipp_error_log_contains(dir: &std::path::Path, needle: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     entries.flatten().any(|e| {
         e.file_name().to_string_lossy().ends_with("_errors.log")
-            && std::fs::read_to_string(e.path())
-                .is_ok_and(|s| s.contains("Unable to bind TCP socket"))
+            && std::fs::read_to_string(e.path()).is_ok_and(|s| s.contains(needle))
     })
 }
 
@@ -1751,10 +1755,14 @@ fn sipr_per_call_sockets_against_real_sipp_uas() {
             stderr.contains("successful 3 failed 0"),
             "-t {mode}: {stderr}"
         );
-        assert_eq!(
-            sipp_code,
-            Some(0),
-            "-t {mode}: sipp uas must complete all calls"
+        // Real sipp's UAS keeps each call in a 4 s timewait after the final
+        // 200; under `tn` sipr closes the per-call connection as soon as its
+        // call ends, and sipp (on Linux, promptly) books that call as
+        // "TCP closed" — exit 1 with every call otherwise complete. sipr's
+        // side, asserted above, is what this test is about.
+        assert!(
+            matches!(sipp_code, Some(0 | 1)),
+            "-t {mode}: sipp uas exited {sipp_code:?}"
         );
     }
 }
@@ -2313,13 +2321,32 @@ fn per_ip_sockets_both_ways_against_real_sipp() {
     {
         let port = free_port();
         let p = port.to_string();
-        let mut uas_args = ui(&["-sn", "uas", "-p", &p, "-m", "2", "-timeout", "20"]);
+        let mut uas_args = ui(&[
+            "-sn",
+            "uas",
+            "-p",
+            &p,
+            "-m",
+            "2",
+            "-timeout",
+            "20",
+            "-trace_err",
+        ]);
         if uas_bg {
             uas_args.push("-bg".into());
         }
         let uas_refs: Vec<&str> = uas_args.iter().map(String::as_str).collect();
         let mut uas = spawn(uas_bin, &uas_refs);
         std::thread::sleep(Duration::from_millis(400));
+        // sipp's own -t ui UAS fails to bind on macOS ("Address family not
+        // supported by protocol family", errno 47): a sipp limitation, skip.
+        if !uas_bg && sipp_error_log_contains(dir.path(), "Unable to bind main socket") {
+            eprintln!(
+                "SKIPPED interop::per_ip_sockets_both_ways_against_real_sipp (sipp -t ui UAS) — \
+                 sipp cannot bind its per-IP main socket on this host."
+            );
+            continue;
+        }
         let target = format!("{lan}:{port}");
         let mut uac_args: Vec<&str> = vec![
             "-sn",
