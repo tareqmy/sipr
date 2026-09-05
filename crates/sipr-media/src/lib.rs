@@ -25,9 +25,11 @@ pub mod replay;
 pub mod rtp;
 pub mod sdp;
 pub mod srtp;
+pub mod srtp_echo;
 
 pub use echo::EchoServer;
 pub use pcap::{Frame, PcapError, PcapStream};
 pub use replay::{MediaEvent, MediaPlayer, Source, StreamSpec};
 pub use rtp::{RtpParams, RtpSource};
 pub use srtp::{MasterKey, SrtpContext, Suite};
+pub use srtp_echo::EchoStream;

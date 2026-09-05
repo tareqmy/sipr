@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use crate::diag::{Diagnostic, Diagnostics};
 use crate::model::{
     Action, ArithOp, CompareOp, Expect, IntCmd, MediaKind, Operand, PauseSpec, RecvStep, Role,
-    RtpSource, RtpStreamCmd, Scenario, SearchIn, SendStep, Step, StepCommon, StepIndex, VarId,
-    VarTable,
+    RtpEchoCmd, RtpEchoVerb, RtpSource, RtpStreamCmd, Scenario, SearchIn, SendStep, Step,
+    StepCommon, StepIndex, VarId, VarTable,
 };
 use crate::template::{self, Keyword, MsgTemplate};
 use crate::xml::{self, Element, Node};
@@ -935,16 +935,9 @@ impl Compiler {
                         "rtp_echo",
                     ],
                 );
-                if el.attr("rtp_echo").is_some() {
-                    self.diags.error(
-                        Some(line),
-                        "exec rtp_echo=startaudio|… (per-call SRTP echo) is not supported — \
-                         use -rtp_echo and the <rtp_echo value=> action for plain RTP echo",
-                    );
-                    return None;
-                }
                 let media_attrs = [
                     "rtp_stream",
+                    "rtp_echo",
                     "play_dtmf",
                     "play_pcap_audio",
                     "play_pcap_video",
@@ -958,10 +951,13 @@ impl Compiler {
                 if media_attrs > 1 {
                     self.diags.error(
                         Some(line),
-                        "exec: only one of rtp_stream=/play_dtmf=/play_pcap_*=/int_cmd=/\
-                         command= per action",
+                        "exec: only one of rtp_stream=/rtp_echo=/play_dtmf=/play_pcap_*=/\
+                         int_cmd=/command= per action",
                     );
                     return None;
+                }
+                if let Some(v) = el.attr("rtp_echo") {
+                    return self.parse_rtp_echo(v, line).map(Action::RtpEcho);
                 }
                 if let Some(v) = el.attr("rtp_stream") {
                     return self.parse_rtp_stream(v, line).map(Action::RtpStream);
@@ -1082,6 +1078,63 @@ impl Compiler {
                 None
             }
         }
+    }
+
+    /// `exec rtp_echo="<verb>[,payload_type[,payload_name]]"` — SIPp's
+    /// `setRTPEchoActInfo` grammar; verbs matched by prefix as SIPp does.
+    fn parse_rtp_echo(&mut self, value: &str, line: u32) -> Option<RtpEchoCmd> {
+        let mut fields = value.trim().split(',').map(str::trim);
+        let verb_text = fields.next().unwrap_or_default();
+        let (verb, video) = if let Some(rest) = verb_text.strip_prefix("start") {
+            (RtpEchoVerb::Start, rest)
+        } else if let Some(rest) = verb_text.strip_prefix("update") {
+            (RtpEchoVerb::Update, rest)
+        } else if let Some(rest) = verb_text.strip_prefix("stop") {
+            (RtpEchoVerb::Stop, rest)
+        } else {
+            self.diags.error(
+                Some(line),
+                format!(
+                    "exec rtp_echo=\"{verb_text}\": expected startaudio|updateaudio|stopaudio|\
+                     startvideo|updatevideo|stopvideo"
+                ),
+            );
+            return None;
+        };
+        let video = match video {
+            "audio" => false,
+            "video" => true,
+            _ => {
+                self.diags.error(
+                    Some(line),
+                    format!("exec rtp_echo=\"{verb_text}\": verb must end in audio or video"),
+                );
+                return None;
+            }
+        };
+        let payload_type = match fields.next().filter(|f| !f.is_empty()) {
+            None => None,
+            Some(raw) => match raw.parse::<u8>() {
+                Ok(pt) if pt <= 127 => Some(pt),
+                _ => {
+                    self.diags.error(
+                        Some(line),
+                        format!("exec rtp_echo=: invalid payload type '{raw}' (0..=127)"),
+                    );
+                    return None;
+                }
+            },
+        };
+        let payload_name = fields
+            .next()
+            .filter(|f| !f.is_empty())
+            .map(ToOwned::to_owned);
+        Some(RtpEchoCmd {
+            verb,
+            video,
+            payload_type,
+            payload_name,
+        })
     }
 
     /// `exec rtp_stream="file|apattern|vpattern|pause|resume[,...]"` —

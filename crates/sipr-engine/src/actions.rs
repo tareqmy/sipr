@@ -133,6 +133,8 @@ pub enum ActionOutcome {
     PlayDtmf(String),
     /// `<rtp_echo value=>`: switch global echoing. Not terminal.
     RtpEcho(bool),
+    /// `exec rtp_echo=`: start/update/stop this call's echo. Not terminal.
+    RtpEchoCmd(sipr_scenario::model::RtpEchoCmd),
 }
 
 /// Run every action in order, mutating the store and collecting outcomes.
@@ -175,6 +177,7 @@ fn run_actions_impl(
                 | ActionOutcome::RtpStream(_)
                 | ActionOutcome::PlayDtmf(_)
                 | ActionOutcome::RtpEcho(_)
+                | ActionOutcome::RtpEchoCmd(_)
         );
         out.push(outcome);
         if terminal {
@@ -212,9 +215,21 @@ fn run_one(
             assign_to,
         } => {
             let haystack = match cmd_text {
-                Some(text) => cmd_haystack(*search_in, header.as_deref(), text),
+                Some(text) => cmd_haystack(*search_in, header.as_deref(), *start_line, text),
                 None => ereg_haystack(*search_in, header.as_deref(), *start_line, last_msg),
             };
+            // SIPp: a `hdr` search whose header is absent fails the call
+            // outright under check_it (E_AR_HDR_NOT_FOUND), whatever the
+            // regexp would have made of an empty haystack.
+            if *search_in == SearchIn::Hdr && *check_it && haystack.is_empty() {
+                for &var in assign_to {
+                    store.set(var, Value::Unset);
+                }
+                return ActionOutcome::FailCall(format!(
+                    "ereg: header {} not found in message (check_it)",
+                    header.as_deref().unwrap_or("")
+                ));
+            }
             match regexp.find_strings(haystack.as_bytes()) {
                 Some(caps) => {
                     // assign_to[0] gets the whole match; [1..] get groups.
@@ -356,6 +371,7 @@ fn run_one(
         Action::RtpStream(cmd) => ActionOutcome::RtpStream(cmd.clone()),
         Action::PlayDtmf(t) => ActionOutcome::PlayDtmf(render_with_store(t, store, base_ctx)),
         Action::RtpEchoState(on) => ActionOutcome::RtpEcho(*on),
+        Action::RtpEcho(cmd) => ActionOutcome::RtpEchoCmd(cmd.clone()),
         Action::ExecInt(cmd) => match cmd {
             sipr_scenario::model::IntCmd::StopCall => {
                 ActionOutcome::FailCall("exec stop_call".into())
@@ -402,23 +418,40 @@ fn run_one(
 }
 
 /// Haystack for `<recvCmd>` actions: the raw twin command text (`search_in`
-/// `msg`), or a header extracted from it (`hdr`). The command is a plain text
-/// blob (SIPp treats it likewise), so header extraction is a simple line scan.
-fn cmd_haystack(search_in: SearchIn, header: Option<&str>, text: &str) -> String {
+/// `msg`), or a header extracted from it (`hdr`) exactly as from a SIP
+/// message (SIPp runs the same `extractSubMessage` on the command blob).
+fn cmd_haystack(search_in: SearchIn, header: Option<&str>, start_line: bool, text: &str) -> String {
     match search_in {
         SearchIn::Msg => text.to_owned(),
-        SearchIn::Hdr => {
-            let want = header.unwrap_or("").trim_end_matches(':');
-            text.lines()
-                .filter_map(|l| {
-                    l.split_once(':').and_then(|(name, val)| {
-                        name.trim().eq_ignore_ascii_case(want).then(|| val.trim())
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join("\r\n")
-        }
+        SearchIn::Hdr => header_haystack(text, header.unwrap_or(""), start_line),
     }
+}
+
+/// SIPp's `extractSubMessage` for `search_in="hdr"`: the text after the
+/// first occurrence of the `header` string (`"CSeq:"` — colon included, it
+/// is a plain substring, so `header="CSeq"` yields `": 1 INVITE"`) up to the
+/// end of that line, leading space and all. `start_line="true"` anchors the
+/// match to the beginning of a line. Empty when absent. sipr matches the
+/// name case-insensitively where SIPp (without `case_indep`) would not — a
+/// tolerance on the inbound side only.
+fn header_haystack(text: &str, header: &str, start_line: bool) -> String {
+    if header.is_empty() {
+        return String::new();
+    }
+    let lower_text = text.to_ascii_lowercase();
+    let lower_header = header.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(rel) = lower_text[from..].find(&lower_header) {
+        let at = from + rel;
+        let at_line_start = at == 0 || lower_text.as_bytes()[at - 1] == b'\n';
+        if !start_line || at_line_start {
+            let rest = &text[at + header.len()..];
+            let end = rest.find(['\r', '\n']).unwrap_or(rest.len());
+            return rest[..end].to_owned();
+        }
+        from = at + 1;
+    }
+    String::new()
 }
 
 fn ereg_haystack(
@@ -431,9 +464,7 @@ fn ereg_haystack(
         return String::new();
     };
     match search_in {
-        SearchIn::Hdr => header
-            .map(|h| msg.header_lines(h).join("\r\n"))
-            .unwrap_or_default(),
+        SearchIn::Hdr => header_haystack(&msg.reconstruct(), header.unwrap_or(""), start_line),
         SearchIn::Msg => {
             if start_line {
                 msg.start_line().to_owned()
@@ -488,6 +519,33 @@ mod tests {
         assert_eq!(Value::Unset.as_str(), "");
         assert!(!Value::Unset.is_set());
         assert!(Value::Num(0.0).is_set());
+    }
+
+    /// SIPp's `extractSubMessage`: `[$1]` of `ereg regexp=".*" search_in="hdr"
+    /// header="CSeq:"` is ` 1 INVITE` — the rest of the line after the
+    /// header string, leading space included, first occurrence only.
+    #[test]
+    fn hdr_haystack_is_the_rest_of_the_first_matching_line() {
+        let msg = "INVITE sip:s@x SIP/2.0\r\nVia: SIP/2.0/UDP a;branch=1\r\n\
+            Via: SIP/2.0/UDP b\r\nCSeq: 1 INVITE\r\nContact: <sip:c@x>\r\n\r\n";
+        assert_eq!(header_haystack(msg, "CSeq:", false), " 1 INVITE");
+        assert_eq!(header_haystack(msg, "cseq:", false), " 1 INVITE");
+        assert_eq!(header_haystack(msg, "CSeq", false), ": 1 INVITE");
+        assert_eq!(
+            header_haystack(msg, "Via:", false),
+            " SIP/2.0/UDP a;branch=1"
+        );
+        assert_eq!(header_haystack(msg, "X-Missing:", false), "");
+        assert_eq!(header_haystack(msg, "", false), "");
+        // start_line anchors: "act:" occurs mid-line in "Contact:" only.
+        assert_eq!(header_haystack(msg, "act:", false), " <sip:c@x>");
+        assert_eq!(header_haystack(msg, "act:", true), "");
+        assert_eq!(header_haystack(msg, "INVITE", true), " sip:s@x SIP/2.0");
+        let inbound = sipr_net::message::Inbound::parse(msg.as_bytes()).expect("parse");
+        assert_eq!(
+            ereg_haystack(SearchIn::Hdr, Some("CSeq:"), false, Some(&inbound)),
+            " 1 INVITE"
+        );
     }
 
     #[test]

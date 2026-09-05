@@ -350,6 +350,31 @@ pub enum RtpStreamCmd {
     },
 }
 
+/// `exec rtp_echo="startaudio|updateaudio|stopaudio|startvideo|updatevideo|
+/// stopvideo[,payload_type[,payload_name]]"` — SIPp's per-call (S)RTP echo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RtpEchoCmd {
+    /// Start, update (re-key), or stop.
+    pub verb: RtpEchoVerb,
+    /// The video stream rather than audio.
+    pub video: bool,
+    /// Payload type; `None` = the `-rtp_payload` default.
+    pub payload_type: Option<u8>,
+    /// Payload name; `None` = SIPp's default for 0/8/9/18.
+    pub payload_name: Option<String>,
+}
+
+/// The `rtp_echo` verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtpEchoVerb {
+    /// `start…`
+    Start,
+    /// `update…` (re-derive keys after a renegotiation).
+    Update,
+    /// `stop…`
+    Stop,
+}
+
 /// A v1 action (docs/SIPP_COMPAT.md §1).
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -472,6 +497,8 @@ pub enum Action {
     /// `<rtp_echo value="0|1"/>`: switch the process-wide `-rtp_echo`
     /// echoing off or on (SIPp's global `rtp_echo_state`).
     RtpEchoState(bool),
+    /// `exec rtp_echo="start…"`: this call echoes (S)RTP on its media port.
+    RtpEcho(RtpEchoCmd),
     /// Look up a key in an indexed injection file; store the matched line
     /// number (or -1 on a miss) into a variable.
     Lookup {
@@ -536,6 +563,14 @@ impl Scenario {
         })
     }
 
+    /// Every `rtp_echo` command.
+    pub fn rtp_echo_cmds(&self) -> impl Iterator<Item = &RtpEchoCmd> {
+        self.all_actions().filter_map(|a| match a {
+            Action::RtpEcho(cmd) => Some(cmd),
+            _ => None,
+        })
+    }
+
     /// Every `rtp_stream` play command.
     pub fn rtp_stream_plays(&self) -> impl Iterator<Item = &RtpStreamCmd> {
         self.all_actions().filter_map(|a| match a {
@@ -551,7 +586,10 @@ impl Scenario {
         self.all_actions().any(|a| {
             matches!(
                 a,
-                Action::PlayPcap { .. } | Action::RtpStream(_) | Action::PlayDtmf(_)
+                Action::PlayPcap { .. }
+                    | Action::RtpStream(_)
+                    | Action::PlayDtmf(_)
+                    | Action::RtpEcho(_)
             )
         })
     }

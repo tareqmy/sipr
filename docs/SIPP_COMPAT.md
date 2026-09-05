@@ -1,3 +1,35 @@
+
+- `exec rtp_echo=` (M25; verified in `actions.cpp` `setRTPEchoActInfo`,
+  `scenario.cpp` ~l.1729, `rtpstream.cpp` ~l.2519-2665): the value is
+  `<verb>,<payload_type>,<payload_name>`; verbs are matched by **prefix**
+  (`startaudio`, `updateaudio`, `stopaudio`, `startvideo`, `updatevideo`,
+  `stopvideo`), the payload type defaults to `-rtp_payload` and the name to
+  SIPp's table for 0/8/9/18 — an unknown codec is a parse-time error. The
+  echo thread `recvfrom`s on the call's `[rtpstream_*_port]`, and when the
+  answer carried `a=crypto` it `processIncomingPacket`s under the peer's
+  key, rebuilds the packet, `setSSRC`s the *incoming* SSRC, re-protects it
+  under the local key with the incoming sequence number, and `sendto`s the
+  packet's source; an authentication failure is only logged and the bytes
+  go out anyway. Both threads are process singletons — a second call's
+  `startaudio` re-keys the same thread. sipr matches the grammar, the
+  defaults and validation, the port, the re-keying with the caller's SSRC
+  and sequence numbers, and the counters, with these divergences: (1) one
+  echo per `(call, kind)`, stopped with the call, instead of a shared
+  singleton; (2) a packet failing authentication is dropped, not echoed;
+  (3) `update` restarts the echo with the current negotiation (the port is
+  released synchronously so nothing is lost but the packets in flight)
+  rather than swapping keys in place. Verified against real sipp: its
+  `pfca_uac_apattern_crypto_simple.xml` passes its own RTP check (exit 0)
+  against sipr playing `pfca_uas_audio_crypto_simple.xml` unchanged.
+- `ereg search_in="hdr"` (M25; verified in `call.cpp` `extractSubMessage`):
+  the haystack is the text after the **first occurrence of the header
+  string as a plain substring** (`header="CSeq:"` gives ` 1 INVITE`,
+  leading space included; `header="CSeq"` gives `: 1 INVITE`) up to the
+  end of that line; `start_line="true"` anchors the match to a line start;
+  `case_indep` selects case-insensitive matching; and an absent header
+  under `check_it` fails the call (`E_AR_HDR_NOT_FOUND`) regardless of the
+  regexp. sipr matches this, matching the header string case-insensitively
+  always (tolerance on the inbound side only).
 # SIPp compatibility surface
 
 What "SIPp-compatible" means, precisely. Source of truth for the grammar:
@@ -51,8 +83,8 @@ classic 3PCC (`sendCmd`/`recvCmd`) in M10 (see §6).
 
 Shipped: `exec play_pcap_audio|video|image=` and `<recv ignoresdp>` (M14),
 `exec rtp_stream=` (file/pattern/pause/resume) and `exec play_dtmf=` (M15) —
-see §6. Still later: `exec rtp_echo=`, `-rtp_echo` global echo, rtpcheck,
-SRTP, `verifyauth`, `closecon`, `pauserestore`.
+`-rtp_echo` + rtpcheck (M18), SRTP (M23), `exec rtp_echo=` (M25) — see §6.
+Still later: `verifyauth`, `closecon`, `pauserestore`.
 
 ## 2. Keywords (v1)
 
@@ -488,8 +520,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   matches the echo sockets, probing, counters, toggle action, compare
   semantics, and exit code, with these divergences: (1) a stream is
   judged **only when `-audiotolerance`/`-videotolerance` was given**;
-  (2) `exec rtp_echo=` (SRTP) is rejected with a pointer to `-rtp_echo`;
-  (3) `<rtp_echo variable=>` is rejected (value only).
+  (2) `<rtp_echo variable=>` is rejected (value only). `exec rtp_echo=`
+  (the per-call SRTP echo) is M25 below.
 - AKA resynchronisation (M19): SIPp's `auth.cpp` has an AUTS branch guarded
   by `if (1/*sqn[5] > sqn_he[5]*/)` (~l.676) whose real condition is
   commented out, so the always-taken branch stores one SQN byte into a
@@ -560,9 +592,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   a rollover; (2) master keys come from sipr's seeded RNG (reproducible
   across runs with the same seed) rather than `RAND_bytes`; (3) an
   unsupported peer suite or undecodable key logs and falls back to plain
-  RTP instead of `rejectCall()`; (4) `exec rtp_echo=start…` (SIPp as an
-  SRTP echo server) is not implemented; (5) payload length is taken from
-  the datagram, not configured. Interop verified with sipp's own
+  RTP instead of `rejectCall()`; (4) payload length is taken from the
+  datagram, not configured. Interop verified with sipp's own
   `-srtpcheck_debug` log: it authenticates and decrypts sipr's packets
   (`processIncomingPacket() rc == 0`). Also found: sipp's per-call SRTP
   echo does `sendto()` with an explicit address on a socket it has

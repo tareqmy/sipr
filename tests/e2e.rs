@@ -3415,6 +3415,152 @@ fn srtp_stream_passes_the_echo_check_against_an_srtp_echo_peer() {
     assert!(echoed >= 20, "echoed only {echoed} SRTP packets");
 }
 
+// ---- exec rtp_echo=: sipr as a per-call SRTP echo server (M25) ------------------
+
+/// A sipr UAS runs a SIPp-style SRTP echo scenario (`exec rtp_echo=startaudio`
+/// then `updateaudio`, keyed from the SDES answer) and a sipr UAC streaming
+/// an SRTP pattern passes its echo check against it.
+#[test]
+fn srtp_echo_server_passes_a_peers_echo_check() {
+    let sip_port = free_port();
+    let uas_media = free_port_block(2);
+    let corpus = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sipr-scenario/tests/corpus/positive/srtp_echo_uas.xml"
+    );
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sf",
+        corpus,
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &sip_port.to_string(),
+        "-mp",
+        &uas_media.to_string(),
+        "-m",
+        "1",
+        "-timeout",
+        "20",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let scenario_path = dir.join(format!("sipr-e2e-srtp-echo-{pid}.xml"));
+    std::fs::write(
+        &scenario_path,
+        r#"<scenario name="uac-srtp-vs-echo-server">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]e[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipr@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=sipr 0 0 IN IP[local_ip_type] [local_ip]
+    s=-
+    c=IN IP[media_ip_type] [media_ip]
+    t=0 0
+    m=audio [rtpstream_audio_port] RTP/AVP 0
+    a=crypto:[cryptotag1audio] [cryptosuiteaescm128sha1801audio] inline:[cryptokeyparams1audio]
+    a=rtpmap:0 PCMU/8000
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]e[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <nop><action><exec rtp_stream="apattern,1,0,PCMU/8000"/></action></nop>
+  <pause milliseconds="1500"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]e[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#,
+    )
+    .expect("write scenario");
+    let out = run_sipr(&[
+        "-sf",
+        scenario_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-mp",
+        &free_port_block(2).to_string(),
+        "-audiotolerance",
+        "0.5",
+        "-cp",
+        "0",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &format!("127.0.0.1:{sip_port}"),
+    ]);
+    let _ = std::fs::remove_file(&scenario_path);
+    let uac_err = String::from_utf8_lossy(&out.stderr);
+    let uas_code = wait_exit(&mut uas, Duration::from_secs(10));
+    let uas_err = uas_err.join().expect("uas stderr");
+    assert_eq!(out.status.code(), Some(0), "uac stderr:\n{uac_err}");
+    assert!(uac_err.contains("rtpcheck 0/1 failed"), "{uac_err}");
+    assert_eq!(uas_code, Some(0), "uas stderr:\n{uas_err}");
+    assert!(uas_err.contains("successful 1 failed 0"), "{uas_err}");
+}
+
+/// An `rtp_echo` whose codec SIPp would not know fails at load, as SIPp's
+/// parser does.
+#[test]
+fn rtp_echo_with_an_unknown_codec_fails_at_load() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let path = dir.join(format!("sipr-e2e-echo-codec-{pid}.xml"));
+    std::fs::write(
+        &path,
+        r#"<scenario name="bad-echo">
+  <recv request="INVITE"/>
+  <nop><action><exec rtp_echo="startaudio,96,NOPE/8000"/></action></nop>
+</scenario>"#,
+    )
+    .expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-p",
+        "0",
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("rtp_echo"), "{err}");
+}
+
 // ---- [authentication] from an injection field, and SIPp's bare form ------------
 
 /// SIPp's documented recipe (docs/scenarios/sipauth.rst): the CSV holds the

@@ -200,7 +200,6 @@ fn play_pcap_exec_compiles_to_a_media_action() {
 #[test]
 fn unsupported_media_execs_are_clear_errors() {
     for attr in [
-        r#"rtp_echo="startaudio""#,
         r#"play_pcap="x.pcap""#,
         r#"play_pcap_audio="a.pcap" play_pcap_video="v.pcap""#,
         r#"play_pcap_audio="a.pcap" int_cmd="stop_call""#,
@@ -600,4 +599,68 @@ fn hide_and_display_attributes_land_in_step_common() {
     };
     assert!(!common.hide);
     assert_eq!(common.display, None, "blank display is no display");
+}
+
+#[test]
+fn rtp_echo_exec_parses_sipp_verbs() {
+    use sipr_scenario::model::{RtpEchoCmd, RtpEchoVerb};
+    let cases: Vec<(&str, RtpEchoCmd)> = vec![
+        (
+            "startaudio,0,PCMU/8000",
+            RtpEchoCmd {
+                verb: RtpEchoVerb::Start,
+                video: false,
+                payload_type: Some(0),
+                payload_name: Some("PCMU/8000".into()),
+            },
+        ),
+        (
+            "updatevideo,99,H264/90000",
+            RtpEchoCmd {
+                verb: RtpEchoVerb::Update,
+                video: true,
+                payload_type: Some(99),
+                payload_name: Some("H264/90000".into()),
+            },
+        ),
+        (
+            "stopaudio",
+            RtpEchoCmd {
+                verb: RtpEchoVerb::Stop,
+                video: false,
+                payload_type: None,
+                payload_name: None,
+            },
+        ),
+    ];
+    for (value, expected) in cases {
+        let xml = wrap(&format!(
+            r#"{invite}
+               <nop><action><exec rtp_echo="{value}"/></action></nop>"#,
+            invite = send_invite()
+        ));
+        let out = compile("test", &xml);
+        assert!(out.diagnostics.is_empty(), "{value}: {:?}", out.diagnostics);
+        let sc = out.scenario.expect("compiles");
+        let Step::Nop { actions, .. } = &sc.steps[1] else {
+            panic!("nop")
+        };
+        assert!(
+            matches!(&actions[0], Action::RtpEcho(cmd) if *cmd == expected),
+            "{value}"
+        );
+        assert!(sc.has_media());
+    }
+    for bad in [
+        r#"rtp_echo="pause""#,
+        r#"rtp_echo="startaudio,300""#,
+        r#"rtp_echo="startimage""#,
+    ] {
+        let xml = wrap(&format!(
+            r#"{invite}
+               <nop><action><exec {bad}/></action></nop>"#,
+            invite = send_invite()
+        ));
+        assert!(!errors(&xml).is_empty(), "{bad}");
+    }
 }

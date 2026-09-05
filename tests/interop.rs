@@ -1142,3 +1142,127 @@ fn srtp_against_real_sipp_echo() {
         );
     }
 }
+
+/// SIPp's own SRTP pair with the roles swapped: real sipp plays
+/// `pfca_uac_apattern_crypto_simple.xml` (SDES offer, PRACK, an audio
+/// pattern under SRTP, and its RTP check) against sipr running SIPp's
+/// `pfca_uas_audio_crypto_simple.xml` unchanged — `exec rtp_echo=startaudio`
+/// / `updateaudio` / `stopaudio`. sipp must judge the echoed audio good
+/// (exit 0, not 253) and its rtpcheck vector must show real traffic.
+#[test]
+fn real_sipp_srtp_uac_against_sipr_echo_server() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::real_sipp_srtp_uac_against_sipr_echo_server — no sipp binary.");
+        return;
+    };
+    let src = std::env::var("SIPP_SRC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home).join("development/cprojects/sipp")
+        });
+    let uac_xml = src.join("sipp_scenarios/pfca_uac_apattern_crypto_simple.xml");
+    let uas_xml = src.join("sipp_scenarios/pfca_uas_audio_crypto_simple.xml");
+    if !uac_xml.is_file() || !uas_xml.is_file() {
+        eprintln!(
+            "SKIPPED interop::real_sipp_srtp_uac_against_sipr_echo_server — {} not found \
+             (set SIPP_SRC).",
+            uac_xml.display()
+        );
+        return;
+    }
+    let port = free_port();
+    let sipp_media = free_even_port();
+    let sipr_media = free_even_port();
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let sipp_dir = dir.join(format!("sipr-interop-srtp-echo-{pid}-sipp"));
+    let _ = std::fs::remove_dir_all(&sipp_dir);
+    std::fs::create_dir_all(&sipp_dir).expect("sipp dir");
+    let mut sipr_uas = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .current_dir(&sipp_dir)
+            .args([
+                "-sf",
+                uas_xml.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-mp",
+                &sipr_media.to_string(),
+                "-m",
+                "1",
+                "-timeout",
+                "30",
+                "-bg",
+            ])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sipr uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    // sipp's -rtpcheck_debug file lands in its working directory.
+    let mut sipp_uac = Reaper(
+        Command::new(&sipp)
+            .current_dir(&sipp_dir)
+            .args([
+                "-sf",
+                uac_xml.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-mi",
+                "127.0.0.1",
+                "-mp",
+                &sipp_media.to_string(),
+                "-audiotolerance",
+                "0.5",
+                "-rtpcheck_debug",
+                "-m",
+                "1",
+                "-timeout",
+                "20s",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uac"),
+    );
+    let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
+    let sipr_code = wait_with_timeout(&mut sipr_uas.0, Duration::from_secs(15));
+    let stderr = sipr_uas
+        .0
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    let check_log = std::fs::read_to_string(sipp_dir.join("debugafile")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&sipp_dir);
+    assert_eq!(
+        sipp_code,
+        Some(0),
+        "sipp's RTP check of sipr's SRTP echo must pass (253 = failed); sipr stderr:\n{stderr}\n\
+         sipp rtpcheck log:\n{check_log}"
+    );
+    assert_eq!(sipr_code, Some(0), "sipr stderr:\n{stderr}");
+    assert!(stderr.contains("successful 1 failed 0"), "{stderr}");
+    // "----PACKET COUNTS----" is followed by the per-task counts; the first
+    // task is the audio pattern sipp streamed at us.
+    let sent: u64 = check_log
+        .split("----PACKET COUNTS----")
+        .nth(1)
+        .and_then(|rest| rest.lines().nth(1))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0);
+    assert!(
+        sent >= 20,
+        "sipp streamed only {sent} packets:\n{check_log}"
+    );
+}

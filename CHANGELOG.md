@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **SRTP echo server** — `exec rtp_echo="startaudio|updateaudio|stopaudio|
+  startvideo|updatevideo|stopvideo[,pt[,name]]"`: the call echoes (S)RTP on
+  its advertised media port, re-keyed from the SDES negotiation with the
+  caller's SSRC and sequence numbers preserved. SIPp's
+  `pfca_uas_*_crypto_*.xml` scenarios now run unchanged, and real sipp's
+  UAC passes its own RTP check against them.
+
+### Fixed
+
+- `ereg search_in="hdr"` now hands the regexp what SIPp does: the rest of
+  the first matching line after the header string (so `header="CSeq:"`
+  works and `CSeq: [$1]` replays the caller's CSeq), and an absent header
+  fails the call under `check_it`.
+
 ## [0.13.0] — 2026-09-05
 
 ### Added

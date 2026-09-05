@@ -683,6 +683,48 @@ the header-line rendering (~l.4149-4155); `docs/scenarios/sipauth.rst`
       existing `Authorization: [authentication …]` tests keep passing.
 - [x] Deferred: SIPp's "only one [authentication] per message" error.
 
+## M25 — SRTP echo server (`exec rtp_echo=`) ✅
+
+Behavioral oracle: `actions.cpp` `setRTPEchoActInfo` (grammar
+`<verb>,<payload_type>,<payload_name>`), `scenario.cpp` ~l.1729 (verbs by
+prefix: `startaudio`/`updateaudio`/`stopaudio` and the `…video` trio),
+`rtpstream.cpp` `rtpstream_audioecho_thread`/`rtpstream_videoecho_thread`
+(~l.2519-2665), and SIPp's own pair `pfca_uas_audio_crypto_simple.xml` /
+`pfca_uac_apattern_crypto_simple.xml`.
+
+- [x] `exec rtp_echo="<verb>[,pt[,name]]"` compiles to `Action::RtpEcho`
+      (`RtpEchoCmd{verb, video, payload_type, payload_name}`); unknown verbs,
+      a payload type > 127 and a codec SIPp would not know (via
+      `RtpParams::resolve`, checked at load) are errors, as in SIPp.
+- [x] `start`: one echo thread per `(call, audio|video)` bound to the port the
+      call advertised (`[rtpstream_*_port]`, else the `[media_port]` form),
+      keyed from `CallCrypto::negotiate` — receive under the peer's SDES key,
+      re-protect under ours keeping the caller's SSRC and sequence numbers,
+      `send_to` the packet's source. Plain RTP when the peer offered no
+      crypto. `update`: restart with the current negotiation (SIPp re-derives
+      keys in place). `stop`, call teardown: the thread is woken and joined so
+      the port is free at once. Counters feed `rtp_echo_packets`/
+      `rtp_echo2_packets` alongside the global `-rtp_echo` echo.
+- [x] Found on the way and fixed: `ereg search_in="hdr"` handed the regexp
+      whole `Name: value` lines and could not match SIPp's `header="CSeq:"`
+      spelling at all; SIPp's `extractSubMessage` yields the rest of the first
+      line *after* the header string (leading space included) and fails the
+      call under `check_it` when the header is absent. SIPp's UAS scenarios
+      replay `CSeq: [$1]` from that capture.
+- [x] Tests: media unit (plain echo, SRTP re-key round trip with the caller's
+      key, unauthenticated packet dropped, port released synchronously);
+      compile `rtp_echo_exec_parses_sipp_verbs`; corpus
+      `positive/srtp_echo_uas.xml`; e2e
+      `srtp_echo_server_passes_a_peers_echo_check` (sipr UAC's rtpcheck
+      against a sipr echo server) and `rtp_echo_with_an_unknown_codec_fails_at_load`;
+      interop `real_sipp_srtp_uac_against_sipr_echo_server` — real sipp plays
+      its SRTP UAC scenario against sipr running SIPp's UAS scenario
+      **unchanged** and passes its own RTP check (exit 0).
+- [x] Deferred: SIPp's per-process echo state shared across calls (its echo
+      threads are global singletons; sipr's are per call), forwarding of
+      packets that fail authentication (sipr drops them).
+
 ## Post-v1 backlog (ordered)
 
-SRTP echo server (`exec rtp_echo=`).
+`exec verifyauth=` / `closecon` / `pauserestore` — the last exec verbs still
+rejected at load.

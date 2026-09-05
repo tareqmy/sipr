@@ -123,7 +123,8 @@ root for media.
 
 ## Not yet (post-v1 roadmap)
 
-sipr as an SRTP echo server (`exec rtp_echo=`).
+The last SIPp exec corners: `verifyauth`, `closecon`, `pauserestore` (still
+clear load-time errors).
 
 ## Brand
 

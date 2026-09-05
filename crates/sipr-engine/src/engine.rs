@@ -28,8 +28,8 @@ use sipr_net::{
 };
 use sipr_scenario::inject::{InjectMode, InjectionFile};
 use sipr_scenario::model::{
-    Action, Expect, MediaKind, PauseSpec, RecvStep, Role, RtpSource, RtpStreamCmd, Scenario, Step,
-    StepCommon,
+    Action, Expect, MediaKind, PauseSpec, RecvStep, Role, RtpEchoCmd, RtpEchoVerb, RtpSource,
+    RtpStreamCmd, Scenario, Step, StepCommon,
 };
 use sipr_scenario::template::{CryptoKw, Keyword, MsgTemplate, Span};
 
@@ -539,6 +539,10 @@ struct Engine<'s> {
     rate_scale: f64,
     /// `-rtp_echo`: the global echo sockets, when enabled.
     echo: Option<sipr_media::EchoServer>,
+    /// Per-call `exec rtp_echo=` streams by `(call id, video?)`.
+    call_echoes: HashMap<(String, bool), sipr_media::EchoStream>,
+    /// Counters shared by every per-call echo, `[audio, video]`.
+    call_echo_counters: [Arc<sipr_media::echo::EchoCounters>; 2],
     /// `-rate_increase`: when the ramp last fired (SIPp `ratetask`).
     last_ramp: Instant,
     /// `set hide` (SIPp `do_hide`): hidden steps stay off the scenario screen.
@@ -674,6 +678,16 @@ impl<'s> Engine<'s> {
         // the media thread exists only when something will be played.
         let pcaps = load_pcaps(scenario, config)?;
         let rtp_files = load_rtp_files(scenario, config)?;
+        for cmd in scenario.rtp_echo_cmds() {
+            // SIPp resolves the echo's codec at parse time and fails on an
+            // unknown one; sipr only needs the validation.
+            sipr_media::RtpParams::resolve(
+                cmd.payload_type
+                    .unwrap_or(config.rtp_payload.unwrap_or(DEFAULT_RTP_PAYLOAD)),
+                cmd.payload_name.as_deref(),
+            )
+            .map_err(|e| EngineError(format!("exec rtp_echo=: {e}")))?;
+        }
         // -rtp_echo binds the media port (and +2) up front, probing upward
         // like SIPp; the port that bound is what [media_port] renders.
         let echo_ip = config
@@ -974,6 +988,8 @@ impl<'s> Engine<'s> {
             _http: http,
             rate_scale: config.rate_scale.unwrap_or(1.0),
             echo,
+            call_echoes: HashMap::new(),
+            call_echo_counters: [Arc::default(), Arc::default()],
             last_ramp: Instant::now(),
             hide: true,
             screen_request: None,
@@ -1106,10 +1122,16 @@ impl<'s> Engine<'s> {
             self.stats.rtp_packets_sent = m.packets_sent();
             self.stats.rtp_bytes_sent = m.bytes_sent();
         }
-        if let Some(e) = self.echo.as_ref() {
-            self.stats.rtp_echo_packets = e.audio.packets.load(Ordering::Relaxed);
-            self.stats.rtp_echo2_packets = e.video.packets.load(Ordering::Relaxed);
-        }
+        let global = self.echo.as_ref().map_or((0, 0), |e| {
+            (
+                e.audio.packets.load(Ordering::Relaxed),
+                e.video.packets.load(Ordering::Relaxed),
+            )
+        });
+        self.stats.rtp_echo_packets =
+            global.0 + self.call_echo_counters[0].packets.load(Ordering::Relaxed);
+        self.stats.rtp_echo2_packets =
+            global.1 + self.call_echo_counters[1].packets.load(Ordering::Relaxed);
     }
 
     fn publish_snapshot(&mut self) {
@@ -2166,9 +2188,74 @@ impl<'s> Engine<'s> {
                         e.set_enabled(on);
                     }
                 }
+                crate::actions::ActionOutcome::RtpEchoCmd(cmd) => {
+                    self.on_rtp_echo(call_id, &cmd);
+                }
             }
         }
         false
+    }
+
+    /// `exec rtp_echo=start…|update…|stop…`: this call echoes (S)RTP on
+    /// the port it advertised (`[rtpstream_*_port]`, else the `[media_port]`
+    /// form), re-keying under the negotiated SDES contexts when the peer
+    /// offered crypto — SIPp's `rtpstream_rtpecho_start*`. `update` restarts
+    /// with the current negotiation (SIPp re-derives keys in place).
+    fn on_rtp_echo(&mut self, call_id: &str, cmd: &RtpEchoCmd) {
+        let key = (call_id.to_owned(), cmd.video);
+        if cmd.verb == RtpEchoVerb::Stop {
+            self.call_echoes.remove(&key);
+            return;
+        }
+        let Some(call) = self.calls.get(call_id) else {
+            return;
+        };
+        let kind = if cmd.video {
+            MediaKind::Video
+        } else {
+            MediaKind::Audio
+        };
+        let number = call.number;
+        let local_port = call.rtpstream_ports[usize::from(cmd.video)].unwrap_or_else(|| {
+            let (auto, offset) = self.port_layout[kind.index()];
+            crate::render::media_port_value(self.media_port, auto, offset, number)
+        });
+        // Echo receives under the peer's key and sends under ours: the
+        // reverse of a stream's (send, receive) pair.
+        let srtp = match call.crypto.negotiate(cmd.video) {
+            Ok(Some((tx, rx))) => Some((rx, tx)),
+            Ok(None) => None,
+            Err(why) => {
+                self.log_err(&format!(
+                    "call {call_id}: rtp_echo: SRTP: {why} — echoing plain RTP"
+                ));
+                None
+            }
+        };
+        let encrypted = srtp.is_some();
+        // A restart (start twice, or update) replaces the running echo,
+        // freeing its port first.
+        self.call_echoes.remove(&key);
+        let local = SocketAddr::new(self.media_ip, local_port);
+        match sipr_media::EchoStream::start(
+            local,
+            srtp,
+            Arc::clone(&self.call_echo_counters[usize::from(cmd.video)]),
+        ) {
+            Ok(stream) => {
+                self.log_err(&format!(
+                    "call {call_id}: rtp_echo {}: echoing on {local} ({})",
+                    kind.as_str(),
+                    if encrypted { "SRTP" } else { "plain RTP" }
+                ));
+                self.call_echoes.insert(key, stream);
+            }
+            Err(e) => {
+                let line = format!("call {call_id}: rtp_echo: cannot bind {local}: {e}");
+                eprintln!("sipr: warning: {line}");
+                self.log_err(&line);
+            }
+        }
     }
 
     /// `[rtpstream_audio_port]` / `[rtpstream_video_port]`: give the call a
@@ -2847,10 +2934,11 @@ impl<'s> Engine<'s> {
 
     /// A call that ends takes its media with it (SIPp joins the media thread
     /// in the call destructor).
-    fn stop_media(&self, call_id: &str) {
+    fn stop_media(&mut self, call_id: &str) {
         if let Some(m) = self.media.as_ref() {
             m.stop(call_id, None);
         }
+        self.call_echoes.retain(|(id, _), _| id != call_id);
     }
 
     /// Return a finished call's user id to the free pool (`-users` mode), so a
