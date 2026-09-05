@@ -929,16 +929,18 @@ Behavioral oracle: `sipp.cpp` ~l.209-243, `socket.cpp` ~l.806-850 (notify),
       interop `sctp_both_ways_against_real_sipp` (skips unless sipp banners
       `-SCTP`). CI job `sctp` on ubuntu: `modprobe sctp`, sipp built from
       source with `USE_SCTP`, `cargo test --features sctp`, the interop test.
-- [ ] **Unverified on the development host** (no SCTP stack): the first green
-      `sctp` CI run is the acceptance evidence — check it before relying on
-      this transport.
+- [x] Verified in Linux CI (run 33977957760, 2026-09-05): `sctp` job green —
+      `messages_keep_their_boundaries_and_round_trip`,
+      `sctp_mono_and_per_call_calls_complete`, and
+      `sctp_both_ways_against_real_sipp` all ran (not skipped) against a
+      SIPp 3.7.7 built with `USE_SCTP`. The development host (macOS) still
+      cannot run them.
 - [x] Deferred for good: `SCTP_NODELAY`, notifications, per-path parameters,
       multi-homing, SHUTDOWN-vs-ABORT.
 
 ## Post-v1 backlog (ordered)
 
-Nothing queued: the SIPp surface sipr targets is complete. Watch the first
-`sctp` CI run (M32) and fix what it finds. (Checked after M30: the pacer's first call comes one
+Nothing queued: the SIPp surface sipr targets is complete. (Checked after M30: the pacer's first call comes one
 inter-call interval after start-up in SIPp too — `call_generation_task.cpp`
 opens calls when `elapsed × rate / rate_period` reaches the count; no
 divergence, see SIPP_COMPAT §6.)

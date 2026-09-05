@@ -12,7 +12,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cargo feature, via `socket2`: one SCTP message per SIP message as SIPp
   does, mono and per-call associations, reconnection. Needs an OS SCTP
   stack at run time (Linux with the `sctp` module); SIPp's SCTP option
-  flags are rejected with an explanation. Exercised only in Linux CI.
+  flags are rejected with an explanation. Exercised in Linux CI against a
+  SIPp built with `USE_SCTP`.
+
+### Fixed
+
+- CI now runs on pushes to `master` (it only ran for pull requests) and
+  builds SIPp 3.7.7 from source for the interop suite; a few tests that
+  raced the echo threads' counters or assumed macOS socket timing are
+  settled.
 
 ## [0.20.0] — 2026-09-05
 
