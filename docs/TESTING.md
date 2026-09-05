@@ -55,6 +55,13 @@ from `../../cprojects/sipp` (`cmake . && make`, or `./build.sh`) or
 `apt/brew install sipp`. Tests bind ephemeral ports on 127.0.0.1 and must run
 in parallel safely; each test gets its own port pair.
 
+Lessons from driving real sipp in tests (M26): a scenario file handed to
+sipp must start with the `<?xml version="1.0" encoding="ISO-8859-1" ?>`
+declaration or its loader reports "Unable to load or parse"; never assert
+on the exit code of a sipp started with `-bg` (the forked parent exits 99 at
+once) — run it in the foreground with stdin/stdout/stderr null and reap it;
+sipp as a UAS ignores SIGTERM once curses is up — kill it with SIGKILL.
+
 ## 5. Performance (M3+)
 
 `criterion` benches: template fill, inbound parse+route, timer churn — plus a

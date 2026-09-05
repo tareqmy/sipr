@@ -3561,6 +3561,167 @@ fn rtp_echo_with_an_unknown_codec_fails_at_load() {
     assert!(err.contains("rtp_echo"), "{err}");
 }
 
+// ---- <verifyauth>: sipr as a digest-checking registrar (M26) -------------------
+
+/// SIPp's documented registrar recipe (docs/scenarios/actions.rst): challenge,
+/// then `<verifyauth>` on the re-sent REGISTER and branch on the boolean.
+const VERIFYAUTH_UAS: &str = r#"<scenario name="verifyauth-registrar">
+  <recv request="REGISTER"/>
+  <send><![CDATA[
+    SIP/2.0 401 Authorization Required
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    WWW-Authenticate: Digest realm="sipr.test", nonce="47364c23432d2e131a5fb210812c", qop="auth", algorithm=MD5
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="REGISTER">
+    <action>
+      <verifyauth assign_to="authvalid" username="alice" password="secret"/>
+    </action>
+  </recv>
+  <nop hide="true" test="authvalid" next="goodauth"/>
+  <nop hide="true" next="badauth"/>
+  <label id="goodauth"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <nop hide="true" next="done"/>
+  <label id="badauth"/>
+  <send><![CDATA[
+    SIP/2.0 403 Forbidden
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <label id="done"/>
+</scenario>
+"#;
+
+/// A UAC that registers with digest credentials and expects `expect`.
+fn verifyauth_uac_scenario(password: &str, expect: u16) -> String {
+    format!(
+        r#"<scenario name="register-with-{password}">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:alice@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:alice@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Contact: <sip:alice@[local_ip]:[local_port]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:alice@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:alice@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    Contact: <sip:alice@[local_ip]:[local_port]>
+    [authentication username=alice password={password}]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="{expect}"/>
+</scenario>
+"#
+    )
+}
+
+/// Run the registrar for one call and a UAC against it; return both stderrs
+/// and exit codes as (uac_code, uac_err, uas_code, uas_err).
+fn run_verifyauth_pair(
+    uas_xml: &str,
+    uac_xml: &str,
+    tag: &str,
+) -> (Option<i32>, String, Option<i32>, String) {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let uas_path = dir.join(format!("sipr-e2e-verifyauth-uas-{tag}-{pid}.xml"));
+    let uac_path = dir.join(format!("sipr-e2e-verifyauth-uac-{tag}-{pid}.xml"));
+    std::fs::write(&uas_path, uas_xml).expect("write uas");
+    std::fs::write(&uac_path, uac_xml).expect("write uac");
+    let port = free_port();
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sf",
+        uas_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(300));
+    let out = run_sipr(&[
+        "-sf",
+        uac_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-m",
+        "1",
+        "-timeout",
+        "10",
+        "-bg",
+        &format!("127.0.0.1:{port}"),
+    ]);
+    let uas_code = wait_exit(&mut uas, Duration::from_secs(10));
+    let _ = std::fs::remove_file(&uas_path);
+    let _ = std::fs::remove_file(&uac_path);
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        uas_code,
+        uas_err.join().expect("uas stderr"),
+    )
+}
+
+#[test]
+fn verifyauth_accepts_the_right_password_and_branches_to_200() {
+    let (uac, uac_err, uas, uas_err) = run_verifyauth_pair(
+        VERIFYAUTH_UAS,
+        &verifyauth_uac_scenario("secret", 200),
+        "good",
+    );
+    assert_eq!(uac, Some(0), "uac:\n{uac_err}\nuas:\n{uas_err}");
+    assert_eq!(uas, Some(0), "uas:\n{uas_err}");
+    assert!(uas_err.contains("successful 1 failed 0"), "{uas_err}");
+}
+
+#[test]
+fn verifyauth_rejects_a_wrong_password_and_branches_to_403() {
+    let (uac, uac_err, uas, uas_err) = run_verifyauth_pair(
+        VERIFYAUTH_UAS,
+        &verifyauth_uac_scenario("wrong", 403),
+        "bad",
+    );
+    assert_eq!(uac, Some(0), "uac:\n{uac_err}\nuas:\n{uas_err}");
+    assert_eq!(uas, Some(0), "uas:\n{uas_err}");
+    assert!(uas_err.contains("successful 1 failed 0"), "{uas_err}");
+}
+
 // ---- [authentication] from an injection field, and SIPp's bare form ------------
 
 /// SIPp's documented recipe (docs/scenarios/sipauth.rst): the CSV holds the

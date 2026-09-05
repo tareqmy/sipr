@@ -32,7 +32,7 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 
 `ereg` (with `assign_to`, `check_it`, `header`, `regexp`, `search_in`,
 `start_line`), `log`, `warning`, `error`, `assign`, `assignstr`, `strcmp`,
-`test`, `add`, `subtract`, `multiply`, `divide`, `todouble`, `jump`, `trim`,
+`verifyauth` (with `assign_to`, `username`, `password`), `test`, `add`, `subtract`, `multiply`, `divide`, `todouble`, `jump`, `trim`,
 `gettimeofday`, `urlencode`, `urldecode`,
 `exec` with `int_cmd` only (`stop_now`, `stop_gracefully`, `stop_call`).
 
@@ -52,7 +52,7 @@ classic 3PCC (`sendCmd`/`recvCmd`) in M10 (see §6).
 Shipped: `exec play_pcap_audio|video|image=` and `<recv ignoresdp>` (M14),
 `exec rtp_stream=` (file/pattern/pause/resume) and `exec play_dtmf=` (M15) —
 `-rtp_echo` + rtpcheck (M18), SRTP (M23), `exec rtp_echo=` (M25) — see §6.
-Still later: `verifyauth`, `closecon`, `pauserestore`.
+Still later: `closecon`, `pauserestore`.
 
 ## 2. Keywords (v1)
 
@@ -612,5 +612,27 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   under `check_it` fails the call (`E_AR_HDR_NOT_FOUND`) regardless of the
   regexp. sipr matches this, matching the header string case-insensitively
   always (tolerance on the inbound side only).
+- `<verifyauth>` (M26; verified in `scenario.cpp` ~l.1572, `call.cpp`
+  ~l.5946 `E_AT_VERIFY_AUTH`, `auth.cpp` `verifyAuthHeader`): `username`
+  and `password` are message templates rendered at execution (keywords and
+  `[$var]` allowed — SIPp's documented recipe pulls them from a `<lookup>`
+  line); the method is the received start line's **first token** (a start
+  line without a space verifies false — and a response's "method" is
+  `SIP/2.0`, so it never verifies); the credential is the first
+  `Authorization:` header only (`Proxy-Authorization:` is never consulted);
+  every digest parameter — `realm`, `uri`, `nonce`, `cnonce`, `nc`, `qop`,
+  `algorithm` (default MD5; matched by prefix, so `MD5-sess` computes as
+  plain MD5), `response` — is read from the **client's** header, so only
+  the shared secret is checked, never the server's own nonce or realm;
+  `qop=auth-int` hashes the request body; the RFC 2617 form with
+  `nc:cnonce:qop` is selected by **`cnonce` being present**, not by `qop`;
+  `-auth_uri` replaces the header's `uri=` in the verifier's HA2 too; a
+  non-Digest scheme or an algorithm other than MD5/SHA-256 WARNINGs and
+  yields false. The verdict is a boolean variable (`test=` branches on it).
+  sipr matches all of this, with one tolerance: the `response` hex is
+  compared case-insensitively (SIPp's `strcmp` rejects uppercase hex).
+  Verified both ways against real sipp: sipr's `<verifyauth>` accepts and
+  rejects sipp's `[authentication]` header, and sipp's accepts and rejects
+  sipr's.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

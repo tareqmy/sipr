@@ -413,6 +413,17 @@ pub enum Action {
         /// Value template.
         value: MsgTemplate,
     },
+    /// `<verifyauth assign_to= username= password=>`: check the received
+    /// request's `Authorization:` against the rendered credentials; the
+    /// boolean result goes to `assign_to` (SIPp's `E_AT_VERIFY_AUTH`).
+    VerifyAuth {
+        /// Destination for the boolean verdict.
+        assign_to: VarId,
+        /// Username template (keywords allowed, as SIPp's `createSendingMessage`).
+        username: MsgTemplate,
+        /// Password template.
+        password: MsgTemplate,
+    },
     /// String-compare a variable against a literal; result to a variable.
     Strcmp {
         /// Destination for the comparison result.

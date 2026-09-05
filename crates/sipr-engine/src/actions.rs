@@ -144,8 +144,9 @@ pub fn run_actions(
     store: &mut VarStore,
     last_msg: Option<&Inbound>,
     base_ctx: &RenderCtx<'_>,
+    auth_uri: Option<&str>,
 ) -> Vec<ActionOutcome> {
-    run_actions_impl(actions, store, last_msg, None, base_ctx)
+    run_actions_impl(actions, store, last_msg, None, base_ctx, auth_uri)
 }
 
 /// Like [`run_actions`], but `ereg` searches the raw 3PCC command `cmd_text`
@@ -156,7 +157,7 @@ pub fn run_cmd_actions(
     cmd_text: &str,
     base_ctx: &RenderCtx<'_>,
 ) -> Vec<ActionOutcome> {
-    run_actions_impl(actions, store, None, Some(cmd_text), base_ctx)
+    run_actions_impl(actions, store, None, Some(cmd_text), base_ctx, None)
 }
 
 fn run_actions_impl(
@@ -165,10 +166,11 @@ fn run_actions_impl(
     last_msg: Option<&Inbound>,
     cmd_text: Option<&str>,
     base_ctx: &RenderCtx<'_>,
+    auth_uri: Option<&str>,
 ) -> Vec<ActionOutcome> {
     let mut out = Vec::new();
     for action in actions {
-        let outcome = run_one(action, store, last_msg, cmd_text, base_ctx);
+        let outcome = run_one(action, store, last_msg, cmd_text, base_ctx, auth_uri);
         let terminal = !matches!(
             outcome,
             ActionOutcome::Continue
@@ -204,8 +206,23 @@ fn run_one(
     last_msg: Option<&Inbound>,
     cmd_text: Option<&str>,
     base_ctx: &RenderCtx<'_>,
+    auth_uri: Option<&str>,
 ) -> ActionOutcome {
     match action {
+        Action::VerifyAuth {
+            assign_to,
+            username,
+            password,
+        } => {
+            let username = render_with_store(username, store, base_ctx);
+            let password = render_with_store(password, store, base_ctx);
+            let (verdict, log) = verify_auth(last_msg, &username, &password, auth_uri);
+            store.set(*assign_to, Value::Bool(verdict));
+            match log {
+                Some(line) => ActionOutcome::Log(format!("[warning] verifyauth: {line}")),
+                None => ActionOutcome::Continue,
+            }
+        }
         Action::Ereg {
             regexp,
             search_in,
@@ -414,6 +431,34 @@ fn run_one(
                 Err(e) => ActionOutcome::FailCall(e),
             }
         }
+    }
+}
+
+/// SIPp's `E_AT_VERIFY_AUTH` (`call.cpp` ~l.5946): the method is the start
+/// line's first token (a start line without a space, or no message at all,
+/// verifies false), the credential is the first `Authorization:` header
+/// (never `Proxy-Authorization:`), and the body feeds `qop=auth-int`. A
+/// non-Digest or unsupported-algorithm header is "false" plus a warning,
+/// as SIPp's `verifyAuthHeader` WARNINGs.
+fn verify_auth(
+    msg: Option<&Inbound>,
+    username: &str,
+    password: &str,
+    auth_uri: Option<&str>,
+) -> (bool, Option<String>) {
+    let Some(msg) = msg else {
+        return (false, None);
+    };
+    let Some((method, _)) = msg.start_line().split_once(' ') else {
+        return (false, None);
+    };
+    let Some(header) = msg.header("Authorization") else {
+        return (false, None);
+    };
+    match sipr_auth::verify_authorization(header, username, password, method, msg.body(), auth_uri)
+    {
+        Ok(ok) => (ok, None),
+        Err(e) => (false, Some(e.to_string())),
     }
 }
 

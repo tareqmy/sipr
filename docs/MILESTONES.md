@@ -724,7 +724,37 @@ prefix: `startaudio`/`updateaudio`/`stopaudio` and the `…video` trio),
       threads are global singletons; sipr's are per call), forwarding of
       packets that fail authentication (sipr drops them).
 
+## M26 — `<verifyauth>` ✅
+
+Behavioral oracle: `scenario.cpp` ~l.1572 (attributes `assign_to`,
+`username`, `password`), `call.cpp` ~l.5946 (`E_AT_VERIFY_AUTH`: method from
+the start line, `Authorization:` only, body for auth-int), `auth.cpp`
+`verifyAuthHeader` + `createAuthResponseMD5/SHA256`, and its gtests
+(`DigestAuth.BasicVerification*`); `docs/scenarios/actions.rst` recipe.
+
+- [x] `<verifyauth assign_to= username= password=/>` compiles to
+      `Action::VerifyAuth` with both credentials as message templates
+      (rendered at execution, `[$var]`/`[fieldN]` allowed).
+- [x] `sipr_auth::verify_authorization`: MD5 and SHA-256, with or without
+      qop (`cnonce` present selects the RFC 2617 form, as SIPp), `auth-int`
+      body hashing, `-auth_uri` override of the header's `uri=`; non-Digest
+      and other algorithms are typed errors → false + a warning line.
+- [x] Engine: the verdict is stored as a boolean (`test=` branches on it);
+      the method is the received start line's first token, the credential
+      the first `Authorization:` header.
+- [x] Tests: auth unit (SIPp's own MD5 and SHA-256 vectors, sipr's qop=auth
+      header, `-auth_uri`, auth-int, scheme/algorithm errors); compile
+      `verifyauth_compiles_with_templated_credentials`; e2e
+      `verifyauth_accepts_the_right_password_and_branches_to_200` /
+      `…rejects_a_wrong_password_and_branches_to_403` (SIPp's registrar
+      recipe verbatim, branching with `test=`/`next=`); interop
+      `sipr_verifyauth_judges_real_sipp_credentials` and
+      `real_sipp_verifyauth_judges_sipr_credentials` — both directions,
+      right and wrong password.
+- [x] Deferred: SIPp's `TRACE_CALLDEBUG` line with the expected and received
+      response values.
+
 ## Post-v1 backlog (ordered)
 
-`exec verifyauth=` / `closecon` / `pauserestore` — the last exec verbs still
-rejected at load.
+`closecon` / `pauserestore` — the last two action elements still rejected
+at load (both need the TCP connection model).

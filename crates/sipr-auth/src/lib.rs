@@ -71,6 +71,10 @@ pub struct AkaKeys {
 /// Why an authorization header could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
+    /// `verifyauth`: the credential is not a Digest one.
+    NotDigest,
+    /// `verifyauth`: an algorithm other than MD5 / SHA-256.
+    UnsupportedAlgorithm(String),
     /// The challenge is `AKAv1-MD5` but no `aka_K`/`aka_OP` were given.
     AkaKeysMissing,
     /// The nonce is not base64 or decodes to fewer than 32 bytes.
@@ -84,6 +88,11 @@ pub enum AuthError {
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NotDigest => write!(f, "authentication must be Digest"),
+            Self::UnsupportedAlgorithm(algo) => write!(
+                f,
+                "authentication must use MD5 or SHA-256, value is '{algo}'"
+            ),
             Self::AkaKeysMissing => write!(
                 f,
                 "AKAv1-MD5 challenge but no AKA keys: give aka_K= and aka_OP= (or aka_OPc=) \
@@ -383,6 +392,84 @@ pub fn authorization_header(ch: &Challenge, cred: &Credentials<'_>) -> Result<St
     Ok(v)
 }
 
+/// `<verifyauth>`: check a request's `Authorization:` value against a known
+/// username and password, the way SIPp's `verifyAuthHeader` does — the
+/// digest parameters (`realm`, `uri`, `nonce`, `cnonce`, `nc`, `qop`,
+/// `algorithm`, `response`) are all taken from the header the client sent,
+/// so only the shared secret is checked, not the server's own challenge.
+///
+/// `method` is the request method; `body` is the message body for
+/// `qop=auth-int`; `auth_uri` is the `-auth_uri` override, which SIPp
+/// applies to the verifier's HA2 as well (`sip:<auth_uri>`).
+///
+/// # Errors
+///
+/// [`AuthError::NotDigest`] when the header is not a Digest credential, and
+/// [`AuthError::UnsupportedAlgorithm`] for anything but MD5 / SHA-256 — the
+/// two cases SIPp warns about and treats as "not verified".
+pub fn verify_authorization(
+    header_value: &str,
+    username: &str,
+    password: &str,
+    method: &str,
+    body: &[u8],
+    auth_uri: Option<&str>,
+) -> Result<bool, AuthError> {
+    let rest = header_value.trim();
+    let Some(rest) = strip_prefix_ignore_case(rest, "Digest") else {
+        return Err(AuthError::NotDigest);
+    };
+    let params = parse_params(rest);
+    let param = |name: &str| -> String {
+        params
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    let algo = param("algorithm");
+    let algorithm = if algo.is_empty() || algo.len() >= 3 && algo[..3].eq_ignore_ascii_case("MD5") {
+        Algorithm::Md5
+    } else if algo.len() >= 7 && algo[..7].eq_ignore_ascii_case("SHA-256") {
+        Algorithm::Sha256
+    } else {
+        return Err(AuthError::UnsupportedAlgorithm(algo));
+    };
+    let uri = match auth_uri {
+        Some(u) => format!("sip:{u}"),
+        None => param("uri"),
+    };
+    let qop = param("qop");
+    let cnonce = param("cnonce");
+    let ha1 = algorithm.hash(format!("{username}:{}:{password}", param("realm")).as_bytes());
+    let ha2 = if qop.to_ascii_lowercase().contains("auth-int") {
+        let body_hash = algorithm.hash(body);
+        algorithm.hash(format!("{method}:{uri}:{body_hash}").as_bytes())
+    } else {
+        algorithm.hash(format!("{method}:{uri}").as_bytes())
+    };
+    // SIPp keys the qop form on cnonce being present, not on qop.
+    let expected = if cnonce.is_empty() {
+        algorithm.hash(format!("{ha1}:{}:{ha2}", param("nonce")).as_bytes())
+    } else {
+        algorithm.hash(
+            format!(
+                "{ha1}:{}:{}:{cnonce}:{qop}:{ha2}",
+                param("nonce"),
+                param("nc")
+            )
+            .as_bytes(),
+        )
+    };
+    Ok(expected.eq_ignore_ascii_case(&param("response")))
+}
+
+fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,6 +767,136 @@ mod tests {
         assert!(
             parse_challenge("Digest realm=\"r\"", false).is_none(),
             "no nonce"
+        );
+    }
+
+    /// SIPp's own `DigestAuth.BasicVerification` vectors (auth.cpp gtests):
+    /// the header its `createAuthHeader` built, verified by `verifyAuthHeader`.
+    #[test]
+    fn verifies_sipps_md5_and_sha256_vectors() {
+        let md5 = "Digest username=\"testuser\",realm=\"testrealm@host.com\",\
+            uri=\"sip:sip:example.com\",nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\",\
+            response=\"db94e01e92f2b09a52a234eeca8b90f7\",algorithm=MD5,\
+            opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"";
+        assert_eq!(
+            verify_authorization(md5, "testuser", "secret", "REGISTER", b"hello world", None),
+            Ok(true)
+        );
+        assert_eq!(
+            verify_authorization(md5, "testuser", "wrong", "REGISTER", b"", None),
+            Ok(false)
+        );
+        assert_eq!(
+            verify_authorization(md5, "testuser", "secret", "INVITE", b"", None),
+            Ok(false)
+        );
+        let sha = "Digest username=\"testuser\",realm=\"testrealm@host.com\",\
+            uri=\"sip:sip:example.com\",nonce=\"ZaGxV2WhsCtREI2EsiD1LR0RYd\",\
+            response=\"91b58523b983191b52d14455a2599631990110c974ed2e4b4b49bc6053af04ce\",\
+            algorithm=SHA-256";
+        assert_eq!(
+            verify_authorization(sha, "testuser", "secret", "REGISTER", b"", None),
+            Ok(true)
+        );
+        // Uppercase hex from a client still verifies (SIPp's strcmp would not).
+        let upper = sha.replace(
+            "91b58523b983191b52d14455a2599631990110c974ed2e4b4b49bc6053af04ce",
+            "91B58523B983191B52D14455A2599631990110C974ED2E4B4B49BC6053AF04CE",
+        );
+        assert_eq!(
+            verify_authorization(&upper, "testuser", "secret", "REGISTER", b"", None),
+            Ok(true)
+        );
+    }
+
+    /// What sipr itself sends (qop=auth, and the `-auth_uri` form) verifies.
+    #[test]
+    fn verifies_sipr_own_qop_header_and_auth_uri_override() {
+        let ch = parse_challenge(
+            "Digest realm=\"r\", nonce=\"n1\", qop=\"auth\", algorithm=MD5",
+            false,
+        )
+        .expect("challenge");
+        let cred = Credentials {
+            username: "alice",
+            password: "pw",
+            method: "INVITE",
+            uri: "sip:10.0.0.1:5060",
+            cnonce: "abc123",
+            nc: 1,
+            aka: None,
+        };
+        let line = authorization_header(&ch, &cred).expect("header");
+        let value = line.strip_prefix("Authorization: ").expect("name");
+        assert_eq!(
+            verify_authorization(value, "alice", "pw", "INVITE", b"", None),
+            Ok(true)
+        );
+        assert_eq!(
+            verify_authorization(value, "alice", "pw", "INVITE", b"", Some("other")),
+            Ok(false)
+        );
+        // With -auth_uri the verifier hashes `sip:<auth_uri>` instead of uri=.
+        let cred_uri = Credentials {
+            uri: "sip:other",
+            ..cred
+        };
+        let line = authorization_header(&ch, &cred_uri).expect("header");
+        let value = line.strip_prefix("Authorization: ").expect("name");
+        assert_eq!(
+            verify_authorization(value, "alice", "pw", "INVITE", b"", Some("other")),
+            Ok(true)
+        );
+    }
+
+    /// `qop=auth-int` hashes the body; cnonce (not qop) selects the RFC 2617 form.
+    #[test]
+    fn auth_int_and_scheme_errors() {
+        let body = b"v=0\r\n";
+        let realm = "r";
+        let nonce = "n";
+        let ha1 = md5_hex(b"bob:r:pw");
+        let body_hash = md5_hex(body);
+        let ha2 = md5_hex(format!("INVITE:sip:x:{body_hash}").as_bytes());
+        let response = md5_hex(format!("{ha1}:{nonce}:00000001:cn:auth-int:{ha2}").as_bytes());
+        let header = format!(
+            "Digest username=\"bob\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"sip:x\", \
+             qop=auth-int, nc=00000001, cnonce=\"cn\", response=\"{response}\""
+        );
+        assert_eq!(
+            verify_authorization(&header, "bob", "pw", "INVITE", body, None),
+            Ok(true)
+        );
+        assert_eq!(
+            verify_authorization(&header, "bob", "pw", "INVITE", b"other", None),
+            Ok(false)
+        );
+        assert_eq!(
+            verify_authorization("Basic Zm9vOmJhcg==", "bob", "pw", "INVITE", b"", None),
+            Err(AuthError::NotDigest)
+        );
+        assert_eq!(
+            verify_authorization(
+                "Digest username=\"bob\", algorithm=AKAv1-MD5, response=\"00\"",
+                "bob",
+                "pw",
+                "INVITE",
+                b"",
+                None
+            ),
+            Err(AuthError::UnsupportedAlgorithm("AKAv1-MD5".into()))
+        );
+        // digest is case-insensitive as a scheme token
+        assert_eq!(
+            verify_authorization(
+                "digest username=\"bob\", response=\"00\"",
+                "bob",
+                "pw",
+                "X",
+                b"",
+                None
+            ),
+            Ok(false)
         );
     }
 }

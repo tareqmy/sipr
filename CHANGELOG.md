@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`<verifyauth>`** — sipr can play a digest-checking registrar: the
+  received `Authorization:` header is verified against a username and
+  password (MD5 or SHA-256, qop auth/auth-int, `-auth_uri`) and the
+  boolean verdict drives `test=` branching, exactly SIPp's documented
+  recipe. Verified in both directions against real sipp.
+
 ## [0.14.0] — 2026-09-05
 
 ### Added

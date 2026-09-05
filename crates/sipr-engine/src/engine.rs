@@ -2141,7 +2141,13 @@ impl<'s> Engine<'s> {
             };
             match cmd_text {
                 Some(text) => crate::actions::run_cmd_actions(actions, &mut store, text, &ctx),
-                None => crate::actions::run_actions(actions, &mut store, last.as_ref(), &ctx),
+                None => crate::actions::run_actions(
+                    actions,
+                    &mut store,
+                    last.as_ref(),
+                    &ctx,
+                    self.config.auth_uri.as_deref(),
+                ),
             }
         };
         // Persist the mutated store.

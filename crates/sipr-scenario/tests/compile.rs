@@ -664,3 +664,33 @@ fn rtp_echo_exec_parses_sipp_verbs() {
         assert!(!errors(&xml).is_empty(), "{bad}");
     }
 }
+
+#[test]
+fn verifyauth_compiles_with_templated_credentials() {
+    let xml = wrap(
+        r#"<recv request="REGISTER">
+             <action>
+               <verifyauth assign_to="authvalid" username="[field0]" password="secret"/>
+             </action>
+           </recv>
+           <nop test="authvalid" next="ok"/>
+           <label id="ok"/>"#,
+    );
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let Step::Recv(recv) = &sc.steps[0] else {
+        panic!("recv")
+    };
+    assert!(matches!(&recv.actions[0], Action::VerifyAuth { .. }));
+    for missing in [
+        r#"<verifyauth username="u" password="p"/>"#,
+        r#"<verifyauth assign_to="v" password="p"/>"#,
+        r#"<verifyauth assign_to="v" username="u"/>"#,
+    ] {
+        let xml = wrap(&format!(
+            r#"<recv request="REGISTER"><action>{missing}</action></recv>"#
+        ));
+        assert!(!errors(&xml).is_empty(), "{missing}");
+    }
+}

@@ -123,8 +123,8 @@ root for media.
 
 ## Not yet (post-v1 roadmap)
 
-The last SIPp exec corners: `verifyauth`, `closecon`, `pauserestore` (still
-clear load-time errors).
+The last SIPp action corners: `closecon`, `pauserestore` (still clear
+load-time errors).
 
 ## Brand
 

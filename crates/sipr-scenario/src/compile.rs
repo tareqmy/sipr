@@ -778,6 +778,17 @@ impl Compiler {
                     value: tmpl,
                 })
             }
+            "verifyauth" => {
+                self.warn_unknown_attrs(el, &["assign_to", "username", "password"]);
+                let to = self.require_attr(el, "assign_to")?;
+                let username = self.require_attr(el, "username")?;
+                let password = self.require_attr(el, "password")?;
+                Some(Action::VerifyAuth {
+                    assign_to: self.var_writes(&to),
+                    username: self.templ(&username, line),
+                    password: self.templ(&password, line),
+                })
+            }
             "strcmp" => {
                 self.warn_unknown_attrs(el, &["assign_to", "variable", "value"]);
                 let to = self.require_attr(el, "assign_to")?;
@@ -1061,7 +1072,7 @@ impl Compiler {
                     }
                 }
             }
-            "closecon" | "pauserestore" | "verifyauth" => {
+            "closecon" | "pauserestore" => {
                 self.diags.error(
                     Some(line),
                     format!(

@@ -1266,3 +1266,199 @@ fn real_sipp_srtp_uac_against_sipr_echo_server() {
         "sipp streamed only {sent} packets:\n{check_log}"
     );
 }
+
+/// SIPp's registrar recipe (docs/scenarios/actions.rst `verifyauth`), as a
+/// scenario both tools can run: challenge, verify, branch to 200 or 403.
+const VERIFYAUTH_UAS: &str = r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="verifyauth-registrar">
+  <recv request="REGISTER"/>
+  <send><![CDATA[
+    SIP/2.0 401 Authorization Required
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    WWW-Authenticate: Digest realm="sipr.test", nonce="47364c23432d2e131a5fb210812c", qop="auth", algorithm=MD5
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="REGISTER">
+    <action>
+      <verifyauth assign_to="authvalid" username="alice" password="secret"/>
+    </action>
+  </recv>
+  <nop hide="true" test="authvalid" next="goodauth"/>
+  <nop hide="true" next="badauth"/>
+  <label id="goodauth"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <nop hide="true" next="done"/>
+  <label id="badauth"/>
+  <send><![CDATA[
+    SIP/2.0 403 Forbidden
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <label id="done"/>
+</scenario>
+"#;
+
+/// A UAC (either tool) registering with digest credentials, expecting `expect`.
+fn verifyauth_uac_scenario(password: &str, expect: u16) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="register-{password}">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:alice@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:alice@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Contact: <sip:alice@[local_ip]:[local_port]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:alice@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:alice@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    Contact: <sip:alice@[local_ip]:[local_port]>
+    [authentication username=alice password={password}]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="{expect}"/>
+</scenario>
+"#
+    )
+}
+
+/// Spawn `bin` (sipp or sipr) as the registrar on `port`, then `uac_bin` with
+/// `uac_xml` against it; return (uac exit, uas exit).
+fn run_verifyauth_pair(
+    uas_bin: &std::path::Path,
+    uac_bin: &std::path::Path,
+    password: &str,
+    expect: u16,
+    tag: &str,
+) -> (Option<i32>, Option<i32>) {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let uas_path = dir.join(format!("sipr-interop-verifyauth-uas-{tag}-{pid}.xml"));
+    let uac_path = dir.join(format!("sipr-interop-verifyauth-uac-{tag}-{pid}.xml"));
+    std::fs::write(&uas_path, VERIFYAUTH_UAS).expect("write uas");
+    std::fs::write(&uac_path, verifyauth_uac_scenario(password, expect)).expect("write uac");
+    let port = free_port();
+    let mut uas = Reaper(
+        Command::new(uas_bin)
+            .current_dir(&dir)
+            .args([
+                "-sf",
+                uas_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "1",
+                "-timeout",
+                "20",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut uac = Reaper(
+        Command::new(uac_bin)
+            .current_dir(&dir)
+            .args([
+                "-sf",
+                uac_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-m",
+                "1",
+                "-timeout",
+                "10",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uac"),
+    );
+    let uac_code = wait_with_timeout(&mut uac.0, Duration::from_secs(15));
+    let uas_code = wait_with_timeout(&mut uas.0, Duration::from_secs(15));
+    let _ = std::fs::remove_file(&uas_path);
+    let _ = std::fs::remove_file(&uac_path);
+    (uac_code, uas_code)
+}
+
+/// sipr's `<verifyauth>` judges real sipp's `[authentication]` header: the
+/// right password reaches 200, a wrong one 403.
+#[test]
+fn sipr_verifyauth_judges_real_sipp_credentials() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::sipr_verifyauth_judges_real_sipp_credentials — no sipp.");
+        return;
+    };
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let (uac, uas) = run_verifyauth_pair(&sipr, &sipp, "secret", 200, "sipr-uas-good");
+    assert_eq!(
+        uac,
+        Some(0),
+        "sipp uac with the right password must get 200"
+    );
+    assert_eq!(uas, Some(0), "sipr registrar");
+    let (uac, uas) = run_verifyauth_pair(&sipr, &sipp, "wrong", 403, "sipr-uas-bad");
+    assert_eq!(uac, Some(0), "sipp uac with a wrong password must get 403");
+    assert_eq!(uas, Some(0), "sipr registrar");
+}
+
+/// The mirror image: real sipp's `<verifyauth>` judges sipr's header.
+#[test]
+fn real_sipp_verifyauth_judges_sipr_credentials() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::real_sipp_verifyauth_judges_sipr_credentials — no sipp.");
+        return;
+    };
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let (uac, uas) = run_verifyauth_pair(&sipp, &sipr, "secret", 200, "sipp-uas-good");
+    assert_eq!(
+        uac,
+        Some(0),
+        "sipr uac with the right password must get 200 from sipp"
+    );
+    assert_eq!(uas, Some(0), "sipp registrar");
+    let (uac, uas) = run_verifyauth_pair(&sipp, &sipr, "wrong", 403, "sipp-uas-bad");
+    assert_eq!(
+        uac,
+        Some(0),
+        "sipr uac with a wrong password must get 403 from sipp"
+    );
+    assert_eq!(uas, Some(0), "sipp registrar");
+}
