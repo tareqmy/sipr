@@ -62,6 +62,11 @@ on the exit code of a sipp started with `-bg` (the forked parent exits 99 at
 once) — run it in the foreground with stdin/stdout/stderr null and reap it;
 sipp as a UAS ignores SIGTERM once curses is up — kill it with SIGKILL.
 
+SCTP cannot be tested on this development host: macOS has no SCTP stack and
+the Homebrew sipp is built without `USE_SCTP` (its banner lacks `-SCTP`).
+Any SCTP work needs Linux with the `sctp` module and a sipp built with
+`-DUSE_SCTP=1` (see MILESTONES.md M32).
+
 ## 5. Performance (M3+)
 
 `criterion` benches: template fill, inbound parse+route, timer churn — plus a

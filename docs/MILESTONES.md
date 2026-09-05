@@ -897,10 +897,62 @@ Behavioral oracle: `sipp.cpp` ~l.316/~l.1572/~l.1996, `socket.cpp`
       local IPv4 address).
 - [x] Deferred: host names in the IP column.
 
+## M32 — SCTP (`-t s1|sn`) — PROPOSAL, decision needed before any code
+
+Findings (2026-09-05, from `sipp.cpp` ~l.209-243 and `socket.cpp`
+~l.806-850, ~l.888-905, ~l.1694-1775, ~l.2076):
+
+- SIPp's SCTP surface: `-t s1|sn` (one-to-one `SOCK_STREAM` SCTP sockets,
+  mono or per call), `-multihome <ip>` (`sctp_bindx` a second local
+  address), `-heartbeat <ms>`, `-assocmaxret`, `-pathmaxret`, `-pmtu`
+  (`SCTP_PEER_ADDR_PARAMS` per peer address after `sctp_getpaddrs`),
+  `-gracefulclose` (SHUTDOWN vs ABORT). It subscribes to `SCTP_EVENTS`,
+  sets `SCTP_NODELAY`, receives with `sctp_recvmsg` one SIP message per
+  SCTP message (no Content-Length framing), treats `MSG_NOTIFICATION`
+  records (`SCTP_ASSOC_CHANGE` → `SCTP_COMM_UP`, `SCTP_SHUTDOWN_EVENT`)
+  as state, and holds sends until the association is up. All of it is
+  behind `#ifdef USE_SCTP`; a SIPp built without it says "SCTP support is
+  not enabled!".
+- This development host cannot do SCTP at all: macOS has no SCTP stack
+  (`socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)` → "Protocol not
+  supported") and the local `sipp` is `v3.7.7-TLS-PCAP-SHA256` — built
+  without SCTP. Neither an e2e nor an interop test can run here; only
+  Linux with the `sctp` kernel module and a sipp built with `USE_SCTP`
+  can exercise it.
+- Rust `std` has no SCTP. Reaching it means one of: (A) the `socket2`
+  crate (safe API, pure Rust over `libc`, which is already in the lock
+  file transitively) to open `SOCK_STREAM`/`IPPROTO_SCTP` sockets and use
+  plain `send`/`recv` — SCTP preserves message boundaries, so one `recv`
+  is one SIP message — but none of SIPp's tunables (`SCTP_EVENTS`,
+  `SCTP_NODELAY`, peer-address params, `sctp_bindx`) are reachable
+  without SCTP-specific `setsockopt` structs; (B) `libc` FFI directly,
+  i.e. an `unsafe` exception in one `sipr-net` module, which breaks the
+  workspace-wide `#![forbid(unsafe_code)]` rule; (C) a libsctp-binding
+  crate — a native C dependency, which CONVENTIONS.md rules out without
+  discussion.
+
+Proposal (not started): option A, Linux-only (`cfg(target_os = "linux")`),
+behind a cargo feature `sctp` that is off by default, covering `-t s1|sn`
+with SIPp's message-per-message framing and association-up gating, and
+rejecting `-multihome`/`-heartbeat`/`-assocmaxret`/`-pathmaxret`/`-pmtu`
+with a clear "needs libsctp" error; interop coverage only in a Linux CI
+job running a sipp image built with `USE_SCTP`. Alternatively option (C′):
+leave SCTP out of scope for good and say so in README/SIPP_COMPAT.
+
+Decisions the owner must make before work starts (AGENTS.md: dependency
+additions and PLAN.md deviations are asked, not assumed):
+
+1. Add `socket2` to the sanctioned dependencies (option A), allow a scoped
+   `unsafe` FFI exception (B), or declare SCTP out of scope (C′)?
+2. Is a Linux-only, feature-gated transport acceptable for a project whose
+   selling point is a portable single binary?
+3. Is a Linux CI job with an SCTP-enabled sipp container acceptable as the
+   only acceptance test (nothing here can run it)?
+
 ## Post-v1 backlog (ordered)
 
-SCTP (needs an OS SCTP stack and a socket API the std-only, no-`unsafe`
-rules cannot reach without a new dependency — a PLAN.md decision). (Checked after M30: the pacer's first call comes one
+SCTP — blocked on the M32 decisions above. Otherwise the SIPp surface that
+sipr targets is complete. (Checked after M30: the pacer's first call comes one
 inter-call interval after start-up in SIPp too — `call_generation_task.cpp`
 opens calls when `elapsed × rate / rate_period` reaches the count; no
 divergence, see SIPP_COMPAT §6.)
