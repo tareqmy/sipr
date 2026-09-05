@@ -161,6 +161,8 @@ fn run(cli: &Cli) -> ExitCode {
             crate::cli::Transport::TcpPerCall => sipr_engine::TransportKind::TcpPerCall,
             crate::cli::Transport::TlsMono => sipr_engine::TransportKind::TlsMono,
             crate::cli::Transport::TlsPerCall => sipr_engine::TransportKind::TlsPerCall,
+            crate::cli::Transport::SctpMono => sipr_engine::TransportKind::SctpMono,
+            crate::cli::Transport::SctpPerCall => sipr_engine::TransportKind::SctpPerCall,
         },
         max_socket: cli.max_socket.unwrap_or(50_000),
         ip_field: cli.ip_field,

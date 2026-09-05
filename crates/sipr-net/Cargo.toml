@@ -14,6 +14,11 @@ categories.workspace = true
 [dependencies]
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+socket2 = { workspace = true, optional = true }
+
+[features]
+# `-t s1|sn`: SCTP over socket2 (see src/sctp.rs).
+sctp = ["dep:socket2"]
 
 [dev-dependencies]
 rcgen = { workspace = true }

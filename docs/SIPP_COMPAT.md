@@ -97,7 +97,8 @@ Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 (M20 ramps).
 Network: `-p <local port>` `-i <local ip>` `-t u1|un|ui|t1|tn|l1|ln` (UDP /
 TCP / TLS, one socket, one socket per call, or one UDP socket per injected
-IP) `-ip_field <n>` (the `-inf` column holding that IP)
+IP; `s1|sn` = SCTP, only in a build with the `sctp` cargo feature on a host
+with an SCTP stack) `-ip_field <n>` (the `-inf` column holding that IP)
 `-max_socket <n>` (per-call modes share sockets past n) `-rsa <host[:port]>`
 (remote sending address) `-max_reconnect <n>` `-reconnect_close <bool>`
 `-reconnect_sleep <ms>` (TCP/TLS reconnection) `-s <service>` (called number)
@@ -789,5 +790,24 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   to the receiving socket on the server, `[server_ip]` renders the socket
   IP, the errors are fatal at the same points — with one divergence: IPs
   must be literal (SIPp resolves host names in the column).
+- SCTP `-t s1|sn` (M32; verified in `sipp.cpp` ~l.209-243, `socket.cpp`
+  ~l.806-850, ~l.888-905, ~l.1575-1590, ~l.1694-1775, ~l.2076): SIPp uses
+  one-to-one `SOCK_STREAM` SCTP sockets, receives with `sctp_recvmsg` —
+  **one SCTP message is one SIP message**, no Content-Length framing —
+  holds sends until `SCTP_COMM_UP` arrives as an `SCTP_EVENTS`
+  notification, sets `SCTP_NODELAY`, and applies `-heartbeat`,
+  `-pathmaxret`, `-pmtu`, `-assocmaxret` per peer address
+  (`SCTP_PEER_ADDR_PARAMS`), `-multihome` via `sctp_bindx`, `-gracefulclose`
+  as SHUTDOWN vs ABORT. A SIPp built without `USE_SCTP` errors "SCTP support
+  is not enabled!". sipr (cargo feature `sctp`, off by default; `socket2`)
+  matches the socket type, the message-per-message model, `s1`/`sn`, the
+  association-up gating (a blocking `connect`), reliability (no
+  retransmissions), reconnection and the clear error without support, with
+  these divergences: no `SCTP_NODELAY`, no notifications (a peer's SHUTDOWN
+  is seen as end-of-stream), and the six SCTP option flags are **rejected**
+  rather than applied — socket2 cannot set SCTP-level socket options. Only
+  Linux with the `sctp` module has a stack; macOS and Windows report "SCTP
+  is not supported on this host". Verified in Linux CI against a sipp built
+  with `USE_SCTP`; the development host cannot run it.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

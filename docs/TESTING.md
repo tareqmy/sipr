@@ -64,8 +64,11 @@ sipp as a UAS ignores SIGTERM once curses is up — kill it with SIGKILL.
 
 SCTP cannot be tested on this development host: macOS has no SCTP stack and
 the Homebrew sipp is built without `USE_SCTP` (its banner lacks `-SCTP`).
-Any SCTP work needs Linux with the `sctp` module and a sipp built with
-`-DUSE_SCTP=1` (see MILESTONES.md M32).
+SCTP therefore lives behind the `sctp` cargo feature, its tests skip when
+the host has no stack, and the CI job `sctp` (ubuntu: `modprobe sctp`, a
+sipp built with `-DUSE_SCTP=1`) is where it is actually exercised:
+`cargo test --workspace --features sctp` and
+`SIPP_BIN=... cargo test --features sctp --test interop sctp`.
 
 ## 5. Performance (M3+)
 

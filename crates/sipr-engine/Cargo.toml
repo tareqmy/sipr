@@ -19,5 +19,8 @@ sipr-stats = { workspace = true }
 sipr-media = { workspace = true }
 sipr-control = { workspace = true }
 
+[features]
+sctp = ["sipr-net/sctp"]
+
 [lints]
 workspace = true

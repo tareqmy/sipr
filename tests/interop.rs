@@ -2354,3 +2354,98 @@ fn per_ip_sockets_both_ways_against_real_sipp() {
         );
     }
 }
+
+/// `-t s1` against a real sipp built with SCTP (`sipp -v` banners `-SCTP`),
+/// both directions; skips without such a sipp or without an SCTP stack.
+#[cfg(feature = "sctp")]
+#[test]
+fn sctp_both_ways_against_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::sctp_both_ways_against_real_sipp — no sipp.");
+        return;
+    };
+    let banner = Command::new(&sipp)
+        .arg("-v")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    if !banner.contains("SCTP") || !sipr_net::sctp::available() {
+        eprintln!(
+            "SKIPPED interop::sctp_both_ways_against_real_sipp — sipp without SCTP or no SCTP stack."
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let spawn = |bin: &std::path::Path, args: &[&str]| {
+        Reaper(
+            Command::new(bin)
+                .current_dir(dir.path())
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn"),
+        )
+    };
+    for (uas_bin, uac_bin, uas_bg, uac_bg) in
+        [(&sipp, &sipr, false, true), (&sipr, &sipp, true, false)]
+    {
+        let port = free_port();
+        let p = port.to_string();
+        let mut uas_args: Vec<&str> = vec![
+            "-sn",
+            "uas",
+            "-t",
+            "s1",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &p,
+            "-m",
+            "2",
+            "-timeout",
+            "20",
+        ];
+        if uas_bg {
+            uas_args.push("-bg");
+        }
+        let mut uas = spawn(uas_bin, &uas_args);
+        std::thread::sleep(Duration::from_millis(500));
+        let target = format!("127.0.0.1:{port}");
+        let mut uac_args: Vec<&str> = vec![
+            "-sn",
+            "uac",
+            "-t",
+            "s1",
+            "-i",
+            "127.0.0.1",
+            "-r",
+            "10",
+            "-m",
+            "2",
+            "-d",
+            "100",
+            "-timeout",
+            "10",
+        ];
+        if uac_bg {
+            uac_args.push("-bg");
+        }
+        uac_args.push(&target);
+        let mut uac = spawn(uac_bin, &uac_args);
+        assert_eq!(
+            wait_with_timeout(&mut uac.0, Duration::from_secs(15)),
+            Some(0),
+            "sctp uac {}",
+            uac_bin.display()
+        );
+        assert_eq!(
+            wait_with_timeout(&mut uas.0, Duration::from_secs(10)),
+            Some(0),
+            "sctp uas {}",
+            uas_bin.display()
+        );
+    }
+}

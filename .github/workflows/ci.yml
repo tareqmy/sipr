@@ -34,3 +34,28 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y sip-tester
       - name: Interop against real SIPp
         run: SIPP_BIN=$(command -v sipp) cargo test --test interop -- --nocapture
+
+  # SCTP needs an OS stack and a sipp built with USE_SCTP; only Linux has both.
+  sctp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Load the SCTP kernel module
+        run: sudo modprobe sctp && cat /proc/net/protocols | grep -i sctp
+      - name: Build real SIPp with SCTP
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libsctp-dev libpcap-dev libncurses-dev libssl-dev
+          git clone --depth 1 https://github.com/SIPp/sipp.git /tmp/sipp
+          cd /tmp/sipp && cmake . -DUSE_SCTP=1 -DUSE_PCAP=1 -DUSE_SSL=1 && make -j"$(nproc)"
+          /tmp/sipp/sipp -v | head -1
+      - name: Clippy (sctp feature)
+        run: cargo clippy --workspace --all-targets --features sctp -- -D warnings
+      - name: Tests (sctp feature)
+        run: cargo test --workspace --features sctp
+      - name: SCTP interop against real SIPp
+        run: SIPP_BIN=/tmp/sipp/sipp cargo test --features sctp --test interop sctp -- --nocapture

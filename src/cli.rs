@@ -29,6 +29,10 @@ pub enum Transport {
     TlsMono,
     /// `ln`: TLS with one connection per call.
     TlsPerCall,
+    /// `s1`: SCTP with one association per peer (needs the `sctp` build feature).
+    SctpMono,
+    /// `sn`: SCTP with one association per call.
+    SctpPerCall,
 }
 
 /// `-tls_version` argument. SIPp accepts 1.0–1.3; rustls has no pre-1.2
@@ -421,7 +425,7 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "t",
         true,
         "MODE",
-        "Transport: u1 (UDP, default), un (UDP, one socket per call), ui (UDP, one socket per injected IP; needs -inf and -ip_field), t1 (TCP), tn (TCP, one connection per call), l1 (TLS), ln (TLS, one connection per call)",
+        "Transport: u1 (UDP, default), un (UDP, one socket per call), ui (UDP, one socket per injected IP; needs -inf and -ip_field), s1 (SCTP), sn (SCTP, one association per call; both need a build with the sctp feature and a Linux SCTP stack), t1 (TCP), tn (TCP, one connection per call), l1 (TLS), ln (TLS, one connection per call)",
     ),
     (
         "s",
@@ -484,6 +488,37 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         true,
         "N",
         "Maximum UDP retransmissions per message",
+    ),
+    (
+        "multihome",
+        true,
+        "IP",
+        "SIPp SCTP option: not supported by sipr (SCTP socket options are out of reach)",
+    ),
+    (
+        "heartbeat",
+        true,
+        "MS",
+        "SIPp SCTP option: not supported by sipr",
+    ),
+    (
+        "assocmaxret",
+        true,
+        "N",
+        "SIPp SCTP option: not supported by sipr",
+    ),
+    (
+        "pathmaxret",
+        true,
+        "N",
+        "SIPp SCTP option: not supported by sipr",
+    ),
+    ("pmtu", true, "N", "SIPp SCTP option: not supported by sipr"),
+    (
+        "gracefulclose",
+        true,
+        "true|false",
+        "SIPp SCTP option: not supported by sipr",
     ),
     (
         "ip_field",
@@ -745,6 +780,12 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "users" => cli.users = Some(parse_num(flag, &val(value))?),
         "rsa" => cli.remote_sending = Some(val(value)),
         "ip_field" => cli.ip_field = parse_num(flag, &val(value))?,
+        "multihome" | "heartbeat" | "assocmaxret" | "pathmaxret" | "pmtu" | "gracefulclose" => {
+            return Err(format!(
+                "-{flag} sets an SCTP socket option (libsctp) that sipr's SCTP transport \
+                 cannot reach; it is not supported (docs/SIPP_COMPAT.md §6)"
+            ));
+        }
         "max_reconnect" => cli.max_reconnect = parse_num(flag, &val(value))?,
         "reconnect_close" => cli.reconnect_close = parse_bool_value(flag, &val(value))?,
         "reconnect_sleep" => cli.reconnect_sleep_ms = parse_num(flag, &val(value))?,
@@ -818,8 +859,10 @@ fn parse_transport(s: &str) -> Result<Transport, String> {
         "tn" => Ok(Transport::TcpPerCall),
         "l1" => Ok(Transport::TlsMono),
         "ln" => Ok(Transport::TlsPerCall),
+        "s1" => Ok(Transport::SctpMono),
+        "sn" => Ok(Transport::SctpPerCall),
         other => Err(format!(
-            "unknown transport mode '{other}' (expected u1, un, ui, t1, tn, l1, or ln)"
+            "unknown transport mode '{other}' (expected u1, un, ui, t1, tn, l1, ln, s1, or sn)"
         )),
     }
 }
@@ -1012,6 +1055,10 @@ mod tests {
             cli(&["-t", "ui", "-inf", "ips.csv", "host"]).transport,
             Transport::UdpPerIp
         );
+        assert_eq!(cli(&["-t", "s1", "host"]).transport, Transport::SctpMono);
+        assert_eq!(cli(&["-t", "sn", "host"]).transport, Transport::SctpPerCall);
+        let err = run(&["-t", "s1", "-heartbeat", "500", "host"]).unwrap_err();
+        assert!(err.contains("not supported"), "{err}");
         assert_eq!(cli(&["-ip_field", "2", "host"]).ip_field, 2);
         let err = run(&["-t", "ui", "host"]).unwrap_err();
         assert!(err.contains("-inf"), "{err}");

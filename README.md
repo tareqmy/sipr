@@ -87,7 +87,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   and SIPp's ramps (`-rate_increase`, `-rate_max`, `-rate_interval`).
 - UDP, TCP, and TLS transports, one socket (`-t u1|t1|l1`), one per call
   (`-t un|tn|ln`, `-max_socket`), or one UDP socket per injected IP
-  (`-t ui`, `-ip_field`, `[server_ip]`); streams frame by
+  (`-t ui`, `-ip_field`, `[server_ip]`); SCTP (`-t s1|sn`) with
+  `--features sctp` on Linux; streams frame by
   Content-Length and carry no SIP retransmissions (reliable transports). TLS
   takes SIPp's `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version`
   flags with SIPp's verification semantics.
@@ -125,8 +126,8 @@ root for media.
 
 ## Not yet (post-v1 roadmap)
 
-The SIPp scenario surface is covered. Remaining SIPp corners are transport
-modes: SCTP.
+SIPp's SCTP socket options (`-multihome`, `-heartbeat`, `-pathmaxret`,
+`-pmtu`, `-assocmaxret`, `-gracefulclose`) — out of reach without libsctp.
 
 ## Brand
 

@@ -3904,6 +3904,91 @@ fn tls_per_call_connections_complete_calls() {
     assert!(uas_err.contains("successful 2 failed 0"), "{uas_err}");
 }
 
+// ---- -t s1|sn: SCTP (cargo feature `sctp`; needs an OS SCTP stack) (M32) --------
+
+/// `-t s1` and `-t sn`: whole calls between a sipr SCTP UAS and UAC. Skips
+/// where the host has no SCTP stack (macOS, Windows).
+#[cfg(feature = "sctp")]
+#[test]
+fn sctp_mono_and_per_call_calls_complete() {
+    if !sipr_net::sctp::available() {
+        eprintln!("SKIPPED sctp_mono_and_per_call_calls_complete — no SCTP stack on this host.");
+        return;
+    }
+    for mode in ["s1", "sn"] {
+        let port = free_port();
+        let (mut uas, uas_err) = spawn_sipr_bg(&[
+            "-sn",
+            "uas",
+            "-t",
+            "s1",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-m",
+            "2",
+            "-timeout",
+            "15",
+            "-bg",
+        ]);
+        std::thread::sleep(Duration::from_millis(400));
+        let out = run_sipr(&[
+            "-sn",
+            "uac",
+            "-t",
+            mode,
+            "-i",
+            "127.0.0.1",
+            "-r",
+            "10",
+            "-m",
+            "2",
+            "-d",
+            "100",
+            "-timeout",
+            "10",
+            "-bg",
+            &format!("127.0.0.1:{port}"),
+        ]);
+        let uac_err = String::from_utf8_lossy(&out.stderr);
+        let uas_code = wait_exit(&mut uas, Duration::from_secs(10));
+        let uas_err = uas_err.join().expect("uas stderr");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "-t {mode} uac:\n{uac_err}\nuas:\n{uas_err}"
+        );
+        assert!(uac_err.contains("successful 2 failed 0"), "{uac_err}");
+        assert_eq!(uas_code, Some(0), "uas:\n{uas_err}");
+        assert!(uas_err.contains("successful 2 failed 0"), "{uas_err}");
+    }
+}
+
+/// Without an SCTP stack, `-t s1` is a clear start-up error, like SIPp's
+/// "SCTP support is not enabled!".
+#[test]
+fn sctp_without_a_stack_or_feature_is_a_clear_error() {
+    #[cfg(feature = "sctp")]
+    if sipr_net::sctp::available() {
+        return; // covered by sctp_mono_and_per_call_calls_complete
+    }
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "s1",
+        "-i",
+        "127.0.0.1",
+        "-m",
+        "1",
+        "127.0.0.1:5060",
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(err.contains("SCTP"), "{err}");
+}
+
 // ---- -t ui: one UDP socket per injected IP, -ip_field, [server_ip] (M31) --------
 
 const UI_UAC: &str = r#"<scenario name="ui-uac">

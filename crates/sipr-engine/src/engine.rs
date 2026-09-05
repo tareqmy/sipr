@@ -26,6 +26,8 @@ use sipr_net::{
     Inbound, NetEvent, RetransSchedule, TcpCallConn, TcpTransport, TimerService, TlsCallConn,
     TlsTransport, TransportConfig, TwinChannel, UdpCallSocket, UdpTransport,
 };
+#[cfg(feature = "sctp")]
+use sipr_net::{SctpCallConn, SctpTransport};
 use sipr_scenario::inject::{InjectMode, InjectionFile};
 use sipr_scenario::model::{
     Action, Expect, MediaKind, PauseSpec, RecvStep, Role, RtpEchoCmd, RtpEchoVerb, RtpSource,
@@ -197,13 +199,21 @@ pub enum TransportKind {
     TlsMono,
     /// `ln`: TLS, one connection per call (client side).
     TlsPerCall,
+    /// `s1`: SCTP, one association per peer (cargo feature `sctp`; needs an
+    /// OS SCTP stack at run time).
+    SctpMono,
+    /// `sn`: SCTP, one association per call (client side).
+    SctpPerCall,
 }
 
 impl TransportKind {
     /// SIPp's `multisocket`: one socket per call on the client side.
     #[must_use]
     pub fn per_call(self) -> bool {
-        matches!(self, Self::UdpPerCall | Self::TcpPerCall | Self::TlsPerCall)
+        matches!(
+            self,
+            Self::UdpPerCall | Self::TcpPerCall | Self::TlsPerCall | Self::SctpPerCall
+        )
     }
 }
 
@@ -509,6 +519,8 @@ enum Transport {
     Udp(UdpTransport),
     Tcp(TcpTransport),
     Tls(TlsTransport),
+    #[cfg(feature = "sctp")]
+    Sctp(SctpTransport),
 }
 
 /// A call's own socket in the per-call modes (`un`/`tn`/`ln`). Shared
@@ -520,6 +532,8 @@ enum CallSocket {
     Udp(Arc<UdpCallSocket>),
     Tcp(Arc<TcpCallConn>),
     Tls(Arc<TlsCallConn>),
+    #[cfg(feature = "sctp")]
+    Sctp(Arc<SctpCallConn>),
 }
 
 impl CallSocket {
@@ -528,6 +542,8 @@ impl CallSocket {
             Self::Udp(s) => s.local_addr().port(),
             Self::Tcp(c) => c.local_addr().port(),
             Self::Tls(c) => c.local_addr().port(),
+            #[cfg(feature = "sctp")]
+            Self::Sctp(c) => c.local_addr().port(),
         }
     }
 
@@ -536,6 +552,8 @@ impl CallSocket {
             Self::Udp(s) => WeakCallSocket::Udp(Arc::downgrade(s)),
             Self::Tcp(c) => WeakCallSocket::Tcp(Arc::downgrade(c)),
             Self::Tls(c) => WeakCallSocket::Tls(Arc::downgrade(c)),
+            #[cfg(feature = "sctp")]
+            Self::Sctp(c) => WeakCallSocket::Sctp(Arc::downgrade(c)),
         }
     }
 }
@@ -545,6 +563,8 @@ enum WeakCallSocket {
     Udp(std::sync::Weak<UdpCallSocket>),
     Tcp(std::sync::Weak<TcpCallConn>),
     Tls(std::sync::Weak<TlsCallConn>),
+    #[cfg(feature = "sctp")]
+    Sctp(std::sync::Weak<SctpCallConn>),
 }
 
 impl WeakCallSocket {
@@ -553,6 +573,8 @@ impl WeakCallSocket {
             Self::Udp(w) => w.upgrade().map(CallSocket::Udp),
             Self::Tcp(w) => w.upgrade().map(CallSocket::Tcp),
             Self::Tls(w) => w.upgrade().map(CallSocket::Tls),
+            #[cfg(feature = "sctp")]
+            Self::Sctp(w) => w.upgrade().map(CallSocket::Sctp),
         }
     }
 }
@@ -563,6 +585,8 @@ impl Transport {
             Self::Udp(u) => u.local_addr(),
             Self::Tcp(t) => t.local_addr(),
             Self::Tls(t) => t.local_addr(),
+            #[cfg(feature = "sctp")]
+            Self::Sctp(t) => t.local_addr(),
         }
     }
 
@@ -571,6 +595,8 @@ impl Transport {
             Self::Udp(u) => u.send_to(data, to, lost_pct),
             Self::Tcp(t) => t.send_to(data, to, lost_pct),
             Self::Tls(t) => t.send_to(data, to, lost_pct),
+            #[cfg(feature = "sctp")]
+            Self::Sctp(t) => t.send_to(data, to, lost_pct),
         }
     }
 
@@ -580,6 +606,8 @@ impl Transport {
             Self::Udp(_) => {}
             Self::Tcp(t) => t.forget(peer),
             Self::Tls(t) => t.forget(peer),
+            #[cfg(feature = "sctp")]
+            Self::Sctp(t) => t.forget(peer),
         }
     }
 }
@@ -810,6 +838,9 @@ impl<'s> Engine<'s> {
                         .map_err(|e| EngineError(format!("cannot bind TCP listener: {e}")))?,
                 };
                 (Transport::Tcp(t), "TCP", true)
+            }
+            TransportKind::SctpMono | TransportKind::SctpPerCall => {
+                build_sctp_transport(config, &tcfg, net_tx, scenario.role, per_call)?
             }
             TransportKind::TlsMono | TransportKind::TlsPerCall => {
                 let tls_cfg = config
@@ -3197,6 +3228,11 @@ impl<'s> Engine<'s> {
                     .connect_call(remote)
                     .map(|c| CallSocket::Tls(Arc::new(c)))
                     .map_err(|e| format!("cannot connect TLS to {remote}: {e}"))?,
+                #[cfg(feature = "sctp")]
+                Transport::Sctp(t) => t
+                    .connect_call(remote)
+                    .map(|c| CallSocket::Sctp(Arc::new(c)))
+                    .map_err(|e| format!("cannot connect SCTP to {remote}: {e}"))?,
             };
             self.call_socket_pool.push(opened.downgrade());
             opened
@@ -3286,6 +3322,10 @@ impl<'s> Engine<'s> {
             (Some(CallSocket::Tls(c)), Transport::Tls(t)) => {
                 return t.send_via(c, data, lost_pct);
             }
+            #[cfg(feature = "sctp")]
+            (Some(CallSocket::Sctp(c)), Transport::Sctp(t)) => {
+                return t.send_via(c, data, lost_pct);
+            }
             _ => {}
         }
         if !self.send_may_reconnect(to) {
@@ -3370,6 +3410,8 @@ impl<'s> Engine<'s> {
         let result = match &self.transport {
             Transport::Tcp(t) => t.reconnect(peer),
             Transport::Tls(t) => t.reconnect(peer),
+            #[cfg(feature = "sctp")]
+            Transport::Sctp(t) => t.reconnect(peer),
             Transport::Udp(_) => Ok(()),
         };
         match result {
@@ -3755,6 +3797,55 @@ fn step_label(step: &Step) -> String {
         Step::Label { id, .. } => format!("label {id}"),
         Step::Timewait { ms, .. } => format!("timewait {ms}ms"),
     }
+}
+
+/// `-t s1|sn`: the SCTP transport, when sipr was built with the `sctp`
+/// feature and the host has an SCTP stack (SIPp without `USE_SCTP` says
+/// "SCTP support is not enabled!" at the same point).
+#[cfg(feature = "sctp")]
+fn build_sctp_transport(
+    config: &EngineConfig,
+    tcfg: &TransportConfig,
+    net_tx: std::sync::mpsc::Sender<NetEvent>,
+    role: Role,
+    per_call: bool,
+) -> Result<(Transport, &'static str, bool), EngineError> {
+    if !sipr_net::sctp::available() {
+        return Err(EngineError(
+            "SCTP is not supported on this host (the kernel has no SCTP stack; Linux needs the \
+             `sctp` module)"
+                .into(),
+        ));
+    }
+    let t = match role {
+        Role::Uac if per_call => SctpTransport::client_pool(tcfg, net_tx),
+        Role::Uac => {
+            let remote = config
+                .target
+                .ok_or_else(|| EngineError("SCTP UAC needs a remote target".into()))?;
+            let remote = config.remote_sending_addr.unwrap_or(remote);
+            SctpTransport::connect(tcfg, net_tx, remote)
+                .map_err(|e| EngineError(format!("cannot connect SCTP to {remote}: {e}")))?
+        }
+        Role::Uas => SctpTransport::listen(tcfg, net_tx)
+            .map_err(|e| EngineError(format!("cannot bind SCTP listener: {e}")))?,
+    };
+    Ok((Transport::Sctp(t), "SCTP", true))
+}
+
+/// `-t s1|sn` in a build without the `sctp` feature.
+#[cfg(not(feature = "sctp"))]
+fn build_sctp_transport(
+    _config: &EngineConfig,
+    _tcfg: &TransportConfig,
+    _net_tx: std::sync::mpsc::Sender<NetEvent>,
+    _role: Role,
+    _per_call: bool,
+) -> Result<(Transport, &'static str, bool), EngineError> {
+    Err(EngineError(
+        "SCTP support is not enabled: rebuild sipr with `--features sctp` (Linux only at run time)"
+            .into(),
+    ))
 }
 
 /// Fresh call state.

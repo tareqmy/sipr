@@ -897,62 +897,48 @@ Behavioral oracle: `sipp.cpp` ~l.316/~l.1572/~l.1996, `socket.cpp`
       local IPv4 address).
 - [x] Deferred: host names in the IP column.
 
-## M32 — SCTP (`-t s1|sn`) — PROPOSAL, decision needed before any code
+## M32 — SCTP `-t s1|sn` behind the `sctp` cargo feature ✅ (verified only in Linux CI)
 
-Findings (2026-09-05, from `sipp.cpp` ~l.209-243 and `socket.cpp`
-~l.806-850, ~l.888-905, ~l.1694-1775, ~l.2076):
+Decision (owner, 2026-09-05): option A — `socket2` as a sanctioned dependency,
+used only behind an off-by-default `sctp` feature; SCTP-specific socket
+options stay out of scope. Findings that led here are in the git history of
+this section (macOS has no SCTP stack and the local sipp lacks `USE_SCTP`;
+Rust std has no SCTP; `libc` FFI would need an `unsafe` exception).
 
-- SIPp's SCTP surface: `-t s1|sn` (one-to-one `SOCK_STREAM` SCTP sockets,
-  mono or per call), `-multihome <ip>` (`sctp_bindx` a second local
-  address), `-heartbeat <ms>`, `-assocmaxret`, `-pathmaxret`, `-pmtu`
-  (`SCTP_PEER_ADDR_PARAMS` per peer address after `sctp_getpaddrs`),
-  `-gracefulclose` (SHUTDOWN vs ABORT). It subscribes to `SCTP_EVENTS`,
-  sets `SCTP_NODELAY`, receives with `sctp_recvmsg` one SIP message per
-  SCTP message (no Content-Length framing), treats `MSG_NOTIFICATION`
-  records (`SCTP_ASSOC_CHANGE` → `SCTP_COMM_UP`, `SCTP_SHUTDOWN_EVENT`)
-  as state, and holds sends until the association is up. All of it is
-  behind `#ifdef USE_SCTP`; a SIPp built without it says "SCTP support is
-  not enabled!".
-- This development host cannot do SCTP at all: macOS has no SCTP stack
-  (`socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)` → "Protocol not
-  supported") and the local `sipp` is `v3.7.7-TLS-PCAP-SHA256` — built
-  without SCTP. Neither an e2e nor an interop test can run here; only
-  Linux with the `sctp` kernel module and a sipp built with `USE_SCTP`
-  can exercise it.
-- Rust `std` has no SCTP. Reaching it means one of: (A) the `socket2`
-  crate (safe API, pure Rust over `libc`, which is already in the lock
-  file transitively) to open `SOCK_STREAM`/`IPPROTO_SCTP` sockets and use
-  plain `send`/`recv` — SCTP preserves message boundaries, so one `recv`
-  is one SIP message — but none of SIPp's tunables (`SCTP_EVENTS`,
-  `SCTP_NODELAY`, peer-address params, `sctp_bindx`) are reachable
-  without SCTP-specific `setsockopt` structs; (B) `libc` FFI directly,
-  i.e. an `unsafe` exception in one `sipr-net` module, which breaks the
-  workspace-wide `#![forbid(unsafe_code)]` rule; (C) a libsctp-binding
-  crate — a native C dependency, which CONVENTIONS.md rules out without
-  discussion.
+Behavioral oracle: `sipp.cpp` ~l.209-243, `socket.cpp` ~l.806-850 (notify),
+~l.888-905 (`sctp_recvmsg`, one SIP message per SCTP message), ~l.1575-1590
+(connect), ~l.1694-1775 (peer params, `SCTP_EVENTS`, `SCTP_NODELAY`).
 
-Proposal (not started): option A, Linux-only (`cfg(target_os = "linux")`),
-behind a cargo feature `sctp` that is off by default, covering `-t s1|sn`
-with SIPp's message-per-message framing and association-up gating, and
-rejecting `-multihome`/`-heartbeat`/`-assocmaxret`/`-pathmaxret`/`-pmtu`
-with a clear "needs libsctp" error; interop coverage only in a Linux CI
-job running a sipp image built with `USE_SCTP`. Alternatively option (C′):
-leave SCTP out of scope for good and say so in README/SIPP_COMPAT.
-
-Decisions the owner must make before work starts (AGENTS.md: dependency
-additions and PLAN.md deviations are asked, not assumed):
-
-1. Add `socket2` to the sanctioned dependencies (option A), allow a scoped
-   `unsafe` FFI exception (B), or declare SCTP out of scope (C′)?
-2. Is a Linux-only, feature-gated transport acceptable for a project whose
-   selling point is a portable single binary?
-3. Is a Linux CI job with an SCTP-enabled sipp container acceptable as the
-   only acceptance test (nothing here can run it)?
+- [x] `sipr-net::sctp` (feature `sctp`): one-to-one `SOCK_STREAM`/
+      `IPPROTO_SCTP` sockets via socket2; blocking `connect` returns at
+      association-up (SIPp's `SCTP_COMM_UP` gating); each read is one SCTP
+      message = one SIP message (no Content-Length framing); `s1` mono and
+      `sn` per-call associations, `reconnect`/`forget`, disconnect reports —
+      the same shape as the TCP transport. `available()` probes the kernel
+      at run time; the module compiles on every OS.
+- [x] Engine: `TransportKind::SctpMono|SctpPerCall`, `[transport]` = `SCTP`,
+      reliable (no retransmissions), per-call pool, reconnection. Without
+      the feature or without a stack, `-t s1` is a clear start-up error
+      (SIPp: "SCTP support is not enabled!").
+- [x] CLI: `-t s1|sn`; SIPp's `-multihome`, `-heartbeat`, `-assocmaxret`,
+      `-pathmaxret`, `-pmtu`, `-gracefulclose` are rejected with a message
+      naming why (SCTP socket options socket2 cannot set).
+- [x] Tests: net unit `messages_keep_their_boundaries_and_round_trip`
+      (skips without a stack), e2e `sctp_mono_and_per_call_calls_complete`
+      (skips) and `sctp_without_a_stack_or_feature_is_a_clear_error`,
+      interop `sctp_both_ways_against_real_sipp` (skips unless sipp banners
+      `-SCTP`). CI job `sctp` on ubuntu: `modprobe sctp`, sipp built from
+      source with `USE_SCTP`, `cargo test --features sctp`, the interop test.
+- [ ] **Unverified on the development host** (no SCTP stack): the first green
+      `sctp` CI run is the acceptance evidence — check it before relying on
+      this transport.
+- [x] Deferred for good: `SCTP_NODELAY`, notifications, per-path parameters,
+      multi-homing, SHUTDOWN-vs-ABORT.
 
 ## Post-v1 backlog (ordered)
 
-SCTP — blocked on the M32 decisions above. Otherwise the SIPp surface that
-sipr targets is complete. (Checked after M30: the pacer's first call comes one
+Nothing queued: the SIPp surface sipr targets is complete. Watch the first
+`sctp` CI run (M32) and fix what it finds. (Checked after M30: the pacer's first call comes one
 inter-call interval after start-up in SIPp too — `call_generation_task.cpp`
 opens calls when `elapsed × rate / rate_period` reaches the count; no
 divergence, see SIPP_COMPAT §6.)

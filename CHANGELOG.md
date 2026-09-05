@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **SCTP transport** (`-t s1|sn`) behind the new off-by-default `sctp`
+  cargo feature, via `socket2`: one SCTP message per SIP message as SIPp
+  does, mono and per-call associations, reconnection. Needs an OS SCTP
+  stack at run time (Linux with the `sctp` module); SIPp's SCTP option
+  flags are rejected with an explanation. Exercised only in Linux CI.
+
 ## [0.20.0] — 2026-09-05
 
 ### Added
