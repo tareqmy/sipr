@@ -1,7 +1,0 @@
-Closing calls, because of TCP reset or close!
-call 1-88383@127.0.0.1 failed: TCP connection closed
-Socket required a reconnection.
-TCP connection with 127.0.0.1:64134 closed by the peer
-Closing calls, because of TCP reset or close!
-call 2-88383@127.0.0.1 failed: TCP connection closed
-Socket required a reconnection.
