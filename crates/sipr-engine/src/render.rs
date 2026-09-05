@@ -443,7 +443,34 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
                     Some(expr) => resolve_line_expr(expr, ctx),
                 };
                 if let Some(l) = chosen {
-                    ctx.fields.read(fi, l, *index, out);
+                    let mut value = String::new();
+                    ctx.fields.read(fi, l, *index, &mut value);
+                    // SIPp (`call.cpp` E_Message_Injection): a field whose
+                    // text carries `[authentication …]` is re-parsed as the
+                    // keyword at send time, so credentials can live in the
+                    // CSV. Only that keyword; the rest of the field stays
+                    // literal.
+                    match value.find("[authentication") {
+                        Some(start) => {
+                            let close = value[start..]
+                                .find(']')
+                                .map_or(value.len(), |i| start + i + 1);
+                            out.push_str(&value[..start]);
+                            let mut scratch = sipr_scenario::diag::Diagnostics::new("injection");
+                            let sub = sipr_scenario::template::tokenize(
+                                &value[start..close],
+                                0,
+                                &mut scratch,
+                            );
+                            for kw in sub.keywords() {
+                                if let Keyword::Authentication(params) = kw {
+                                    render_authentication(params, ctx, out)?;
+                                }
+                            }
+                            out.push_str(&value[close..]);
+                        }
+                        None => out.push_str(&value),
+                    }
                 }
             }
         }
@@ -463,39 +490,7 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
                 }
             }
         }
-        Keyword::Authentication(raw_params) => {
-            if let Some(vc) = &ctx.var_ctx {
-                if let Some(ch) = vc.challenge {
-                    // SIPp renders every parameter as a sub-message, so
-                    // `username=[field0]` or `aka_K=[$k]` work.
-                    let rendered = render_auth_params(raw_params, ctx);
-                    let params = &rendered;
-                    let user = param_or(params, "username", vc.auth_user);
-                    let pass = param_or(params, "password", vc.auth_password);
-                    let aka = if ch.algorithm == sipr_auth::Algorithm::AkaV1Md5 {
-                        Some(aka_keys(params, pass)?)
-                    } else {
-                        None
-                    };
-                    let cred = sipr_auth::Credentials {
-                        username: user,
-                        password: pass,
-                        method: vc.method,
-                        uri: vc.digest_uri,
-                        cnonce: vc.cnonce,
-                        nc: 1,
-                        aka,
-                    };
-                    // authorization_header returns "Name: Digest ..."; the
-                    // scenario supplies the header name context, so emit only
-                    // the value after the colon.
-                    let line = sipr_auth::authorization_header(ch, &cred)
-                        .map_err(|e| RenderError(format!("[authentication]: {e}")))?;
-                    let value = line.split_once(": ").map_or(line.as_str(), |(_, v)| v);
-                    out.push_str(value);
-                }
-            }
-        }
+        Keyword::Authentication(raw_params) => render_authentication(raw_params, ctx, out)?,
         Keyword::Unknown(u) => {
             // Tokenizer emits unknown keywords as literals; reaching here is
             // a bug upstream, but render verbatim rather than dying.
@@ -633,6 +628,63 @@ fn resolve_line_expr(expr: &LineExpr, ctx: &RenderCtx<'_>) -> Option<usize> {
             }
         }
     }
+}
+
+/// `[authentication …]`: the digest (or AKA) header for the pending
+/// challenge. SIPp renders the **whole header line** — `Authorization:`
+/// for a 401, `Proxy-Authorization:` for a 407 — and its scenarios put the
+/// keyword on a line of its own. sipr does the same, and additionally
+/// recognises the `Authorization: [authentication …]` spelling (the header
+/// name already rendered on the current line) and then emits only the
+/// value, so both forms produce one well-formed header.
+fn render_authentication(
+    raw_params: &[(String, String)],
+    ctx: &RenderCtx<'_>,
+    out: &mut String,
+) -> Result<(), RenderError> {
+    let Some(vc) = &ctx.var_ctx else {
+        return Ok(());
+    };
+    let Some(ch) = vc.challenge else {
+        return Ok(());
+    };
+    // SIPp renders every parameter as a sub-message, so
+    // `username=[field0]` or `aka_K=[$k]` work.
+    let rendered = render_auth_params(raw_params, ctx);
+    let params = &rendered;
+    let user = param_or(params, "username", vc.auth_user);
+    let pass = param_or(params, "password", vc.auth_password);
+    let aka = if ch.algorithm == sipr_auth::Algorithm::AkaV1Md5 {
+        Some(aka_keys(params, pass)?)
+    } else {
+        None
+    };
+    let cred = sipr_auth::Credentials {
+        username: user,
+        password: pass,
+        method: vc.method,
+        uri: vc.digest_uri,
+        cnonce: vc.cnonce,
+        nc: 1,
+        aka,
+    };
+    let line = sipr_auth::authorization_header(ch, &cred)
+        .map_err(|e| RenderError(format!("[authentication]: {e}")))?;
+    if header_name_already_rendered(out) {
+        let value = line.split_once(": ").map_or(line.as_str(), |(_, v)| v);
+        out.push_str(value);
+    } else {
+        out.push_str(&line);
+    }
+    Ok(())
+}
+
+/// True when the current output line already reads `Authorization:` or
+/// `Proxy-Authorization:` (sipr's older spelling of the keyword's line).
+fn header_name_already_rendered(out: &str) -> bool {
+    let line = out.rsplit('\n').next().unwrap_or("").trim_end();
+    let line = line.trim_end_matches(':').trim_end();
+    line.eq_ignore_ascii_case("Authorization") || line.eq_ignore_ascii_case("Proxy-Authorization")
 }
 
 /// Expand keywords inside `[authentication]` parameter values (SIPp renders

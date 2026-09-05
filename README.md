@@ -123,7 +123,6 @@ root for media.
 
 ## Not yet (post-v1 roadmap)
 
-A whole `[authentication]` keyword arriving from an injection field, and
 sipr as an SRTP echo server (`exec rtp_echo=`).
 
 ## Brand

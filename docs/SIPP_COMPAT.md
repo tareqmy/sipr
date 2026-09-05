@@ -569,5 +569,18 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `connect()`ed, which macOS rejects with EISCONN (errno 56) — on macOS a
   sipp SRTP echo server never answers (Linux allows it). Same family as
   the stream-client bind limitation.
+- `[authentication]` placement and injection (M24; verified in `call.cpp`
+  ~l.4022-4045 `E_Message_Injection` and ~l.4149-4155): the keyword renders
+  the **entire header line** including its name — `Authorization: ` after
+  a 401, `Proxy-Authorization: ` after a 407 — which is why SIPp's
+  scenarios put `[authentication …]` alone on a line; and an injected
+  field whose text contains `[authentication` is re-parsed as the keyword
+  at send time (a temporary NUL at the first `]`), which is the documented
+  way to give each call its own credentials from a CSV. Only one
+  `[authentication]` per message is allowed (fatal). sipr renders the full
+  line like SIPp, re-parses injected fields the same way, and additionally
+  accepts `Authorization: [authentication …]` (its pre-M24 spelling) by
+  emitting only the value when the header name is already on the line;
+  the one-per-message check is not enforced.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

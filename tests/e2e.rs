@@ -3414,3 +3414,124 @@ fn srtp_stream_passes_the_echo_check_against_an_srtp_echo_peer() {
     let echoed = echo.join().expect("echo");
     assert!(echoed >= 20, "echoed only {echoed} SRTP packets");
 }
+
+// ---- [authentication] from an injection field, and SIPp's bare form ------------
+
+/// SIPp's documented recipe (docs/scenarios/sipauth.rst): the CSV holds the
+/// whole `[authentication …]` keyword and the scenario places `[field1]` on
+/// a line of its own — the field is re-parsed as the keyword and renders the
+/// full `Authorization:` header.
+#[test]
+fn authentication_keyword_from_an_injection_field() {
+    let (addr, registrar) = spawn_digest_registrar("sip.example.com", "alice", "secret");
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let inf = dir.join(format!("sipr-authfield-{pid}.csv"));
+    std::fs::write(
+        &inf,
+        "SEQUENTIAL\nalice;[authentication username=alice password=secret]\n",
+    )
+    .expect("write inf");
+    let scenario = r#"<scenario name="register-auth-field">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:[field0]@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[field0]@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:[field0]@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    [field1]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+    let path = dir.join(format!("sipr-authfield-{pid}.xml"));
+    std::fs::write(&path, scenario).expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-inf",
+        inf.to_str().expect("utf8"),
+        "-cp",
+        "0",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&inf);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "sipr stderr:\n{err}");
+    assert!(
+        registrar.join().expect("registrar"),
+        "the injected [authentication] must verify"
+    );
+}
+
+/// SIPp's own form: the keyword alone on a line renders the whole header,
+/// `Proxy-Authorization:` when the challenge was a 407.
+#[test]
+fn bare_authentication_keyword_renders_the_full_header_line() {
+    let (addr, registrar) = spawn_digest_registrar("r", "u", "p");
+    let scenario = r#"<scenario name="reg-bare">
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:u@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:u@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 1 REGISTER
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="401" auth="true"/>
+  <send retrans="500"><![CDATA[
+    REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:u@[remote_ip]>;tag=[pid]r[call_number]
+    To: <sip:u@[remote_ip]>
+    Call-ID: [call_id]
+    CSeq: 2 REGISTER
+    [authentication username=u password=p]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+    let path = std::env::temp_dir().join(format!("sipr-authbare-{}.xml", std::process::id()));
+    std::fs::write(&path, scenario).expect("write");
+    let out = run_sipr(&[
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-cp",
+        "0",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "sipr stderr:\n{err}");
+    assert!(
+        registrar.join().expect("registrar"),
+        "the bare keyword must render Authorization:"
+    );
+}

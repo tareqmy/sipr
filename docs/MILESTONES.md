@@ -660,7 +660,29 @@ per-call echo), SIPp's `pfca_*crypto*` scenarios. Divergences in SIPP_COMPAT §6
       SRTCP, MKI, per-call video crypto beyond the keywords, SRTP on pcap
       replays.
 
+## M24 — `[authentication]` from an injection field ✅
+
+Behavioral oracle: `call.cpp` `E_Message_Injection` (~l.4022-4045) and
+the header-line rendering (~l.4149-4155); `docs/scenarios/sipauth.rst`
+("Make a CSV like this…").
+
+- [x] A `[fieldN]` whose text contains `[authentication …]` is re-parsed as
+      the keyword at send time (up to the first `]`, as SIPp's temporary
+      NUL does); the rest of the field stays literal. So a CSV column can
+      hold per-call credentials or AKA secrets, exactly SIPp's recipe.
+- [x] Found on the way and fixed: SIPp's `[authentication]` renders the
+      **whole header line** (`Authorization:` for a 401,
+      `Proxy-Authorization:` for a 407) and its scenarios put the keyword
+      on a line of its own; sipr rendered only the value, so a real SIPp
+      scenario produced a nameless header. sipr now renders the full line
+      like SIPp and still accepts its older `Authorization: [authentication]`
+      spelling (the name already on the line → value only).
+- [x] Tests: e2e `authentication_keyword_from_an_injection_field` (SIPp's
+      documented CSV + `[field1]` on its own line) and
+      `bare_authentication_keyword_renders_the_full_header_line`; the
+      existing `Authorization: [authentication …]` tests keep passing.
+- [x] Deferred: SIPp's "only one [authentication] per message" error.
+
 ## Post-v1 backlog (ordered)
 
-`[authentication]` from injection fields → SRTP echo server
-(`exec rtp_echo=`).
+SRTP echo server (`exec rtp_echo=`).

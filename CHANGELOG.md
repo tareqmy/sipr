@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`[authentication]` from an injection field** — a CSV column holding
+  `[authentication username=… password=…]` (or AKA parameters) is
+  re-parsed as the keyword at send time, SIPp's documented way to give
+  each call its own credentials.
+
+### Fixed
+
+- `[authentication]` now renders the whole header line as SIPp does
+  (`Authorization:` after a 401, `Proxy-Authorization:` after a 407), so
+  SIPp scenarios that place the keyword on its own line work unchanged.
+  sipr's earlier `Authorization: [authentication …]` spelling still works.
+
 ## [0.12.0] — 2026-09-05
 
 ### Added
