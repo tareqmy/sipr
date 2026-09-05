@@ -7,9 +7,10 @@
 //! RNG) applies on both paths *before* any real I/O or delivery, exactly as
 //! if the network dropped the packet.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::Mutex;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::message::{Inbound, ParseError};
@@ -63,13 +64,97 @@ pub struct TransportConfig {
     pub loss_seed: u64,
 }
 
-/// The `u1` UDP transport.
+/// The `u1` UDP transport (also the main socket of `un`).
 pub struct UdpTransport {
     socket: UdpSocket,
     local_addr: SocketAddr,
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
+    recv_loss_pct: f64,
+    loss_seed: u64,
+    sink: Sender<NetEvent>,
     recv_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// A per-call UDP socket (`-t un`, SIPp's `new_sipp_call_socket`): bound to
+/// the local IP on a system-chosen port, with its own recv loop delivering
+/// into the transport's sink. Dropping it closes the socket.
+pub struct UdpCallSocket {
+    socket: UdpSocket,
+    local_addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UdpCallSocket {
+    /// The bound local address (`[local_port]` for this call).
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+impl Drop for UdpCallSocket {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        // Wake the blocking recv with an empty datagram, then reap it.
+        let any: IpAddr = match self.local_addr.ip() {
+            IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+            IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
+        };
+        if let Ok(waker) = UdpSocket::bind(SocketAddr::new(any, 0)) {
+            let _ = waker.send_to(&[], self.local_addr);
+        }
+        let _ = thread.join();
+    }
+}
+
+/// One socket's receive loop: parse, route, deliver until the sink is gone,
+/// the socket dies, or `stop` is raised (per-call sockets).
+fn recv_loop(
+    socket: &UdpSocket,
+    sink: &Sender<NetEvent>,
+    recv_loss_pct: f64,
+    mut recv_rng: Rng,
+    stop: Option<&AtomicBool>,
+) {
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+                    return;
+                }
+                if n == 0 {
+                    continue; // a wake-up, or noise
+                }
+                if recv_loss_pct > 0.0 && recv_rng.chance_pct(recv_loss_pct) {
+                    continue; // simulated inbound loss
+                }
+                let event = match Inbound::parse(&buf[..n]) {
+                    Ok(message) => NetEvent::Packet(InboundPacket {
+                        message,
+                        raw: buf[..n].to_vec(),
+                        from,
+                        received_at: Instant::now(),
+                    }),
+                    Err(reason) => NetEvent::Garbage { from, reason },
+                };
+                if sink.send(event).is_err() {
+                    return; // engine gone
+                }
+            }
+            Err(e) => {
+                if stop.is_none() {
+                    let _ = sink.send(NetEvent::SocketError(e.kind()));
+                }
+                return;
+            }
+        }
+    }
 }
 
 impl UdpTransport {
@@ -84,45 +169,89 @@ impl UdpTransport {
         let local_addr = socket.local_addr()?;
         let recv_socket = socket.try_clone()?;
         let recv_loss_pct = config.recv_loss_pct;
-        let mut recv_rng = Rng::new(config.loss_seed ^ 0x5EED_0002);
+        let recv_rng = Rng::new(config.loss_seed ^ 0x5EED_0002);
+        let recv_sink = sink.clone();
         let recv_thread = std::thread::Builder::new()
             .name("sipr-udp-recv".into())
-            .spawn(move || {
-                let mut buf = vec![0u8; MAX_DATAGRAM];
-                loop {
-                    match recv_socket.recv_from(&mut buf) {
-                        Ok((n, from)) => {
-                            if recv_loss_pct > 0.0 && recv_rng.chance_pct(recv_loss_pct) {
-                                continue; // simulated inbound loss
-                            }
-                            let event = match Inbound::parse(&buf[..n]) {
-                                Ok(message) => NetEvent::Packet(InboundPacket {
-                                    message,
-                                    raw: buf[..n].to_vec(),
-                                    from,
-                                    received_at: Instant::now(),
-                                }),
-                                Err(reason) => NetEvent::Garbage { from, reason },
-                            };
-                            if sink.send(event).is_err() {
-                                return; // engine gone
-                            }
-                        }
-                        Err(e) => {
-                            let _ = sink.send(NetEvent::SocketError(e.kind()));
-                            return;
-                        }
-                    }
-                }
-            })
+            .spawn(move || recv_loop(&recv_socket, &recv_sink, recv_loss_pct, recv_rng, None))
             .ok();
         Ok(Self {
             socket,
             local_addr,
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0001)),
             send_loss_pct: config.send_loss_pct,
+            recv_loss_pct: config.recv_loss_pct,
+            loss_seed: config.loss_seed,
+            sink,
             recv_thread,
         })
+    }
+
+    /// Open a per-call socket (`-t un`) on the same local IP, system-chosen
+    /// port, delivering into this transport's sink.
+    ///
+    /// # Errors
+    ///
+    /// Bind or thread-spawn failures.
+    pub fn open_call_socket(&self) -> std::io::Result<UdpCallSocket> {
+        let socket = UdpSocket::bind(SocketAddr::new(self.local_addr.ip(), 0))?;
+        let local_addr = socket.local_addr()?;
+        let recv_socket = socket.try_clone()?;
+        let sink = self.sink.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let recv_loss_pct = self.recv_loss_pct;
+        let recv_rng = Rng::new(self.loss_seed ^ u64::from(local_addr.port()) ^ 0x5EED_0003);
+        let thread = std::thread::Builder::new()
+            .name("sipr-udp-call".into())
+            .spawn(move || {
+                recv_loop(
+                    &recv_socket,
+                    &sink,
+                    recv_loss_pct,
+                    recv_rng,
+                    Some(&stop_flag),
+                );
+            })?;
+        Ok(UdpCallSocket {
+            socket,
+            local_addr,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Send `data` to `to` from a per-call socket, honoring simulated loss
+    /// like [`Self::send_to`].
+    ///
+    /// # Errors
+    ///
+    /// Real socket errors.
+    pub fn send_via(
+        &self,
+        socket: &UdpCallSocket,
+        data: &[u8],
+        to: SocketAddr,
+        lost_pct: Option<f64>,
+    ) -> std::io::Result<bool> {
+        if self.simulate_loss(lost_pct) {
+            return Ok(false);
+        }
+        socket.socket.send_to(data, to)?;
+        Ok(true)
+    }
+
+    /// Roll the simulated-loss dice for one send.
+    fn simulate_loss(&self, lost_pct: Option<f64>) -> bool {
+        let pct = lost_pct.unwrap_or(self.send_loss_pct);
+        if pct <= 0.0 {
+            return false;
+        }
+        let mut rng = match self.send_rng.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        rng.chance_pct(pct)
     }
 
     /// The bound local address (real port when `-p` was omitted).
@@ -145,18 +274,8 @@ impl UdpTransport {
         to: SocketAddr,
         lost_pct: Option<f64>,
     ) -> std::io::Result<bool> {
-        let pct = lost_pct.unwrap_or(self.send_loss_pct);
-        if pct > 0.0 {
-            let dropped = {
-                let mut rng = match self.send_rng.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                rng.chance_pct(pct)
-            };
-            if dropped {
-                return Ok(false);
-            }
+        if self.simulate_loss(lost_pct) {
+            return Ok(false);
         }
         self.socket.send_to(data, to)?;
         Ok(true)
@@ -190,6 +309,40 @@ mod tests {
     }
 
     const OPTIONS: &[u8] = b"OPTIONS sip:x SIP/2.0\r\nCall-ID: t-1\r\nCSeq: 9 OPTIONS\r\n\r\n";
+
+    /// `-t un`: a per-call socket has its own port, delivers into the same
+    /// sink, and closes (port released, thread reaped) on drop.
+    #[test]
+    fn per_call_socket_round_trips_and_closes() {
+        let (a, arx) = bind(&TransportConfig::default());
+        let (b, brx) = bind(&TransportConfig::default());
+        let call = a.open_call_socket().expect("call socket");
+        let call_port = call.local_addr().port();
+        assert_ne!(call_port, a.local_addr().port());
+        assert!(
+            a.send_via(&call, OPTIONS, b.local_addr(), None)
+                .expect("send")
+        );
+        let from = match brx.recv_timeout(Duration::from_secs(2)).expect("delivered") {
+            NetEvent::Packet(p) => p.from,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(from.port(), call_port, "sent from the call socket");
+        // A reply to the call socket lands in a's sink.
+        assert!(b.send_to(OPTIONS, from, None).expect("reply"));
+        assert!(matches!(
+            arx.recv_timeout(Duration::from_secs(2)).expect("delivered"),
+            NetEvent::Packet(_)
+        ));
+        let started = std::time::Instant::now();
+        drop(call);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "drop hung on the recv thread"
+        );
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), call_port))
+            .expect("call socket port released");
+    }
 
     #[test]
     fn loopback_roundtrip_parses_and_routes() {

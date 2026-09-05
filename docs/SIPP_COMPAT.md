@@ -95,8 +95,10 @@ Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 `-d <pause ms default>` `-users` (v1.x closed loop) `-rate_increase <n>`
 `-rate_max <n>` `-rate_interval <time>` `-no_rate_quit` `-rate_scale <n>`
 (M20 ramps).
-Network: `-p <local port>` `-i <local ip>` `-t u1|t1|l1` (UDP / TCP / TLS
-mono-socket; `tn`/`ln` accepted as aliases) `-s <service>` (called number)
+Network: `-p <local port>` `-i <local ip>` `-t u1|un|t1|tn|l1|ln` (UDP /
+TCP / TLS, one socket or one socket per call; `ui` not implemented)
+`-max_socket <n>` (per-call modes share sockets past n) `-s <service>`
+(called number)
 `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version` (TLS material,
 SIPp defaults `cacert.pem`/`cakey.pem`).
 Media: `-mi <ip>` (media address; default local IP) `-mp <port>` (base media
@@ -268,9 +270,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   back on the connection the request arrived on (keyed by peer address, like
   SIPp routes by the socket the message came in on). Reliable transports carry
   NO SIP retransmissions (RFC 3261 §18.2), so `retrans=`/`-max_retrans` are
-  ignored under `t1`. SIPp's multi-socket `tn` maps onto the same
-  connection-per-peer model. Not yet: TLS (`l1`), connection re-dial after a
-  drop, and `-t un`/`ui`.
+  ignored under `t1`. Per-call connections (`tn`) are M28 below. Not yet:
+  connection re-dial after a drop, and `-t ui`.
 - Message framing fix surfaced by TCP: every SIP message must end with the
   header/body separator (`\r\n\r\n`) even with no body (RFC 3261 §7). sipr's
   CDATA normalization trimmed the trailing blank line for body-less messages
@@ -674,5 +675,30 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `-rsa`). Only the per-call socket modes (`un`, `tn`, `ln`) actually close
   a connection. sipr accepts the action as a no-op — the same observable
   behavior — and the per-call socket modes remain unimplemented.
+- Per-call sockets `-t un|tn|ln` (M28; verified in `sipp.cpp` ~l.1660
+  (`multisocket`), `call.cpp` `connect_socket_if_needed` ~l.1419 and its
+  call site at the top of `createSendingMessage` ~l.1737, `E_Message_Local_Port`
+  ~l.2753, `socket.cpp` `new_sipp_call_socket` ~l.1340 and the call-creation
+  branches ~l.1148-1185): `multisocket` only changes the **client** side. A
+  call opens its own socket at its first send — "socket port must be known
+  before string substitution" — bound to the local IP on a system-chosen
+  port for UDP, or dialed to the target for TCP/TLS; `[local_port]` then
+  renders that socket's port (`call_port`) instead of `-p`, but only for
+  clients (`sendMode != MODE_SERVER`). A server call keeps the socket the
+  message arrived on: the main UDP socket under `un`, the accepted
+  connection under `tn`/`ln` — so a per-call server is the mono server.
+  Past `-max_socket` (default 50000) open call sockets, a new call is handed
+  an existing one round-robin (`next_socket`), and a socket closes when the
+  last call holding it ends (the reference count `closecon` decrements).
+  A per-call TCP/TLS connect failure fails **that call**
+  (`E_FAILED_TCP_CONNECT`) when reconnects are allowed, else the run. sipr
+  matches all of this — pool sharing, `[local_port]`, server-side
+  behavior, closing with the last holder, and `<closecon/>` now really
+  closing a per-call socket with the next send opening a fresh one — with
+  these divergences: a connect failure always fails only the call
+  (`-max_reconnect`/`-reconnect_*` are not implemented, nor `-rsa`); each
+  per-call socket has its own receive thread rather than SIPp's single
+  `poll` loop, so very large `-max_socket` values cost threads; `-t ui`
+  (one socket per injected IP) is not implemented.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

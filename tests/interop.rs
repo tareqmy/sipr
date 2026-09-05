@@ -1660,3 +1660,192 @@ fn real_sipp_unexp_handler_against_sipr_uac() {
         "pause cut short: {elapsed:?}"
     );
 }
+
+/// Run sipr's embedded UAC in transport `mode` against real sipp's embedded
+/// UAS in `sipp_mode`; return (sipr exit, sipp exit, sipr stderr).
+fn sipr_uac_vs_sipp_uas(
+    mode: &str,
+    sipp_mode: &str,
+    calls: u32,
+) -> (Option<i32>, Option<i32>, String) {
+    let sipp = sipp_bin().expect("caller checked");
+    let port = free_port();
+    let dir = std::env::temp_dir();
+    let mut sipp_uas = Reaper(
+        Command::new(&sipp)
+            .current_dir(&dir)
+            .args([
+                "-sn",
+                "uas",
+                "-t",
+                sipp_mode,
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                &calls.to_string(),
+                "-timeout",
+                "30",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut sipr_uac = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .args([
+                "-sn",
+                "uac",
+                "-t",
+                mode,
+                "-i",
+                "127.0.0.1",
+                "-r",
+                "10",
+                "-m",
+                &calls.to_string(),
+                "-d",
+                "200",
+                "-timeout",
+                "20",
+                "-bg",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sipr uac"),
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_uac.0, Duration::from_secs(25));
+    let stderr = sipr_uac
+        .0
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    let sipp_code = wait_with_timeout(&mut sipp_uas.0, Duration::from_secs(15));
+    (sipr_code, sipp_code, stderr)
+}
+
+/// `-t un` and `-t tn`: sipr's per-call sockets and connections against
+/// real sipp's mono-socket UAS — every call completes on both sides.
+#[test]
+fn sipr_per_call_sockets_against_real_sipp_uas() {
+    if sipp_bin().is_none() {
+        eprintln!("SKIPPED interop::sipr_per_call_sockets_against_real_sipp_uas — no sipp.");
+        return;
+    }
+    for (mode, sipp_mode) in [("un", "u1"), ("tn", "t1")] {
+        let (sipr_code, sipp_code, stderr) = sipr_uac_vs_sipp_uas(mode, sipp_mode, 3);
+        assert_eq!(sipr_code, Some(0), "-t {mode}: sipr stderr:\n{stderr}");
+        assert!(
+            stderr.contains("successful 3 failed 0"),
+            "-t {mode}: {stderr}"
+        );
+        assert_eq!(
+            sipp_code,
+            Some(0),
+            "-t {mode}: sipp uas must complete all calls"
+        );
+    }
+}
+
+/// The mirror: real sipp's `-t un` / `-t tn` UAC against sipr's UAS — each
+/// call arrives from its own socket/connection and is answered on it.
+#[test]
+fn real_sipp_per_call_uac_against_sipr_uas() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::real_sipp_per_call_uac_against_sipr_uas — no sipp.");
+        return;
+    };
+    for (sipp_mode, sipr_mode) in [("un", "u1"), ("tn", "t1")] {
+        let port = free_port();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sipr_uas = Reaper(
+            Command::new(env!("CARGO_BIN_EXE_sipr"))
+                .args([
+                    "-sn",
+                    "uas",
+                    "-t",
+                    sipr_mode,
+                    "-i",
+                    "127.0.0.1",
+                    "-p",
+                    &port.to_string(),
+                    "-m",
+                    "3",
+                    "-timeout",
+                    "30",
+                    "-bg",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn sipr uas"),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let mut sipp_uac = Reaper(
+            Command::new(&sipp)
+                .current_dir(dir.path())
+                .args([
+                    "-sn",
+                    "uac",
+                    "-t",
+                    sipp_mode,
+                    "-i",
+                    "127.0.0.1",
+                    "-r",
+                    "10",
+                    "-m",
+                    "3",
+                    "-d",
+                    "200",
+                    "-timeout",
+                    "20",
+                    "-trace_err",
+                    &format!("127.0.0.1:{port}"),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn sipp uac"),
+        );
+        let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
+        let sipr_code = wait_with_timeout(&mut sipr_uas.0, Duration::from_secs(15));
+        let stderr = sipr_uas
+            .0
+            .stderr
+            .take()
+            .map(|mut s| {
+                use std::io::Read;
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            })
+            .unwrap_or_default();
+        if sipp_code != Some(0) && sipp_stream_client_cannot_bind(dir.path()) {
+            eprintln!(
+                "SKIPPED interop::real_sipp_per_call_uac_against_sipr_uas (-t {sipp_mode}) — \
+                 sipp-on-macOS stream-client bind limitation (docs/TESTING.md)."
+            );
+            continue;
+        }
+        assert_eq!(
+            sipp_code,
+            Some(0),
+            "sipp -t {sipp_mode} uac; sipr stderr:\n{stderr}"
+        );
+        assert_eq!(sipr_code, Some(0), "sipr uas; stderr:\n{stderr}");
+        assert!(stderr.contains("successful 3 failed 0"), "{stderr}");
+    }
+}

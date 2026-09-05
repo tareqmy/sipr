@@ -3580,6 +3580,299 @@ fn rtp_echo_with_an_unknown_codec_fails_at_load() {
     assert!(err.contains("rtp_echo"), "{err}");
 }
 
+// ---- per-call sockets: -t un / tn / ln, -max_socket (M28) ----------------------
+
+/// What a recording UAS saw of each INVITE: the socket it came from and the
+/// port the caller wrote in its Via (`[local_port]`).
+#[derive(Debug, Clone)]
+struct SeenInvite {
+    source_port: u16,
+    via_port: u16,
+}
+
+/// The port in a top Via's sent-by (`SIP/2.0/UDP 127.0.0.1:PORT;...`).
+fn via_port(msg: &sipr_net::Inbound) -> u16 {
+    let via = msg.header("Via").unwrap_or_default();
+    let sent_by = via.split_whitespace().nth(1).unwrap_or_default();
+    let host_port = sent_by.split(';').next().unwrap_or_default();
+    host_port
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A minimal UDP UAS answering INVITE and BYE with 200 and recording where
+/// each INVITE came from; returns after `calls` BYEs.
+fn spawn_recording_udp_uas(calls: usize) -> (SocketAddr, std::thread::JoinHandle<Vec<SeenInvite>>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut byes = 0;
+        let mut buf = [0u8; 65_535];
+        while byes < calls {
+            let Ok((n, from)) = sock.recv_from(&mut buf) else {
+                break;
+            };
+            let Ok(msg) = sipr_net::Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            let Some(method) = msg.method() else { continue };
+            match method {
+                "INVITE" => seen.push(SeenInvite {
+                    source_port: from.port(),
+                    via_port: via_port(&msg),
+                }),
+                "BYE" => byes += 1,
+                _ => continue,
+            }
+            let reply = ok_reply(&msg, method == "INVITE");
+            let _ = sock.send_to(reply.as_bytes(), from);
+        }
+        seen
+    });
+    (addr, handle)
+}
+
+/// A 200 OK echoing the dialog headers (a To tag for the INVITE).
+fn ok_reply(msg: &sipr_net::Inbound, tag_to: bool) -> String {
+    let mut out = String::from("SIP/2.0 200 OK\r\n");
+    for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
+        for line in msg.header_lines(name) {
+            out.push_str(line);
+            if name == "To" && tag_to && !line.contains("tag=") {
+                out.push_str(";tag=uas1");
+            }
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("Contact: <sip:uas@127.0.0.1>\r\nContent-Length: 0\r\n\r\n");
+    out
+}
+
+/// A minimal TCP UAS: accepts connections, frames requests, answers INVITE
+/// and BYE with 200 on the same connection; returns the number of
+/// connections accepted once `calls` BYEs were answered.
+fn spawn_counting_tcp_uas(calls: usize) -> (SocketAddr, std::thread::JoinHandle<usize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind uas");
+    let addr = listener.local_addr().expect("addr");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let handle = std::thread::spawn(move || {
+        let byes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut conns = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while byes.load(std::sync::atomic::Ordering::Relaxed) < calls
+            && std::time::Instant::now() < deadline
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // macOS accepted sockets inherit the listener's
+                    // non-blocking mode; the reader wants to block.
+                    let _ = stream.set_nonblocking(false);
+                    conns += 1;
+                    let byes = byes.clone();
+                    std::thread::spawn(move || {
+                        let mut framer = sipr_net::TcpFramer::new();
+                        let mut buf = [0u8; 65_535];
+                        while let Ok(n) = stream.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            framer.push(&buf[..n]);
+                            while let Some(raw) = framer.next_message() {
+                                let Ok(msg) = sipr_net::Inbound::parse(&raw) else {
+                                    continue;
+                                };
+                                let Some(method) = msg.method() else { continue };
+                                if method == "ACK" {
+                                    continue;
+                                }
+                                if method == "BYE" {
+                                    byes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                let reply = ok_reply(&msg, method == "INVITE");
+                                let _ = stream.write_all(reply.as_bytes());
+                            }
+                        }
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        conns
+    });
+    (addr, handle)
+}
+
+/// `-t un`: every call sends from its own UDP socket, and `[local_port]`
+/// (the Via) names that socket's port — SIPp's `call_port`.
+#[test]
+fn udp_per_call_sockets_give_each_call_its_own_port() {
+    let (addr, uas) = spawn_recording_udp_uas(3);
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "un",
+        "-i",
+        "127.0.0.1",
+        "-r",
+        "10",
+        "-m",
+        "3",
+        "-d",
+        "300",
+        "-timeout",
+        "10",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    let seen = uas.join().expect("uas");
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    let mut ports: Vec<u16> = seen.iter().map(|s| s.source_port).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    assert_eq!(ports.len(), 3, "calls must not share a socket: {seen:?}");
+    for s in &seen {
+        assert_eq!(
+            s.via_port, s.source_port,
+            "[local_port] must be the call socket's: {s:?}"
+        );
+    }
+}
+
+/// `-max_socket 1`: past the cap, calls share the open sockets
+/// round-robin (SIPp's `new_sipp_call_socket` reuse).
+#[test]
+fn max_socket_makes_calls_share_sockets() {
+    let (addr, uas) = spawn_recording_udp_uas(3);
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "un",
+        "-max_socket",
+        "1",
+        "-i",
+        "127.0.0.1",
+        "-r",
+        "10",
+        "-m",
+        "3",
+        "-d",
+        "1000",
+        "-timeout",
+        "10",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    let seen = uas.join().expect("uas");
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert!(
+        seen.iter().all(|s| s.source_port == seen[0].source_port),
+        "all calls must share the one socket: {seen:?}"
+    );
+}
+
+/// `-t tn`: one TCP connection per call.
+#[test]
+fn tcp_per_call_connections_one_per_call() {
+    let (addr, uas) = spawn_counting_tcp_uas(2);
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "tn",
+        "-i",
+        "127.0.0.1",
+        "-r",
+        "10",
+        "-m",
+        "2",
+        "-d",
+        "500",
+        "-timeout",
+        "10",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("one connection per call"), "{err}");
+    assert_eq!(uas.join().expect("uas"), 2, "two calls, two connections");
+}
+
+/// `-t ln`: one TLS connection per call, against a sipr `l1` server.
+#[test]
+fn tls_per_call_connections_complete_calls() {
+    let id = tls_identity();
+    let port = free_port();
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sn",
+        "uas",
+        "-t",
+        "l1",
+        "-tls_cert",
+        id.cert_path.to_str().expect("utf8"),
+        "-tls_key",
+        id.key_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-m",
+        "2",
+        "-timeout",
+        "15",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "ln",
+        "-tls_cert",
+        id.cert_path.to_str().expect("utf8"),
+        "-tls_key",
+        id.key_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-r",
+        "10",
+        "-m",
+        "2",
+        "-d",
+        "300",
+        "-timeout",
+        "10",
+        "-bg",
+        &format!("127.0.0.1:{port}"),
+    ]);
+    let uac_err = String::from_utf8_lossy(&out.stderr);
+    let uas_code = wait_exit(&mut uas, Duration::from_secs(10));
+    let uas_err = uas_err.join().expect("uas stderr");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "uac:\n{uac_err}\nuas:\n{uas_err}"
+    );
+    assert!(uac_err.contains("one connection per call"), "{uac_err}");
+    assert_eq!(uas_code, Some(0), "uas:\n{uas_err}");
+    assert!(uas_err.contains("successful 2 failed 0"), "{uas_err}");
+}
+
 // ---- _unexp.main handler, pauserestore, jump variable=, closecon (M27) ---------
 
 /// A UAC that sends an INFO in the middle of the UAS's pause, then expects

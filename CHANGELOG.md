@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-call sockets** — `-t un`, `-t tn`, `-t ln`: every call opens its
+  own UDP socket or TCP/TLS connection at its first send (SIPp's
+  multisocket modes), `[local_port]` names it, and `-max_socket` caps how
+  many are open before calls share them round-robin. `<closecon/>` now
+  closes a per-call socket for real. Verified both ways against real sipp.
+
 ## [0.16.0] — 2026-09-05
 
 ### Added

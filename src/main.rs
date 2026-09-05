@@ -155,9 +155,13 @@ fn run(cli: &Cli) -> ExitCode {
         inf_index: cli.inf_index.clone(),
         transport: match cli.transport {
             crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
+            crate::cli::Transport::UdpPerCall => sipr_engine::TransportKind::UdpPerCall,
             crate::cli::Transport::TcpMono => sipr_engine::TransportKind::TcpMono,
+            crate::cli::Transport::TcpPerCall => sipr_engine::TransportKind::TcpPerCall,
             crate::cli::Transport::TlsMono => sipr_engine::TransportKind::TlsMono,
+            crate::cli::Transport::TlsPerCall => sipr_engine::TransportKind::TlsPerCall,
         },
+        max_socket: cli.max_socket.unwrap_or(50_000),
         twin_addr: match &cli.three_pcc {
             Some(raw) => match resolve_target(raw) {
                 Ok(addr) => Some(addr),
@@ -199,7 +203,11 @@ fn run(cli: &Cli) -> ExitCode {
             .map(std::path::Path::to_path_buf),
         // Built only when TLS is selected: cert/key defaults (cacert.pem /
         // cakey.pem, like SIPp) would otherwise error on absent files.
-        tls: (cli.transport == crate::cli::Transport::TlsMono).then(|| sipr_engine::TlsConfig {
+        tls: matches!(
+            cli.transport,
+            crate::cli::Transport::TlsMono | crate::cli::Transport::TlsPerCall
+        )
+        .then(|| sipr_engine::TlsConfig {
             cert: cli.tls_cert.clone(),
             key: cli.tls_key.clone(),
             ca: cli.tls_ca.clone(),

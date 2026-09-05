@@ -11,17 +11,22 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 /// Transport mode (`-t`).
-// The shared `Mono` postfix is SIPp's own taxonomy (`u1`/`t1`/`l1` = one
-// socket) and will contrast with per-call multi-socket modes if those land.
-#[allow(clippy::enum_variant_names)]
+// SIPp's own taxonomy: `u1`/`t1`/`l1` = one socket, `un`/`tn`/`ln` = one
+// socket per call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     /// `u1`: UDP with one socket shared by all calls (SIPp's default).
     UdpMono,
+    /// `un`: UDP with one socket per call.
+    UdpPerCall,
     /// `t1`: TCP with one connection per peer (client dials, server accepts).
     TcpMono,
+    /// `tn`: TCP with one connection per call.
+    TcpPerCall,
     /// `l1`: TLS over TCP, same connection-per-peer model.
     TlsMono,
+    /// `ln`: TLS with one connection per call.
+    TlsPerCall,
 }
 
 /// `-tls_version` argument. SIPp accepts 1.0–1.3; rustls has no pre-1.2
@@ -103,6 +108,8 @@ pub struct Cli {
     pub http_token: Option<String>,
     /// `-t`: transport mode.
     pub transport: Transport,
+    /// `-max_socket`: sockets to open before per-call modes start sharing.
+    pub max_socket: Option<usize>,
     /// `-s`: service / called user part, substituted for `[service]`.
     pub service: String,
     /// `-au`: username for `[authentication]`.
@@ -192,6 +199,7 @@ impl Default for Cli {
             http: None,
             http_token: None,
             transport: Transport::UdpMono,
+            max_socket: None,
             service: "service".to_owned(),
             auth_user: None,
             auth_password: None,
@@ -396,7 +404,7 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "t",
         true,
         "MODE",
-        "Transport mode: u1 (UDP), t1 (TCP), l1 (TLS) [default: u1]",
+        "Transport: u1 (UDP, default), un (UDP, one socket per call), t1 (TCP), tn (TCP, one connection per call), l1 (TLS), ln (TLS, one connection per call)",
     ),
     (
         "s",
@@ -459,6 +467,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         true,
         "N",
         "Maximum UDP retransmissions per message",
+    ),
+    (
+        "max_socket",
+        true,
+        "N",
+        "Sockets to open before per-call modes (-t un|tn|ln) share them round-robin (default 50000)",
     ),
     (
         "inf",
@@ -679,6 +693,13 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "inf" => cli.inf.push(std::path::PathBuf::from(val(value))),
         "3pcc" => cli.three_pcc = Some(val(value)),
         "users" => cli.users = Some(parse_num(flag, &val(value))?),
+        "max_socket" => {
+            let n: usize = parse_num(flag, &val(value))?;
+            if n == 0 {
+                return Err("-max_socket must be at least 1".into());
+            }
+            cli.max_socket = Some(n);
+        }
         "tls_cert" => cli.tls_cert = PathBuf::from(val(value)),
         "tls_key" => cli.tls_key = PathBuf::from(val(value)),
         "tls_ca" => cli.tls_ca = Some(PathBuf::from(val(value))),
@@ -725,16 +746,18 @@ fn parse_num<T: std::str::FromStr>(flag: &str, raw: &str) -> Result<T, String> {
 fn parse_transport(s: &str) -> Result<Transport, String> {
     match s {
         "u1" => Ok(Transport::UdpMono),
-        // SIPp's `tn`/`ln` (multi-socket) collapse onto our
-        // one-connection-per-peer model; accept them as aliases.
-        "t1" | "tn" => Ok(Transport::TcpMono),
-        "l1" | "ln" => Ok(Transport::TlsMono),
-        "un" | "ui" => Err(format!(
-            "transport mode '{s}' is not implemented yet — 'u1' (UDP), 't1' \
-             (TCP), and 'l1' (TLS) are supported"
-        )),
+        "un" => Ok(Transport::UdpPerCall),
+        "t1" => Ok(Transport::TcpMono),
+        "tn" => Ok(Transport::TcpPerCall),
+        "l1" => Ok(Transport::TlsMono),
+        "ln" => Ok(Transport::TlsPerCall),
+        "ui" => Err(
+            "transport mode 'ui' (one UDP socket per injected IP) is not implemented — \
+             u1/un (UDP), t1/tn (TCP), and l1/ln (TLS) are supported"
+                .into(),
+        ),
         other => Err(format!(
-            "unknown transport mode '{other}' (expected 'u1', 't1', or 'l1')"
+            "unknown transport mode '{other}' (expected u1, un, t1, tn, l1, or ln)"
         )),
     }
 }
@@ -897,10 +920,14 @@ mod tests {
     fn transport_modes_parse_and_reject() {
         assert_eq!(cli(&["-t", "t1", "host"]).transport, Transport::TcpMono);
         assert_eq!(cli(&["-t", "l1", "host"]).transport, Transport::TlsMono);
-        // ln collapses onto connection-per-peer, like tn.
-        assert_eq!(cli(&["-t", "ln", "host"]).transport, Transport::TlsMono);
-        let err = run(&["-t", "un"]).unwrap_err();
-        assert!(err.contains("not implemented yet"), "{err}");
+        assert_eq!(cli(&["-t", "un", "host"]).transport, Transport::UdpPerCall);
+        assert_eq!(cli(&["-t", "tn", "host"]).transport, Transport::TcpPerCall);
+        assert_eq!(cli(&["-t", "ln", "host"]).transport, Transport::TlsPerCall);
+        assert_eq!(cli(&["-max_socket", "3", "host"]).max_socket, Some(3));
+        let err = run(&["-max_socket", "0", "host"]).unwrap_err();
+        assert!(err.contains("at least 1"), "{err}");
+        let err = run(&["-t", "ui"]).unwrap_err();
+        assert!(err.contains("not implemented"), "{err}");
         let err = run(&["-t", "x9"]).unwrap_err();
         assert!(err.contains("unknown transport mode"), "{err}");
     }

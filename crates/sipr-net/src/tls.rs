@@ -101,8 +101,42 @@ pub struct TlsTransport {
     conns: Conns,
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
+    sink: Sender<NetEvent>,
+    /// Client configuration, kept for per-call connections (`ln`).
+    client: Option<Arc<ClientConfig>>,
     /// Kept so the accept loop lives as long as the transport (server only).
     _accept: Option<std::thread::JoinHandle<()>>,
+}
+
+/// A per-call TLS connection (`-t ln`): dialed and handshaken for one call,
+/// read by its own thread into the transport's sink; dropping it closes it.
+pub struct TlsCallConn {
+    tls: Arc<Mutex<Connection>>,
+    sock: TcpStream,
+    local_addr: SocketAddr,
+}
+
+impl TlsCallConn {
+    /// The connection's local address (`[local_port]` for this call).
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+impl Drop for TlsCallConn {
+    fn drop(&mut self) {
+        if let Ok(mut tls) = self.tls.lock() {
+            tls.send_close_notify();
+            let mut out = &self.sock;
+            while tls.wants_write() {
+                if tls.write_tls(&mut out).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = self.sock.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 impl TlsTransport {
@@ -126,7 +160,8 @@ impl TlsTransport {
         // address, and rustls sends no SNI for IP names — behavior matches.
         let name = ServerName::from(peer.ip());
         let mut tls = Connection::from(
-            ClientConnection::new(client_config, name).map_err(std::io::Error::other)?,
+            ClientConnection::new(Arc::clone(&client_config), name)
+                .map_err(std::io::Error::other)?,
         );
         complete_handshake(&mut tls, &mut sock)
             .map_err(|e| std::io::Error::other(format!("TLS handshake with {remote}: {e}")))?;
@@ -137,8 +172,96 @@ impl TlsTransport {
             conns,
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0021)),
             send_loss_pct: config.send_loss_pct,
+            sink,
+            client: Some(client_config),
             _accept: None,
         })
+    }
+
+    /// Client in `ln` mode: no connection yet — each call dials its own with
+    /// [`Self::connect_call`].
+    ///
+    /// # Errors
+    ///
+    /// Certificate/key loading failures.
+    pub fn client_pool(
+        config: &TransportConfig,
+        tls_config: &TlsConfig,
+        sink: Sender<NetEvent>,
+    ) -> std::io::Result<Self> {
+        let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        Ok(Self {
+            local_addr: SocketAddr::new(ip, 0),
+            conns: Arc::new(Mutex::new(HashMap::new())),
+            send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0023)),
+            send_loss_pct: config.send_loss_pct,
+            sink,
+            client: Some(client_config(tls_config)?),
+            _accept: None,
+        })
+    }
+
+    /// Dial and handshake a per-call connection to `remote` (`-t ln`).
+    ///
+    /// # Errors
+    ///
+    /// Connection or handshake failures (the call fails, not the run); a
+    /// server-side transport has no client configuration.
+    pub fn connect_call(&self, remote: SocketAddr) -> std::io::Result<TlsCallConn> {
+        let client_config = self.client.clone().ok_or_else(|| {
+            std::io::Error::other("per-call TLS connections need a client configuration")
+        })?;
+        let mut sock = TcpStream::connect(remote)?;
+        let local_addr = sock.local_addr()?;
+        let peer = sock.peer_addr()?;
+        let name = ServerName::from(peer.ip());
+        let mut tls = Connection::from(
+            ClientConnection::new(client_config, name).map_err(std::io::Error::other)?,
+        );
+        complete_handshake(&mut tls, &mut sock)
+            .map_err(|e| std::io::Error::other(format!("TLS handshake with {remote}: {e}")))?;
+        let read_sock = sock.try_clone()?;
+        let tls = Arc::new(Mutex::new(tls));
+        let reader_tls = Arc::clone(&tls);
+        let sink = self.sink.clone();
+        std::thread::Builder::new()
+            .name("sipr-tls-call".into())
+            .spawn(move || read_loop(read_sock, &reader_tls, peer, &sink))?;
+        Ok(TlsCallConn {
+            tls,
+            sock,
+            local_addr,
+        })
+    }
+
+    /// Send `data` on a per-call connection, honoring simulated loss.
+    ///
+    /// # Errors
+    ///
+    /// Encryption or write failures.
+    pub fn send_via(
+        &self,
+        conn: &TlsCallConn,
+        data: &[u8],
+        lost_pct: Option<f64>,
+    ) -> std::io::Result<bool> {
+        if self.simulate_loss(lost_pct) {
+            return Ok(false);
+        }
+        write_tls(&conn.tls, &conn.sock, data)?;
+        Ok(true)
+    }
+
+    fn simulate_loss(&self, lost_pct: Option<f64>) -> bool {
+        let pct = lost_pct.unwrap_or(self.send_loss_pct);
+        if pct <= 0.0 {
+            return false;
+        }
+        let mut rng = match self.send_rng.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        rng.chance_pct(pct)
     }
 
     /// Server (`UAS`): bind a listener and accept connections. Each accepted
@@ -160,6 +283,7 @@ impl TlsTransport {
         let local_addr = listener.local_addr()?;
         let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
         let accept_conns = conns.clone();
+        let accept_sink = sink.clone();
         let accept = std::thread::Builder::new()
             .name("sipr-tls-accept".into())
             .spawn(move || {
@@ -173,7 +297,7 @@ impl TlsTransport {
                         continue;
                     };
                     let conns = accept_conns.clone();
-                    let sink = sink.clone();
+                    let sink = accept_sink.clone();
                     // Handshake per connection, off the accept loop.
                     let _ = std::thread::Builder::new()
                         .name("sipr-tls-handshake".into())
@@ -200,6 +324,8 @@ impl TlsTransport {
             conns,
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0022)),
             send_loss_pct: config.send_loss_pct,
+            sink,
+            client: None,
             _accept: accept,
         })
     }
@@ -223,18 +349,8 @@ impl TlsTransport {
         to: SocketAddr,
         lost_pct: Option<f64>,
     ) -> std::io::Result<bool> {
-        let pct = lost_pct.unwrap_or(self.send_loss_pct);
-        if pct > 0.0 {
-            let dropped = {
-                let mut rng = match self.send_rng.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                rng.chance_pct(pct)
-            };
-            if dropped {
-                return Ok(false); // simulated app-layer loss
-            }
+        if self.simulate_loss(lost_pct) {
+            return Ok(false); // simulated app-layer loss
         }
         let map = match self.conns.lock() {
             Ok(g) => g,
@@ -246,18 +362,23 @@ impl TlsTransport {
                 format!("no TLS connection to {to}"),
             ));
         };
-        let mut tls = match conn.tls.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        tls.writer().write_all(data)?;
-        let mut out = &conn.sock;
-        while tls.wants_write() {
-            tls.write_tls(&mut out)?;
-        }
-        out.flush()?;
+        write_tls(&conn.tls, &conn.sock, data)?;
         Ok(true)
     }
+}
+
+/// Encrypt `data` under the connection lock and push the records out.
+fn write_tls(tls: &Mutex<Connection>, sock: &TcpStream, data: &[u8]) -> std::io::Result<()> {
+    let mut tls = match tls.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    tls.writer().write_all(data)?;
+    let mut out = sock;
+    while tls.wants_write() {
+        tls.write_tls(&mut out)?;
+    }
+    out.flush()
 }
 
 /// Drive the handshake to completion on a blocking socket.
@@ -288,7 +409,12 @@ fn register(
     let conns = conns.clone();
     std::thread::Builder::new()
         .name("sipr-tls-recv".into())
-        .spawn(move || read_loop(read_sock, &reader_tls, peer, &sink, &conns))
+        .spawn(move || {
+            read_loop(read_sock, &reader_tls, peer, &sink);
+            if let Ok(mut map) = conns.lock() {
+                map.remove(&peer);
+            }
+        })
         .ok();
     Ok(())
 }
@@ -302,7 +428,6 @@ fn read_loop(
     tls: &Arc<Mutex<Connection>>,
     peer: SocketAddr,
     sink: &Sender<NetEvent>,
-    conns: &Conns,
 ) {
     let mut framer = TcpFramer::new();
     let mut buf = vec![0u8; READ_CHUNK];
@@ -371,9 +496,6 @@ fn read_loop(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
             Err(_) => break,
         };
-    }
-    if let Ok(mut map) = conns.lock() {
-        map.remove(&peer);
     }
 }
 

@@ -786,7 +786,36 @@ an unexpected message, `queue_up`), ~l.1975 / ~l.2315 (`paused_until`),
 - [x] Deferred: `un`/`tn`/`ln` per-call sockets (the only mode where
       `closecon` closes a connection), `-rsa`.
 
+## M28 — per-call sockets: `-t un|tn|ln`, `-max_socket` ✅
+
+Behavioral oracle: `sipp.cpp` ~l.1660 (`multisocket`), `call.cpp`
+`connect_socket_if_needed` ~l.1419 / `createSendingMessage` ~l.1737 /
+`E_Message_Local_Port` ~l.2753, `socket.cpp` `new_sipp_call_socket` ~l.1340
+and the call-creation branches ~l.1148-1185.
+
+- [x] `sipr-net`: `UdpTransport::open_call_socket` (own recv thread, woken
+      and reaped on drop), `TcpTransport::client_pool` + `connect_call`,
+      `TlsTransport::client_pool` + `connect_call` (handshake per call),
+      `send_via` on each; a dropped call socket/connection closes.
+- [x] Engine: a client call opens (or, past `-max_socket`, shares
+      round-robin) its socket at its first send; sends and retransmissions
+      go out on it; `[local_port]` renders its port; the socket closes with
+      the last call holding it; `<closecon/>` drops the reference and the
+      next send opens a fresh one. Servers keep the socket the call arrived
+      on, as SIPp. A per-call connect failure fails only that call.
+- [x] CLI: `-t un|tn|ln`, `-max_socket <n>` (≥ 1, default 50000); `-t ui`
+      stays a clear error.
+- [x] Tests: net unit (`per_call_socket_round_trips_and_closes`,
+      `per_call_connections_are_distinct_and_close_on_drop`); e2e
+      `udp_per_call_sockets_give_each_call_its_own_port` (source port ==
+      Via port, all distinct), `max_socket_makes_calls_share_sockets`,
+      `tcp_per_call_connections_one_per_call` (a counting TCP UAS),
+      `tls_per_call_connections_complete_calls`; interop
+      `sipr_per_call_sockets_against_real_sipp_uas` (`un`, `tn`) and
+      `real_sipp_per_call_uac_against_sipr_uas` (`un`, `tn`).
+- [x] Deferred: `-t ui`, `-rsa`, `-max_reconnect`/`-reconnect_close`/
+      `-reconnect_sleep`, SCTP.
+
 ## Post-v1 backlog (ordered)
 
-Nothing queued from the SIPp action/keyword surface. Candidates: the
-per-call socket transports (`un`/`tn`/`ln`), `-rsa`, SCTP.
+`-rsa` (remote sending address), `-t ui`, the reconnect options, SCTP.

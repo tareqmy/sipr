@@ -85,7 +85,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   binding; `[local_ip]`/`[remote_ip]` are bracketed in URIs and Via.
 - UAC and UAS roles; open-loop pacing (`-r/-rp/-l/-m`) with rate smoothing
   and SIPp's ramps (`-rate_increase`, `-rate_max`, `-rate_interval`).
-- UDP (`-t u1`), TCP (`-t t1`), and TLS (`-t l1`) transports; streams frame by
+- UDP, TCP, and TLS transports, one socket (`-t u1|t1|l1`) or one per call
+  (`-t un|tn|ln`, `-max_socket`); streams frame by
   Content-Length and carry no SIP retransmissions (reliable transports). TLS
   takes SIPp's `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version`
   flags with SIPp's verification semantics.
@@ -124,7 +125,7 @@ root for media.
 ## Not yet (post-v1 roadmap)
 
 The SIPp scenario surface is covered. Remaining SIPp corners are transport
-modes: per-call sockets (`un`/`tn`/`ln`), `-rsa`, SCTP.
+modes: `-rsa`, `-t ui`, the reconnect options, SCTP.
 
 ## Brand
 

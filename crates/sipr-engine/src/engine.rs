@@ -23,8 +23,8 @@ use sipr_media::sdp::CryptoAttr;
 use sipr_media::{MediaEvent, MediaPlayer, PcapStream, Source, StreamSpec};
 use sipr_net::timer::TimerId;
 use sipr_net::{
-    Inbound, NetEvent, RetransSchedule, TcpTransport, TimerService, TlsTransport, TransportConfig,
-    TwinChannel, UdpTransport,
+    Inbound, NetEvent, RetransSchedule, TcpCallConn, TcpTransport, TimerService, TlsCallConn,
+    TlsTransport, TransportConfig, TwinChannel, UdpCallSocket, UdpTransport,
 };
 use sipr_scenario::inject::{InjectMode, InjectionFile};
 use sipr_scenario::model::{
@@ -58,6 +58,9 @@ pub struct EngineConfig {
     pub pause_default: Duration,
     /// Global retransmission attempt cap (`-max_retrans`).
     pub max_retrans: Option<u32>,
+    /// `-max_socket`: per-call socket modes share sockets round-robin past
+    /// this many open ones (SIPp default 50000).
+    pub max_socket: usize,
     /// Disable retransmissions (`-nr`).
     pub no_retrans: bool,
     /// Global test timeout (`-timeout`).
@@ -164,10 +167,25 @@ pub enum TransportKind {
     /// `u1`: UDP, one socket shared by all calls (SIPp default).
     #[default]
     UdpMono,
+    /// `un`: UDP, one socket per call (client side; a server answers from
+    /// the socket the call arrived on, as SIPp does).
+    UdpPerCall,
     /// `t1`: TCP, one connection per peer (client dials, server accepts).
     TcpMono,
+    /// `tn`: TCP, one connection per call (client side).
+    TcpPerCall,
     /// `l1`: TLS over TCP, same connection-per-peer model.
     TlsMono,
+    /// `ln`: TLS, one connection per call (client side).
+    TlsPerCall,
+}
+
+impl TransportKind {
+    /// SIPp's `multisocket`: one socket per call on the client side.
+    #[must_use]
+    pub fn per_call(self) -> bool {
+        matches!(self, Self::UdpPerCall | Self::TcpPerCall | Self::TlsPerCall)
+    }
 }
 
 /// Final counters of a run.
@@ -366,6 +384,9 @@ struct CallState {
     pause_deadline: Option<(usize, Instant)>,
     /// A `<pauserestore>` deadline to serve before the next step executes.
     paused_until: Option<Instant>,
+    /// This call's own socket in the per-call modes (opened at its first
+    /// send, SIPp's `connect_socket_if_needed`); `None` = the shared one.
+    socket: Option<CallSocket>,
 }
 
 /// Why the engine refused to run a scenario.
@@ -461,6 +482,52 @@ enum Transport {
     Tls(TlsTransport),
 }
 
+/// A call's own socket in the per-call modes (`un`/`tn`/`ln`). Shared
+/// (`Arc`) because past `-max_socket` calls share sockets, as SIPp's
+/// `new_sipp_call_socket` hands out existing ones round-robin; the socket
+/// closes when the last call holding it ends (SIPp's refcount).
+#[derive(Clone)]
+enum CallSocket {
+    Udp(Arc<UdpCallSocket>),
+    Tcp(Arc<TcpCallConn>),
+    Tls(Arc<TlsCallConn>),
+}
+
+impl CallSocket {
+    fn local_port(&self) -> u16 {
+        match self {
+            Self::Udp(s) => s.local_addr().port(),
+            Self::Tcp(c) => c.local_addr().port(),
+            Self::Tls(c) => c.local_addr().port(),
+        }
+    }
+
+    fn downgrade(&self) -> WeakCallSocket {
+        match self {
+            Self::Udp(s) => WeakCallSocket::Udp(Arc::downgrade(s)),
+            Self::Tcp(c) => WeakCallSocket::Tcp(Arc::downgrade(c)),
+            Self::Tls(c) => WeakCallSocket::Tls(Arc::downgrade(c)),
+        }
+    }
+}
+
+/// The pool's view of a call socket: it must not keep one alive.
+enum WeakCallSocket {
+    Udp(std::sync::Weak<UdpCallSocket>),
+    Tcp(std::sync::Weak<TcpCallConn>),
+    Tls(std::sync::Weak<TlsCallConn>),
+}
+
+impl WeakCallSocket {
+    fn upgrade(&self) -> Option<CallSocket> {
+        match self {
+            Self::Udp(w) => w.upgrade().map(CallSocket::Udp),
+            Self::Tcp(w) => w.upgrade().map(CallSocket::Tcp),
+            Self::Tls(w) => w.upgrade().map(CallSocket::Tls),
+        }
+    }
+}
+
 impl Transport {
     fn local_addr(&self) -> SocketAddr {
         match self {
@@ -486,6 +553,14 @@ struct Engine<'s> {
     /// `[transport]` token and whether the transport is reliable (no retrans).
     transport_token: &'static str,
     reliable: bool,
+    /// One socket per call (`un`/`tn`/`ln` as a client).
+    per_call: bool,
+    /// `-max_socket`: share call sockets round-robin past this many.
+    max_socket: usize,
+    /// Every call socket opened and not yet closed, for sharing.
+    call_socket_pool: Vec<WeakCallSocket>,
+    /// Round-robin cursor over the pool (SIPp's `next_socket`).
+    next_shared_socket: usize,
     timers: TimerService<Event>,
     rx: Receiver<Event>,
     calls: HashMap<String, CallState>,
@@ -599,14 +674,17 @@ impl<'s> Engine<'s> {
             recv_loss_pct: 0.0,
             loss_seed: config.seed,
         };
+        let per_call = config.transport.per_call() && scenario.role == Role::Uac;
         let (transport, transport_token, reliable) = match config.transport {
-            TransportKind::UdpMono => {
+            TransportKind::UdpMono | TransportKind::UdpPerCall => {
                 let u = UdpTransport::bind(&tcfg, net_tx)
                     .map_err(|e| EngineError(format!("cannot bind UDP socket: {e}")))?;
                 (Transport::Udp(u), "UDP", false)
             }
-            TransportKind::TcpMono => {
+            TransportKind::TcpMono | TransportKind::TcpPerCall => {
                 let t = match scenario.role {
+                    // `tn` client: every call dials its own connection later.
+                    Role::Uac if per_call => TcpTransport::client_pool(&tcfg, net_tx),
                     // Client: one mono-socket connection to the target, opened now.
                     Role::Uac => {
                         let remote = config
@@ -622,12 +700,15 @@ impl<'s> Engine<'s> {
                 };
                 (Transport::Tcp(t), "TCP", true)
             }
-            TransportKind::TlsMono => {
+            TransportKind::TlsMono | TransportKind::TlsPerCall => {
                 let tls_cfg = config
                     .tls
                     .as_ref()
                     .ok_or_else(|| EngineError("TLS transport needs TLS configuration".into()))?;
                 let t = match scenario.role {
+                    // `ln` client: every call dials and handshakes its own.
+                    Role::Uac if per_call => TlsTransport::client_pool(&tcfg, tls_cfg, net_tx)
+                        .map_err(|e| EngineError(format!("TLS configuration: {e}")))?,
                     // Client: dial + handshake now; a failure is a startup error.
                     Role::Uac => {
                         let remote = config
@@ -866,13 +947,20 @@ impl<'s> Engine<'s> {
             timers.arm(t, Event::GlobalTimeout);
         }
         let local_addr = transport.local_addr();
-        eprintln!(
-            "sipr: bound to {local_addr} ({})",
-            match scenario.role {
-                Role::Uac => "placing calls",
-                Role::Uas => "answering calls",
-            }
-        );
+        if per_call && !matches!(transport, Transport::Udp(_)) {
+            eprintln!(
+                "sipr: one connection per call from {} (placing calls)",
+                local_addr.ip()
+            );
+        } else {
+            eprintln!(
+                "sipr: bound to {local_addr} ({})",
+                match scenario.role {
+                    Role::Uac => "placing calls",
+                    Role::Uas => "answering calls",
+                }
+            );
+        }
         let open_trace = |path: &Option<std::path::PathBuf>,
                           what: &str|
          -> Result<Option<sipr_stats::TraceFile>, EngineError> {
@@ -942,6 +1030,10 @@ impl<'s> Engine<'s> {
             transport,
             transport_token,
             reliable,
+            per_call,
+            max_socket: config.max_socket.max(1),
+            call_socket_pool: Vec::new(),
+            next_shared_socket: 0,
             timers,
             rx,
             calls: HashMap::new(),
@@ -1611,6 +1703,15 @@ impl<'s> Engine<'s> {
                     let method_is_new_txn = is_req && first != "ACK" && first != "CANCEL";
                     self.allocate_rtpstream_ports(call_id, &send.template);
                     self.prepare_crypto(call_id, &send.template);
+                    // SIPp: the socket (and so `[local_port]`) must exist
+                    // before substitution; a failed dial fails this call only.
+                    if let Err(why) = self.ensure_call_socket(call_id) {
+                        self.stats.failed_other += 1;
+                        eprintln!("sipr: warning: call {call_id}: {why}");
+                        self.log_err(&format!("call {call_id} failed: {why}"));
+                        self.remove_call(call_id);
+                        return;
+                    }
                     let (buf, remote) = {
                         let Some(call) = self.calls.get(call_id) else {
                             return;
@@ -1632,7 +1733,7 @@ impl<'s> Engine<'s> {
                             remote_ip: &remote_ip,
                             remote_port: call.remote.port(),
                             local_ip: &self.local_ip_str,
-                            local_port: self.transport.local_addr().port(),
+                            local_port: self.call_local_port(call),
                             media_ip: &self.media_ip_str,
                             media_port: self.media_port,
                             rtpstream_ports: rtpstream_ports(call),
@@ -1669,8 +1770,7 @@ impl<'s> Engine<'s> {
                         return;
                     }
                     let _ = self
-                        .transport
-                        .send_to(&buf, remote, send.lost_pct)
+                        .send_for_call(call_id, &buf, remote, send.lost_pct)
                         .unwrap_or(false); // simulated drops still count as "sent"
                     self.stats.messages_sent += 1;
                     if let Some(s) = self.stats.step_mut(index) {
@@ -1985,7 +2085,7 @@ impl<'s> Engine<'s> {
                 .get(&call_id)
                 .and_then(|c| c.last_sent.clone().map(|b| (b, c.remote)));
             if let Some((buf, remote)) = resend {
-                let _ = self.transport.send_to(&buf, remote, None);
+                let _ = self.send_for_call(&call_id, &buf, remote, None);
                 self.stats.retrans_sent += 1;
                 self.trace_send(&buf, remote);
             }
@@ -2152,7 +2252,7 @@ impl<'s> Engine<'s> {
                 remote_ip: &remote_ip,
                 remote_port: call.remote.port(),
                 local_ip: &self.local_ip_str,
-                local_port: self.transport.local_addr().port(),
+                local_port: self.call_local_port(call),
                 media_ip: &self.media_ip_str,
                 media_port: self.media_port,
                 rtpstream_ports: rtpstream_ports(call),
@@ -2220,10 +2320,15 @@ impl<'s> Engine<'s> {
                         call.paused_until = (ms > 0.0).then_some(deadline);
                     }
                 }
-                // SIPp releases the call's reference to its socket; with the
-                // mono-socket transports sipr offers the socket stays open
-                // (docs/SIPP_COMPAT.md §6), so there is nothing to do.
-                crate::actions::ActionOutcome::CloseCon => {}
+                // SIPp releases the call's reference to its socket: on a
+                // mono-socket transport that closes nothing; in the per-call
+                // modes the socket closes with its last holder and the next
+                // send opens a fresh one (docs/SIPP_COMPAT.md §6).
+                crate::actions::ActionOutcome::CloseCon => {
+                    if let Some(call) = self.calls.get_mut(call_id) {
+                        call.socket = None;
+                    }
+                }
                 crate::actions::ActionOutcome::FailCall(why) => {
                     self.stats.failed_other += 1;
                     self.log_err(&format!("call {call_id} failed: {why}"));
@@ -2741,7 +2846,7 @@ impl<'s> Engine<'s> {
             remote_ip: &remote_ip,
             remote_port: call.remote.port(),
             local_ip: &self.local_ip_str,
-            local_port: self.transport.local_addr().port(),
+            local_port: self.call_local_port(call),
             media_ip: &self.media_ip_str,
             media_port: self.media_port,
             rtpstream_ports: rtpstream_ports(call),
@@ -2895,10 +3000,83 @@ impl<'s> Engine<'s> {
         }
         out.push_str("Content-Length: 0\r\n\r\n");
         let buf = out.into_bytes();
-        let _ = self.transport.send_to(&buf, remote, None);
+        let _ = self.send_for_call(call_id, &buf, remote, None);
         self.stats.auto_answered += 1;
         self.trace_send(&buf, remote);
         true
+    }
+
+    /// Open (or, past `-max_socket`, share) this call's socket in the
+    /// per-call modes — SIPp's `connect_socket_if_needed` +
+    /// `new_sipp_call_socket`. No-op elsewhere.
+    fn ensure_call_socket(&mut self, call_id: &str) -> Result<(), String> {
+        if !self.per_call {
+            return Ok(());
+        }
+        let Some(call) = self.calls.get(call_id) else {
+            return Ok(());
+        };
+        if call.socket.is_some() {
+            return Ok(());
+        }
+        let remote = call.remote;
+        // Sockets whose last call ended are gone; the rest can be shared.
+        self.call_socket_pool.retain(|w| w.upgrade().is_some());
+        let socket = if self.call_socket_pool.len() >= self.max_socket {
+            let i = self.next_shared_socket % self.call_socket_pool.len();
+            self.next_shared_socket = self.next_shared_socket.wrapping_add(1);
+            self.call_socket_pool[i]
+                .upgrade()
+                .ok_or_else(|| "no call socket left to share".to_owned())?
+        } else {
+            let opened = match &self.transport {
+                Transport::Udp(u) => u
+                    .open_call_socket()
+                    .map(|s| CallSocket::Udp(Arc::new(s)))
+                    .map_err(|e| format!("cannot open a UDP call socket: {e}"))?,
+                Transport::Tcp(t) => t
+                    .connect_call(remote)
+                    .map(|c| CallSocket::Tcp(Arc::new(c)))
+                    .map_err(|e| format!("cannot connect TCP to {remote}: {e}"))?,
+                Transport::Tls(t) => t
+                    .connect_call(remote)
+                    .map(|c| CallSocket::Tls(Arc::new(c)))
+                    .map_err(|e| format!("cannot connect TLS to {remote}: {e}"))?,
+            };
+            self.call_socket_pool.push(opened.downgrade());
+            opened
+        };
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.socket = Some(socket);
+        }
+        Ok(())
+    }
+
+    /// Send on the call's own socket when it has one, else the shared
+    /// transport.
+    fn send_for_call(
+        &self,
+        call_id: &str,
+        data: &[u8],
+        to: SocketAddr,
+        lost_pct: Option<f64>,
+    ) -> std::io::Result<bool> {
+        let own = self.calls.get(call_id).and_then(|c| c.socket.as_ref());
+        match (own, &self.transport) {
+            (Some(CallSocket::Udp(s)), Transport::Udp(u)) => u.send_via(s, data, to, lost_pct),
+            (Some(CallSocket::Tcp(c)), Transport::Tcp(t)) => t.send_via(c, data, lost_pct),
+            (Some(CallSocket::Tls(c)), Transport::Tls(t)) => t.send_via(c, data, lost_pct),
+            _ => self.transport.send_to(data, to, lost_pct),
+        }
+    }
+
+    /// `[local_port]`: the call's own socket in the per-call client modes
+    /// (SIPp's `call_port`), else the transport's.
+    fn call_local_port(&self, call: &CallState) -> u16 {
+        call.socket.as_ref().map_or_else(
+            || self.transport.local_addr().port(),
+            CallSocket::local_port,
+        )
     }
 
     fn trace_send(&mut self, buf: &[u8], remote: SocketAddr) {
@@ -2999,7 +3177,7 @@ impl<'s> Engine<'s> {
         let Some(remote) = self.calls.get(call_id).map(|c| c.remote) else {
             return;
         };
-        let _ = self.transport.send_to(&buf, remote, lost);
+        let _ = self.send_for_call(call_id, &buf, remote, lost);
         self.stats.retrans_sent += 1;
         self.trace_send(&buf, remote);
         match next {
@@ -3200,6 +3378,7 @@ fn new_call(
         generation: 0,
         pause_deadline: None,
         paused_until: None,
+        socket: None,
     }
 }
 
