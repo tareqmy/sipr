@@ -754,7 +754,39 @@ the start line, `Authorization:` only, body for auth-int), `auth.cpp`
 - [x] Deferred: SIPp's `TRACE_CALLDEBUG` line with the expected and received
       response values.
 
+## M27 — `_unexp.main` handler, `pauserestore`, `jump variable=`, `closecon` ✅
+
+Behavioral oracle: `scenario.cpp` ~l.1065 (`_unexp.main`, `_unexp.retaddr`,
+`_unexp.pausedaddr`), ~l.1344 `handle_rhs`; `call.cpp` ~l.5449 (the jump on
+an unexpected message, `queue_up`), ~l.1975 / ~l.2315 (`paused_until`),
+~l.6003 (`E_AT_PAUSE_RESTORE`), ~l.5836 (`E_AT_CLOSE_CON`); `socket.cpp`
+`SIPpSocket::close` refcount; `docs/scenarios/actions.rst` (jump).
+
+- [x] `<label id="_unexp.main"/>` turns an unexpected in-call message into a
+      jump: `_unexp.retaddr` ← interrupted index, `_unexp.pausedaddr` ←
+      the running pause's deadline (ms since start, 0 = none), timers
+      cancelled, the message re-offered to the handler's `<recv>`; refused
+      while `_unexp.retaddr` is non-zero (SIPp's "already in a jump").
+- [x] `<jump value=|variable=>` (SIPp's `handle_rhs`; the variable form is
+      the recipe's return); out of range fails the call.
+- [x] `<pauserestore value=|variable=>`: the deadline is served before the
+      next step executes and that step is then skipped (`run()` + `next()`),
+      so an interrupted `<pause>` resumes for exactly its remaining time.
+- [x] `<closecon/>`: accepted as a no-op — in SIPp it is a reference-count
+      drop that never closes a mono-socket transport (§6 note). The
+      per-call socket modes (`un`/`tn`/`ln`) stay out of scope.
+- [x] Tests: compile `unexp_handler_pauserestore_jump_variable_and_closecon_compile`
+      + corpus `positive/unexp_handler.xml` (SIPp-loadable); e2e
+      `unexp_handler_restores_the_interrupted_pause` (an INFO 0.5 s into a
+      3 s pause; the BYE after the pause must come ~2.5 s later, and the
+      run must last the full 3 s) and `closecon_is_accepted_over_tcp`;
+      interop `sipr_unexp_handler_against_real_sipp_uac` and
+      `real_sipp_unexp_handler_against_sipr_uac` — the same corpus
+      scenario played by each tool against the other's INFO.
+- [x] Deferred: `un`/`tn`/`ln` per-call sockets (the only mode where
+      `closecon` closes a connection), `-rsa`.
+
 ## Post-v1 backlog (ordered)
 
-`closecon` / `pauserestore` — the last two action elements still rejected
-at load (both need the TCP connection model).
+Nothing queued from the SIPp action/keyword surface. Candidates: the
+per-call socket transports (`un`/`tn`/`ln`), `-rsa`, SCTP.

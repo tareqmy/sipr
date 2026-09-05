@@ -694,3 +694,63 @@ fn verifyauth_compiles_with_templated_credentials() {
         assert!(!errors(&xml).is_empty(), "{missing}");
     }
 }
+
+#[test]
+fn unexp_handler_pauserestore_jump_variable_and_closecon_compile() {
+    use sipr_scenario::model::{JumpTarget, Operand};
+    let xml = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/corpus/positive/unexp_handler.xml"
+    ))
+    .expect("corpus");
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let retaddr = sc.vars.find("_unexp.retaddr").expect("retaddr var");
+    let pausedaddr = sc.vars.find("_unexp.pausedaddr").expect("pausedaddr var");
+    assert_eq!(sc.unexp_retaddr, Some(retaddr));
+    assert_eq!(sc.unexp_pausedaddr, Some(pausedaddr));
+    // The label is a step of its own; the handler's INFO recv follows it.
+    let handler = sc.unexpected_jump.expect("_unexp.main");
+    assert!(matches!(&sc.steps[handler], Step::Label { .. }));
+    assert!(
+        matches!(&sc.steps[handler + 1], Step::Recv(r) if r.expect == sipr_scenario::model::Expect::Request("INFO".into()))
+    );
+    let actions: Vec<&Action> = sc.all_actions().collect();
+    assert!(actions.iter().any(|a| matches!(a, Action::CloseCon)));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::PauseRestore(Operand::Var(v)) if *v == pausedaddr))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::Jump { dest: JumpTarget::Var(v) } if *v == retaddr))
+    );
+    // A scenario without the label has no handler and mentions no _unexp vars.
+    let plain = compile("plain", &wrap(send_invite()));
+    let plain = plain.scenario.expect("compiles");
+    assert_eq!(plain.unexpected_jump, None);
+    assert_eq!(plain.unexp_retaddr, None);
+    // Both operands, or neither, are errors; so is a non-numeric value.
+    for bad in [
+        r#"<jump value="1" variable="v"/>"#,
+        r#"<jump/>"#,
+        r#"<pauserestore/>"#,
+        r#"<pauserestore value="soon"/>"#,
+    ] {
+        let xml = wrap(&format!(
+            r#"{invite}
+               <nop><action>{bad}</action></nop>"#,
+            invite = send_invite()
+        ));
+        assert!(!errors(&xml).is_empty(), "{bad}");
+    }
+    let literal = wrap(&format!(
+        r#"{invite}
+           <nop><action><pauserestore value="0"/><jump value="0"/></action></nop>"#,
+        invite = send_invite()
+    ));
+    assert!(errors(&literal).is_empty());
+}

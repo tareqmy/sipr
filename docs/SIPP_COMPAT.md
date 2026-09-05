@@ -32,8 +32,10 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 
 `ereg` (with `assign_to`, `check_it`, `header`, `regexp`, `search_in`,
 `start_line`), `log`, `warning`, `error`, `assign`, `assignstr`, `strcmp`,
-`verifyauth` (with `assign_to`, `username`, `password`), `test`, `add`, `subtract`, `multiply`, `divide`, `todouble`, `jump`, `trim`,
-`gettimeofday`, `urlencode`, `urldecode`,
+`verifyauth` (with `assign_to`, `username`, `password`), `pauserestore`
+(`value`/`variable`), `closecon`, `test`, `add`, `subtract`, `multiply`, `divide`, `todouble`, `jump`, `trim`,
+`gettimeofday`, `urlencode`, `urldecode`, `jump` (`value`/`variable`; the
+`_unexp.main` label, `_unexp.retaddr` and `_unexp.pausedaddr` recipe),
 `exec` with `int_cmd` only (`stop_now`, `stop_gracefully`, `stop_call`).
 
 ### v1.x tier (fast follow)
@@ -52,7 +54,6 @@ classic 3PCC (`sendCmd`/`recvCmd`) in M10 (see §6).
 Shipped: `exec play_pcap_audio|video|image=` and `<recv ignoresdp>` (M14),
 `exec rtp_stream=` (file/pattern/pause/resume) and `exec play_dtmf=` (M15) —
 `-rtp_echo` + rtpcheck (M18), SRTP (M23), `exec rtp_echo=` (M25) — see §6.
-Still later: `closecon`, `pauserestore`.
 
 ## 2. Keywords (v1)
 
@@ -634,5 +635,44 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   Verified both ways against real sipp: sipr's `<verifyauth>` accepts and
   rejects sipp's `[authentication]` header, and sipp's accepts and rejects
   sipr's.
+- `_unexp.main`, `<jump variable=>`, `<pauserestore>` (M27; verified in
+  `scenario.cpp` ~l.1065 and `call.cpp` ~l.5449, ~l.1975, ~l.2315,
+  ~l.6003): when a scenario has `<label id="_unexp.main"/>`, an unexpected
+  in-call message does not fail the call — SIPp stores the current
+  message index in `_unexp.retaddr` and the running pause's absolute
+  deadline (`paused_until`, a ms clock tick; 0 when not pausing) in
+  `_unexp.pausedaddr` (each only if the scenario mentions the variable),
+  cancels the pause, jumps to the label and re-queues the message for the
+  handler's `<recv>`. It does **not** count as unexpected in the stats. The
+  jump is refused (normal unexpected handling) while `_unexp.retaddr` is
+  non-zero — "already in a jump" — and nothing ever resets that variable,
+  so one interruption per call unless the scenario zeroes it. The handler
+  ends with `<pauserestore variable="_unexp.pausedaddr"/>` and
+  `<jump variable="_unexp.retaddr"/>`: `pauserestore` sets `paused_until`
+  to the operand (`(int)`, absolute), and `run()` serves a pending
+  `paused_until` **before executing the current message** and then
+  `next()`s past it — so jumping back to an interrupted `<pause>` waits
+  out the original deadline and skips the pause; jumping back to a
+  `<recv>` (pausedaddr 0) simply re-arms it. `<jump>` itself is `handle_rhs`
+  (`value=` or `variable=`, `msg_index = (int)operand - 1`); an
+  out-of-range target is a fatal ERROR. sipr matches all of this (deadlines
+  are ms since the run started, like SIPp's clock tick), with two
+  divergences: an out-of-range jump fails the call rather than the run,
+  and the `_unexp.main` jump is tried before `-aa` auto-answering.
+  Verified both ways against real sipp with an INFO during a 3 s pause: the
+  BYE after the pause lands ~2.5 s after the INFO, not ~3 s.
+- `<closecon/>` (M27; verified in `call.cpp` ~l.5836 `E_AT_CLOSE_CON`,
+  `socket.cpp` `SIPpSocket::close` ~l.1045, ~l.1155-1168, `call.cpp`
+  ~l.1089, ~l.1481): it is `call_socket->close(); call_socket = nullptr`,
+  and `close()` only **decrements a reference count**, freeing the socket
+  at zero. Every call holds one reference on the socket it uses and the
+  process holds another on the shared ones (`main_socket`,
+  `tcp_multiplex`, each accepted server connection), so in the
+  mono-socket modes (`u1`, `t1`, `l1` — everything sipr offers) `closecon`
+  never closes anything: it drops the call's reference, after which a
+  further `<send>` on that call has no socket (`send_raw` asserts unless
+  `-rsa`). Only the per-call socket modes (`un`, `tn`, `ln`) actually close
+  a connection. sipr accepts the action as a no-op — the same observable
+  behavior — and the per-call socket modes remain unimplemented.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

@@ -123,8 +123,8 @@ root for media.
 
 ## Not yet (post-v1 roadmap)
 
-The last SIPp action corners: `closecon`, `pauserestore` (still clear
-load-time errors).
+The SIPp scenario surface is covered. Remaining SIPp corners are transport
+modes: per-call sockets (`un`/`tn`/`ln`), `-rsa`, SCTP.
 
 ## Brand
 

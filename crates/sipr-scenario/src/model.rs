@@ -35,6 +35,12 @@ impl VarTable {
         self.names.len() - 1
     }
 
+    /// The id of `name`, if the scenario ever mentioned it.
+    #[must_use]
+    pub fn find(&self, name: &str) -> Option<VarId> {
+        self.names.iter().position(|n| n == name)
+    }
+
     /// Name of a variable id.
     #[must_use]
     pub fn name(&self, id: VarId) -> &str {
@@ -261,6 +267,15 @@ pub enum Operand {
     Var(VarId),
 }
 
+/// The destination of a `<jump>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JumpTarget {
+    /// `value="N"`: absolute step index.
+    Index(StepIndex),
+    /// `variable="v"`: the step index held in `v` at execution time.
+    Var(VarId),
+}
+
 /// `int_cmd` of the `exec` action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntCmd {
@@ -460,11 +475,20 @@ pub enum Action {
         /// Source.
         variable: VarId,
     },
-    /// Jump to a message index.
+    /// Jump to a message index (`value=`) or to the index held in a
+    /// variable (`variable=`, SIPp's `_unexp.retaddr` recipe).
     Jump {
-        /// Absolute step index.
-        dest: StepIndex,
+        /// Where to go.
+        dest: JumpTarget,
     },
+    /// `<pauserestore value=|variable=>`: resume a pause interrupted by the
+    /// `_unexp.main` handler — the operand is the absolute deadline in ms
+    /// since the run started (SIPp's `paused_until` clock tick); 0 = none.
+    PauseRestore(Operand),
+    /// `<closecon/>`: release this call's reference to its connection
+    /// (SIPp `E_AT_CLOSE_CON`; see docs/SIPP_COMPAT.md §6 for what that
+    /// does — and does not — close).
+    CloseCon,
     /// Trim whitespace around a variable's value.
     Trim {
         /// Variable to trim in place.
@@ -553,6 +577,15 @@ pub struct Scenario {
     pub response_time_repartition: Vec<u64>,
     /// `CallLengthRepartition` bucket bounds (ms).
     pub call_length_repartition: Vec<u64>,
+    /// The step after `<label id="_unexp.main"/>`, when present: SIPp's
+    /// unexpected-message handler (`scenario.cpp` `unexpected_jump`).
+    pub unexpected_jump: Option<StepIndex>,
+    /// `_unexp.retaddr`, when the scenario mentions it: receives the
+    /// interrupted step index on an `_unexp.main` jump.
+    pub unexp_retaddr: Option<VarId>,
+    /// `_unexp.pausedaddr`, when mentioned: receives the interrupted pause's
+    /// deadline (ms since start, 0 = no pause) on an `_unexp.main` jump.
+    pub unexp_pausedaddr: Option<VarId>,
 }
 
 impl Scenario {

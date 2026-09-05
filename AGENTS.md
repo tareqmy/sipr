@@ -4,8 +4,8 @@ sipr is a SIPp-like SIP testing tool and traffic generator written in Rust. It p
 call flows described in SIPp's XML scenario format, as UAC or UAS, at a controlled
 rate, and reports live (TUI) and aggregate statistics.
 
-**Current state: v1 shipped, M0–M26 complete** (UDP/TCP/TLS transports, UAC/UAS,
-stats + TUI, actions/auth incl. IMS AKA + AUTS resync + `verifyauth`, `-inf` injection, 3PCC, `-users`, IPv6,
+**Current state: v1 shipped, M0–M27 complete** (UDP/TCP/TLS transports, UAC/UAS,
+stats + TUI, the full SIPp action set incl. `_unexp.main`, auth incl. IMS AKA + AUTS resync + `verifyauth`, `-inf` injection, 3PCC, `-users`, IPv6,
 pcap replay, RTP streaming + DTMF, RTP echo + rtpcheck, SRTP + SRTP echo server, SIPp
 control socket + HTTP API). `PLAN.md` is the
 master plan (its dependency choices were superseded by in-tree implementations —

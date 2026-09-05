@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **SIPp's unexpected-message handler** — `<label id="_unexp.main"/>`,
+  `_unexp.retaddr`, `_unexp.pausedaddr`, `<jump variable=>` and
+  `<pauserestore>`: an unexpected in-call message jumps to the handler,
+  which answers it and resumes the interrupted pause for exactly its
+  remaining time. Verified both ways against real sipp.
+- **`<closecon/>`** is accepted (a no-op, as SIPp's reference-count drop is
+  on every mono-socket transport).
+
 ## [0.15.0] — 2026-09-05
 
 ### Added

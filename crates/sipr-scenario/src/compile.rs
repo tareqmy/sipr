@@ -10,9 +10,9 @@ use std::collections::HashMap;
 
 use crate::diag::{Diagnostic, Diagnostics};
 use crate::model::{
-    Action, ArithOp, CompareOp, Expect, IntCmd, MediaKind, Operand, PauseSpec, RecvStep, Role,
-    RtpEchoCmd, RtpEchoVerb, RtpSource, RtpStreamCmd, Scenario, SearchIn, SendStep, Step,
-    StepCommon, StepIndex, VarId, VarTable,
+    Action, ArithOp, CompareOp, Expect, IntCmd, JumpTarget, MediaKind, Operand, PauseSpec,
+    RecvStep, Role, RtpEchoCmd, RtpEchoVerb, RtpSource, RtpStreamCmd, Scenario, SearchIn, SendStep,
+    Step, StepCommon, StepIndex, VarId, VarTable,
 };
 use crate::template::{self, Keyword, MsgTemplate};
 use crate::xml::{self, Element, Node};
@@ -96,6 +96,33 @@ impl Compiler {
         let id = self.var(name);
         self.var_read[id] = true;
         id
+    }
+
+    /// SIPp's `handle_rhs`: exactly one of `value=` (numeric) or `variable=`.
+    fn parse_operand(&mut self, el: &Element, line: u32) -> Operand {
+        match (el.attr("value"), el.attr("variable")) {
+            (Some(v), None) => match v.parse() {
+                Ok(n) => Operand::Value(n),
+                Err(_) => {
+                    self.diags.error(
+                        Some(line),
+                        format!("{} 'value' must be numeric: '{v}'", el.name),
+                    );
+                    Operand::Value(0.0)
+                }
+            },
+            (None, Some(v)) => {
+                let v = v.to_owned();
+                Operand::Var(self.var_reads(&v))
+            }
+            _ => {
+                self.diags.error(
+                    Some(line),
+                    format!("<{}> needs exactly one of 'value' or 'variable'", el.name),
+                );
+                Operand::Value(0.0)
+            }
+        }
     }
 
     fn var_writes(&mut self, name: &str) -> VarId {
@@ -844,29 +871,7 @@ impl Compiler {
                     _ => ArithOp::Divide,
                 };
                 let to = self.require_attr(el, "assign_to")?;
-                let operand = match (el.attr("value"), el.attr("variable")) {
-                    (Some(v), None) => match v.parse() {
-                        Ok(n) => Operand::Value(n),
-                        Err(_) => {
-                            self.diags.error(
-                                Some(line),
-                                format!("{} 'value' must be numeric: '{v}'", el.name),
-                            );
-                            Operand::Value(0.0)
-                        }
-                    },
-                    (None, Some(v)) => {
-                        let v = v.to_owned();
-                        Operand::Var(self.var_reads(&v))
-                    }
-                    _ => {
-                        self.diags.error(
-                            Some(line),
-                            format!("<{}> needs exactly one of 'value' or 'variable'", el.name),
-                        );
-                        Operand::Value(0.0)
-                    }
-                };
+                let operand = self.parse_operand(el, line);
                 // Read-modify-write: the destination is also an input.
                 let assign_to = self.var_reads(&to);
                 let assign_to_w = self.var_writes(&to);
@@ -887,18 +892,42 @@ impl Compiler {
                 })
             }
             "jump" => {
-                self.warn_unknown_attrs(el, &["value"]);
-                let raw = self.require_attr(el, "value")?;
-                match raw.parse::<usize>() {
-                    Ok(dest) => Some(Action::Jump { dest }),
-                    Err(_) => {
+                self.warn_unknown_attrs(el, &["value", "variable"]);
+                match (el.attr("value"), el.attr("variable")) {
+                    (Some(raw), None) => match raw.parse::<usize>() {
+                        Ok(dest) => Some(Action::Jump {
+                            dest: JumpTarget::Index(dest),
+                        }),
+                        Err(_) => {
+                            self.diags.error(
+                                Some(line),
+                                format!("jump 'value' must be a message index: '{raw}'"),
+                            );
+                            None
+                        }
+                    },
+                    (None, Some(v)) => {
+                        let v = v.to_owned();
+                        Some(Action::Jump {
+                            dest: JumpTarget::Var(self.var_reads(&v)),
+                        })
+                    }
+                    _ => {
                         self.diags.error(
                             Some(line),
-                            format!("jump 'value' must be a message index: '{raw}'"),
+                            "<jump> needs exactly one of 'value' or 'variable'",
                         );
                         None
                     }
                 }
+            }
+            "pauserestore" => {
+                self.warn_unknown_attrs(el, &["value", "variable"]);
+                Some(Action::PauseRestore(self.parse_operand(el, line)))
+            }
+            "closecon" => {
+                self.warn_unknown_attrs(el, &[]);
+                Some(Action::CloseCon)
             }
             "trim" | "urlencode" | "urldecode" => {
                 self.warn_unknown_attrs(el, &["variable"]);
@@ -1071,17 +1100,6 @@ impl Compiler {
                         None
                     }
                 }
-            }
-            "closecon" | "pauserestore" => {
-                self.diags.error(
-                    Some(line),
-                    format!(
-                        "action <{}> is not supported yet — later milestones \
-                         (docs/SIPP_COMPAT.md §1)",
-                        el.name
-                    ),
-                );
-                None
             }
             other => {
                 self.diags
@@ -1347,10 +1365,12 @@ impl Compiler {
                 _ => continue,
             };
             for a in actions {
-                if let Action::Jump { dest } = a {
-                    if *dest >= max {
-                        bad_jumps.push(*dest);
-                    }
+                if let Action::Jump {
+                    dest: JumpTarget::Index(dest),
+                } = a
+                    && *dest >= max
+                {
+                    bad_jumps.push(*dest);
                 }
             }
         }
@@ -1373,7 +1393,10 @@ impl Compiler {
         // Variable usage.
         for id in 0..self.vars.len() {
             let name = self.vars.name(id).to_owned();
-            match (self.var_read[id], self.var_written[id]) {
+            // `_unexp.retaddr` / `_unexp.pausedaddr` are written by the
+            // engine on an `_unexp.main` jump, not by an action.
+            let engine_set = name.starts_with("_unexp.");
+            match (self.var_read[id], self.var_written[id] || engine_set) {
                 (true, false) => self.diags.error(
                     None,
                     format!("variable '{name}' is read but never set by any action"),
@@ -1395,9 +1418,14 @@ impl Compiler {
                 name: self.name,
                 role,
                 steps: self.steps,
-                vars: self.vars,
                 response_time_repartition: self.response_time_repartition,
                 call_length_repartition: self.call_length_repartition,
+                // SIPp: `labelMap.find("_unexp.main")`, `find_var` on the two
+                // `_unexp.*` names — present only if the scenario mentions them.
+                unexpected_jump: self.labels.get("_unexp.main").copied(),
+                unexp_retaddr: self.vars.find("_unexp.retaddr"),
+                unexp_pausedaddr: self.vars.find("_unexp.pausedaddr"),
+                vars: self.vars,
             })
         };
         CompileOutcome {

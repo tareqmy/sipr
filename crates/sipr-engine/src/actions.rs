@@ -6,7 +6,9 @@
 //! everything else is arithmetic/string/control over the store.
 
 use sipr_net::Inbound;
-use sipr_scenario::model::{Action, ArithOp, CompareOp, Operand, SearchIn, VarId, VarTable};
+use sipr_scenario::model::{
+    Action, ArithOp, CompareOp, JumpTarget, Operand, SearchIn, VarId, VarTable,
+};
 use sipr_scenario::template::MsgTemplate;
 
 use crate::render::{RenderCtx, render_to_string};
@@ -135,6 +137,11 @@ pub enum ActionOutcome {
     RtpEcho(bool),
     /// `exec rtp_echo=`: start/update/stop this call's echo. Not terminal.
     RtpEchoCmd(sipr_scenario::model::RtpEchoCmd),
+    /// `<pauserestore>`: resume a pause until this deadline (ms since the
+    /// run started; 0 = none). Not terminal.
+    PauseRestore(f64),
+    /// `<closecon/>`. Not terminal.
+    CloseCon,
 }
 
 /// Run every action in order, mutating the store and collecting outcomes.
@@ -180,6 +187,8 @@ fn run_actions_impl(
                 | ActionOutcome::PlayDtmf(_)
                 | ActionOutcome::RtpEcho(_)
                 | ActionOutcome::RtpEchoCmd(_)
+                | ActionOutcome::PauseRestore(_)
+                | ActionOutcome::CloseCon
         );
         out.push(outcome);
         if terminal {
@@ -354,7 +363,17 @@ fn run_one(
             store.set(*assign_to, Value::Num(store.get(*variable).as_num()));
             ActionOutcome::Continue
         }
-        Action::Jump { dest } => ActionOutcome::Jump(*dest),
+        Action::Jump { dest } => ActionOutcome::Jump(match dest {
+            JumpTarget::Index(i) => *i,
+            // SIPp: `(int)operand`; a negative index is nonsense → 0.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            JumpTarget::Var(v) => store.get(*v).as_num().max(0.0) as usize,
+        }),
+        Action::PauseRestore(op) => ActionOutcome::PauseRestore(match op {
+            Operand::Value(v) => *v,
+            Operand::Var(id) => store.get(*id).as_num(),
+        }),
+        Action::CloseCon => ActionOutcome::CloseCon,
         Action::Trim { variable } => {
             let v = store.get(*variable).as_str().trim().to_owned();
             store.set(*variable, Value::Str(v));

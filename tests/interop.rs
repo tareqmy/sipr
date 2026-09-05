@@ -28,7 +28,7 @@ fn sipp_bin() -> Option<PathBuf> {
 /// echo binds both).
 fn free_even_port() -> u16 {
     for _ in 0..100 {
-        let base = (free_port().max(20_000)) & !1;
+        let base = media_port_candidate();
         let a = UdpSocket::bind(("127.0.0.1", base));
         let b = UdpSocket::bind(("127.0.0.1", base + 2));
         if a.is_ok() && b.is_ok() {
@@ -42,7 +42,7 @@ fn free_even_port() -> u16 {
 /// scenarios that spread calls over 4-port blocks.
 fn free_port_block(span: u16) -> u16 {
     for _ in 0..100 {
-        let base = free_port().max(20_000) & !1;
+        let base = media_port_candidate();
         let held: Vec<_> = (0..span)
             .map(|i| UdpSocket::bind(("127.0.0.1", base + i)))
             .collect();
@@ -51,6 +51,25 @@ fn free_port_block(span: u16) -> u16 {
         }
     }
     panic!("no free port block of {span}");
+}
+/// A random even port in 20000..45000 — below the OS ephemeral range
+/// (49152+ on macOS), so a media port probed-then-released here is not
+/// handed to some other test's socket a moment later.
+fn media_port_candidate() -> u16 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let n = SEED.fetch_add(1, Ordering::Relaxed);
+    let mut x =
+        nanos ^ (u64::from(std::process::id()) << 32) ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    x ^= x >> 29;
+    #[allow(clippy::cast_possible_truncation)]
+    let port = 20_000 + (x % 25_000) as u16;
+    port & !1
 }
 
 /// A free UDP port on loopback (bind-then-drop; racy in theory, fine here).
@@ -1461,4 +1480,183 @@ fn real_sipp_verifyauth_judges_sipr_credentials() {
         "sipr uac with a wrong password must get 403 from sipp"
     );
     assert_eq!(uas, Some(0), "sipp registrar");
+}
+
+/// The corpus `_unexp.main` handler scenario (pauserestore, jump variable=,
+/// closecon), with the XML declaration sipp insists on.
+fn unexp_handler_uas_xml() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sipr-scenario/tests/corpus/positive/unexp_handler.xml"
+    ))
+    .expect("corpus")
+}
+
+/// A UAC that sends an INFO during the UAS's pause and expects its BYE
+/// within `bye_timeout_ms` (see the e2e twin for the timing argument).
+fn info_during_pause_uac_xml(bye_timeout_ms: u32) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="uac-info-during-pause">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <pause milliseconds="500"/>
+  <send retrans="500"><![CDATA[
+    INFO sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 INFO
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <recv request="BYE" timeout="{bye_timeout_ms}"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>
+"#
+    )
+}
+
+/// Run `uas_bin` on the handler scenario and `uac_bin` on the INFO scenario
+/// against it; return (uac exit, uas exit, wall time of the UAC).
+fn run_unexp_pair(
+    uas_bin: &std::path::Path,
+    uac_bin: &std::path::Path,
+    tag: &str,
+) -> (Option<i32>, Option<i32>, Duration) {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let uas_path = dir.join(format!("sipr-interop-unexp-uas-{tag}-{pid}.xml"));
+    let uac_path = dir.join(format!("sipr-interop-unexp-uac-{tag}-{pid}.xml"));
+    std::fs::write(&uas_path, unexp_handler_uas_xml()).expect("write uas");
+    std::fs::write(&uac_path, info_during_pause_uac_xml(2800)).expect("write uac");
+    let port = free_port();
+    let mut uas = Reaper(
+        Command::new(uas_bin)
+            .current_dir(&dir)
+            .args([
+                "-sf",
+                uas_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "1",
+                "-timeout",
+                "20",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let started = std::time::Instant::now();
+    let mut uac = Reaper(
+        Command::new(uac_bin)
+            .current_dir(&dir)
+            .args([
+                "-sf",
+                uac_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-m",
+                "1",
+                "-timeout",
+                "15",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uac"),
+    );
+    let uac_code = wait_with_timeout(&mut uac.0, Duration::from_secs(20));
+    let elapsed = started.elapsed();
+    let uas_code = wait_with_timeout(&mut uas.0, Duration::from_secs(15));
+    let _ = std::fs::remove_file(&uas_path);
+    let _ = std::fs::remove_file(&uac_path);
+    (uac_code, uas_code, elapsed)
+}
+
+/// sipr plays SIPp's `_unexp.main` recipe as the UAS: real sipp's INFO in
+/// the middle of the pause is answered and the pause resumes where it was.
+#[test]
+fn sipr_unexp_handler_against_real_sipp_uac() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::sipr_unexp_handler_against_real_sipp_uac — no sipp.");
+        return;
+    };
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let (uac, uas, elapsed) = run_unexp_pair(&sipr, &sipp, "sipr-uas");
+    assert_eq!(
+        uac,
+        Some(0),
+        "sipp uac must get its INFO answered and the BYE in time"
+    );
+    assert_eq!(uas, Some(0), "sipr uas");
+    assert!(
+        elapsed >= Duration::from_millis(2900),
+        "pause cut short: {elapsed:?}"
+    );
+}
+
+/// The mirror: real sipp runs the same handler scenario against sipr's INFO,
+/// pinning the recipe's semantics (retaddr, pausedaddr, restore) to SIPp's.
+#[test]
+fn real_sipp_unexp_handler_against_sipr_uac() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::real_sipp_unexp_handler_against_sipr_uac — no sipp.");
+        return;
+    };
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let (uac, uas, elapsed) = run_unexp_pair(&sipp, &sipr, "sipp-uas");
+    assert_eq!(
+        uac,
+        Some(0),
+        "sipr uac must get its INFO answered and sipp's BYE in time"
+    );
+    assert_eq!(uas, Some(0), "sipp uas");
+    assert!(
+        elapsed >= Duration::from_millis(2900),
+        "pause cut short: {elapsed:?}"
+    );
 }

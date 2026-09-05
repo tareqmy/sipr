@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!-- SIPp's unexpected-message handler: _unexp.main, _unexp.retaddr,
+     _unexp.pausedaddr, jump variable=, pauserestore, closecon. -->
+<scenario name="unexp-handler-uas">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+  <pause milliseconds="3000"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:[service]@[local_ip]:[local_port]>;tag=[pid]SIPpTag01[call_number]
+    To: <sip:sipp@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 BYE
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <nop hide="true"><action><closecon/></action></nop>
+  <nop hide="true" next="end"/>
+  <label id="_unexp.main"/>
+  <recv request="INFO"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <nop hide="true">
+    <action>
+      <pauserestore variable="_unexp.pausedaddr"/>
+      <jump variable="_unexp.retaddr"/>
+    </action>
+  </nop>
+  <label id="end"/>
+</scenario>

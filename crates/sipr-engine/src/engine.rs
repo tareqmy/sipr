@@ -360,6 +360,12 @@ struct CallState {
     timer: Option<(TimerId, TimerKind)>,
     /// Bumped whenever timers are (re)armed; stale fires are ignored.
     generation: u64,
+    /// The running `<pause>`: its step index and when it ends (SIPp's
+    /// `msg_index` / `paused_until`), for `_unexp.retaddr` / `pausedaddr`
+    /// — `index` already points past the pause while it runs.
+    pause_deadline: Option<(usize, Instant)>,
+    /// A `<pauserestore>` deadline to serve before the next step executes.
+    paused_until: Option<Instant>,
 }
 
 /// Why the engine refused to run a scenario.
@@ -1561,6 +1567,31 @@ impl<'s> Engine<'s> {
                 self.complete_call(call_id);
                 return;
             };
+            // A restored pause (SIPp `run()`: `paused_until` is served before
+            // the step, which is then skipped with `next()`).
+            if let Some(deadline) = self.calls.get(call_id).and_then(|c| c.paused_until) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let Some(call) = self.calls.get_mut(call_id) else {
+                    return;
+                };
+                call.paused_until = None;
+                call.index = index + 1;
+                if remaining.is_zero() {
+                    continue;
+                }
+                call.generation += 1;
+                let timer = self.timers.arm(
+                    remaining,
+                    Event::CallTimer {
+                        call_id: call_id.to_owned(),
+                        generation: call.generation,
+                        kind: TimerKind::Pause,
+                    },
+                );
+                call.timer = Some((timer, TimerKind::Pause));
+                call.pause_deadline = Some((index, deadline));
+                return;
+            }
             // condexec: run this step only if the variable's set-ness matches.
             if let Some(common) = step_common(step) {
                 if let Some(v) = common.condexec {
@@ -1724,6 +1755,7 @@ impl<'s> Engine<'s> {
                     };
                     call.generation += 1;
                     call.index = jump; // applied when the timer fires
+                    call.pause_deadline = Some((index, Instant::now() + dur));
                     let timer = self.timers.arm(
                         dur,
                         Event::CallTimer {
@@ -1981,6 +2013,9 @@ impl<'s> Engine<'s> {
                 }
             }
             Scan::NoMatch => {
+                if self.try_unexpected_jump(&call_id, packet) {
+                    return;
+                }
                 if self.try_auto_answer(&call_id, msg) {
                     return;
                 }
@@ -2159,12 +2194,36 @@ impl<'s> Engine<'s> {
                 crate::actions::ActionOutcome::Continue => {}
                 crate::actions::ActionOutcome::Log(line) => self.log_err(&line),
                 crate::actions::ActionOutcome::Jump(dest) => {
+                    // SIPp: "Jump statement out of range" is fatal; sipr
+                    // fails the call instead of the run.
+                    if dest >= self.scenario.steps.len() {
+                        self.stats.failed_other += 1;
+                        self.log_err(&format!(
+                            "call {call_id} failed: jump to message index {dest} is out of \
+                             range (0..{})",
+                            self.scenario.steps.len()
+                        ));
+                        self.remove_call(call_id);
+                        return true;
+                    }
                     if let Some(call) = self.calls.get_mut(call_id) {
                         call.index = dest;
                     }
                     self.advance(call_id);
                     return true;
                 }
+                crate::actions::ActionOutcome::PauseRestore(ms) => {
+                    let started = self.stats.started;
+                    if let Some(call) = self.calls.get_mut(call_id) {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let deadline = started + Duration::from_millis(ms.max(0.0) as u64);
+                        call.paused_until = (ms > 0.0).then_some(deadline);
+                    }
+                }
+                // SIPp releases the call's reference to its socket; with the
+                // mono-socket transports sipr offers the socket stays open
+                // (docs/SIPP_COMPAT.md §6), so there is nothing to do.
+                crate::actions::ActionOutcome::CloseCon => {}
                 crate::actions::ActionOutcome::FailCall(why) => {
                     self.stats.failed_other += 1;
                     self.log_err(&format!("call {call_id} failed: {why}"));
@@ -2763,6 +2822,57 @@ impl<'s> Engine<'s> {
 
     /// `-aa`: answer in-dialog OPTIONS/INFO/UPDATE/NOTIFY with 200 without
     /// disturbing the scenario. Returns true when handled.
+    /// SIPp's `_unexp.main` label (`call.cpp` ~l.5449): an unexpected message
+    /// jumps there, saving the interrupted step index in `_unexp.retaddr`
+    /// and a running pause's deadline (ms since start, 0 = none) in
+    /// `_unexp.pausedaddr`, then the message is offered to the handler
+    /// (SIPp `queue_up`). Not re-entered while `_unexp.retaddr` is non-zero
+    /// — SIPp's "already in a jump".
+    fn try_unexpected_jump(&mut self, call_id: &str, packet: &sipr_net::InboundPacket) -> bool {
+        let Some(target) = self.scenario.unexpected_jump else {
+            return false;
+        };
+        let started = self.stats.started;
+        let Some(call) = self.calls.get_mut(call_id) else {
+            return false;
+        };
+        // The step being interrupted: the running pause, else the recv.
+        let interrupted = call.pause_deadline.map_or(call.index, |(i, _)| i);
+        if let Some(v) = self.scenario.unexp_retaddr {
+            if call.store.get(v).as_num() != 0.0 {
+                return false;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            call.store
+                .set(v, crate::actions::Value::Num(interrupted as f64));
+        }
+        if let Some(v) = self.scenario.unexp_pausedaddr {
+            #[allow(clippy::cast_precision_loss)]
+            let ms = call.pause_deadline.map_or(0.0, |(_, d)| {
+                d.saturating_duration_since(started).as_millis() as f64
+            });
+            call.store.set(v, crate::actions::Value::Num(ms));
+        }
+        let pending = call.timer.take();
+        call.generation += 1;
+        call.pause_deadline = None;
+        call.waiting = false;
+        call.index = target;
+        if let Some((timer, _)) = pending {
+            self.timers.cancel(timer);
+        }
+        let what = packet.message.method().map_or_else(
+            || format!("{:?}", packet.message.status_code()),
+            ToOwned::to_owned,
+        );
+        self.log_err(&format!(
+            "call {call_id}: unexpected {what} at index {interrupted}: jumping to _unexp.main"
+        ));
+        self.advance(call_id);
+        self.on_packet(packet);
+        true
+    }
+
     fn try_auto_answer(&mut self, call_id: &str, msg: &Inbound) -> bool {
         if !self.config.auto_answer {
             return false;
@@ -2859,7 +2969,12 @@ impl<'s> Engine<'s> {
                     None => self.fail_call(call_id, "recv timeout"),
                 }
             }
-            TimerKind::Pause => self.advance(call_id),
+            TimerKind::Pause => {
+                if let Some(call) = self.calls.get_mut(call_id) {
+                    call.pause_deadline = None;
+                }
+                self.advance(call_id);
+            }
             TimerKind::Timewait => self.complete_call(call_id),
             TimerKind::Retrans => unreachable!("handled above"),
         }
@@ -3083,6 +3198,8 @@ fn new_call(
         retrans: None,
         timer: None,
         generation: 0,
+        pause_deadline: None,
+        paused_until: None,
     }
 }
 

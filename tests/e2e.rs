@@ -266,7 +266,7 @@ fn silence_leads_to_failed_calls_and_exit_1() {
 /// scenarios that spread calls over `[auto_media_port]` blocks.
 fn free_port_block(span: u16) -> u16 {
     for _ in 0..100 {
-        let base = free_port().max(20_000) & !1;
+        let base = media_port_candidate();
         let held: Vec<_> = (0..span)
             .map(|i| UdpSocket::bind(("127.0.0.1", base + i)))
             .collect();
@@ -275,6 +275,25 @@ fn free_port_block(span: u16) -> u16 {
         }
     }
     panic!("no free port block of {span}");
+}
+/// A random even port in 20000..45000 — below the OS ephemeral range
+/// (49152+ on macOS), so a media port probed-then-released here is not
+/// handed to some other test's socket a moment later.
+fn media_port_candidate() -> u16 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let n = SEED.fetch_add(1, Ordering::Relaxed);
+    let mut x =
+        nanos ^ (u64::from(std::process::id()) << 32) ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    x ^= x >> 29;
+    #[allow(clippy::cast_possible_truncation)]
+    let port = 20_000 + (x % 25_000) as u16;
+    port & !1
 }
 
 /// A free loopback UDP port (bind-then-drop).
@@ -3559,6 +3578,214 @@ fn rtp_echo_with_an_unknown_codec_fails_at_load() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_ne!(out.status.code(), Some(0), "{err}");
     assert!(err.contains("rtp_echo"), "{err}");
+}
+
+// ---- _unexp.main handler, pauserestore, jump variable=, closecon (M27) ---------
+
+/// A UAC that sends an INFO in the middle of the UAS's pause, then expects
+/// the UAS's BYE within `bye_timeout_ms` of its INFO round trip.
+fn info_during_pause_uac(bye_timeout_ms: u32) -> String {
+    format!(
+        r#"<scenario name="uac-info-during-pause">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <pause milliseconds="500"/>
+  <send retrans="500"><![CDATA[
+    INFO sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 INFO
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <recv request="BYE" timeout="{bye_timeout_ms}"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>
+"#
+    )
+}
+
+/// SIPp's `_unexp.main` recipe, from the corpus: an INFO arriving during
+/// the UAS's 3 s pause is answered by the handler, which restores the
+/// pause (`pauserestore`) and jumps back (`jump variable=`). The BYE the UAS
+/// sends after the pause must arrive ~2.5 s after the INFO — a pause that
+/// restarted from scratch would be ~3 s, so a 2.8 s timeout on the UAC's
+/// BYE tells the two apart; the run must still last the full 3 s.
+#[test]
+fn unexp_handler_restores_the_interrupted_pause() {
+    let corpus = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sipr-scenario/tests/corpus/positive/unexp_handler.xml"
+    );
+    let port = free_port();
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sf",
+        corpus,
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-m",
+        "1",
+        "-timeout",
+        "20",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(300));
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let uac_path = dir.join(format!("sipr-e2e-unexp-uac-{pid}.xml"));
+    std::fs::write(&uac_path, info_during_pause_uac(2800)).expect("write");
+    let started = std::time::Instant::now();
+    let out = run_sipr(&[
+        "-sf",
+        uac_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &format!("127.0.0.1:{port}"),
+    ]);
+    let elapsed = started.elapsed();
+    let _ = std::fs::remove_file(&uac_path);
+    let uac_err = String::from_utf8_lossy(&out.stderr);
+    let uas_code = wait_exit(&mut uas, Duration::from_secs(10));
+    let uas_err = uas_err.join().expect("uas stderr");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "uac:\n{uac_err}\nuas:\n{uas_err}"
+    );
+    assert_eq!(uas_code, Some(0), "uas:\n{uas_err}");
+    assert!(uas_err.contains("successful 1 failed 0"), "{uas_err}");
+    assert!(
+        elapsed >= Duration::from_millis(2900),
+        "the restored pause was cut short: {elapsed:?}"
+    );
+}
+
+/// `<closecon/>` on the mono-socket TCP transport releases nothing
+/// observable (SIPp's refcount semantics) — the call still completes.
+#[test]
+fn closecon_is_accepted_over_tcp() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let uas_path = dir.join(format!("sipr-e2e-closecon-{pid}.xml"));
+    std::fs::write(
+        &uas_path,
+        r#"<scenario name="closecon-uas">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <nop><action><closecon/></action></nop>
+</scenario>
+"#,
+    )
+    .expect("write");
+    let port = free_port();
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sf",
+        uas_path.to_str().expect("utf8"),
+        "-t",
+        "t1",
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(300));
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "t1",
+        "-i",
+        "127.0.0.1",
+        "-m",
+        "1",
+        "-d",
+        "100",
+        "-timeout",
+        "10",
+        "-bg",
+        &format!("127.0.0.1:{port}"),
+    ]);
+    let _ = std::fs::remove_file(&uas_path);
+    let uac_err = String::from_utf8_lossy(&out.stderr);
+    let uas_code = wait_exit(&mut uas, Duration::from_secs(10));
+    let uas_err = uas_err.join().expect("uas stderr");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "uac:\n{uac_err}\nuas:\n{uas_err}"
+    );
+    assert_eq!(uas_code, Some(0), "uas:\n{uas_err}");
+    assert!(uas_err.contains("successful 1 failed 0"), "{uas_err}");
 }
 
 // ---- <verifyauth>: sipr as a digest-checking registrar (M26) -------------------
