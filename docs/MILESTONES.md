@@ -940,7 +940,78 @@ Behavioral oracle: `sipp.cpp` ~l.209-243, `socket.cpp` ~l.806-850 (notify),
 
 ## Post-v1 backlog (ordered)
 
-Nothing queued: the SIPp surface sipr targets is complete. (Checked after M30: the pacer's first call comes one
-inter-call interval after start-up in SIPp too — `call_generation_task.cpp`
-opens calls when `elapsed × rate / rate_period` reaches the count; no
-divergence, see SIPP_COMPAT §6.)
+(Checked after M30: the pacer's first call comes one inter-call interval
+after start-up in SIPp too — `call_generation_task.cpp` opens calls when
+`elapsed × rate / rate_period` reaches the count; no divergence, see
+SIPP_COMPAT §6.)
+
+### M33 — Out-of-call scenarios: `-oocsf`, `-oocsn`, `set display ooc`
+
+Behavioral oracle: `sipp.cpp` ~l.177 (option table), ~l.1792-1800 (parse:
+`-oocsf <file>` loads a scenario file, `-oocsn <name>` an embedded one),
+~l.2113-2116 (the `ooc_default` fallback is **commented out** — with no
+`-oocs*` flag a UAC keeps discarding unmapped requests with the
+"Discarding message which can't be mapped to a known SIPp call" warning),
+~l.2147-2149 (fatal in server mode: "SIPp cannot use out-of-call scenarios
+when running in server mode"); `socket.cpp` ~l.1195-1217 (dispatch: a
+*request* whose Call-ID matches no call, in client mode, spawns a call on
+the ooc scenario with no user id, counts `E_CREATE_INCOMING_CALL` on the
+ooc scenario's stats plus the global `E_AUTO_ANSWERED`, logs the
+"Received out-of-call %s message, using the out-of-call scenario" warning
+and feeds it the message; an unmapped *response* only counts
+`E_OUT_OF_CALL_MSGS`), ~l.191 (`set display ooc` swaps the TUI scenario);
+`call.cpp` ~l.6641 (ooc calls may not use `-inf`: "Automatic calls
+(created by -aa, -oocsn or -oocsf) cannot use input files!");
+`scenario.cpp` ~l.1933 (embedded names `ooc_default`, `ooc_dummy`);
+`docs/int_scenarios.rst` "UAC Out-of-call Messages" and
+`docs/ooc_default.xml` (recv `request=".*" regexp_match="true"`, send
+200 with `[last_*]` copies and a `Contact`, `timewait 4000`).
+
+- [ ] `-oocsf <file>` / `-oocsn <name>`: load a second, independently
+      compiled scenario next to the main one (own variable table, own
+      per-step stats and repartitions). Client mode only — fatal at startup
+      in server mode with SIPp's wording. Mutually exclusive with each other.
+- [ ] Embedded `ooc_default` (the XML above, byte-for-byte SIPp's) and
+      `ooc_dummy`; `-sd ooc_default` dumps it. Loading `-oocsn ooc_default`
+      is the documented way to get the 200-OK behaviour; with no flag sipr
+      keeps today's discard-and-count path (matches SIPp's commented-out
+      fallback — record this in SIPP_COMPAT §6).
+- [ ] Dispatch in `engine.rs` (the `out-of-call message ignored` branch,
+      ~l.2240): an unmapped *request* in client mode with an ooc scenario
+      loaded creates a call on the ooc scenario keyed by the incoming
+      Call-ID, remote = the packet source (or `-rsa`), no user id, no
+      injection line, and runs it from step 0 with the request as the first
+      inbound message; counts as an incoming call on the ooc scenario's
+      stats and bumps the global auto-answered counter; logs SIPp's warning
+      (method name, `-trace_err`). Unmapped *responses* stay ignored.
+      Ooc calls never count toward `-m`/`-l`/`-users` and never end the run
+      (SIPp's `calls_to_open` ignores them); they do participate in the
+      quit ladder (drain like any call).
+- [ ] `[fieldN]`/`-inf` use inside an ooc scenario is a load-time error
+      with SIPp's wording; `[userid]` renders 0.
+- [ ] TUI + control: `set display ooc` (control socket, and the screen key
+      if SIPp has one — verify) switches the scenario screen to the ooc
+      scenario's steps; `set display main` switches back. Stats screen
+      keeps showing the main scenario (SIPp `display_scenario` only affects
+      the scenario page). `-trace_stat`/`-stf`: ooc scenario stats go to
+      `<ooc name>_<pid>_.csv` alongside the main file (SIPp
+      `stats->setFileName(scenario name)`).
+- [ ] `--check` lints the ooc scenario with the same rules; unknown
+      elements are hard errors there too.
+- [ ] Tests: scenario unit (embedded `ooc_default` parses; `-inf` keyword
+      in an ooc scenario rejected); CLI parse (`-oocsf`/`-oocsn`, server
+      mode fatal, both flags fatal); e2e `uac_answers_out_of_call_options_with_ooc_scenario`
+      (sipr UAC on a main scenario, a peer sends an OPTIONS with a fresh
+      Call-ID mid-run, sipr replies 200 with the copied headers and the main
+      call flow is unaffected; without `-oocs*` the OPTIONS is discarded
+      and counted); `set display ooc` control test; interop: real sipp UAC
+      with `-oocsn ooc_default` vs sipr sending it an out-of-call OPTIONS,
+      and the mirror (sipr `-oocsn ooc_default`, sipp sends), both
+      transcripts compared.
+- [ ] Docs: SIPP_COMPAT §1 (`-oocsf`/`-oocsn` in §3), §6 behaviour note
+      (commented-out default, client-only, no `-inf`, unmapped responses
+      never spawn); ARCHITECTURE "two scenarios, one engine" paragraph;
+      drop the M22 "no out-of-call scenarios" deferral once shipped.
+- [ ] Out of scope (say so in SIPP_COMPAT): `-rxsf`/`-rxinf` mixed-mode
+      receive scenario (`MODE_MIXED`, `rx_scenario`) — a separate item if
+      ever wanted.
