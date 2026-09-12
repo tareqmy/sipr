@@ -638,6 +638,20 @@ impl Scenario {
         })
     }
 
+    /// True when any send template reads an injection file (`[fieldN]`).
+    /// Calls SIPp creates by itself — out-of-call and `-aa` ones — carry no
+    /// injection line, so such a scenario cannot serve them.
+    #[must_use]
+    pub fn uses_injection_fields(&self) -> bool {
+        self.steps.iter().any(|step| match step {
+            Step::Send(send) => send
+                .template
+                .keywords()
+                .any(|kw| matches!(kw, Keyword::Field { .. })),
+            _ => false,
+        })
+    }
+
     /// True when any step toggles `<rtp_echo>` (needs `-rtp_echo`).
     #[must_use]
     pub fn toggles_rtp_echo(&self) -> bool {

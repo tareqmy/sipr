@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- sipr embedded 'ooc_dummy' scenario: SIPp's placeholder out-of-call    -->
+<!-- scenario. It expects a request no peer sends, so every out-of-call    -->
+<!-- request that spawns a call on it fails as unexpected and is counted   -->
+<!-- rather than answered.                                                 -->
+
+<scenario name="Out-of-call UAS">
+  <recv request="DUMMY" />
+
+  <!-- definition of the response time repartition table (unit is ms)   -->
+  <ResponseTimeRepartition value="10, 20, 30, 40, 50, 100, 150, 200"/>
+
+  <!-- definition of the call length repartition table (unit is ms)     -->
+  <CallLengthRepartition value="10, 50, 100, 500, 1000, 5000, 10000"/>
+
+</scenario>

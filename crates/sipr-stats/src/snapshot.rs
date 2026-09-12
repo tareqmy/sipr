@@ -121,6 +121,11 @@ pub struct Snapshot {
     pub call_length_rows: Vec<(String, u64)>,
     /// Per-step rows for the scenario screen.
     pub steps: Vec<StepRow>,
+    /// `set display ooc`: the scenario screen shows the out-of-call
+    /// scenario named here, and `steps` are its rows (the counters above
+    /// stay the main scenario's, as SIPp's `display_scenario` only swaps
+    /// the scenario page).
+    pub display_ooc: Option<String>,
     /// `set hide true|false` (SIPp `do_hide`, default true): whether
     /// hidden steps stay off the scenario screen.
     pub hide: bool,
@@ -185,8 +190,13 @@ impl crate::StatSet {
         );
         snap.response_rows = self.response_repartition.rows();
         snap.call_length_rows = self.call_length_repartition.rows();
-        snap.steps = self
-            .steps
+        snap.steps = self.step_rows();
+    }
+
+    /// The per-step rows of the scenario screen.
+    #[must_use]
+    pub fn step_rows(&self) -> Vec<StepRow> {
+        self.steps
             .iter()
             .enumerate()
             .map(|(i, s)| StepRow {
@@ -198,6 +208,6 @@ impl crate::StatSet {
                 hidden: self.step_hidden.get(i).copied().unwrap_or(false),
                 stats: s.clone(),
             })
-            .collect();
+            .collect()
     }
 }

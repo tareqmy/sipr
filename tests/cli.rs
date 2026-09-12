@@ -224,3 +224,116 @@ fn help_mentions_sipp_flag_convention() {
     assert!(out.contains("single-dash names"), "{out}");
     assert!(out.contains("-trace_stat"), "{out}");
 }
+
+#[test]
+fn sd_dumps_embedded_out_of_call_scenarios() {
+    let o = sipr(&["-sd", "ooc_default"]);
+    assert_code(&o, 0);
+    let out = stdout(&o);
+    assert!(out.contains("<scenario name=\"Out-of-call UAS\">"), "{out}");
+    assert!(
+        out.contains("<recv request=\".*\" regexp_match=\"true\" />"),
+        "{out}"
+    );
+    assert!(out.contains("<timewait milliseconds=\"4000\"/>"), "{out}");
+    let o = sipr(&["-sd", "ooc_dummy"]);
+    assert_code(&o, 0);
+    assert!(stdout(&o).contains("<recv request=\"DUMMY\" />"));
+    // -sd's error lists the ooc names alongside uac/uas.
+    let o = sipr(&["-sd", "nope"]);
+    assert_code(&o, 255);
+    assert!(stderr(&o).contains("uac, uas, ooc_default, ooc_dummy"));
+}
+
+#[test]
+fn ooc_scenario_in_server_mode_is_fatal_with_sipps_wording() {
+    let o = sipr(&["-sn", "uas", "-oocsn", "ooc_default", "-timeout", "1"]);
+    assert_code(&o, 255);
+    let err = stderr(&o);
+    assert!(
+        err.contains("SIPp cannot use out-of-call scenarios when running in server mode"),
+        "{err}"
+    );
+}
+
+#[test]
+fn ooc_flags_are_mutually_exclusive_and_names_are_checked() {
+    let o = sipr(&["-oocsf", "x.xml", "-oocsn", "ooc_default", "127.0.0.1:1"]);
+    assert_code(&o, 2);
+    assert!(stderr(&o).contains("'-oocsf' and '-oocsn' cannot be used together"));
+    let o = sipr(&["-oocsn", "nope", "127.0.0.1:1"]);
+    assert_code(&o, 255);
+    assert!(stderr(&o).contains("unknown embedded scenario 'nope'"));
+    let o = sipr(&["-oocsf", "/nonexistent/ooc.xml", "127.0.0.1:1"]);
+    assert_code(&o, 255);
+    assert!(stderr(&o).contains("cannot read out-of-call scenario file"));
+}
+
+#[test]
+fn ooc_scenario_reading_injection_files_is_fatal_with_sipps_wording() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("sipr-cli-ooc-field-{}.xml", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"<scenario name="ooc-with-field">
+  <recv request="OPTIONS"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    X-User: [field0]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>"#,
+    )
+    .expect("write scenario");
+    let o = sipr(&[
+        "-sn",
+        "uac",
+        "-oocsf",
+        path.to_str().expect("utf8"),
+        "127.0.0.1:1",
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_code(&o, 255);
+    let err = stderr(&o);
+    assert!(
+        err.contains("Automatic calls (created by -aa, -oocsn or -oocsf) cannot use input files!"),
+        "{err}"
+    );
+}
+
+#[test]
+fn check_mode_lints_the_ooc_scenario_too() {
+    let o = sipr(&["--check", "-sn", "uac", "-oocsn", "ooc_default"]);
+    assert_code(&o, 0);
+    let out = stdout(&o);
+    assert!(out.contains("scenario 'Basic Sipstone UAC'"), "{out}");
+    assert!(
+        out.contains("out-of-call scenario 'Out-of-call UAS': role=UAS, 3 steps"),
+        "{out}"
+    );
+    // An unknown element in the ooc scenario fails the lint like the main one.
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("sipr-cli-ooc-bad-{}.xml", std::process::id()));
+    std::fs::write(
+        &path,
+        "<scenario name=\"bad-ooc\">\n  <recv request=\"OPTIONS\"/>\n  <bogus/>\n</scenario>\n",
+    )
+    .expect("write scenario");
+    let o = sipr(&[
+        "--check",
+        "-sn",
+        "uac",
+        "-oocsf",
+        path.to_str().expect("utf8"),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_code(&o, 1);
+    let err = stderr(&o);
+    assert!(err.contains("bogus"), "{err}");
+}

@@ -7,9 +7,10 @@
 //! implemented surface and `docs/ARCHITECTURE.md` §3.3 for the IR design.
 //!
 //! Also hosts the embedded default scenarios behind SIPp's `-sn`/`-sd` flags:
-//! clean-room ports of SIPp's classic `uac`/`uas` flows — functionally
-//! identical (same steps, attributes, keywords) so the two tools interop out
-//! of the box.
+//! clean-room ports of SIPp's classic `uac`/`uas` flows and of its
+//! `ooc_default`/`ooc_dummy` out-of-call responders (`-oocsn`) —
+//! functionally identical (same steps, attributes, keywords) so the two
+//! tools interop out of the box.
 
 mod compile;
 pub mod diag;
@@ -21,15 +22,18 @@ mod xml;
 
 pub use compile::{CompileOutcome, compile};
 
-/// Names accepted by `-sn` and `-sd`, in display order.
-pub const EMBEDDED_NAMES: &[&str] = &["uac", "uas"];
+/// Names accepted by `-sn`, `-sd` and `-oocsn`, in display order.
+pub const EMBEDDED_NAMES: &[&str] = &["uac", "uas", "ooc_default", "ooc_dummy"];
 
-/// Returns the embedded default scenario XML for `name` (`"uac"` / `"uas"`).
+/// Returns the embedded default scenario XML for `name` (`"uac"`, `"uas"`,
+/// `"ooc_default"`, `"ooc_dummy"`).
 #[must_use]
 pub fn embedded(name: &str) -> Option<&'static str> {
     match name {
         "uac" => Some(include_str!("../assets/uac.xml")),
         "uas" => Some(include_str!("../assets/uas.xml")),
+        "ooc_default" => Some(include_str!("../assets/ooc_default.xml")),
+        "ooc_dummy" => Some(include_str!("../assets/ooc_dummy.xml")),
         _ => None,
     }
 }
@@ -78,5 +82,50 @@ mod tests {
             uas.steps.last(),
             Some(model::Step::Timewait { ms: 4000, .. })
         ));
+    }
+
+    #[test]
+    fn embedded_ooc_scenarios_answer_or_reject_any_request() {
+        use model::{Role, Step};
+        // ooc_default: recv any request (regexp), send 200, linger 4 s.
+        let ooc = compile("ooc_default", embedded("ooc_default").unwrap())
+            .scenario
+            .unwrap();
+        assert_eq!(ooc.name, "Out-of-call UAS");
+        assert_eq!(ooc.role, Role::Uas);
+        assert_eq!(ooc.steps.len(), 3);
+        assert!(matches!(
+            &ooc.steps[0],
+            Step::Recv(r) if r.regexp_match && matches!(&r.expect, model::Expect::Request(m) if m == ".*")
+        ));
+        assert!(matches!(&ooc.steps[1], Step::Send(_)));
+        assert!(matches!(&ooc.steps[2], Step::Timewait { ms: 4000, .. }));
+        assert!(!ooc.uses_injection_fields());
+        // ooc_dummy: a recv nobody satisfies, so every spawned call fails.
+        let dummy = compile("ooc_dummy", embedded("ooc_dummy").unwrap())
+            .scenario
+            .unwrap();
+        assert_eq!(dummy.steps.len(), 1);
+        assert!(matches!(&dummy.steps[0], Step::Recv(_)));
+    }
+
+    #[test]
+    fn injection_field_use_is_detected() {
+        let xml = r#"<scenario name="f">
+  <recv request="OPTIONS"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    X-User: [field0]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>"#;
+        let sc = compile("f", xml).scenario.unwrap();
+        assert!(sc.uses_injection_fields());
     }
 }

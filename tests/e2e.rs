@@ -5052,3 +5052,240 @@ fn bare_authentication_keyword_renders_the_full_header_line() {
         "the bare keyword must render Authorization:"
     );
 }
+
+// ---- out-of-call scenarios (M33) -------------------------------------------
+
+/// The scripted UAS of [`run_uas`], which additionally probes the UAC with an
+/// out-of-call OPTIONS (a fresh Call-ID) right after answering each INVITE,
+/// and collects whatever comes back for those probes.
+fn spawn_options_probing_uas(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(idle)).expect("timeout");
+    let handle = std::thread::spawn(move || {
+        let mut probe_replies = Vec::new();
+        let mut probes = 0u32;
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            if msg.status_code().is_some() {
+                if msg.call_id().unwrap_or_default().starts_with("ooc-probe-") {
+                    probe_replies.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                }
+                continue;
+            }
+            match msg.method() {
+                Some("INVITE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "180 Ringing", true), from);
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", true), from);
+                    probes += 1;
+                    let options = format!(
+                        "OPTIONS sip:sipr@{from} SIP/2.0\r\n\
+                         Via: SIP/2.0/UDP {addr};branch=z9hG4bK-probe-{probes}\r\n\
+                         From: probe <sip:probe@{addr}>;tag=probe{probes}\r\n\
+                         To: <sip:sipr@{from}>\r\n\
+                         Call-ID: ooc-probe-{probes}@{}\r\n\
+                         CSeq: 7 OPTIONS\r\n\
+                         Max-Forwards: 70\r\n\
+                         Content-Length: 0\r\n\r\n",
+                        addr.ip()
+                    );
+                    let _ = sock.send_to(options.as_bytes(), from);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        probe_replies
+    });
+    (addr, handle)
+}
+
+/// Run sipr in `dir` (so its trace files land there) and return the output
+/// plus the contents of its `*_errors.log`.
+fn run_sipr_in(dir: &std::path::Path, args: &[&str]) -> (std::process::Output, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("spawn sipr");
+    let errors = std::fs::read_dir(dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_errors.log"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (out, errors)
+}
+
+/// A UAC with `-oocsn ooc_default` answers an OPTIONS of no known call with
+/// a 200 mirroring the request's headers, and the main flow is unaffected;
+/// without an ooc scenario the OPTIONS is discarded and counted; with
+/// `ooc_dummy` it spawns a call that fails on the ooc stats and stays
+/// unanswered (SIPp `socket.cpp` `process_message`).
+#[test]
+fn uac_answers_out_of_call_options_with_ooc_scenario() {
+    let dir = std::env::temp_dir().join(format!("sipr-ooc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let run = |ooc: Option<&str>| {
+        let (addr, uas) = spawn_options_probing_uas(Duration::from_secs(2));
+        let target = addr.to_string();
+        let mut args = vec![
+            "-sn",
+            "uac",
+            "-i",
+            "127.0.0.1",
+            "-m",
+            "2",
+            "-d",
+            "300",
+            "-timeout",
+            "15",
+            "-trace_err",
+        ];
+        if let Some(name) = ooc {
+            args.extend(["-oocsn", name]);
+        }
+        args.push(&target);
+        let (out, errors) = run_sipr_in(&dir, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(0), "ooc={ooc:?} stderr:\n{stderr}");
+        assert!(
+            stderr.contains("successful 2 failed 0"),
+            "ooc={ooc:?}\n{stderr}"
+        );
+        let replies = uas.join().expect("uas");
+        for f in std::fs::read_dir(&dir).expect("readdir").flatten() {
+            let _ = std::fs::remove_file(f.path());
+        }
+        (stderr, errors, replies)
+    };
+
+    // ooc_default: every probe gets a 200 with the copied headers.
+    let (stderr, errors, replies) = run(Some("ooc_default"));
+    assert_eq!(
+        replies.len(),
+        2,
+        "probe replies:\n{replies:?}\nstderr:\n{stderr}"
+    );
+    for (i, reply) in replies.iter().enumerate() {
+        let n = i + 1;
+        assert!(reply.starts_with("SIP/2.0 200 OK\r\n"), "{reply}");
+        assert!(
+            reply.contains(&format!(";branch=z9hG4bK-probe-{n}\r\n")),
+            "{reply}"
+        );
+        assert!(reply.contains(&format!(">;tag=probe{n}\r\n")), "{reply}");
+        assert!(reply.contains("\r\nTo: <sip:sipr@"), "{reply}");
+        assert!(
+            reply.contains(&format!("\r\nCall-ID: ooc-probe-{n}@")),
+            "{reply}"
+        );
+        assert!(reply.contains("\r\nCSeq: 7 OPTIONS\r\n"), "{reply}");
+        assert!(reply.contains("\r\nContact: <sip:127.0.0.1:"), "{reply}");
+        assert!(reply.contains(";transport=UDP>\r\n"), "{reply}");
+        assert!(reply.ends_with("Content-Length: 0\r\n\r\n"), "{reply}");
+    }
+    assert!(
+        errors.contains("Received out-of-call OPTIONS message, using the out-of-call scenario"),
+        "{errors}"
+    );
+    // The main scenario's counters see nothing unexpected.
+    assert!(stderr.contains(" unexpected 0 "), "{stderr}");
+
+    // No ooc scenario: SIPp's default — discard and count.
+    let (stderr, errors, replies) = run(None);
+    assert!(replies.is_empty(), "unexpected replies:\n{replies:?}");
+    assert!(stderr.contains(" unexpected 2 "), "{stderr}");
+    assert!(errors.contains("out-of-call message ignored"), "{errors}");
+
+    // ooc_dummy: the probe spawns an ooc call that fails on the ooc stats;
+    // nothing is answered and the main counters stay clean.
+    let (stderr, errors, replies) = run(Some("ooc_dummy"));
+    assert!(replies.is_empty(), "unexpected replies:\n{replies:?}");
+    assert!(stderr.contains(" unexpected 0 "), "{stderr}");
+    assert!(
+        errors.contains("Received out-of-call OPTIONS message, using the out-of-call scenario"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("unexpected OPTIONS for call ooc-probe-1@"),
+        "{errors}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `set display ooc` (control socket) swaps the scenario screen — visible
+/// through the HTTP API's `display` and `steps` — and `set display main`
+/// swaps it back; the statistics stay the main scenario's.
+#[test]
+fn set_display_ooc_swaps_the_scenario_screen() {
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let cp = free_port();
+    let port = free_port();
+    let (mut child, stderr) = spawn_sipr_bg(&[
+        "-sn",
+        "uac",
+        "-oocsn",
+        "ooc_default",
+        "-r",
+        "1",
+        "-m",
+        "6",
+        "-d",
+        "20",
+        "-cp",
+        &cp.to_string(),
+        "--sipr-http",
+        &port.to_string(),
+        "-timeout",
+        "30",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let api = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut ready = false;
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(api).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "HTTP API never came up");
+    let ctl = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let target = SocketAddr::from(([127, 0, 0, 1], cp));
+    std::thread::sleep(Duration::from_millis(1200));
+    let (st, body) = http(api, "GET", "/stats", "");
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"display\":\"main\""), "{body}");
+    assert!(body.contains("\"label\":\"send INVITE\""), "{body}");
+
+    ctl.send_to(b"cset display ooc\n", target).expect("send");
+    std::thread::sleep(Duration::from_millis(1500));
+    let (st, body) = http(api, "GET", "/stats", "");
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"display\":\"ooc\""), "{body}");
+    assert!(body.contains("\"label\":\"recv .*\""), "{body}");
+    assert!(body.contains("\"label\":\"send 200\""), "{body}");
+    assert!(!body.contains("\"label\":\"send INVITE\""), "{body}");
+    // The counters are still the main scenario's: calls have been created.
+    assert!(!body.contains("\"created\":0,"), "{body}");
+
+    ctl.send_to(b"cset display main\n", target).expect("send");
+    std::thread::sleep(Duration::from_millis(1500));
+    let (st, body) = http(api, "GET", "/stats", "");
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"display\":\"main\""), "{body}");
+    assert!(body.contains("\"label\":\"send INVITE\""), "{body}");
+
+    let code = wait_exit(&mut child, Duration::from_secs(15));
+    let err = stderr.join().expect("stderr");
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 6 failed 0"), "{err}");
+}

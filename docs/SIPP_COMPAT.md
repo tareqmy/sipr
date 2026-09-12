@@ -89,8 +89,10 @@ C++ and record below).
 
 ## 3. CLI flags (v1 set, SIPp names)
 
-Scenario/mode: `-sf <file>` `-sn uac|uas` `-sd` (dump embedded) `--check` (sipr
-addition: lint scenario and exit).
+Scenario/mode: `-sf <file>` `-sn uac|uas|ooc_default|ooc_dummy` `-sd` (dump
+embedded) `-oocsf <file>` / `-oocsn ooc_default|ooc_dummy` (out-of-call
+scenario, client mode only, M33) `--check` (sipr addition: lint scenario —
+and the ooc one — and exit).
 Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 `-d <pause ms default>` `-users` (v1.x closed loop) `-rate_increase <n>`
 `-rate_max <n>` `-rate_interval <time>` `-no_rate_quit` `-rate_scale <n>`
@@ -163,6 +165,48 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
     INVITE and PRACK both 200s match the following recvs, while a response
     to a method never sent cannot. (Until M23 sipr kept only the nearest
     preceding method, which rejected the INVITE's 200 after a PRACK.)
+- `regexp_match="true"` (verified in `call.cpp` `matches_scenario`
+  ~l.4540-4575): the request expectation runs as an unanchored POSIX
+  extended regex (`REG_NOSUB`) over the **method**, the response one over
+  the **decimal status code** (`snprintf("%u")`), and the CSeq-method guard
+  above still applies afterwards. So `request=".*"` takes any request and
+  `response="18[0-9]"` any 18x. Until M33 sipr compiled the regex but then
+  matched literally — fixed with M33 (`recv_matches`).
+- Out-of-call scenarios (M33; verified in `sipp.cpp` ~l.1792-1800 (parse),
+  ~l.2113-2116 (the `ooc_default` fallback is **commented out**),
+  ~l.2147-2149 (server-mode fatal), `socket.cpp` ~l.1160-1240
+  (`process_message` dispatch), `call.cpp` ~l.6641 (`-inf` fatal),
+  `scenario.cpp` ~l.1933 (embedded names), `reporttask.cpp` ~l.94 (only
+  the main stats are ever dumped)): `-oocsf <file>` / `-oocsn <name>` load
+  a second, independently compiled scenario with its own variable table,
+  per-step stats and repartitions. In **client mode** a *request* whose
+  Call-ID matches no live call spawns a call on it — keyed by that Call-ID,
+  remote = the packet's source (or `-rsa`), no user id and no injection
+  line (`[userid]` renders 0; any `[fieldN]` in the ooc scenario is fatal at
+  startup: "Automatic calls (created by -aa, -oocsn or -oocsf) cannot use
+  input files!") — logs "Received out-of-call METHOD message, using the
+  out-of-call scenario", counts an incoming call on the **ooc** stats plus
+  the global auto-answered counter, and feeds it the request at step 0
+  (`ooc_dummy` then fails it as unexpected, on the ooc stats). An unmapped
+  *response* is only counted (`E_OUT_OF_CALL_MSGS` = sipr's `unexpected`)
+  and never spawns anything, ooc scenario or not. Without `-oocs*` a UAC
+  keeps discarding unmapped requests the same way — SIPp's default since
+  the fallback was commented out. Server mode is fatal ("SIPp cannot use
+  out-of-call scenarios when running in server mode"); `-oocsf` and
+  `-oocsn` are mutually exclusive. SIPp's `open_calls` counts main-scenario
+  calls only, so ooc calls never count toward `-l`, `-users` or `-m`, and
+  the run ends when the main calls are done — lingering ooc calls (the
+  default's 4 s timewait) are dropped. `set display ooc|main` swaps only
+  the scenario page (SIPp `display_scenario`); the statistics stay the
+  main scenario's, and `-trace_stat` never writes an ooc CSV (SIPp's
+  `stattask::report` dumps `main_scenario->stats` only). Two SIPp
+  behaviours seen in the interop runs and *not* reproduced: on exit SIPp
+  aborts its lingering ooc calls with a BYE (its generic established-call
+  abort, `sipp_exit`); and a SIPp **UAS** spawns a main-scenario call for
+  *any* unmapped message, responses included — the 200 answering its own
+  out-of-call OPTIONS fails a call and eats its `-m` budget — where a sipr
+  UAS keeps discarding unmapped responses. Out of scope: `-rxsf`/`-rxinf`
+  (`MODE_MIXED`, `rx_scenario`), a separate item if ever wanted.
 - A matched recv cancels the pending retransmission of the last send
   (`next_retrans = 0`) — including a matched *provisional*. SIPp's own code
   carries a TODO admitting this can erroneously stop retransmission (e.g.
@@ -465,8 +509,9 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   these divergences: (1) default bind is loopback, `-ci` opts into more;
   (2) `-cp 0` disables the socket; (3) the bound address is printed;
   (4) screen digits are ignored (sipr's TUI cycles with `s`); (5) `set
-  display ooc|rx`, `trace logs|shortmessages`, and `dump variables` warn
-  that they are unsupported instead of silently succeeding; (6) `set
+  display rx`, `trace logs|shortmessages`, and `dump variables` warn
+  that they are unsupported instead of silently succeeding (`set display
+  ooc|main` works as SIPp's since M33); (6) `set
   limit` in sipr simply sets `-l` (sipr never auto-sizes the cap from the
   rate). The HTTP API is a sipr addition with no SIPp counterpart.
 - RTP echo and the RTP check (M18; verified in `sipp.cpp` `rtp_echo_thread`
@@ -698,11 +743,11 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   matches all of this — pool sharing, `[local_port]`, server-side
   behavior, closing with the last holder, and `<closecon/>` now really
   closing a per-call socket with the next send opening a fresh one — with
-  these divergences: a connect failure always fails only the call
-  (`-max_reconnect`/`-reconnect_*` are not implemented, nor `-rsa`); each
-  per-call socket has its own receive thread rather than SIPp's single
-  `poll` loop, so very large `-max_socket` values cost threads; `-t ui`
-  (one socket per injected IP) is not implemented.
+  these divergences: a connect failure always fails only the call (the
+  `-max_reconnect`/`-reconnect_*` family, `-rsa` and `-t ui` landed later,
+  in M29–M31 — see their notes below); each per-call socket has its own
+  receive thread rather than SIPp's single `poll` loop, so very large
+  `-max_socket` values cost threads.
 - `-rsa host[:port]` (M29; verified in `sipp.cpp` ~l.1827 (parse, default
   port 5060), `call_generation_task.cpp` ~l.152 and `socket.cpp` ~l.1146-1230
   (the call's `call_peer`), `socket.cpp` ~l.2588 and `call.cpp` ~l.1489

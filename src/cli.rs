@@ -60,6 +60,11 @@ pub struct Cli {
     pub sn: Option<String>,
     /// `-sd`: print an embedded default scenario to stdout and exit.
     pub sd: Option<String>,
+    /// `-oocsf`: load the out-of-call scenario from an XML file.
+    pub oocsf: Option<PathBuf>,
+    /// `-oocsn`: use an embedded out-of-call scenario (`ooc_default` |
+    /// `ooc_dummy`).
+    pub oocsn: Option<String>,
     /// `--check`: lint the scenario, print its compiled form, and exit (M1).
     pub check: bool,
     /// `-r`: new calls per rate period.
@@ -188,6 +193,8 @@ impl Default for Cli {
             sf: None,
             sn: None,
             sd: None,
+            oocsf: None,
+            oocsn: None,
             check: false,
             rate: 10.0,
             rate_period_ms: 1000,
@@ -269,13 +276,25 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "sn",
         true,
         "NAME",
-        "Use an embedded default scenario: uac | uas",
+        "Use an embedded default scenario: uac | uas | ooc_default | ooc_dummy",
     ),
     (
         "sd",
         true,
         "NAME",
         "Print an embedded default scenario and exit",
+    ),
+    (
+        "oocsf",
+        true,
+        "FILE",
+        "Load the out-of-call scenario (answers requests of no known call; client mode only) from an XML file",
+    ),
+    (
+        "oocsn",
+        true,
+        "NAME",
+        "Use an embedded out-of-call scenario: ooc_default | ooc_dummy",
     ),
     (
         "check",
@@ -691,6 +710,9 @@ where
     if cli.sf.is_some() && cli.sn.is_some() {
         return Err("options '-sf' and '-sn' cannot be used together".to_owned());
     }
+    if cli.oocsf.is_some() && cli.oocsn.is_some() {
+        return Err("options '-oocsf' and '-oocsn' cannot be used together".to_owned());
+    }
     if cli.users.is_some() && cli.limit.is_some() {
         return Err(
             "options '-users' and '-l' cannot be used together (users mode is closed-loop)"
@@ -711,6 +733,8 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "sf" => cli.sf = Some(PathBuf::from(val(value))),
         "sn" => cli.sn = Some(val(value)),
         "sd" => cli.sd = Some(val(value)),
+        "oocsf" => cli.oocsf = Some(PathBuf::from(val(value))),
+        "oocsn" => cli.oocsn = Some(val(value)),
         "check" => cli.check = true,
         "r" => cli.rate = parse_num(flag, &val(value))?,
         "rp" => cli.rate_period_ms = parse_num(flag, &val(value))?,
@@ -1019,6 +1043,22 @@ mod tests {
     fn sf_conflicts_with_sn() {
         let err = run(&["-sf", "x.xml", "-sn", "uac"]).unwrap_err();
         assert!(err.contains("cannot be used together"), "{err}");
+    }
+
+    #[test]
+    fn out_of_call_scenario_flags_parse_and_conflict() {
+        let c = cli(&["-oocsn", "ooc_default", "host"]);
+        assert_eq!(c.oocsn.as_deref(), Some("ooc_default"));
+        assert!(c.oocsf.is_none());
+        let c = cli(&["-oocsf", "ooc.xml", "host"]);
+        assert_eq!(c.oocsf.as_deref(), Some(std::path::Path::new("ooc.xml")));
+        let err = run(&["-oocsf", "ooc.xml", "-oocsn", "ooc_default"]).unwrap_err();
+        assert!(
+            err.contains("'-oocsf' and '-oocsn' cannot be used together"),
+            "{err}"
+        );
+        let err = run(&["-oocsn"]).unwrap_err();
+        assert!(err.contains("'-oocsn' requires a value"), "{err}");
     }
 
     #[test]

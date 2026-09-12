@@ -70,13 +70,33 @@ fn run(cli: &Cli) -> ExitCode {
     for d in &outcome.diagnostics {
         eprintln!("sipr: {d}");
     }
+    // The out-of-call scenario (-oocsf/-oocsn) compiles independently, with
+    // the same loud diagnostics and the same lint rules under --check.
+    let ooc_outcome = match load_ooc_source(cli) {
+        Ok(Some((name, source))) => {
+            let out = sipr_scenario::compile(&name, &source);
+            for d in &out.diagnostics {
+                eprintln!("sipr: {d}");
+            }
+            Some((name, out))
+        }
+        Ok(None) => None,
+        Err(msg) => return fatal(&msg),
+    };
 
     if cli.check {
         // Lint mode: dump the IR; any diagnostic (even a warning) fails.
         if let Some(sc) = &outcome.scenario {
             print!("{}", sc.dump());
         }
-        return if outcome.diagnostics.is_empty() {
+        let mut clean = outcome.diagnostics.is_empty();
+        if let Some((_, out)) = &ooc_outcome {
+            if let Some(sc) = &out.scenario {
+                print!("out-of-call {}", sc.dump());
+            }
+            clean &= out.diagnostics.is_empty();
+        }
+        return if clean {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(1)
@@ -85,6 +105,15 @@ fn run(cli: &Cli) -> ExitCode {
 
     let Some(scenario) = outcome.scenario else {
         return fatal(&format!("scenario '{scenario_name}' failed to compile"));
+    };
+    let ooc_scenario = match ooc_outcome {
+        Some((name, out)) => match out.scenario {
+            Some(sc) => Some(sc),
+            None => {
+                return fatal(&format!("out-of-call scenario '{name}' failed to compile"));
+            }
+        },
+        None => None,
     };
 
     // A UAC needs somewhere to send calls; a UAS listens and needs none.
@@ -245,8 +274,9 @@ fn run(cli: &Cli) -> ExitCode {
             .name("sipr-tui".into())
             .spawn(move || sipr_tui::run(&snap_rx, &key_tx))
             .ok();
-        let outcome = sipr_engine::run_with_ui(
+        let outcome = sipr_engine::run_scenarios(
             &scenario,
+            ooc_scenario.as_ref(),
             &config,
             Some(sipr_engine::UiChannels {
                 snapshots: snap_tx,
@@ -258,7 +288,8 @@ fn run(cli: &Cli) -> ExitCode {
         }
         outcome.map(|(report, _)| report)
     } else {
-        sipr_engine::run(&scenario, &config)
+        sipr_engine::run_scenarios(&scenario, ooc_scenario.as_ref(), &config, None)
+            .map(|(report, _)| report)
     };
     match result {
         Ok(report) => {
@@ -323,6 +354,28 @@ fn resolve_target(raw: &str) -> Result<std::net::SocketAddr, String> {
         .map_err(|e| format!("cannot resolve target '{raw}': {e}"))?
         .next()
         .ok_or_else(|| format!("target '{raw}' resolved to no addresses"))
+}
+
+/// The out-of-call scenario source: `-oocsf` reads a file, `-oocsn` an
+/// embedded one (`ooc_default` / `ooc_dummy`). `None` when neither is set —
+/// requests of no known call are then discarded, as SIPp does by default.
+fn load_ooc_source(cli: &Cli) -> Result<Option<(String, String)>, String> {
+    if let Some(path) = &cli.oocsf {
+        let bytes = std::fs::read(path).map_err(|e| {
+            format!(
+                "cannot read out-of-call scenario file {}: {e}",
+                path.display()
+            )
+        })?;
+        return Ok(Some((path.display().to_string(), latin1_tolerant(bytes))));
+    }
+    let Some(name) = cli.oocsn.as_deref() else {
+        return Ok(None);
+    };
+    match sipr_scenario::embedded(name) {
+        Some(xml) => Ok(Some((name.to_owned(), xml.to_owned()))),
+        None => Err(unknown_embedded(name)),
+    }
 }
 
 fn unknown_embedded(name: &str) -> String {

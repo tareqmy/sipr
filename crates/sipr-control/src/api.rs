@@ -255,6 +255,10 @@ pub fn snapshot_json(s: &Snapshot) -> Json {
         ("rate_cumulative_cps", num(s.rate_cumulative)),
         ("paused", Json::Bool(s.paused)),
         ("hide", Json::Bool(s.hide)),
+        (
+            "display",
+            text(s.display_ooc.as_deref().map_or("main", |_| "ooc")),
+        ),
         ("created", num_u64(s.created)),
         ("successful", num_u64(s.successful)),
         ("failed", num_u64(s.failed)),

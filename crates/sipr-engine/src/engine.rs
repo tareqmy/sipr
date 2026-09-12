@@ -426,6 +426,9 @@ struct CallState {
     render_remote: SocketAddr,
     /// `[server_ip]`: the IP of the socket this call's messages leave on.
     server_ip: String,
+    /// Runs the out-of-call scenario (spawned by an unmapped request) rather
+    /// than the main one; never counts toward `-l`/`-users`/`-m`.
+    ooc: bool,
 }
 
 /// Why the engine refused to run a scenario.
@@ -482,13 +485,44 @@ pub fn run_with_ui(
     config: &EngineConfig,
     ui: Option<UiChannels>,
 ) -> Result<(RunReport, EngineControl), EngineError> {
+    run_scenarios(scenario, None, config, ui)
+}
+
+/// [`run_with_ui`] with an out-of-call scenario (`-oocsf`/`-oocsn`) loaded
+/// next to the main one: a request whose Call-ID matches no live call spawns
+/// a call on `ooc` instead of being discarded (SIPp `socket.cpp`
+/// `process_message`). Client mode only, as in SIPp.
+///
+/// # Errors
+///
+/// See [`run`]; additionally when `ooc` is given in server mode or reads
+/// injection files (`[fieldN]`), with SIPp's wordings.
+pub fn run_scenarios(
+    scenario: &Scenario,
+    ooc: Option<&Scenario>,
+    config: &EngineConfig,
+    ui: Option<UiChannels>,
+) -> Result<(RunReport, EngineControl), EngineError> {
     validate_for_engine(scenario)?;
+    if let Some(ooc) = ooc {
+        validate_for_engine(ooc)?;
+        if scenario.role == Role::Uas {
+            return Err(EngineError(
+                "SIPp cannot use out-of-call scenarios when running in server mode".into(),
+            ));
+        }
+        if ooc.uses_injection_fields() {
+            return Err(EngineError(
+                "Automatic calls (created by -aa, -oocsn or -oocsf) cannot use input files!".into(),
+            ));
+        }
+    }
     if scenario.role == Role::Uac && config.target.is_none() {
         return Err(EngineError(
             "this scenario places calls (UAC): a remote target is required".into(),
         ));
     }
-    let mut engine = Engine::new(scenario, config, ui)?;
+    let mut engine = Engine::new(scenario, ooc, config, ui)?;
     let control = engine.control.clone();
     let report = engine.run_loop();
     Ok((report, control))
@@ -538,12 +572,16 @@ enum CallSocket {
 
 impl CallSocket {
     fn local_port(&self) -> u16 {
+        self.local_addr().port()
+    }
+
+    fn local_addr(&self) -> SocketAddr {
         match self {
-            Self::Udp(s) => s.local_addr().port(),
-            Self::Tcp(c) => c.local_addr().port(),
-            Self::Tls(c) => c.local_addr().port(),
+            Self::Udp(s) => s.local_addr(),
+            Self::Tcp(c) => c.local_addr(),
+            Self::Tls(c) => c.local_addr(),
             #[cfg(feature = "sctp")]
-            Self::Sctp(c) => c.local_addr().port(),
+            Self::Sctp(c) => c.local_addr(),
         }
     }
 
@@ -612,8 +650,27 @@ impl Transport {
     }
 }
 
+/// The out-of-call scenario (`-oocsf`/`-oocsn`), compiled independently of
+/// the main one: its own step stats, repartitions and CSeq guard (SIPp's
+/// `ooc_scenario` with its own `CStat`).
+struct OocScenario<'s> {
+    scenario: &'s Scenario,
+    stats: sipr_stats::StatSet,
+    /// Per-step: CSeq method a response recv must carry (SIPp guard).
+    expected_cseq_method: Vec<Option<String>>,
+}
+
 struct Engine<'s> {
     scenario: &'s Scenario,
+    /// Requests of no known call spawn calls here; `None` keeps SIPp's
+    /// default of discarding them (the `ooc_default` fallback is commented
+    /// out in `sipp.cpp`).
+    ooc: Option<OocScenario<'s>>,
+    /// Live calls on the ooc scenario (SIPp's `open_calls` never includes
+    /// them: `-l`, `-users` and the end of the run look at the main ones).
+    ooc_live: usize,
+    /// `set display ooc`: the scenario screen shows the ooc scenario.
+    display_ooc: bool,
     config: EngineConfig,
     transport: Transport,
     /// `[transport]` token and whether the transport is reliable (no retrans).
@@ -720,6 +777,7 @@ struct Engine<'s> {
 impl<'s> Engine<'s> {
     fn new(
         scenario: &'s Scenario,
+        ooc: Option<&'s Scenario>,
         config: &EngineConfig,
         ui: Option<UiChannels>,
     ) -> Result<Self, EngineError> {
@@ -871,6 +929,11 @@ impl<'s> Engine<'s> {
         };
         // 3PCC twin control channel. The role comes from the first twin command
         // in the scenario: sendCmd-first dials the peer, recvCmd-first listens.
+        if ooc.is_some_and(|o| twin_role(o).is_some()) {
+            return Err(EngineError(
+                "the out-of-call scenario cannot use <sendCmd>/<recvCmd> (3PCC)".into(),
+            ));
+        }
         let twin = match (twin_role(scenario), config.twin_addr) {
             (Some(role), Some(addr)) => {
                 let (twin_tx, twin_rx) = channel::<String>();
@@ -906,9 +969,16 @@ impl<'s> Engine<'s> {
         };
         // Media: captures are parsed once here (SIPp: at scenario parse) and
         // the media thread exists only when something will be played.
-        let pcaps = load_pcaps(scenario, config)?;
-        let rtp_files = load_rtp_files(scenario, config)?;
-        for cmd in scenario.rtp_echo_cmds() {
+        let mut pcaps = load_pcaps(scenario, config)?;
+        let mut rtp_files = load_rtp_files(scenario, config)?;
+        if let Some(o) = ooc {
+            pcaps.extend(load_pcaps(o, config)?);
+            rtp_files.extend(load_rtp_files(o, config)?);
+        }
+        for cmd in scenario
+            .rtp_echo_cmds()
+            .chain(ooc.into_iter().flat_map(Scenario::rtp_echo_cmds))
+        {
             // SIPp resolves the echo's codec at parse time and fails on an
             // unknown one; sipr only needs the validation.
             sipr_media::RtpParams::resolve(
@@ -937,7 +1007,7 @@ impl<'s> Engine<'s> {
             );
             Some(server)
         } else {
-            if scenario.toggles_rtp_echo() {
+            if scenario.toggles_rtp_echo() || ooc.is_some_and(Scenario::toggles_rtp_echo) {
                 eprintln!(
                     "sipr: warning: the scenario uses <rtp_echo> but -rtp_echo was not given — \
                      nothing is echoing"
@@ -945,7 +1015,7 @@ impl<'s> Engine<'s> {
             }
             None
         };
-        let media = if !scenario.has_media() {
+        let media = if !(scenario.has_media() || ooc.is_some_and(Scenario::has_media)) {
             None
         } else {
             let (media_tx, media_rx) = channel::<MediaEvent>();
@@ -1155,23 +1225,20 @@ impl<'s> Engine<'s> {
         if let Some(f) = trace_stat.as_mut() {
             f.write(&sipr_stats::StatSet::csv_header());
         }
-        let mut stat_set = sipr_stats::StatSet::new(
-            &scenario.response_time_repartition,
-            &scenario.call_length_repartition,
-        );
-        stat_set.init_steps(scenario.steps.iter().map(step_label).collect());
-        stat_set.set_step_hidden(
-            scenario
-                .steps
-                .iter()
-                .map(|s| step_common(s).is_some_and(|c| c.hide))
-                .collect(),
-        );
+        let stat_set = new_stat_set(scenario);
+        let ooc = ooc.map(|o| OocScenario {
+            scenario: o,
+            stats: new_stat_set(o),
+            expected_cseq_method: precompute_cseq_methods(o),
+        });
         // Load -inf injection files up front (fail fast on bad files). SIPp
         // keys files by basename; keyword `file=` and `-infindex` match that.
         let inf_len = inf_files.len();
         Ok(Self {
             scenario,
+            ooc,
+            ooc_live: 0,
+            display_ooc: false,
             config: config.clone(),
             transport,
             transport_token,
@@ -1257,7 +1324,9 @@ impl<'s> Engine<'s> {
         self.on_pacer_tick();
         self.refill_users(); // users mode opens its initial N calls now
         loop {
-            if self.hard_stop || (self.done_creating() && self.calls.is_empty()) {
+            // SIPp's `open_calls` counts main-scenario calls only: the run
+            // ends when they are done, whatever ooc calls still linger.
+            if self.hard_stop || (self.done_creating() && self.live_main() == 0) {
                 break;
             }
             match self.rx.recv_timeout(Duration::from_millis(200)) {
@@ -1297,13 +1366,13 @@ impl<'s> Engine<'s> {
                 last_line = Instant::now();
                 self.sample_media_counters();
                 if self.config.periodic_stats {
-                    eprintln!("sipr: {}", self.stats.line(self.calls.len()));
+                    eprintln!("sipr: {}", self.stats.line(self.live_main()));
                 }
                 self.publish_snapshot();
             }
             if self.trace_stat.is_some() && last_stat_dump.elapsed() >= self.config.stat_interval {
                 last_stat_dump = Instant::now();
-                let row = self.stats.csv_row(self.calls.len());
+                let row = self.stats.csv_row(self.live_main());
                 if let Some(f) = self.trace_stat.as_mut() {
                     f.write(&row);
                     f.flush();
@@ -1315,7 +1384,7 @@ impl<'s> Engine<'s> {
         self.collect_final_media_events();
         // Final CSV row + flush all trace files.
         if self.trace_stat.is_some() {
-            let row = self.stats.csv_row(self.calls.len());
+            let row = self.stats.csv_row(self.live_main());
             if let Some(f) = self.trace_stat.as_mut() {
                 f.write(&row);
             }
@@ -1404,7 +1473,15 @@ impl<'s> Engine<'s> {
             screen_request: self.screen_request,
             ..Default::default()
         };
-        self.stats.fill_snapshot(&mut snap, self.calls.len());
+        self.stats.fill_snapshot(&mut snap, self.live_main());
+        // `set display ooc` (SIPp `display_scenario`): only the scenario
+        // screen follows; the statistics stay the main scenario's.
+        if self.display_ooc
+            && let Some(o) = self.ooc.as_ref()
+        {
+            snap.display_ooc = Some(o.scenario.name.clone());
+            snap.steps = o.stats.step_rows();
+        }
         let now = Instant::now();
         let (last_at, last_created) = self.last_snapshot;
         #[allow(clippy::cast_precision_loss)]
@@ -1596,13 +1673,13 @@ impl<'s> Engine<'s> {
                 }
                 self.config.limit = Some(*n);
             }
-            ControlCmd::SetDisplay(which) => {
-                if which != "main" {
-                    return Err(format!(
-                        "set display {which}: sipr has no {which} scenario screen"
-                    ));
-                }
-            }
+            ControlCmd::SetDisplay(which) => match which.as_str() {
+                "main" => self.display_ooc = false,
+                "ooc" if self.ooc.is_some() => self.display_ooc = true,
+                // SIPp: "Unknown display scenario: %s" when that scenario is
+                // not loaded (and sipr has no rx scenario at all).
+                other => return Err(format!("Unknown display scenario: {other}")),
+            },
             ControlCmd::SetHide(on) => self.hide = *on,
             ControlCmd::Trace { log, on } => self.set_trace(log, *on)?,
             ControlCmd::Dump(what) => {
@@ -1622,6 +1699,9 @@ impl<'s> Engine<'s> {
             }
             ControlCmd::ResetStats => {
                 self.stats.reset();
+                if let Some(o) = self.ooc.as_mut() {
+                    o.stats.reset();
+                }
                 self.last_snapshot = (Instant::now(), 0);
             }
             ControlCmd::SetPaused(p) => self.paused = *p,
@@ -1713,12 +1793,60 @@ impl<'s> Engine<'s> {
                 return;
             }
             #[allow(clippy::cast_possible_truncation)]
-            let live = self.calls.len() as u64;
+            let live = self.live_main() as u64;
             if self.config.limit.is_some_and(|l| live >= l) {
                 self.pacer_carry = 0.0;
                 return;
             }
             self.start_call(None);
+        }
+    }
+
+    /// Live calls on the main scenario — SIPp's `open_calls`, which the
+    /// `-l` cap, `-users` refills and the end of the run look at.
+    fn live_main(&self) -> usize {
+        self.calls.len().saturating_sub(self.ooc_live)
+    }
+
+    fn is_ooc(&self, call_id: &str) -> bool {
+        self.calls.get(call_id).is_some_and(|c| c.ooc)
+    }
+
+    /// The scenario a call runs (the ooc one for out-of-call calls).
+    fn scenario_of(&self, call_id: &str) -> &'s Scenario {
+        match self.ooc.as_ref() {
+            Some(o) if self.is_ooc(call_id) => o.scenario,
+            _ => self.scenario,
+        }
+    }
+
+    /// The stat set of the scenario a call runs (see [`stats_for`]).
+    fn stats_of(&mut self, ooc: bool) -> &mut sipr_stats::StatSet {
+        stats_for(&mut self.stats, self.ooc.as_mut(), ooc)
+    }
+
+    fn call_stats(&mut self, call_id: &str) -> &mut sipr_stats::StatSet {
+        let ooc = self.is_ooc(call_id);
+        self.stats_of(ooc)
+    }
+
+    /// The recv-window scan against the scenario a call runs.
+    fn scan_call(&self, ooc: bool, window_start: usize, waiting: bool, msg: &Inbound) -> Scan {
+        match self.ooc.as_ref() {
+            Some(o) if ooc => scan_for_match(
+                o.scenario,
+                &o.expected_cseq_method,
+                window_start,
+                waiting,
+                msg,
+            ),
+            _ => scan_for_match(
+                self.scenario,
+                &self.expected_cseq_method,
+                window_start,
+                waiting,
+                msg,
+            ),
         }
     }
 
@@ -1753,7 +1881,7 @@ impl<'s> Engine<'s> {
         let Some(n) = self.config.users else {
             return;
         };
-        while self.calls.len() < n && !self.done_creating() {
+        while self.live_main() < n && !self.done_creating() {
             let Some(uid) = self.free_users.pop_front() else {
                 break;
             };
@@ -1815,7 +1943,8 @@ impl<'s> Engine<'s> {
                 return;
             };
             let index = call.index;
-            let Some(step) = self.scenario.steps.get(index) else {
+            let scenario = self.scenario_of(call_id);
+            let Some(step) = scenario.steps.get(index) else {
                 self.complete_call(call_id);
                 return;
             };
@@ -1866,7 +1995,7 @@ impl<'s> Engine<'s> {
                     // SIPp: the socket (and so `[local_port]`) must exist
                     // before substitution; a failed dial fails this call only.
                     if let Err(why) = self.ensure_call_socket(call_id) {
-                        self.stats.failed_other += 1;
+                        self.call_stats(call_id).failed_other += 1;
                         eprintln!("sipr: warning: call {call_id}: {why}");
                         self.log_err(&format!("call {call_id} failed: {why}"));
                         self.remove_call(call_id);
@@ -1880,7 +2009,7 @@ impl<'s> Engine<'s> {
                         let digest_uri = self.digest_uri(call.render_remote);
                         let var_ctx = crate::render::VarCtx {
                             store: &call.store,
-                            vars: &self.scenario.vars,
+                            vars: &scenario.vars,
                             challenge: call.challenge.as_ref(),
                             auth_user: self.config.auth_user.as_deref().unwrap_or(""),
                             auth_password: self.config.auth_password.as_deref().unwrap_or(""),
@@ -1938,8 +2067,9 @@ impl<'s> Engine<'s> {
                         self.after_send_failure(call_id, &e);
                         return;
                     }
-                    self.stats.messages_sent += 1;
-                    if let Some(s) = self.stats.step_mut(index) {
+                    let stats = self.call_stats(call_id);
+                    stats.messages_sent += 1;
+                    if let Some(s) = stats.step_mut(index) {
                         s.sent += 1;
                     }
                     self.trace_send(&buf, remote);
@@ -1951,7 +2081,13 @@ impl<'s> Engine<'s> {
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
-                    apply_rtds(call, &mut self.stats, &common, now);
+                    let is_ooc = call.ooc;
+                    apply_rtds(
+                        call,
+                        stats_for(&mut self.stats, self.ooc.as_mut(), is_ooc),
+                        &common,
+                        now,
+                    );
                     if method_is_new_txn {
                         call.cseq = call.cseq.wrapping_add(1);
                     }
@@ -1991,7 +2127,7 @@ impl<'s> Engine<'s> {
                     call.index = jump;
                 }
                 Step::Recv(_) => {
-                    let mandatory = self.window_mandatory(index);
+                    let mandatory = self.window_mandatory(call_id, index);
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
@@ -2135,9 +2271,10 @@ impl<'s> Engine<'s> {
 
     /// The window's mandatory recv step (index, timeout), scanning from
     /// `start` over optional recvs and labels.
-    fn window_mandatory(&self, start: usize) -> Option<(usize, Option<u64>)> {
+    fn window_mandatory(&self, call_id: &str, start: usize) -> Option<(usize, Option<u64>)> {
+        let scenario = self.scenario_of(call_id);
         let mut i = start;
-        while let Some(step) = self.scenario.steps.get(i) {
+        while let Some(step) = scenario.steps.get(i) {
             match step {
                 Step::Recv(r) if r.optional => i += 1,
                 Step::Recv(r) => return Some((i, r.timeout_ms)),
@@ -2235,23 +2372,36 @@ impl<'s> Engine<'s> {
                     call.socket = received_on.map(CallSocket::Udp);
                 }
                 // Fall through to normal matching below (window at 0).
+            } else if let Some(method) = msg.method().filter(|_| self.ooc.is_some()) {
+                // Client mode with an ooc scenario (SIPp socket.cpp
+                // `process_message`): a request of no known call spawns a
+                // call on it — no user id, no injection line — counted as
+                // an incoming call on the ooc stats and as an auto-answer
+                // globally; the request is then matched against its step 0.
+                self.log_err(&format!(
+                    "Received out-of-call {method} message, using the out-of-call scenario"
+                ));
+                self.spawn_ooc_call(&call_id, packet);
             } else {
+                // An unmapped response (or no ooc scenario at all): SIPp's
+                // E_OUT_OF_CALL_MSGS.
                 self.stats.unexpected += 1;
                 self.log_err(&format!("out-of-call message ignored (Call-ID {call_id})"));
                 return;
             }
         }
-        let (window_start, waiting, completing, is_dup) = match self.calls.get(&call_id) {
+        let (window_start, waiting, completing, is_dup, ooc) = match self.calls.get(&call_id) {
             Some(c) => (
                 c.index,
                 c.waiting,
                 c.completing,
                 c.last_recv_key.as_ref() == Some(&key),
+                c.ooc,
             ),
             None => return,
         };
         if is_dup {
-            self.stats.retrans_recv += 1;
+            self.stats_of(ooc).retrans_recv += 1;
             // Re-send our last message (SIPp: retransmitted request → last
             // response again; harmless for a duplicated response).
             let resend = self
@@ -2260,28 +2410,22 @@ impl<'s> Engine<'s> {
                 .and_then(|c| c.last_sent.clone().map(|b| (b, c.remote)));
             if let Some((buf, remote)) = resend {
                 let _ = self.send_for_call(&call_id, &buf, remote, None);
-                self.stats.retrans_sent += 1;
+                self.stats_of(ooc).retrans_sent += 1;
                 self.trace_send(&buf, remote);
             }
             return;
         }
         if completing {
             // Timewait: absorb without failing (deadcall behavior).
-            self.stats.unexpected += 1;
+            self.stats_of(ooc).unexpected += 1;
             return;
         }
-        let scan = scan_for_match(
-            self.scenario,
-            &self.expected_cseq_method,
-            window_start,
-            waiting || window_start == 0,
-            msg,
-        );
+        let scan = self.scan_call(ooc, window_start, waiting || window_start == 0, msg);
         match scan {
             Scan::Forward(si) => self.on_matched(&call_id, si, msg, key),
             Scan::Old => {
                 // Late/repeated optional (e.g. another 180): absorbed.
-                self.stats.messages_matched += 1;
+                self.stats_of(ooc).messages_matched += 1;
                 if let Some(call) = self.calls.get_mut(&call_id) {
                     call.last_recv_key = Some(key);
                 }
@@ -2293,20 +2437,61 @@ impl<'s> Engine<'s> {
                 if self.try_auto_answer(&call_id, msg) {
                     return;
                 }
-                self.stats.unexpected += 1;
-                if let Some(s) = self.stats.step_mut(window_start) {
+                let stats = self.stats_of(ooc);
+                stats.unexpected += 1;
+                if let Some(s) = stats.step_mut(window_start) {
                     s.unexpected += 1;
                 }
+                stats.failed_unexpected += 1;
                 let what = msg
                     .method()
                     .map_or_else(|| format!("{:?}", msg.status_code()), ToOwned::to_owned);
                 self.log_err(&format!(
                     "unexpected {what} for call {call_id}; call failed"
                 ));
-                self.stats.failed_unexpected += 1;
                 self.remove_call(&call_id);
             }
         }
+    }
+
+    /// Create a call on the out-of-call scenario for a request of no known
+    /// call, keyed by its Call-ID. The remote is the packet's source (or
+    /// `-rsa`); the reply leaves on the socket the request hit, when that
+    /// is a per-IP or per-call one.
+    fn spawn_ooc_call(&mut self, call_id: &str, packet: &sipr_net::InboundPacket) {
+        let Some(o) = self.ooc.as_mut() else {
+            return;
+        };
+        o.stats.incoming_created += 1;
+        let number = o.stats.created();
+        let vars = &o.scenario.vars;
+        self.stats.auto_answered += 1;
+        let cnonce = self.make_cnonce(number);
+        let mut call = new_call(
+            number,
+            self.config.remote_sending_addr.unwrap_or(packet.from),
+            packet.from,
+            self.config.base_cseq,
+            vars,
+            cnonce,
+            vec![None; self.inf_files.len()],
+            None,
+        );
+        call.ooc = true;
+        call.server_ip = packet.local.ip().to_string();
+        call.socket = self
+            .ip_sockets
+            .get(&packet.local.ip())
+            .cloned()
+            .map(CallSocket::Udp)
+            .or_else(|| {
+                self.call_socket_pool
+                    .iter()
+                    .filter_map(WeakCallSocket::upgrade)
+                    .find(|s| s.local_addr() == packet.local)
+            });
+        self.calls.insert(call_id.to_owned(), call);
+        self.ooc_live += 1;
     }
 
     /// Common handling for a message matched at step `si`.
@@ -2317,11 +2502,13 @@ impl<'s> Engine<'s> {
         msg: &Inbound,
         key: (String, String, String),
     ) {
-        self.stats.messages_matched += 1;
-        if let Some(s) = self.stats.step_mut(si) {
+        let stats = self.call_stats(call_id);
+        stats.messages_matched += 1;
+        if let Some(s) = stats.step_mut(si) {
             s.recv += 1;
         }
-        let (rrs, ignore_sdp, common) = match &self.scenario.steps[si] {
+        let scenario = self.scenario_of(call_id);
+        let (rrs, ignore_sdp, common) = match &scenario.steps[si] {
             Step::Recv(r) => (r.record_route_set, r.ignore_sdp, r.common.clone()),
             _ => (false, false, StepCommon::default()),
         };
@@ -2353,7 +2540,13 @@ impl<'s> Engine<'s> {
                 .map(ToOwned::to_owned)
                 .collect();
         }
-        apply_rtds(call, &mut self.stats, &common, now);
+        let is_ooc = call.ooc;
+        apply_rtds(
+            call,
+            stats_for(&mut self.stats, self.ooc.as_mut(), is_ooc),
+            &common,
+            now,
+        );
         call.last_recv_key = Some(key);
         if has_media && !ignore_sdp {
             learn_remote_media(call, msg);
@@ -2362,7 +2555,7 @@ impl<'s> Engine<'s> {
         call.waiting = false;
         call.index = si + 1;
         // Capture a digest challenge when this recv has auth="true".
-        let auth = matches!(&self.scenario.steps[si], Step::Recv(r) if r.auth);
+        let auth = matches!(&scenario.steps[si], Step::Recv(r) if r.auth);
         if auth {
             let challenge = msg
                 .header("WWW-Authenticate")
@@ -2376,7 +2569,7 @@ impl<'s> Engine<'s> {
             }
         }
         // Run the recv step's actions (ereg captures, etc.).
-        let recv_actions = match &self.scenario.steps[si] {
+        let recv_actions = match &scenario.steps[si] {
             Step::Recv(r) => r.actions.clone(),
             _ => Vec::new(),
         };
@@ -2410,10 +2603,11 @@ impl<'s> Engine<'s> {
         let mut store = call.store.clone();
         let snapshot = call.store.clone(); // immutable copy for the base ctx
         let last = call.last_recv.clone();
+        let scenario = self.scenario_of(call_id);
         let outcomes = {
             let var_ctx = crate::render::VarCtx {
                 store: &snapshot,
-                vars: &self.scenario.vars,
+                vars: &scenario.vars,
                 challenge: call.challenge.as_ref(),
                 auth_user: self.config.auth_user.as_deref().unwrap_or(""),
                 auth_password: self.config.auth_password.as_deref().unwrap_or(""),
@@ -2471,12 +2665,12 @@ impl<'s> Engine<'s> {
                 crate::actions::ActionOutcome::Jump(dest) => {
                     // SIPp: "Jump statement out of range" is fatal; sipr
                     // fails the call instead of the run.
-                    if dest >= self.scenario.steps.len() {
-                        self.stats.failed_other += 1;
+                    if dest >= scenario.steps.len() {
+                        self.call_stats(call_id).failed_other += 1;
                         self.log_err(&format!(
                             "call {call_id} failed: jump to message index {dest} is out of \
                              range (0..{})",
-                            self.scenario.steps.len()
+                            scenario.steps.len()
                         ));
                         self.remove_call(call_id);
                         return true;
@@ -2505,7 +2699,7 @@ impl<'s> Engine<'s> {
                     }
                 }
                 crate::actions::ActionOutcome::FailCall(why) => {
-                    self.stats.failed_other += 1;
+                    self.call_stats(call_id).failed_other += 1;
                     self.log_err(&format!("call {call_id} failed: {why}"));
                     self.remove_call(call_id);
                     return true;
@@ -3083,7 +3277,7 @@ impl<'s> Engine<'s> {
             return;
         };
         let index = self.calls.get(&call_id).map_or(0, |c| c.index);
-        let (actions, common) = match self.scenario.steps.get(index) {
+        let (actions, common) = match self.scenario_of(&call_id).steps.get(index) {
             Some(Step::RecvCmd {
                 actions, common, ..
             }) => (actions, common),
@@ -3110,7 +3304,8 @@ impl<'s> Engine<'s> {
     /// (SIPp `queue_up`). Not re-entered while `_unexp.retaddr` is non-zero
     /// — SIPp's "already in a jump".
     fn try_unexpected_jump(&mut self, call_id: &str, packet: &sipr_net::InboundPacket) -> bool {
-        let Some(target) = self.scenario.unexpected_jump else {
+        let scenario = self.scenario_of(call_id);
+        let Some(target) = scenario.unexpected_jump else {
             return false;
         };
         let started = self.stats.started;
@@ -3119,7 +3314,7 @@ impl<'s> Engine<'s> {
         };
         // The step being interrupted: the running pause, else the recv.
         let interrupted = call.pause_deadline.map_or(call.index, |(i, _)| i);
-        if let Some(v) = self.scenario.unexp_retaddr {
+        if let Some(v) = scenario.unexp_retaddr {
             if call.store.get(v).as_num() != 0.0 {
                 return false;
             }
@@ -3127,7 +3322,7 @@ impl<'s> Engine<'s> {
             call.store
                 .set(v, crate::actions::Value::Num(interrupted as f64));
         }
-        if let Some(v) = self.scenario.unexp_pausedaddr {
+        if let Some(v) = scenario.unexp_pausedaddr {
             #[allow(clippy::cast_precision_loss)]
             let ms = call.pause_deadline.map_or(0.0, |(_, d)| {
                 d.saturating_duration_since(started).as_millis() as f64
@@ -3361,7 +3556,7 @@ impl<'s> Engine<'s> {
     /// connection for the calls that follow.
     fn after_send_failure(&mut self, call_id: &str, e: &std::io::Error) {
         if self.calls.contains_key(call_id) {
-            self.stats.failed_cannot_send += 1;
+            self.call_stats(call_id).failed_cannot_send += 1;
             self.log_err(&format!("call {call_id} failed: cannot send message: {e}"));
             self.remove_call(call_id);
         }
@@ -3459,7 +3654,7 @@ impl<'s> Engine<'s> {
         }
         self.log_err("Closing calls, because of TCP reset or close!");
         for id in live {
-            self.stats.failed_tcp_closed += 1;
+            self.call_stats(&id).failed_tcp_closed += 1;
             self.log_err(&format!("call {id} failed: TCP connection closed"));
             self.remove_call(&id);
         }
@@ -3584,13 +3779,14 @@ impl<'s> Engine<'s> {
         };
         match kind {
             TimerKind::RecvTimeout => {
-                let mandatory = self.window_mandatory(index);
+                let mandatory = self.window_mandatory(call_id, index);
                 if let Some((mi, _)) = mandatory {
-                    if let Some(s) = self.stats.step_mut(mi) {
+                    if let Some(s) = self.call_stats(call_id).step_mut(mi) {
                         s.timeouts += 1;
                     }
                 }
-                let ontimeout = mandatory.and_then(|(mi, _)| match &self.scenario.steps[mi] {
+                let scenario = self.scenario_of(call_id);
+                let ontimeout = mandatory.and_then(|(mi, _)| match &scenario.steps[mi] {
                     Step::Recv(RecvStep { ontimeout, .. }) => *ontimeout,
                     _ => None,
                 });
@@ -3629,7 +3825,7 @@ impl<'s> Engine<'s> {
         }) else {
             return; // call gone or retransmission already cancelled
         };
-        if let Some(s) = self.stats.step_mut(msg_index) {
+        if let Some(s) = self.call_stats(call_id).step_mut(msg_index) {
             s.retrans += 1;
         }
         let Some(remote) = self.calls.get(call_id).map(|c| c.remote) else {
@@ -3639,7 +3835,7 @@ impl<'s> Engine<'s> {
             self.after_send_failure(call_id, &e);
             return;
         }
-        self.stats.retrans_sent += 1;
+        self.call_stats(call_id).retrans_sent += 1;
         self.trace_send(&buf, remote);
         match next {
             Some(interval) => {
@@ -3675,9 +3871,18 @@ impl<'s> Engine<'s> {
         if let Some(mut call) = self.calls.remove(call_id) {
             self.cancel_call_timers(&mut call);
             self.stop_media(call_id);
-            self.stats.successful += 1;
-            self.stats.record_call_length(call.started.elapsed());
+            self.forget_ooc(&call);
+            let stats = self.stats_of(call.ooc);
+            stats.successful += 1;
+            stats.record_call_length(call.started.elapsed());
             self.return_user(&call);
+        }
+    }
+
+    /// Keep the ooc live count in step when an ooc call leaves the table.
+    fn forget_ooc(&mut self, call: &CallState) {
+        if call.ooc {
+            self.ooc_live = self.ooc_live.saturating_sub(1);
         }
     }
 
@@ -3687,7 +3892,9 @@ impl<'s> Engine<'s> {
         if let Some(mut call) = self.calls.remove(call_id) {
             self.cancel_call_timers(&mut call);
             self.stop_media(call_id);
-            self.stats.record_call_length(call.started.elapsed());
+            self.forget_ooc(&call);
+            self.stats_of(call.ooc)
+                .record_call_length(call.started.elapsed());
             self.return_user(&call);
         }
     }
@@ -3713,10 +3920,11 @@ impl<'s> Engine<'s> {
 
     fn fail_call(&mut self, call_id: &str, reason: &str) {
         if self.calls.contains_key(call_id) {
+            let stats = self.call_stats(call_id);
             match reason {
-                r if r.contains("retransmissions") => self.stats.failed_retrans += 1,
-                r if r.contains("timeout") => self.stats.failed_timeout += 1,
-                _ => self.stats.failed_other += 1,
+                r if r.contains("retransmissions") => stats.failed_retrans += 1,
+                r if r.contains("timeout") => stats.failed_timeout += 1,
+                _ => stats.failed_other += 1,
             }
             self.log_err(&format!("call {call_id} failed: {reason}"));
             self.remove_call(call_id);
@@ -3893,6 +4101,38 @@ fn new_call(
         socket: None,
         render_remote,
         server_ip: String::new(),
+        ooc: false,
+    }
+}
+
+/// A scenario's own stat set: repartitions and per-step counters/labels.
+fn new_stat_set(scenario: &Scenario) -> sipr_stats::StatSet {
+    let mut stats = sipr_stats::StatSet::new(
+        &scenario.response_time_repartition,
+        &scenario.call_length_repartition,
+    );
+    stats.init_steps(scenario.steps.iter().map(step_label).collect());
+    stats.set_step_hidden(
+        scenario
+            .steps
+            .iter()
+            .map(|s| step_common(s).is_some_and(|c| c.hide))
+            .collect(),
+    );
+    stats
+}
+
+/// The stat set a call's events land on (SIPp: each scenario owns its
+/// `CStat`), as a free function for the spots that already hold a `&mut`
+/// into the call table.
+fn stats_for<'a>(
+    main: &'a mut sipr_stats::StatSet,
+    ooc: Option<&'a mut OocScenario<'_>>,
+    is_ooc: bool,
+) -> &'a mut sipr_stats::StatSet {
+    match ooc {
+        Some(o) if is_ooc => &mut o.stats,
+        _ => main,
     }
 }
 
@@ -3995,12 +4235,25 @@ fn recv_matches(
     msg: &Inbound,
 ) -> bool {
     match &step.expect {
-        Expect::Request(m) => msg.method() == Some(m.as_str()),
+        // `regexp_match`: SIPp `matches_scenario` searches the method (and,
+        // below, the decimal status code) with the unanchored regex.
+        Expect::Request(m) => match (&step.expect_regex, msg.method()) {
+            (Some(re), Some(method)) => re.find(method.as_bytes()).is_some(),
+            (None, method) => method == Some(m.as_str()),
+            (Some(_), None) => false,
+        },
         Expect::Response(code) => {
             let Some(actual) = msg.status_code() else {
                 return false;
             };
-            if code.parse::<u16>() != Ok(actual) {
+            let code_matches = match &step.expect_regex {
+                Some(re) => {
+                    let (digits, len) = decimal_digits(actual);
+                    re.find(&digits[..len]).is_some()
+                }
+                None => code.parse::<u16>() == Ok(actual),
+            };
+            if !code_matches {
                 return false;
             }
             // SIPp guard: beyond index 0, the response's CSeq method must
@@ -4016,6 +4269,27 @@ fn recv_matches(
             }
         }
     }
+}
+
+/// A status code as ASCII digits without allocating (hot path: a
+/// `regexp_match` response recv runs per inbound message).
+fn decimal_digits(mut n: u16) -> ([u8; 5], usize) {
+    let mut buf = [0u8; 5];
+    let mut end = buf.len();
+    loop {
+        end -= 1;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            buf[end] = b'0' + (n % 10) as u8;
+        }
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let len = buf.len() - end;
+    buf.copy_within(end.., 0);
+    (buf, len)
 }
 
 /// For every step, the method of the nearest preceding request `<send>`.
@@ -4402,6 +4676,77 @@ mod tests {
             scan_for_match(&sc, &methods, 4, true, &response(486, "INVITE", false)),
             Scan::NoMatch
         ));
+    }
+
+    #[test]
+    fn regexp_match_searches_the_method_and_the_status_code() {
+        let xml = r#"<scenario name="re">
+  <recv request="OPTIONS|INFO" regexp_match="true"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <send><![CDATA[
+    INVITE sip:a SIP/2.0
+    Via: SIP/2.0/UDP h;branch=[branch]
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="18[0-9]" regexp_match="true" optional="true"/>
+  <recv response="^2" regexp_match="true"/>
+</scenario>"#;
+        let sc = sipr_scenario::compile("re", xml).scenario.unwrap();
+        let methods = precompute_cseq_methods(&sc);
+        let request = |m: &str| {
+            Inbound::parse(
+                format!(
+                    "{m} sip:b SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bK-9\r\n\
+                     From: <sip:a>;tag=t\r\nTo: <sip:b>\r\nCall-ID: c9\r\nCSeq: 3 {m}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 0, true, &request("INFO")),
+            Scan::Forward(0)
+        ));
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 0, true, &request("OPTIONS")),
+            Scan::Forward(0)
+        ));
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 0, true, &request("BYE")),
+            Scan::NoMatch
+        ));
+        // Responses: the regex runs over the decimal code, unanchored.
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 3, true, &response(183, "INVITE", false)),
+            Scan::Forward(3)
+        ));
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 3, true, &response(200, "INVITE", true)),
+            Scan::Forward(4)
+        ));
+        assert!(matches!(
+            scan_for_match(&sc, &methods, 3, true, &response(486, "INVITE", true)),
+            Scan::NoMatch
+        ));
+        let digits = |n: u16| {
+            let (buf, len) = decimal_digits(n);
+            String::from_utf8_lossy(&buf[..len]).into_owned()
+        };
+        assert_eq!(digits(0), "0");
+        assert_eq!(digits(486), "486");
+        assert_eq!(digits(65535), "65535");
     }
 
     #[test]

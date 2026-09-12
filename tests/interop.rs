@@ -2476,3 +2476,307 @@ fn sctp_both_ways_against_real_sipp() {
         );
     }
 }
+
+// ---- out-of-call scenarios (M33) -------------------------------------------
+
+/// A UAS flow that, once the call is up, fires an OPTIONS with a fresh
+/// Call-ID at its peer — an out-of-call request for the peer's `-oocsn`
+/// scenario to answer. Valid SIPp and sipr scenario syntax; the probe's
+/// URIs are literal because a SIPp UAS renders `[remote_ip]` empty (it is
+/// the `-rsa`/target global, unset in server mode).
+fn ooc_probing_uas_xml() -> &'static str {
+    r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="uas-ooc-probe">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 180 Ringing
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]ProbeTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]ProbeTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+  <send><![CDATA[
+    OPTIONS sip:probe@127.0.0.1 SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: probe <sip:probe@[local_ip]:[local_port]>;tag=[pid]probe[call_number]
+    To: <sip:probe@127.0.0.1>
+    Call-ID: ooc-probe-[call_number]-[pid]@[local_ip]
+    CSeq: 7 OPTIONS
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <timewait milliseconds="500"/>
+</scenario>
+"#
+}
+
+/// Real sipp UAC with `-oocsn ooc_default` answers the out-of-call OPTIONS
+/// sipr's UAS fires at it: sipp's error log carries SIPp's warning and the
+/// 200s reach sipr as unmapped responses (its `unexpected` counter).
+#[test]
+fn real_sipp_ooc_scenario_answers_siprs_out_of_call_options() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::real_sipp_ooc_scenario_answers_siprs_out_of_call_options — no sipp."
+        );
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let uas_path = dir.path().join("uas-ooc-probe.xml");
+    std::fs::write(&uas_path, ooc_probing_uas_xml()).expect("write uas");
+    let port = free_port();
+    let mut sipr_uas = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .current_dir(dir.path())
+            .args([
+                "-sf",
+                uas_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "3",
+                "-timeout",
+                "30",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipr uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut sipp_uac = Reaper(
+        Command::new(&sipp)
+            .current_dir(dir.path())
+            .args([
+                "-sn",
+                "uac",
+                "-oocsn",
+                "ooc_default",
+                "-i",
+                "127.0.0.1",
+                "-r",
+                "10",
+                "-m",
+                "3",
+                "-d",
+                "300",
+                "-timeout",
+                "20s",
+                "-trace_err",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uac"),
+    );
+    let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
+    assert_eq!(sipp_code, Some(0), "sipp uac must exit 0");
+    let sipr_code = wait_with_timeout(&mut sipr_uas.0, Duration::from_secs(15));
+    let stderr = sipr_uas
+        .0
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        sipr_code,
+        Some(0),
+        "sipr uas must exit 0; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("successful 3 failed 0"), "{stderr}");
+    // sipp's ooc scenario answered each probe: the 200s are responses to no
+    // sipr call, so sipr counted them as out-of-call (unexpected) messages.
+    // On exit sipp also aborts its lingering ooc calls with a BYE each,
+    // which sipr may or may not still be around to count.
+    let unexpected = stderr
+        .split(" unexpected ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0);
+    assert!(unexpected >= 3, "expected >= 3 unmapped 200s:\n{stderr}");
+    let sipp_errors = sipp_error_log(dir.path());
+    assert_eq!(
+        sipp_errors
+            .matches("Received out-of-call OPTIONS message, using the out-of-call scenario")
+            .count(),
+        3,
+        "sipp error log:\n{sipp_errors}"
+    );
+}
+
+/// The concatenated sipp `*_errors.log` files in `dir`.
+fn sipp_error_log(dir: &std::path::Path) -> String {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_errors.log"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .collect()
+}
+
+/// The mirror: sipr UAC with `-oocsn ooc_default` answers the out-of-call
+/// OPTIONS real sipp's UAS fires at it, logging SIPp's warning. A SIPp UAS
+/// spawns a main-scenario call for *any* message of no known call,
+/// responses included, which then aborts on the 200 ("Aborting call on
+/// unexpected message") and eats its `-m` budget — so sipp runs without
+/// `-m`, is reaped once sipr is done, and that abort line is the proof
+/// each 200 arrived.
+#[test]
+fn sipr_ooc_scenario_answers_real_sipps_out_of_call_options() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::sipr_ooc_scenario_answers_real_sipps_out_of_call_options — no sipp."
+        );
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let uas_path = dir.path().join("uas-ooc-probe.xml");
+    std::fs::write(&uas_path, ooc_probing_uas_xml()).expect("write uas");
+    let port = free_port();
+    let sipp_uas = Reaper(
+        Command::new(&sipp)
+            .current_dir(dir.path())
+            .args([
+                "-sf",
+                uas_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-timeout",
+                "30s",
+                "-trace_err",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut sipr_uac = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .current_dir(dir.path())
+            .args([
+                "-sn",
+                "uac",
+                "-oocsn",
+                "ooc_default",
+                "-i",
+                "127.0.0.1",
+                "-r",
+                "10",
+                "-m",
+                "3",
+                "-d",
+                "300",
+                "-timeout",
+                "20",
+                "-trace_err",
+                "-bg",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipr uac"),
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_uac.0, Duration::from_secs(25));
+    let stderr = sipr_uac
+        .0
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        sipr_code,
+        Some(0),
+        "sipr uac must exit 0; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("successful 3 failed 0"), "{stderr}");
+    // The probes were answered by the ooc scenario, not counted against the
+    // main one.
+    assert!(stderr.contains(" unexpected 0 "), "{stderr}");
+    let sipr_errors: String = std::fs::read_dir(dir.path())
+        .expect("readdir")
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("uac_") && n.ends_with("_errors.log")
+        })
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .collect();
+    assert!(
+        sipr_errors
+            .contains("Received out-of-call OPTIONS message, using the out-of-call scenario"),
+        "sipr errors log:\n{sipr_errors}"
+    );
+    assert_eq!(
+        sipr_errors.matches("Received out-of-call OPTIONS").count(),
+        3,
+        "one ooc call per probe:\n{sipr_errors}"
+    );
+    // Each probe's 200 reached sipp, where it aborted a bogus server-mode
+    // call — one abort line per probe in sipp's error log.
+    drop(sipp_uas);
+    let sipp_errors = sipp_error_log(dir.path());
+    let sipp_errors: String = sipp_errors
+        .lines()
+        .filter(|l| !l.contains("SIPrTag"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        sipp_errors
+            .matches("Aborting call on unexpected message for Call-Id 'ooc-probe-")
+            .count(),
+        3,
+        "sipp error log:\n{sipp_errors}"
+    );
+}

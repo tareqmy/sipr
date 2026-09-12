@@ -82,6 +82,16 @@ The moving parts:
 - **Stats**: per-worker atomic/thread-local counters, aggregated each second into
   an immutable `StatsSnapshot` (Arc). TUI and CSV writer are pure readers of
   snapshots. Nothing on the hot path takes the stats lock.
+- **Two scenarios, one engine** (M33): `-oocsf`/`-oocsn` load an out-of-call
+  scenario next to the main one. Both are compiled independently and each
+  owns its stat set, CSeq guard and step labels; a call carries which one
+  it runs (`CallState::ooc`) and every per-call path — recv-window scan,
+  step execution, actions, timers, stats routing — resolves the scenario
+  through that flag. Global concerns (pacer, `-l`/`-users`, end of run,
+  the auto-answered counter, CSV dump, twin socket, transports) stay on
+  the main scenario, as SIPp's `open_calls`/`main_scenario` do. The router
+  spawns an ooc call for a request of no known call in client mode only;
+  unmapped responses are counted and dropped.
 
 ## 3. Hot path rules (enforced in review)
 

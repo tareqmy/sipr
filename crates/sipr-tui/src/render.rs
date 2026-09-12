@@ -188,7 +188,12 @@ fn render_main(snap: &Snapshot, pal: &Palette) -> Vec<String> {
 }
 
 fn render_scenario(snap: &Snapshot, pal: &Palette) -> Vec<String> {
-    let mut out = vec![title_line(snap, "scenario", pal), String::new()];
+    // `set display ooc`: the page shows the out-of-call scenario's steps.
+    let screen = match &snap.display_ooc {
+        Some(name) => format!("scenario (ooc: {name})"),
+        None => "scenario".to_owned(),
+    };
+    let mut out = vec![title_line(snap, &screen, pal), String::new()];
     out.push(pal.paint(
         pal.label,
         &format!(
