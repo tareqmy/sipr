@@ -4,6 +4,23 @@ All notable changes to sipr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] — 2026-09-12
+
+### Added
+
+- **Out-of-call scenarios** (`-oocsf <file>` / `-oocsn <name>`) — a second,
+  independently compiled scenario that answers requests mapping to no
+  known call, as in SIPp: client mode only, the embedded `ooc_default`
+  and `ooc_dummy` (dumpable with `-sd`), own per-step statistics, no
+  `[fieldN]`/`-inf` in ooc calls, and ooc calls never count toward
+  `-m`/`-l`/`-users`. `set display ooc|main` over the control socket swaps
+  the TUI scenario page. Verified both ways against real sipp.
+
+### Fixed
+
+- `regexp_match="true"` on `<recv>` was parsed but never applied by the
+  matcher, so a `request=".*"` step matched nothing.
+
 ## [0.21.0] — 2026-09-06
 
 ### Added
@@ -381,7 +398,8 @@ library — no external crates.
   leftmost-longest — identical on the patterns real scenarios use; see
   `docs/SIPP_COMPAT.md` §6.
 
-[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/tareqmy/sipr/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/tareqmy/sipr/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/tareqmy/sipr/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/tareqmy/sipr/compare/v0.18.0...v0.19.0
