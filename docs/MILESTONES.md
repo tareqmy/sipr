@@ -235,7 +235,8 @@ on a machine with sipp to close them.
       (`tests/e2e.rs::users_closed_loop_binds_user_to_injection_line`: three
       users each run twice under `-users 3 -m 6`, each `[field0]` matching its
       `[userid]`). SIPP_COMPAT §6.
-- [x] Deferred: per-user persistent variables and runtime user-count changes.
+- [x] Deferred: per-user persistent variables (queued as M35; runtime
+      user-count changes shipped with the control socket, M17).
 
 ## M12 — IPv6 ✅
 
@@ -1146,3 +1147,92 @@ no regress test mentions mixed mode.
       semantics), CONTROL_API, ARCHITECTURE "two scenarios, one engine" →
       secondary scenarios, README, AGENTS state line; the M22 `set
       display rx` deferral and M33's out-of-scope line updated.
+
+### M35 — Dynamic users: `<User>`/`<Global>` variable scopes, SIPp's user-id retirement
+
+Runtime user-count changes already exist (`set users N`, the `+ - * /`
+keys, HTTP `/control`, M17). What is missing is the other half of SIPp's
+user model: variables that outlive a call — per user (`<User
+variables="…"/>`, one table per user id, `userVarMap`) and per run
+(`<Global variables="…"/>`, one table for the process) — plus SIPp's exact
+user-id bookkeeping when the count shrinks and grows again. Today both
+elements are hard errors in sipr ("unknown element"), so any SIPp scenario
+using them fails to load.
+
+Behavioral oracle: `scenario.cpp` ~l.718 (every scenario's `allocVars`
+is a child of `userVariables`), ~l.756-779 (`<Global variables>` and
+`<User variables>` allocate the comma-separated names in
+`globalVariables`/`userVariables`), ~l.780-790 (`<Reference>` must name an
+existing variable); `variables.cpp` ~l.187-210 (a `VariableTable` chains
+to its parent and carries a level), ~l.284-296 (`getVar` climbs to the
+level encoded in the variable id), ~l.303-330 (`AllocVariableTable::find`:
+the scenario's own map first, then the parents, then allocate — so a
+name *used before* its `<User>`/`<Global>` declaration is already
+call-scoped and the declaration changes nothing for it); `sipp.cpp`
+~l.1450 (`userVariables` is a child of `globalVariables`), ~l.2123-2126
+(one `VariableTable(userVariables)` per user id at startup), ~l.1097 (the
+tables live for the whole run — a retired id keeps its values);
+`call.cpp` ~l.1100-1115 (a call with a user id parents its table on
+`userVarMap[userId]`; a call without one — UAS, ooc, rx, rate mode — gets
+a fresh private table, so "user" variables are per call there), ~l.1296
+(`free_user` at call end); `call_generation_task.cpp` ~l.252-290
+(`set_users`: growth takes `retiredUsers` first, then `users + 1` with a
+fresh table; `users = open_calls_allowed = new`; `free_user` retires an id
+while `CurrentCall > open_calls_allowed`, else returns it to the pool);
+`socket.cpp` ~l.164-176 (`set users` wordings, already matched),
+~l.407-437 (keys step users by `rate_scale`, already matched); `sipp.dtd`
+(declares `Reference` only — `Global`/`User` are accepted by the parser
+and absent from the DTD and the docs; the regress suite never uses them).
+
+- [ ] Scenario: `<Global variables="a,b"/>` and `<User variables="x"/>`
+      elements (`variables` required; unknown attributes warn). Each
+      variable id carries a scope — `Call` (default), `User`, `Global` —
+      resolved at compile time so the hot path never searches; `Scenario`
+      exposes the per-scope name lists and `dump()` prints them. SIPp's
+      declaration-order quirk (a use before the declaration stays
+      call-scoped): sipr applies the scope to the whole scenario and
+      emits a warning naming the earlier use, so `--check` catches what
+      SIPp silently gets wrong — record the divergence in SIPP_COMPAT §6.
+      `<Reference>` keeps rejecting unknown names.
+- [ ] Engine: a layered variable store — the call's own store, the user's
+      store (by user id, owned by the engine, created when the id is
+      first handed out and kept for the run, SIPp's `userVarMap`) and one
+      global store shared by every call of both scenarios (the secondary
+      scenario's `allocVars` hangs off the same `userVariables`). Reads
+      and writes from every action (`assign`, `assignstr`, `ereg`,
+      arithmetic, `strcmp`, `test`, `lookup`, `gettimeofday`, `trim`,
+      `urlencode`/`urldecode`, `todouble`, `jump variable=`) and `[$var]`
+      rendering go through it by scope. Calls with no user id get a
+      private "user" layer, as SIPp. Single engine thread: no locks, no
+      allocation per access beyond what call-scoped variables do today.
+- [ ] User-id bookkeeping like SIPp's: growth takes retired ids first (so
+      a returning user sees its old variables), then fresh ones; a shrink
+      does not touch the pool — a finishing call's id is retired while
+      the live count exceeds the target and returned otherwise (SIPp
+      `free_user`), so whichever users happen to be live keep their ids
+      and injection lines. Today sipr drops ids above the target
+      regardless of liveness; align and record. `[users]` keeps rendering
+      the current count.
+- [ ] Control: `dump variables` — SIPp prints the displayed scenario's
+      variable names by scope (`AllocVariableTable::dump`); implement it
+      into the error trace (it warns "unsupported" today) or record why
+      not.
+- [ ] `--check` prints the scopes; embedded scenarios untouched.
+- [ ] Tests: scenario unit (both elements parse; scopes resolve; a use
+      before the declaration warns; `<Reference>` to an undeclared name
+      still errors); engine unit (a user variable survives into the same
+      user's next call, a global one is visible to every call, a call
+      variable resets, a UAS call's user variable does not leak into the
+      next call); e2e `user_variables_persist_across_a_users_calls`
+      (`-users 2 -m 6`: the scenario adds 1 to a `<User>` counter and 1
+      to a `<Global>` counter per call and sends both in headers; the peer
+      sees per-user 1,2,3 and global 1..6 in call order),
+      `set_users_retires_and_reuses_ids_like_sipp` (control socket 3 → 1
+      → 3 mid-run; the ids seen after the regrow are the ones that were
+      retired, with their counters continuing); interop: the same
+      counter scenario run by real sipp against a sipr UAS and by sipr
+      against a sipp UAS, the header sequences compared.
+- [ ] Docs: SIPP_COMPAT §1 (the two elements), §6 note (scope chain,
+      declaration-order divergence, private user layer for id-less calls,
+      retirement rules, `dump variables`); ARCHITECTURE variable-store
+      paragraph; README feature bullet; the M11 deferral updated.

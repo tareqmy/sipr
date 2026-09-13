@@ -392,8 +392,11 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   the population stays constant until `-m` total is reached. `-users` and `-l`
   are mutually exclusive. USER-mode `-inf` files resolve line = userId-1
   (SIPp `nextLine(userId)`); `[userid]` renders the id, `[users]` the count.
-  Not supported: per-user persistent variables (SIPp's `userVarMap`) and
-  dynamic user-count changes at runtime — sipr's `-users` is a fixed N.
+  The count changes at runtime through `set users N` (control socket, HTTP
+  `/control`) and the `+ - * /` keys (M17); new ids join the free pool and
+  a smaller target lets the excess calls finish without replacement.
+  Not supported yet: per-user persistent variables (SIPp's `userVarMap`,
+  `<User variables=…/>`) and `<Global variables=…/>` — queued as M35.
 - IPv6 (M12, verified in `call.cpp` `E_Message_Local_IP`/`E_Message_Remote_IP`
   → `local_ip_w_brackets`/`remote_ip_w_brackets` vs `E_Message_Media_IP` →
   raw `media_ip`): `[local_ip]`/`[remote_ip]` render the address bracketed when
