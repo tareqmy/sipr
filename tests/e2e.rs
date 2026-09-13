@@ -5220,9 +5220,10 @@ fn uac_answers_out_of_call_options_with_ooc_scenario() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `set display ooc` (control socket) swaps the scenario screen — visible
-/// through the HTTP API's `display` and `steps` — and `set display main`
-/// swaps it back; the statistics stay the main scenario's.
+/// `set display ooc` (control socket) swaps every screen to the out-of-call
+/// scenario — visible through the HTTP API's `display`, `role`, `steps` and
+/// counters — and `set display main` swaps them back (SIPp's `screen.cpp`
+/// reads `display_scenario->stats` throughout).
 #[test]
 fn set_display_ooc_swaps_the_scenario_screen() {
     let (addr, _uas) = spawn_uas(Duration::from_secs(3));
@@ -5271,18 +5272,343 @@ fn set_display_ooc_swaps_the_scenario_screen() {
     let (st, body) = http(api, "GET", "/stats", "");
     assert_eq!(st, 200, "{body}");
     assert!(body.contains("\"display\":\"ooc\""), "{body}");
+    assert!(body.contains("\"mixed\":false"), "{body}");
+    assert!(body.contains("\"role\":\"UAS\""), "{body}");
     assert!(body.contains("\"label\":\"recv .*\""), "{body}");
     assert!(body.contains("\"label\":\"send 200\""), "{body}");
     assert!(!body.contains("\"label\":\"send INVITE\""), "{body}");
-    // The counters are still the main scenario's: calls have been created.
-    assert!(!body.contains("\"created\":0,"), "{body}");
+    // The counters follow: nothing has reached the ooc scenario.
+    assert!(body.contains("\"created\":0,"), "{body}");
 
     ctl.send_to(b"cset display main\n", target).expect("send");
     std::thread::sleep(Duration::from_millis(1500));
     let (st, body) = http(api, "GET", "/stats", "");
     assert_eq!(st, 200, "{body}");
     assert!(body.contains("\"display\":\"main\""), "{body}");
+    assert!(body.contains("\"role\":\"UAC\""), "{body}");
     assert!(body.contains("\"label\":\"send INVITE\""), "{body}");
+    assert!(!body.contains("\"created\":0,"), "{body}");
+
+    let code = wait_exit(&mut child, Duration::from_secs(15));
+    let err = stderr.join().expect("stderr");
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 6 failed 0"), "{err}");
+}
+
+/// A UDP peer for mixed mode: it answers sipr's calls like [`spawn_uas`]
+/// and, on the first ACK it gets, originates one call of its own towards
+/// sipr (INVITE → expects 180/200 → ACK → BYE → expects 200). Returns the
+/// responses sipr sent to that call, in order.
+fn spawn_mixed_peer(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind peer");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(idle)).expect("timeout");
+    let handle = std::thread::spawn(move || {
+        let mut rx_responses = Vec::new();
+        let mut originated = false;
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            if let Some(code) = msg.status_code() {
+                if !msg.call_id().unwrap_or_default().starts_with("rx-call-") {
+                    continue;
+                }
+                rx_responses.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let cseq = msg.header("CSeq").unwrap_or_default();
+                if code == 200 && cseq.ends_with("INVITE") {
+                    // Established: ACK it, then hang up straight away.
+                    let to = msg.header("To").unwrap_or_default();
+                    let dialog = |method: &str, cseq: u32, branch: &str| {
+                        format!(
+                            "{method} sip:sipr@{from} SIP/2.0\r\n\
+                             Via: SIP/2.0/UDP {addr};branch=z9hG4bK-rx-{branch}\r\n\
+                             From: peer <sip:peer@{addr}>;tag=peer1\r\n\
+                             To: {to}\r\n\
+                             Call-ID: rx-call-1@{}\r\n\
+                             CSeq: {cseq} {method}\r\n\
+                             Max-Forwards: 70\r\n\
+                             Content-Length: 0\r\n\r\n",
+                            addr.ip()
+                        )
+                    };
+                    let _ = sock.send_to(dialog("ACK", 1, "ack").as_bytes(), from);
+                    let _ = sock.send_to(dialog("BYE", 2, "bye").as_bytes(), from);
+                }
+                continue;
+            }
+            match msg.method() {
+                Some("INVITE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "180 Ringing", true), from);
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", true), from);
+                }
+                Some("ACK") if !originated => {
+                    originated = true;
+                    let invite = format!(
+                        "INVITE sip:sipr@{from} SIP/2.0\r\n\
+                         Via: SIP/2.0/UDP {addr};branch=z9hG4bK-rx-1\r\n\
+                         From: peer <sip:peer@{addr}>;tag=peer1\r\n\
+                         To: <sip:sipr@{from}>\r\n\
+                         Call-ID: rx-call-1@{}\r\n\
+                         CSeq: 1 INVITE\r\n\
+                         Contact: <sip:peer@{addr}>\r\n\
+                         Max-Forwards: 70\r\n\
+                         Content-Length: 0\r\n\r\n",
+                        addr.ip()
+                    );
+                    let _ = sock.send_to(invite.as_bytes(), from);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        rx_responses
+    });
+    (addr, handle)
+}
+
+/// Mixed mode: a UAC with `-rxsn uas` terminates the call the peer
+/// originates towards it (180, 200, then 200 to the BYE, all with the
+/// copied headers) while its own calls run clean; without `-rxs*` the
+/// INVITE is discarded and counted (SIPp `socket.cpp` `MODE_MIXED`).
+#[test]
+fn uac_terminates_incoming_calls_with_rx_scenario() {
+    let dir = std::env::temp_dir().join(format!("sipr-rx-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let run = |rx: bool| {
+        let (addr, peer) = spawn_mixed_peer(Duration::from_secs(2));
+        let target = addr.to_string();
+        let mut args = vec![
+            "-sn",
+            "uac",
+            "-i",
+            "127.0.0.1",
+            "-m",
+            "2",
+            "-d",
+            "300",
+            "-timeout",
+            "15",
+            "-trace_err",
+        ];
+        if rx {
+            args.extend(["-rxsn", "uas"]);
+        }
+        args.push(&target);
+        let (out, errors) = run_sipr_in(&dir, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(0), "rx={rx} stderr:\n{stderr}");
+        assert!(
+            stderr.contains("successful 2 failed 0"),
+            "rx={rx}\n{stderr}"
+        );
+        let responses = peer.join().expect("peer");
+        for f in std::fs::read_dir(&dir).expect("readdir").flatten() {
+            let _ = std::fs::remove_file(f.path());
+        }
+        (stderr, errors, responses)
+    };
+
+    // With the receive scenario: 180, 200 (INVITE), 200 (BYE).
+    let (stderr, errors, responses) = run(true);
+    let statuses: Vec<&str> = responses
+        .iter()
+        .map(|r| r.lines().next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        statuses,
+        ["SIP/2.0 180 Ringing", "SIP/2.0 200 OK", "SIP/2.0 200 OK"],
+        "responses:\n{responses:?}\nstderr:\n{stderr}"
+    );
+    let ok_invite = &responses[1];
+    assert!(
+        ok_invite.contains(";branch=z9hG4bK-rx-1\r\n"),
+        "{ok_invite}"
+    );
+    assert!(ok_invite.contains(">;tag=peer1\r\n"), "{ok_invite}");
+    assert!(ok_invite.contains("\r\nTo: <sip:sipr@"), "{ok_invite}");
+    assert!(ok_invite.contains("\r\nCSeq: 1 INVITE\r\n"), "{ok_invite}");
+    assert!(
+        ok_invite.contains("\r\nContact: <sip:127.0.0.1:"),
+        "{ok_invite}"
+    );
+    let ok_bye = &responses[2];
+    assert!(ok_bye.contains(";branch=z9hG4bK-rx-bye\r\n"), "{ok_bye}");
+    assert!(ok_bye.contains("\r\nCSeq: 2 BYE\r\n"), "{ok_bye}");
+    assert!(
+        errors.contains("Received INVITE for no known call, using the receive scenario"),
+        "{errors}"
+    );
+    // The main scenario's counters see nothing unexpected.
+    assert!(stderr.contains(" unexpected 0 "), "{stderr}");
+
+    // No receive scenario: SIPp's client-mode default — discard and count.
+    let (stderr, errors, responses) = run(false);
+    assert!(responses.is_empty(), "unexpected responses:\n{responses:?}");
+    assert!(stderr.contains(" unexpected 1 "), "{stderr}");
+    assert!(errors.contains("out-of-call message ignored"), "{errors}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `-rxinf` files join the injection table after the `-inf` ones: the
+/// receive scenario reads one by name, and its bare `[fieldN]` still reads
+/// the first `-inf` file (SIPp's `default_file`).
+#[test]
+fn rx_scenario_reads_rxinf_by_file_name() {
+    let dir = std::env::temp_dir().join(format!("sipr-rxinf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let xml = dir.join("rx.xml");
+    std::fs::write(
+        &xml,
+        r#"<scenario name="rx-fields">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]RxTag[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    X-Rx-User: [field0 file=rx.csv]
+    X-Main-User: [field1]
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>"#,
+    )
+    .expect("write scenario");
+    let main_csv = dir.join("main.csv");
+    let rx_csv = dir.join("rx.csv");
+    std::fs::write(&main_csv, "SEQUENTIAL\nm0;m1\n").expect("write csv");
+    std::fs::write(&rx_csv, "SEQUENTIAL\nalice;\n").expect("write csv");
+    let (addr, peer) = spawn_mixed_peer(Duration::from_secs(2));
+    let (out, _errors) = run_sipr_in(
+        &dir,
+        &[
+            "-sn",
+            "uac",
+            "-rxsf",
+            xml.to_str().expect("utf8"),
+            "-inf",
+            main_csv.to_str().expect("utf8"),
+            "-rxinf",
+            rx_csv.to_str().expect("utf8"),
+            "-i",
+            "127.0.0.1",
+            "-m",
+            "2",
+            "-d",
+            "300",
+            "-timeout",
+            "15",
+            &addr.to_string(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+    assert!(stderr.contains("successful 2 failed 0"), "{stderr}");
+    let responses = peer.join().expect("peer");
+    let _ = std::fs::remove_dir_all(&dir);
+    let ok_invite = responses
+        .iter()
+        .find(|r| r.starts_with("SIP/2.0 200 OK") && r.contains("CSeq: 1 INVITE"))
+        .unwrap_or_else(|| panic!("no 200 to the INVITE:\n{responses:?}"));
+    assert!(
+        ok_invite.contains("\r\nX-Rx-User: alice\r\n"),
+        "{ok_invite}"
+    );
+    assert!(ok_invite.contains("\r\nX-Main-User: m1\r\n"), "{ok_invite}");
+}
+
+/// `set display rx` (control socket) swaps every screen to the receive
+/// scenario — the HTTP API's `display`, `role`, `steps` and counters — and
+/// `set display main` swaps them back; `mixed` is on throughout.
+#[test]
+fn set_display_rx_swaps_the_screens() {
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let cp = free_port();
+    let port = free_port();
+    let (mut child, stderr) = spawn_sipr_bg(&[
+        "-sn",
+        "uac",
+        "-rxsn",
+        "uas",
+        "-r",
+        "1",
+        "-m",
+        "6",
+        "-d",
+        "20",
+        "-cp",
+        &cp.to_string(),
+        "--sipr-http",
+        &port.to_string(),
+        "-timeout",
+        "30",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let api = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut ready = false;
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(api).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ready, "HTTP API never came up");
+    let ctl = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let target = SocketAddr::from(([127, 0, 0, 1], cp));
+    std::thread::sleep(Duration::from_millis(1200));
+    let (st, body) = http(api, "GET", "/stats", "");
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"display\":\"main\""), "{body}");
+    assert!(body.contains("\"mixed\":true"), "{body}");
+    assert!(body.contains("\"role\":\"UAC\""), "{body}");
+    assert!(body.contains("\"label\":\"send INVITE\""), "{body}");
+
+    ctl.send_to(b"cset display rx\n", target).expect("send");
+    std::thread::sleep(Duration::from_millis(1500));
+    let (st, body) = http(api, "GET", "/stats", "");
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"display\":\"rx\""), "{body}");
+    assert!(body.contains("\"mixed\":true"), "{body}");
+    assert!(body.contains("\"role\":\"UAS\""), "{body}");
+    assert!(
+        body.contains("\"scenario\":\"Basic UAS responder\""),
+        "{body}"
+    );
+    assert!(body.contains("\"label\":\"recv INVITE\""), "{body}");
+    assert!(body.contains("\"label\":\"send 180\""), "{body}");
+    assert!(!body.contains("\"label\":\"send INVITE\""), "{body}");
+    // The counters follow: nobody has called us.
+    assert!(body.contains("\"created\":0,"), "{body}");
+
+    ctl.send_to(b"cset display main\n", target).expect("send");
+    std::thread::sleep(Duration::from_millis(1500));
+    let (st, body) = http(api, "GET", "/stats", "");
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"display\":\"main\""), "{body}");
+    assert!(body.contains("\"role\":\"UAC\""), "{body}");
+    assert!(body.contains("\"label\":\"send INVITE\""), "{body}");
+    assert!(!body.contains("\"created\":0,"), "{body}");
 
     let code = wait_exit(&mut child, Duration::from_secs(15));
     let err = stderr.join().expect("stderr");

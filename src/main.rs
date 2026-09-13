@@ -70,15 +70,16 @@ fn run(cli: &Cli) -> ExitCode {
     for d in &outcome.diagnostics {
         eprintln!("sipr: {d}");
     }
-    // The out-of-call scenario (-oocsf/-oocsn) compiles independently, with
-    // the same loud diagnostics and the same lint rules under --check.
-    let ooc_outcome = match load_ooc_source(cli) {
-        Ok(Some((name, source))) => {
+    // The secondary scenario (-oocsf/-oocsn out-of-call, or -rxsf/-rxsn
+    // receive) compiles independently, with the same loud diagnostics and
+    // the same lint rules under --check.
+    let secondary_outcome = match load_secondary_source(cli) {
+        Ok(Some((kind, name, source))) => {
             let out = sipr_scenario::compile(&name, &source);
             for d in &out.diagnostics {
                 eprintln!("sipr: {d}");
             }
-            Some((name, out))
+            Some((kind, name, out))
         }
         Ok(None) => None,
         Err(msg) => return fatal(&msg),
@@ -90,9 +91,9 @@ fn run(cli: &Cli) -> ExitCode {
             print!("{}", sc.dump());
         }
         let mut clean = outcome.diagnostics.is_empty();
-        if let Some((_, out)) = &ooc_outcome {
+        if let Some((kind, _, out)) = &secondary_outcome {
             if let Some(sc) = &out.scenario {
-                print!("out-of-call {}", sc.dump());
+                print!("{} {}", kind.noun(), sc.dump());
             }
             clean &= out.diagnostics.is_empty();
         }
@@ -106,11 +107,14 @@ fn run(cli: &Cli) -> ExitCode {
     let Some(scenario) = outcome.scenario else {
         return fatal(&format!("scenario '{scenario_name}' failed to compile"));
     };
-    let ooc_scenario = match ooc_outcome {
-        Some((name, out)) => match out.scenario {
-            Some(sc) => Some(sc),
+    let secondary = match secondary_outcome {
+        Some((kind, name, out)) => match out.scenario {
+            Some(sc) => Some((kind, sc)),
             None => {
-                return fatal(&format!("out-of-call scenario '{name}' failed to compile"));
+                return fatal(&format!(
+                    "{} scenario '{name}' failed to compile",
+                    kind.noun()
+                ));
             }
         },
         None => None,
@@ -181,6 +185,7 @@ fn run(cli: &Cli) -> ExitCode {
         }),
         stat_interval: std::time::Duration::from_secs(cli.stat_interval_s.unwrap_or(1)),
         inf_files: cli.inf.clone(),
+        rx_inf_files: cli.rxinf.clone(),
         inf_index: cli.inf_index.clone(),
         transport: match cli.transport {
             crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
@@ -276,7 +281,7 @@ fn run(cli: &Cli) -> ExitCode {
             .ok();
         let outcome = sipr_engine::run_scenarios(
             &scenario,
-            ooc_scenario.as_ref(),
+            secondary.as_ref().map(|(kind, sc)| (*kind, sc)),
             &config,
             Some(sipr_engine::UiChannels {
                 snapshots: snap_tx,
@@ -288,8 +293,13 @@ fn run(cli: &Cli) -> ExitCode {
         }
         outcome.map(|(report, _)| report)
     } else {
-        sipr_engine::run_scenarios(&scenario, ooc_scenario.as_ref(), &config, None)
-            .map(|(report, _)| report)
+        sipr_engine::run_scenarios(
+            &scenario,
+            secondary.as_ref().map(|(kind, sc)| (*kind, sc)),
+            &config,
+            None,
+        )
+        .map(|(report, _)| report)
     };
     match result {
         Ok(report) => {
@@ -356,24 +366,38 @@ fn resolve_target(raw: &str) -> Result<std::net::SocketAddr, String> {
         .ok_or_else(|| format!("target '{raw}' resolved to no addresses"))
 }
 
-/// The out-of-call scenario source: `-oocsf` reads a file, `-oocsn` an
-/// embedded one (`ooc_default` / `ooc_dummy`). `None` when neither is set —
+/// The secondary scenario's kind, name and XML: `-oocsf`/`-rxsf` read a
+/// file, `-oocsn`/`-rxsn` an embedded one. `None` when none is set —
 /// requests of no known call are then discarded, as SIPp does by default.
-fn load_ooc_source(cli: &Cli) -> Result<Option<(String, String)>, String> {
-    if let Some(path) = &cli.oocsf {
+/// (The CLI already refuses an out-of-call and a receive scenario together.)
+fn load_secondary_source(
+    cli: &Cli,
+) -> Result<Option<(sipr_engine::SecondaryKind, String, String)>, String> {
+    use sipr_engine::SecondaryKind;
+    let (kind, file, embedded_name) = if cli.rxsf.is_some() || cli.rxsn.is_some() {
+        (SecondaryKind::Receive, &cli.rxsf, &cli.rxsn)
+    } else {
+        (SecondaryKind::OutOfCall, &cli.oocsf, &cli.oocsn)
+    };
+    if let Some(path) = file {
         let bytes = std::fs::read(path).map_err(|e| {
             format!(
-                "cannot read out-of-call scenario file {}: {e}",
+                "cannot read {} scenario file {}: {e}",
+                kind.noun(),
                 path.display()
             )
         })?;
-        return Ok(Some((path.display().to_string(), latin1_tolerant(bytes))));
+        return Ok(Some((
+            kind,
+            path.display().to_string(),
+            latin1_tolerant(bytes),
+        )));
     }
-    let Some(name) = cli.oocsn.as_deref() else {
+    let Some(name) = embedded_name.as_deref() else {
         return Ok(None);
     };
     match sipr_scenario::embedded(name) {
-        Some(xml) => Ok(Some((name.to_owned(), xml.to_owned()))),
+        Some(xml) => Ok(Some((kind, name.to_owned(), xml.to_owned()))),
         None => Err(unknown_embedded(name)),
     }
 }

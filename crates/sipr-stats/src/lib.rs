@@ -14,7 +14,7 @@ mod histogram;
 mod snapshot;
 
 pub use histogram::{Histogram, Repartition};
-pub use snapshot::{RtdRow, Snapshot, StepRow, StepStats};
+pub use snapshot::{Display, RtdRow, Snapshot, StepRow, StepStats};
 
 use std::collections::HashMap;
 use std::io::Write as _;

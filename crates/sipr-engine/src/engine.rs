@@ -109,6 +109,10 @@ pub struct EngineConfig {
     pub stat_interval: Duration,
     /// `-inf`: injection-file paths (CSV) for `[fieldN]`, in order.
     pub inf_files: Vec<std::path::PathBuf>,
+    /// `-rxinf`: further injection files, loaded after the `-inf` ones into
+    /// the same table (SIPp's shared `inFiles` map) and reachable by name
+    /// from either scenario; a bare `[fieldN]` still means the first `-inf`.
+    pub rx_inf_files: Vec<std::path::PathBuf>,
     /// `-infindex FILE FIELD`: build a lookup index on `FIELD` of the injection
     /// file named `FILE` (matched by basename), enabling `<lookup>`.
     pub inf_index: Vec<(String, usize)>,
@@ -426,9 +430,10 @@ struct CallState {
     render_remote: SocketAddr,
     /// `[server_ip]`: the IP of the socket this call's messages leave on.
     server_ip: String,
-    /// Runs the out-of-call scenario (spawned by an unmapped request) rather
-    /// than the main one; never counts toward `-l`/`-users`/`-m`.
-    ooc: bool,
+    /// Runs the secondary scenario (out-of-call or receive, spawned by a
+    /// request of no known call) rather than the main one; never counts
+    /// toward `-l`/`-users`/`-m`.
+    secondary: bool,
 }
 
 /// Why the engine refused to run a scenario.
@@ -488,44 +493,110 @@ pub fn run_with_ui(
     run_scenarios(scenario, None, config, ui)
 }
 
-/// [`run_with_ui`] with an out-of-call scenario (`-oocsf`/`-oocsn`) loaded
-/// next to the main one: a request whose Call-ID matches no live call spawns
-/// a call on `ooc` instead of being discarded (SIPp `socket.cpp`
-/// `process_message`). Client mode only, as in SIPp.
+/// Which second scenario runs next to the main one (SIPp's `ooc_scenario`
+/// and `rx_scenario`; at most one is loaded — SIPp never reaches the
+/// out-of-call branch in mixed mode, so sipr refuses the combination).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondaryKind {
+    /// `-oocsf`/`-oocsn`: answers requests of no known call, no injection
+    /// line, counted as auto-answered.
+    OutOfCall,
+    /// `-rxsf`/`-rxsn` (mixed mode): terminates the calls the peer
+    /// originates towards us while the main scenario originates ours.
+    Receive,
+}
+
+/// [`run_with_ui`] with a secondary scenario loaded next to the main one:
+/// a request whose Call-ID matches no live call spawns a call on it instead
+/// of being discarded (SIPp `socket.cpp` `process_message`, the
+/// `ooc_scenario` and `MODE_MIXED` branches). Client mode only, as in SIPp.
 ///
 /// # Errors
 ///
-/// See [`run`]; additionally when `ooc` is given in server mode or reads
-/// injection files (`[fieldN]`), with SIPp's wordings.
+/// See [`run`]; additionally, with SIPp's wordings where it has them: an
+/// out-of-call scenario in server mode or reading injection files
+/// (`[fieldN]`); a receive scenario next to a server-mode main scenario, or
+/// one that is not itself server-mode.
 pub fn run_scenarios(
     scenario: &Scenario,
-    ooc: Option<&Scenario>,
+    secondary: Option<(SecondaryKind, &Scenario)>,
     config: &EngineConfig,
     ui: Option<UiChannels>,
 ) -> Result<(RunReport, EngineControl), EngineError> {
     validate_for_engine(scenario)?;
-    if let Some(ooc) = ooc {
-        validate_for_engine(ooc)?;
-        if scenario.role == Role::Uas {
-            return Err(EngineError(
-                "SIPp cannot use out-of-call scenarios when running in server mode".into(),
-            ));
-        }
-        if ooc.uses_injection_fields() {
-            return Err(EngineError(
-                "Automatic calls (created by -aa, -oocsn or -oocsf) cannot use input files!".into(),
-            ));
-        }
+    if let Some((kind, second)) = secondary {
+        validate_for_engine(second)?;
+        validate_secondary(kind, scenario, second)?;
     }
     if scenario.role == Role::Uac && config.target.is_none() {
         return Err(EngineError(
             "this scenario places calls (UAC): a remote target is required".into(),
         ));
     }
-    let mut engine = Engine::new(scenario, ooc, config, ui)?;
+    let mut engine = Engine::new(scenario, secondary, config, ui)?;
     let control = engine.control.clone();
     let report = engine.run_loop();
     Ok((report, control))
+}
+
+/// The startup rules for a secondary scenario. SIPp enforces only the
+/// out-of-call ones; the mixed-mode ones are what its help text promises
+/// ("the second scenario MUST be a server mode scenario, and the first
+/// scenario MUST be a client-mode scenario") and never checks.
+fn validate_secondary(
+    kind: SecondaryKind,
+    main: &Scenario,
+    second: &Scenario,
+) -> Result<(), EngineError> {
+    match kind {
+        SecondaryKind::OutOfCall => {
+            if main.role == Role::Uas {
+                return Err(EngineError(
+                    "SIPp cannot use out-of-call scenarios when running in server mode".into(),
+                ));
+            }
+            if second.uses_injection_fields() {
+                return Err(EngineError(
+                    "Automatic calls (created by -aa, -oocsn or -oocsf) cannot use input files!"
+                        .into(),
+                ));
+            }
+        }
+        SecondaryKind::Receive => {
+            if main.role == Role::Uas {
+                return Err(EngineError(format!(
+                    "-rxsf/-rxsn: the main scenario must be a client-mode scenario \
+                     (it originates the calls), but '{}' starts with a recv",
+                    main.name
+                )));
+            }
+            if second.role == Role::Uac {
+                return Err(EngineError(format!(
+                    "-rxsf/-rxsn: the receive scenario must be a server-mode scenario \
+                     (its first message command a recv), but '{}' starts with a send",
+                    second.name
+                )));
+            }
+        }
+    }
+    if twin_role(second).is_some() {
+        return Err(EngineError(format!(
+            "the {} scenario cannot use <sendCmd>/<recvCmd> (3PCC)",
+            kind.noun()
+        )));
+    }
+    Ok(())
+}
+
+impl SecondaryKind {
+    /// How messages name this scenario: "out-of-call" or "receive".
+    #[must_use]
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::OutOfCall => "out-of-call",
+            Self::Receive => "receive",
+        }
+    }
 }
 
 /// Which end of the 3PCC twin socket this instance is.
@@ -650,10 +721,11 @@ impl Transport {
     }
 }
 
-/// The out-of-call scenario (`-oocsf`/`-oocsn`), compiled independently of
-/// the main one: its own step stats, repartitions and CSeq guard (SIPp's
-/// `ooc_scenario` with its own `CStat`).
-struct OocScenario<'s> {
+/// The secondary scenario (out-of-call or receive), compiled independently
+/// of the main one: its own step stats, repartitions and CSeq guard (SIPp's
+/// `ooc_scenario`/`rx_scenario`, each with its own `CStat`).
+struct SecondaryScenario<'s> {
+    kind: SecondaryKind,
     scenario: &'s Scenario,
     stats: sipr_stats::StatSet,
     /// Per-step: CSeq method a response recv must carry (SIPp guard).
@@ -665,12 +737,12 @@ struct Engine<'s> {
     /// Requests of no known call spawn calls here; `None` keeps SIPp's
     /// default of discarding them (the `ooc_default` fallback is commented
     /// out in `sipp.cpp`).
-    ooc: Option<OocScenario<'s>>,
-    /// Live calls on the ooc scenario (SIPp's `open_calls` never includes
+    secondary: Option<SecondaryScenario<'s>>,
+    /// Live calls on the secondary scenario (SIPp's `open_calls` never includes
     /// them: `-l`, `-users` and the end of the run look at the main ones).
-    ooc_live: usize,
-    /// `set display ooc`: the scenario screen shows the ooc scenario.
-    display_ooc: bool,
+    secondary_live: usize,
+    /// `set display ooc|rx`: the screens show the secondary scenario.
+    display_secondary: bool,
     config: EngineConfig,
     transport: Transport,
     /// `[transport]` token and whether the transport is reliable (no retrans).
@@ -777,7 +849,7 @@ struct Engine<'s> {
 impl<'s> Engine<'s> {
     fn new(
         scenario: &'s Scenario,
-        ooc: Option<&'s Scenario>,
+        secondary: Option<(SecondaryKind, &'s Scenario)>,
         config: &EngineConfig,
         ui: Option<UiChannels>,
     ) -> Result<Self, EngineError> {
@@ -810,8 +882,11 @@ impl<'s> Engine<'s> {
                 }
             });
         // Injection files first: `-t ui` binds sockets from their IP column.
-        let mut inf_files = Vec::with_capacity(config.inf_files.len());
-        for path in &config.inf_files {
+        // `-inf` files lead, `-rxinf` ones follow in the same table (SIPp's
+        // one `inFiles` map): the first `-inf` stays the default file.
+        let inf_default_files = config.inf_files.len();
+        let mut inf_files = Vec::with_capacity(inf_default_files + config.rx_inf_files.len());
+        for path in config.inf_files.iter().chain(&config.rx_inf_files) {
             let text = std::fs::read_to_string(path).map_err(|e| {
                 EngineError(format!(
                     "cannot read injection file {}: {e}",
@@ -842,7 +917,10 @@ impl<'s> Engine<'s> {
             cell.borrow_mut().build_index(*field);
         }
         // Reject scenarios whose [fieldN file=…] names a file we did not load.
-        validate_field_files(scenario, &inf_files)?;
+        validate_field_files(scenario, &inf_files, inf_default_files)?;
+        if let Some((SecondaryKind::Receive, rx)) = secondary {
+            validate_field_files(rx, &inf_files, inf_default_files)?;
+        }
         let mut tcfg = TransportConfig {
             local_ip: config.local_ip,
             port: config.port,
@@ -929,11 +1007,6 @@ impl<'s> Engine<'s> {
         };
         // 3PCC twin control channel. The role comes from the first twin command
         // in the scenario: sendCmd-first dials the peer, recvCmd-first listens.
-        if ooc.is_some_and(|o| twin_role(o).is_some()) {
-            return Err(EngineError(
-                "the out-of-call scenario cannot use <sendCmd>/<recvCmd> (3PCC)".into(),
-            ));
-        }
         let twin = match (twin_role(scenario), config.twin_addr) {
             (Some(role), Some(addr)) => {
                 let (twin_tx, twin_rx) = channel::<String>();
@@ -969,15 +1042,16 @@ impl<'s> Engine<'s> {
         };
         // Media: captures are parsed once here (SIPp: at scenario parse) and
         // the media thread exists only when something will be played.
+        let second: Option<&'s Scenario> = secondary.map(|(_, sc)| sc);
         let mut pcaps = load_pcaps(scenario, config)?;
         let mut rtp_files = load_rtp_files(scenario, config)?;
-        if let Some(o) = ooc {
+        if let Some(o) = second {
             pcaps.extend(load_pcaps(o, config)?);
             rtp_files.extend(load_rtp_files(o, config)?);
         }
         for cmd in scenario
             .rtp_echo_cmds()
-            .chain(ooc.into_iter().flat_map(Scenario::rtp_echo_cmds))
+            .chain(second.into_iter().flat_map(Scenario::rtp_echo_cmds))
         {
             // SIPp resolves the echo's codec at parse time and fails on an
             // unknown one; sipr only needs the validation.
@@ -1007,7 +1081,7 @@ impl<'s> Engine<'s> {
             );
             Some(server)
         } else {
-            if scenario.toggles_rtp_echo() || ooc.is_some_and(Scenario::toggles_rtp_echo) {
+            if scenario.toggles_rtp_echo() || second.is_some_and(Scenario::toggles_rtp_echo) {
                 eprintln!(
                     "sipr: warning: the scenario uses <rtp_echo> but -rtp_echo was not given — \
                      nothing is echoing"
@@ -1015,7 +1089,7 @@ impl<'s> Engine<'s> {
             }
             None
         };
-        let media = if !(scenario.has_media() || ooc.is_some_and(Scenario::has_media)) {
+        let media = if !(scenario.has_media() || second.is_some_and(Scenario::has_media)) {
             None
         } else {
             let (media_tx, media_rx) = channel::<MediaEvent>();
@@ -1226,19 +1300,20 @@ impl<'s> Engine<'s> {
             f.write(&sipr_stats::StatSet::csv_header());
         }
         let stat_set = new_stat_set(scenario);
-        let ooc = ooc.map(|o| OocScenario {
-            scenario: o,
-            stats: new_stat_set(o),
-            expected_cseq_method: precompute_cseq_methods(o),
+        let secondary = secondary.map(|(kind, sc)| SecondaryScenario {
+            kind,
+            scenario: sc,
+            stats: new_stat_set(sc),
+            expected_cseq_method: precompute_cseq_methods(sc),
         });
         // Load -inf injection files up front (fail fast on bad files). SIPp
         // keys files by basename; keyword `file=` and `-infindex` match that.
         let inf_len = inf_files.len();
         Ok(Self {
             scenario,
-            ooc,
-            ooc_live: 0,
-            display_ooc: false,
+            secondary,
+            secondary_live: 0,
+            display_secondary: false,
             config: config.clone(),
             transport,
             transport_token,
@@ -1325,7 +1400,7 @@ impl<'s> Engine<'s> {
         self.refill_users(); // users mode opens its initial N calls now
         loop {
             // SIPp's `open_calls` counts main-scenario calls only: the run
-            // ends when they are done, whatever ooc calls still linger.
+            // ends when they are done, whatever secondary calls still linger.
             if self.hard_stop || (self.done_creating() && self.live_main() == 0) {
                 break;
             }
@@ -1464,32 +1539,47 @@ impl<'s> Engine<'s> {
         if self.snapshot_tx.is_none() && self.control_snapshot.is_none() {
             return;
         }
+        // `set display ooc|rx` (SIPp `display_scenario`): every screen —
+        // counters, statistics, repartitions and the scenario page — shows
+        // the displayed scenario (`screen.cpp` reads `display_scenario->stats`
+        // throughout). Global counters stay global.
+        let displayed = self.displayed_scenario();
+        let (shown, live) = match displayed.secondary_name() {
+            Some(_) => match self.secondary.as_ref() {
+                Some(o) => (&o.stats, self.secondary_live),
+                None => (&self.stats, self.live_main()),
+            },
+            None => (&self.stats, self.live_main()),
+        };
+        let shown_scenario = match self.secondary.as_ref() {
+            Some(o) if displayed.secondary_name().is_some() => o.scenario,
+            _ => self.scenario,
+        };
         let mut snap = sipr_stats::Snapshot {
-            scenario: self.scenario.name.clone(),
-            uas: self.scenario.role == Role::Uas,
+            scenario: shown_scenario.name.clone(),
+            uas: shown_scenario.role == Role::Uas,
+            mixed: self
+                .secondary
+                .as_ref()
+                .is_some_and(|o| o.kind == SecondaryKind::Receive),
             rate_target: self.control.rate(),
             paused: self.paused,
             hide: self.hide,
             screen_request: self.screen_request,
+            display: displayed,
             ..Default::default()
         };
-        self.stats.fill_snapshot(&mut snap, self.live_main());
-        // `set display ooc` (SIPp `display_scenario`): only the scenario
-        // screen follows; the statistics stay the main scenario's.
-        if self.display_ooc
-            && let Some(o) = self.ooc.as_ref()
-        {
-            snap.display_ooc = Some(o.scenario.name.clone());
-            snap.steps = o.stats.step_rows();
-        }
+        shown.fill_snapshot(&mut snap, live);
+        snap.auto_answered = self.stats.auto_answered;
+        snap.garbage = self.stats.garbage;
         let now = Instant::now();
         let (last_at, last_created) = self.last_snapshot;
         #[allow(clippy::cast_precision_loss)]
         {
-            snap.rate_period = (self.stats.created() - last_created) as f64
+            snap.rate_period = shown.created().saturating_sub(last_created) as f64
                 / now.duration_since(last_at).as_secs_f64().max(1e-9);
         }
-        self.last_snapshot = (now, self.stats.created());
+        self.last_snapshot = (now, shown.created());
         if let Some(shared) = self.control_snapshot.as_ref()
             && let Ok(mut slot) = shared.lock()
         {
@@ -1673,13 +1763,23 @@ impl<'s> Engine<'s> {
                 }
                 self.config.limit = Some(*n);
             }
-            ControlCmd::SetDisplay(which) => match which.as_str() {
-                "main" => self.display_ooc = false,
-                "ooc" if self.ooc.is_some() => self.display_ooc = true,
-                // SIPp: "Unknown display scenario: %s" when that scenario is
-                // not loaded (and sipr has no rx scenario at all).
-                other => return Err(format!("Unknown display scenario: {other}")),
-            },
+            ControlCmd::SetDisplay(which) => {
+                let kind = self.secondary.as_ref().map(|o| o.kind);
+                match (which.as_str(), kind) {
+                    ("main", _) => self.display_secondary = false,
+                    ("ooc", Some(SecondaryKind::OutOfCall))
+                    | ("rx", Some(SecondaryKind::Receive)) => self.display_secondary = true,
+                    // SIPp: "Unknown display scenario: %s" when that scenario
+                    // is not loaded.
+                    (other, _) => return Err(format!("Unknown display scenario: {other}")),
+                }
+                // The period rate restarts from the displayed scenario's count.
+                let created = match self.secondary.as_ref() {
+                    Some(o) if self.display_secondary => o.stats.created(),
+                    _ => self.stats.created(),
+                };
+                self.last_snapshot = (Instant::now(), created);
+            }
             ControlCmd::SetHide(on) => self.hide = *on,
             ControlCmd::Trace { log, on } => self.set_trace(log, *on)?,
             ControlCmd::Dump(what) => {
@@ -1699,7 +1799,7 @@ impl<'s> Engine<'s> {
             }
             ControlCmd::ResetStats => {
                 self.stats.reset();
-                if let Some(o) = self.ooc.as_mut() {
+                if let Some(o) = self.secondary.as_mut() {
                     o.stats.reset();
                 }
                 self.last_snapshot = (Instant::now(), 0);
@@ -1802,38 +1902,55 @@ impl<'s> Engine<'s> {
         }
     }
 
+    /// What the screens show (SIPp `display_scenario`).
+    fn displayed_scenario(&self) -> sipr_stats::Display {
+        match self.secondary.as_ref() {
+            Some(o) if self.display_secondary => match o.kind {
+                SecondaryKind::OutOfCall => sipr_stats::Display::OutOfCall(o.scenario.name.clone()),
+                SecondaryKind::Receive => sipr_stats::Display::Receive(o.scenario.name.clone()),
+            },
+            _ => sipr_stats::Display::Main,
+        }
+    }
+
     /// Live calls on the main scenario — SIPp's `open_calls`, which the
     /// `-l` cap, `-users` refills and the end of the run look at.
     fn live_main(&self) -> usize {
-        self.calls.len().saturating_sub(self.ooc_live)
+        self.calls.len().saturating_sub(self.secondary_live)
     }
 
-    fn is_ooc(&self, call_id: &str) -> bool {
-        self.calls.get(call_id).is_some_and(|c| c.ooc)
+    fn on_secondary(&self, call_id: &str) -> bool {
+        self.calls.get(call_id).is_some_and(|c| c.secondary)
     }
 
-    /// The scenario a call runs (the ooc one for out-of-call calls).
+    /// The scenario a call runs (the secondary one for calls spawned on it).
     fn scenario_of(&self, call_id: &str) -> &'s Scenario {
-        match self.ooc.as_ref() {
-            Some(o) if self.is_ooc(call_id) => o.scenario,
+        match self.secondary.as_ref() {
+            Some(o) if self.on_secondary(call_id) => o.scenario,
             _ => self.scenario,
         }
     }
 
     /// The stat set of the scenario a call runs (see [`stats_for`]).
-    fn stats_of(&mut self, ooc: bool) -> &mut sipr_stats::StatSet {
-        stats_for(&mut self.stats, self.ooc.as_mut(), ooc)
+    fn stats_of(&mut self, secondary: bool) -> &mut sipr_stats::StatSet {
+        stats_for(&mut self.stats, self.secondary.as_mut(), secondary)
     }
 
     fn call_stats(&mut self, call_id: &str) -> &mut sipr_stats::StatSet {
-        let ooc = self.is_ooc(call_id);
-        self.stats_of(ooc)
+        let secondary = self.on_secondary(call_id);
+        self.stats_of(secondary)
     }
 
     /// The recv-window scan against the scenario a call runs.
-    fn scan_call(&self, ooc: bool, window_start: usize, waiting: bool, msg: &Inbound) -> Scan {
-        match self.ooc.as_ref() {
-            Some(o) if ooc => scan_for_match(
+    fn scan_call(
+        &self,
+        secondary: bool,
+        window_start: usize,
+        waiting: bool,
+        msg: &Inbound,
+    ) -> Scan {
+        match self.secondary.as_ref() {
+            Some(o) if secondary => scan_for_match(
                 o.scenario,
                 &o.expected_cseq_method,
                 window_start,
@@ -2081,10 +2198,10 @@ impl<'s> Engine<'s> {
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
-                    let is_ooc = call.ooc;
+                    let on_secondary = call.secondary;
                     apply_rtds(
                         call,
-                        stats_for(&mut self.stats, self.ooc.as_mut(), is_ooc),
+                        stats_for(&mut self.stats, self.secondary.as_mut(), on_secondary),
                         &common,
                         now,
                     );
@@ -2372,36 +2489,48 @@ impl<'s> Engine<'s> {
                     call.socket = received_on.map(CallSocket::Udp);
                 }
                 // Fall through to normal matching below (window at 0).
-            } else if let Some(method) = msg.method().filter(|_| self.ooc.is_some()) {
-                // Client mode with an ooc scenario (SIPp socket.cpp
+            } else if let Some(method) = msg.method()
+                && let Some(kind) = self.secondary.as_ref().map(|o| o.kind)
+            {
+                // Client mode with a secondary scenario (SIPp socket.cpp
                 // `process_message`): a request of no known call spawns a
-                // call on it — no user id, no injection line — counted as
-                // an incoming call on the ooc stats and as an auto-answer
-                // globally; the request is then matched against its step 0.
-                self.log_err(&format!(
-                    "Received out-of-call {method} message, using the out-of-call scenario"
-                ));
-                self.spawn_ooc_call(&call_id, packet);
+                // call on it — no user id — counted as an incoming call on
+                // that scenario's stats; the request is then matched against
+                // its step 0. Out-of-call: SIPp's warning plus the global
+                // auto-answered counter. Mixed mode: SIPp logs nothing; the
+                // error-trace line is sipr's.
+                match kind {
+                    SecondaryKind::OutOfCall => self.log_err(&format!(
+                        "Received out-of-call {method} message, using the out-of-call scenario"
+                    )),
+                    SecondaryKind::Receive => self.log_err(&format!(
+                        "Received {method} for no known call, using the receive scenario"
+                    )),
+                }
+                self.spawn_secondary_call(&call_id, packet);
             } else {
-                // An unmapped response (or no ooc scenario at all): SIPp's
-                // E_OUT_OF_CALL_MSGS.
+                // An unmapped response (or no secondary scenario at all):
+                // SIPp's E_OUT_OF_CALL_MSGS. (In mixed mode SIPp spawns a
+                // receive call even for a response, which then fails on it;
+                // sipr keeps discarding responses, as its UAS does.)
                 self.stats.unexpected += 1;
                 self.log_err(&format!("out-of-call message ignored (Call-ID {call_id})"));
                 return;
             }
         }
-        let (window_start, waiting, completing, is_dup, ooc) = match self.calls.get(&call_id) {
+        let (window_start, waiting, completing, is_dup, secondary) = match self.calls.get(&call_id)
+        {
             Some(c) => (
                 c.index,
                 c.waiting,
                 c.completing,
                 c.last_recv_key.as_ref() == Some(&key),
-                c.ooc,
+                c.secondary,
             ),
             None => return,
         };
         if is_dup {
-            self.stats_of(ooc).retrans_recv += 1;
+            self.stats_of(secondary).retrans_recv += 1;
             // Re-send our last message (SIPp: retransmitted request → last
             // response again; harmless for a duplicated response).
             let resend = self
@@ -2410,22 +2539,22 @@ impl<'s> Engine<'s> {
                 .and_then(|c| c.last_sent.clone().map(|b| (b, c.remote)));
             if let Some((buf, remote)) = resend {
                 let _ = self.send_for_call(&call_id, &buf, remote, None);
-                self.stats_of(ooc).retrans_sent += 1;
+                self.stats_of(secondary).retrans_sent += 1;
                 self.trace_send(&buf, remote);
             }
             return;
         }
         if completing {
             // Timewait: absorb without failing (deadcall behavior).
-            self.stats_of(ooc).unexpected += 1;
+            self.stats_of(secondary).unexpected += 1;
             return;
         }
-        let scan = self.scan_call(ooc, window_start, waiting || window_start == 0, msg);
+        let scan = self.scan_call(secondary, window_start, waiting || window_start == 0, msg);
         match scan {
             Scan::Forward(si) => self.on_matched(&call_id, si, msg, key),
             Scan::Old => {
                 // Late/repeated optional (e.g. another 180): absorbed.
-                self.stats_of(ooc).messages_matched += 1;
+                self.stats_of(secondary).messages_matched += 1;
                 if let Some(call) = self.calls.get_mut(&call_id) {
                     call.last_recv_key = Some(key);
                 }
@@ -2437,7 +2566,7 @@ impl<'s> Engine<'s> {
                 if self.try_auto_answer(&call_id, msg) {
                     return;
                 }
-                let stats = self.stats_of(ooc);
+                let stats = self.stats_of(secondary);
                 stats.unexpected += 1;
                 if let Some(s) = stats.step_mut(window_start) {
                     s.unexpected += 1;
@@ -2454,18 +2583,29 @@ impl<'s> Engine<'s> {
         }
     }
 
-    /// Create a call on the out-of-call scenario for a request of no known
+    /// Create a call on the secondary scenario for a request of no known
     /// call, keyed by its Call-ID. The remote is the packet's source (or
     /// `-rsa`); the reply leaves on the socket the request hit, when that
-    /// is a per-IP or per-call one.
-    fn spawn_ooc_call(&mut self, call_id: &str, packet: &sipr_net::InboundPacket) {
-        let Some(o) = self.ooc.as_mut() else {
+    /// is a per-IP or per-call one. An out-of-call call carries no injection
+    /// line and counts as auto-answered (SIPp `E_AUTO_ANSWERED`); a receive
+    /// call draws its lines like any incoming call.
+    fn spawn_secondary_call(&mut self, call_id: &str, packet: &sipr_net::InboundPacket) {
+        let Some(kind) = self.secondary.as_ref().map(|o| o.kind) else {
+            return;
+        };
+        let field_lines = match kind {
+            SecondaryKind::OutOfCall => vec![None; self.inf_files.len()],
+            SecondaryKind::Receive => self.assign_field_lines(None),
+        };
+        let Some(o) = self.secondary.as_mut() else {
             return;
         };
         o.stats.incoming_created += 1;
         let number = o.stats.created();
         let vars = &o.scenario.vars;
-        self.stats.auto_answered += 1;
+        if kind == SecondaryKind::OutOfCall {
+            self.stats.auto_answered += 1;
+        }
         let cnonce = self.make_cnonce(number);
         let mut call = new_call(
             number,
@@ -2474,10 +2614,10 @@ impl<'s> Engine<'s> {
             self.config.base_cseq,
             vars,
             cnonce,
-            vec![None; self.inf_files.len()],
+            field_lines,
             None,
         );
-        call.ooc = true;
+        call.secondary = true;
         call.server_ip = packet.local.ip().to_string();
         call.socket = self
             .ip_sockets
@@ -2491,7 +2631,7 @@ impl<'s> Engine<'s> {
                     .find(|s| s.local_addr() == packet.local)
             });
         self.calls.insert(call_id.to_owned(), call);
-        self.ooc_live += 1;
+        self.secondary_live += 1;
     }
 
     /// Common handling for a message matched at step `si`.
@@ -2540,10 +2680,10 @@ impl<'s> Engine<'s> {
                 .map(ToOwned::to_owned)
                 .collect();
         }
-        let is_ooc = call.ooc;
+        let on_secondary = call.secondary;
         apply_rtds(
             call,
-            stats_for(&mut self.stats, self.ooc.as_mut(), is_ooc),
+            stats_for(&mut self.stats, self.secondary.as_mut(), on_secondary),
             &common,
             now,
         );
@@ -3871,18 +4011,19 @@ impl<'s> Engine<'s> {
         if let Some(mut call) = self.calls.remove(call_id) {
             self.cancel_call_timers(&mut call);
             self.stop_media(call_id);
-            self.forget_ooc(&call);
-            let stats = self.stats_of(call.ooc);
+            self.forget_secondary(&call);
+            let stats = self.stats_of(call.secondary);
             stats.successful += 1;
             stats.record_call_length(call.started.elapsed());
             self.return_user(&call);
         }
     }
 
-    /// Keep the ooc live count in step when an ooc call leaves the table.
-    fn forget_ooc(&mut self, call: &CallState) {
-        if call.ooc {
-            self.ooc_live = self.ooc_live.saturating_sub(1);
+    /// Keep the secondary live count in step when a secondary call leaves
+    /// the table.
+    fn forget_secondary(&mut self, call: &CallState) {
+        if call.secondary {
+            self.secondary_live = self.secondary_live.saturating_sub(1);
         }
     }
 
@@ -3892,8 +4033,8 @@ impl<'s> Engine<'s> {
         if let Some(mut call) = self.calls.remove(call_id) {
             self.cancel_call_timers(&mut call);
             self.stop_media(call_id);
-            self.forget_ooc(&call);
-            self.stats_of(call.ooc)
+            self.forget_secondary(&call);
+            self.stats_of(call.secondary)
                 .record_call_length(call.started.elapsed());
             self.return_user(&call);
         }
@@ -4101,7 +4242,7 @@ fn new_call(
         socket: None,
         render_remote,
         server_ip: String::new(),
-        ooc: false,
+        secondary: false,
     }
 }
 
@@ -4127,11 +4268,11 @@ fn new_stat_set(scenario: &Scenario) -> sipr_stats::StatSet {
 /// into the call table.
 fn stats_for<'a>(
     main: &'a mut sipr_stats::StatSet,
-    ooc: Option<&'a mut OocScenario<'_>>,
-    is_ooc: bool,
+    secondary: Option<&'a mut SecondaryScenario<'_>>,
+    on_secondary: bool,
 ) -> &'a mut sipr_stats::StatSet {
-    match ooc {
-        Some(o) if is_ooc => &mut o.stats,
+    match secondary {
+        Some(o) if on_secondary => &mut o.stats,
         _ => main,
     }
 }
@@ -4562,14 +4703,17 @@ fn validate_for_engine(scenario: &Scenario) -> Result<(), EngineError> {
 
 /// Reject a scenario whose `[fieldN file=…]` names an injection file that was
 /// not loaded (SIPp errors at parse time). A bare name or a numeric index both
-/// count; `None` (default file) needs at least one `-inf`.
+/// count; `None` (the default file) needs at least one `-inf` — the first
+/// `default_files` entries of `files` — as `-rxinf` never sets SIPp's
+/// `default_file` ("No injection file was specified!").
 fn validate_field_files(
     scenario: &Scenario,
     files: &[std::cell::RefCell<InjectionFile>],
+    default_files: usize,
 ) -> Result<(), EngineError> {
     let resolves = |spec: Option<&str>| -> bool {
         match spec {
-            None => !files.is_empty(),
+            None => default_files > 0,
             Some(s) => {
                 files.iter().any(|c| c.borrow().name == s)
                     || s.parse::<usize>().is_ok_and(|i| i < files.len())
@@ -4587,7 +4731,9 @@ fn validate_field_files(
                         "scenario uses [field... file={f}] but no injection file \
                          named '{f}' was given with -inf"
                     ),
-                    None => "scenario uses [fieldN] but no -inf file was given".to_owned(),
+                    None => "No injection file was specified! (the scenario uses a bare \
+                             [fieldN], which reads the first -inf file)"
+                        .to_owned(),
                 }));
             }
         }

@@ -4,6 +4,25 @@ All notable changes to sipr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Mixed mode** (`-rxsf <file>` / `-rxsn <name>`, `-rxinf <file>`) — a
+  second, server-mode scenario terminates the calls the peer originates
+  towards us while the client-mode main scenario originates ours, as in
+  SIPp: own statistics, rx calls never counting toward `-m`/`-l`/`-users`,
+  `-rxinf` files joining the injection table after the `-inf` ones, and
+  `set display rx` over the control socket. sipr enforces the role rules
+  SIPp's help text only promises. Verified against real sipp both ways.
+
+### Changed
+
+- `set display ooc|main|rx` now switches every screen — counters,
+  statistics, repartitions and the scenario page — to the displayed
+  scenario, as SIPp does; 0.22.0 swapped only the scenario page. The HTTP
+  `/stats` document gains a `mixed` flag.
+
 ## [0.22.0] — 2026-09-12
 
 ### Added

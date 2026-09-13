@@ -56,7 +56,7 @@ pub struct Cli {
     pub target: Option<String>,
     /// `-sf`: load a scenario from an XML file.
     pub sf: Option<PathBuf>,
-    /// `-sn`: use an embedded default scenario (`uac` | `uas`).
+    /// `-sn`: use an embedded default scenario (`uac` | `uas` | ...).
     pub sn: Option<String>,
     /// `-sd`: print an embedded default scenario to stdout and exit.
     pub sd: Option<String>,
@@ -65,6 +65,13 @@ pub struct Cli {
     /// `-oocsn`: use an embedded out-of-call scenario (`ooc_default` |
     /// `ooc_dummy`).
     pub oocsn: Option<String>,
+    /// `-rxsf`: load the mixed-mode receive scenario from an XML file.
+    pub rxsf: Option<PathBuf>,
+    /// `-rxsn`: use an embedded scenario (`uas`) as the receive scenario.
+    pub rxsn: Option<String>,
+    /// `-rxinf`: injection files loaded after the `-inf` ones, reachable by
+    /// name from either scenario; repeatable, in order.
+    pub rxinf: Vec<PathBuf>,
     /// `--check`: lint the scenario, print its compiled form, and exit (M1).
     pub check: bool,
     /// `-r`: new calls per rate period.
@@ -195,6 +202,9 @@ impl Default for Cli {
             sd: None,
             oocsf: None,
             oocsn: None,
+            rxsf: None,
+            rxsn: None,
+            rxinf: Vec::new(),
             check: false,
             rate: 10.0,
             rate_period_ms: 1000,
@@ -295,6 +305,18 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         true,
         "NAME",
         "Use an embedded out-of-call scenario: ooc_default | ooc_dummy",
+    ),
+    (
+        "rxsf",
+        true,
+        "FILE",
+        "Mixed mode: load a second, server-mode scenario from an XML file to terminate the calls the peer originates while the main (client-mode) scenario originates ours",
+    ),
+    (
+        "rxsn",
+        true,
+        "NAME",
+        "Mixed mode: use an embedded scenario (uas) as the receive scenario",
     ),
     (
         "check",
@@ -582,6 +604,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "Injection file (CSV) for [fieldN]; repeatable",
     ),
     (
+        "rxinf",
+        true,
+        "FILE",
+        "Injection file (CSV) loaded after the -inf ones, for [fieldN file=NAME] in either scenario; repeatable",
+    ),
+    (
         "infindex",
         true,
         "FILE FIELD",
@@ -713,6 +741,19 @@ where
     if cli.oocsf.is_some() && cli.oocsn.is_some() {
         return Err("options '-oocsf' and '-oocsn' cannot be used together".to_owned());
     }
+    if cli.rxsf.is_some() && cli.rxsn.is_some() {
+        return Err("options '-rxsf' and '-rxsn' cannot be used together".to_owned());
+    }
+    // SIPp's out-of-call branch is unreachable in mixed mode (socket.cpp
+    // `process_message` takes the MODE_MIXED arm first): refuse loudly rather
+    // than load a scenario that never fires.
+    if (cli.rxsf.is_some() || cli.rxsn.is_some()) && (cli.oocsf.is_some() || cli.oocsn.is_some()) {
+        return Err(
+            "options '-rxsf'/'-rxsn' and '-oocsf'/'-oocsn' cannot be used together \
+             (SIPp never reaches the out-of-call scenario in mixed mode)"
+                .to_owned(),
+        );
+    }
     if cli.users.is_some() && cli.limit.is_some() {
         return Err(
             "options '-users' and '-l' cannot be used together (users mode is closed-loop)"
@@ -735,6 +776,9 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "sd" => cli.sd = Some(val(value)),
         "oocsf" => cli.oocsf = Some(PathBuf::from(val(value))),
         "oocsn" => cli.oocsn = Some(val(value)),
+        "rxsf" => cli.rxsf = Some(PathBuf::from(val(value))),
+        "rxsn" => cli.rxsn = Some(val(value)),
+        "rxinf" => cli.rxinf.push(PathBuf::from(val(value))),
         "check" => cli.check = true,
         "r" => cli.rate = parse_num(flag, &val(value))?,
         "rp" => cli.rate_period_ms = parse_num(flag, &val(value))?,
@@ -1059,6 +1103,31 @@ mod tests {
         );
         let err = run(&["-oocsn"]).unwrap_err();
         assert!(err.contains("'-oocsn' requires a value"), "{err}");
+    }
+
+    #[test]
+    fn mixed_mode_flags_parse_and_conflict() {
+        let c = cli(&["-rxsn", "uas", "-rxinf", "a.csv", "-rxinf", "b.csv", "host"]);
+        assert_eq!(c.rxsn.as_deref(), Some("uas"));
+        assert!(c.rxsf.is_none());
+        assert_eq!(
+            c.rxinf,
+            vec![PathBuf::from("a.csv"), PathBuf::from("b.csv")]
+        );
+        let c = cli(&["-rxsf", "rx.xml", "host"]);
+        assert_eq!(c.rxsf.as_deref(), Some(std::path::Path::new("rx.xml")));
+        let err = run(&["-rxsf", "rx.xml", "-rxsn", "uas"]).unwrap_err();
+        assert!(
+            err.contains("'-rxsf' and '-rxsn' cannot be used together"),
+            "{err}"
+        );
+        let err = run(&["-rxsn", "uas", "-oocsn", "ooc_default"]).unwrap_err();
+        assert!(
+            err.contains("'-rxsf'/'-rxsn' and '-oocsf'/'-oocsn' cannot be used together"),
+            "{err}"
+        );
+        let err = run(&["-rxsf"]).unwrap_err();
+        assert!(err.contains("'-rxsf' requires a value"), "{err}");
     }
 
     #[test]

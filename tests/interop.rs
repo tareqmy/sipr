@@ -2780,3 +2780,328 @@ fn sipr_ooc_scenario_answers_real_sipps_out_of_call_options() {
         "sipp error log:\n{sipp_errors}"
     );
 }
+
+/// A UAC flow that lingers in timewait after its BYE: in mixed mode each
+/// side's run ends with its *main* calls, so the timewait is what keeps a
+/// side alive for the peer's last originated call.
+fn mixed_uac_xml() -> &'static str {
+    r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="uac-timewait">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Subject: Mixed-mode test
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200" rtd="true"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <pause/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200" crlf="true"/>
+  <timewait milliseconds="3000"/>
+</scenario>
+"#
+}
+
+/// SIPp's classic UAS responder, as a file for `-rxsf` (SIPp 3.7 rejects
+/// `-rxsn`: the option table spells it `rxrn` and the parser `rxsn`).
+fn mixed_uas_xml() -> &'static str {
+    r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="uas-receive">
+  <recv request="INVITE" crlf="true"/>
+  <send><![CDATA[
+    SIP/2.0 180 Ringing
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <send retrans="500"><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK" rtd="true" crlf="true"/>
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <timewait milliseconds="4000"/>
+</scenario>
+"#
+}
+
+/// Read a reaped child's stderr to a string.
+fn child_stderr(child: &mut Child) -> String {
+    child
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default()
+}
+
+/// Mixed mode both ways: real sipp (`-sf uac -rxsf uas`) and sipr
+/// (`-sf uac -rxsn uas`) each originate three calls to the other and
+/// terminate the other's three on their receive scenario. sipp starts
+/// first at one call per second (its first call comes one interval in),
+/// sipr follows at three per second; each side's timewait keeps it alive
+/// for the peer's last originated call (`socket.cpp` `MODE_MIXED`).
+#[test]
+fn real_sipp_and_sipr_terminate_each_others_calls_in_mixed_mode() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::real_sipp_and_sipr_terminate_each_others_calls_in_mixed_mode — no sipp."
+        );
+        return;
+    };
+    let sipp_dir = tempfile::tempdir().expect("tempdir");
+    let sipr_dir = tempfile::tempdir().expect("tempdir");
+    let uac_path = sipp_dir.path().join("uac-timewait.xml");
+    let uas_path = sipp_dir.path().join("uas-receive.xml");
+    std::fs::write(&uac_path, mixed_uac_xml()).expect("write uac");
+    std::fs::write(&uas_path, mixed_uas_xml()).expect("write uas");
+    let sipp_port = free_port();
+    let sipr_port = free_port();
+    let mut sipp_mixed = Reaper(
+        Command::new(&sipp)
+            .current_dir(sipp_dir.path())
+            .args([
+                "-sf",
+                uac_path.to_str().expect("utf8"),
+                "-rxsf",
+                uas_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &sipp_port.to_string(),
+                "-r",
+                "1",
+                "-m",
+                "3",
+                "-d",
+                "300",
+                "-timeout",
+                "30s",
+                "-trace_err",
+                &format!("127.0.0.1:{sipr_port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp mixed"),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let mut sipr_mixed = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .current_dir(sipr_dir.path())
+            .args([
+                "-sf",
+                uac_path.to_str().expect("utf8"),
+                "-rxsn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &sipr_port.to_string(),
+                "-r",
+                "3",
+                "-m",
+                "3",
+                "-d",
+                "300",
+                "-timeout",
+                "30",
+                "-trace_err",
+                "-bg",
+                &format!("127.0.0.1:{sipp_port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipr mixed"),
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_mixed.0, Duration::from_secs(25));
+    let stderr = child_stderr(&mut sipr_mixed.0);
+    assert_eq!(sipr_code, Some(0), "sipr must exit 0; stderr:\n{stderr}");
+    // sipr's own three calls were answered by sipp's receive scenario…
+    assert!(stderr.contains("successful 3 failed 0"), "{stderr}");
+    assert!(stderr.contains(" unexpected 0 "), "{stderr}");
+    // …and sipp's three were answered by sipr's: sipp exits 0 only when all
+    // of its main calls succeeded.
+    let sipp_code = wait_with_timeout(&mut sipp_mixed.0, Duration::from_secs(25));
+    let sipp_errors = sipp_error_log(sipp_dir.path());
+    assert_eq!(
+        sipp_code,
+        Some(0),
+        "sipp must exit 0; its error log:\n{sipp_errors}"
+    );
+    let sipr_errors = sipp_error_log(sipr_dir.path());
+    assert_eq!(
+        sipr_errors
+            .matches("Received INVITE for no known call, using the receive scenario")
+            .count(),
+        3,
+        "sipr error log:\n{sipr_errors}"
+    );
+}
+
+/// sipr in mixed mode between two plain sipps: its main scenario calls a
+/// real sipp UAS while its receive scenario terminates the calls a real
+/// sipp UAC places at it.
+#[test]
+fn sipr_receive_scenario_answers_a_plain_real_sipp_uac() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::sipr_receive_scenario_answers_a_plain_real_sipp_uac — no sipp."
+        );
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let uac_path = dir.path().join("uac-timewait.xml");
+    std::fs::write(&uac_path, mixed_uac_xml()).expect("write uac");
+    let uas_port = free_port();
+    let sipr_port = free_port();
+    let _sipp_uas = Reaper(
+        Command::new(&sipp)
+            .current_dir(dir.path())
+            .args([
+                "-sn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &uas_port.to_string(),
+                "-timeout",
+                "30s",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uas"),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let mut sipr_mixed = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .current_dir(dir.path())
+            .args([
+                "-sf",
+                uac_path.to_str().expect("utf8"),
+                "-rxsn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &sipr_port.to_string(),
+                "-r",
+                "3",
+                "-m",
+                "3",
+                "-d",
+                "300",
+                "-timeout",
+                "30",
+                "-bg",
+                &format!("127.0.0.1:{uas_port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipr mixed"),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let mut sipp_uac = Reaper(
+        Command::new(&sipp)
+            .current_dir(dir.path())
+            .args([
+                "-sn",
+                "uac",
+                "-i",
+                "127.0.0.1",
+                "-r",
+                "3",
+                "-m",
+                "3",
+                "-d",
+                "300",
+                "-timeout",
+                "20s",
+                "-trace_err",
+                &format!("127.0.0.1:{sipr_port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uac"),
+    );
+    let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(20));
+    let sipp_errors = sipp_error_log(dir.path());
+    assert_eq!(
+        sipp_code,
+        Some(0),
+        "sipp uac must exit 0 (sipr's receive scenario answered it); error log:\n{sipp_errors}"
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_mixed.0, Duration::from_secs(20));
+    let stderr = child_stderr(&mut sipr_mixed.0);
+    assert_eq!(sipr_code, Some(0), "sipr must exit 0; stderr:\n{stderr}");
+    assert!(stderr.contains("successful 3 failed 0"), "{stderr}");
+    assert!(stderr.contains(" unexpected 0 "), "{stderr}");
+}

@@ -28,7 +28,7 @@ echo -n 'cset rate 50' | nc -u -w0 127.0.0.1 8888  # command: rate to 50 cps
   | `set rate-scale N` | step multiplier for the rate keys (default 1) |
   | `set users N` | user count (`-users` mode only) |
   | `set limit N` | concurrent-call cap (rate mode only) |
-  | `set display main\|ooc` | scenario screen shows the main / out-of-call scenario (`ooc` needs `-oocsf`/`-oocsn`; `rx` has no sipr screen) |
+  | `set display main\|ooc\|rx` | every screen (counters, statistics, repartitions, scenario page) shows the main / out-of-call / receive scenario (`ooc` needs `-oocsf`/`-oocsn`, `rx` needs `-rxsf`/`-rxsn`; SIPp's `display_scenario`) |
   | `set hide true\|false` | skip `hide="true"` steps on the scenario screen (default true) |
   | `trace messages\|error on\|off` | open/close the trace file at runtime (SIPp's file naming) |
   | `trace logs\|shortmessages on\|off` | not supported (warning) |
@@ -85,7 +85,7 @@ Statistics snapshot — SIPp's counter names, durations in `_ms`:
 ```json
 {"scenario":"uac","role":"UAC","elapsed_ms":12034,"live":3,
  "rate_target":10,"rate_period_cps":9.8,"rate_cumulative_cps":9.9,"paused":false,"hide":true,
- "display":"main",
+ "display":"main","mixed":false,
  "created":120,"successful":117,"failed":0,
  "failed_unexpected":0,"failed_timeout":0,"failed_retrans":0,"failed_other":0,
  "messages_sent":360,"messages_matched":351,"retrans_sent":0,"retrans_recv":0,

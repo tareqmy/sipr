@@ -36,6 +36,7 @@ fn uas_config() -> EngineConfig {
         trace_stat: None,
         stat_interval: Duration::from_secs(1),
         inf_files: Vec::new(),
+        rx_inf_files: Vec::new(),
         inf_index: Vec::new(),
         transport: sipr_engine::TransportKind::UdpMono,
         max_socket: 50_000,

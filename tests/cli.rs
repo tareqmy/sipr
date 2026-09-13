@@ -337,3 +337,147 @@ fn check_mode_lints_the_ooc_scenario_too() {
     let err = stderr(&o);
     assert!(err.contains("bogus"), "{err}");
 }
+
+#[test]
+fn mixed_mode_flags_conflict_and_roles_are_checked() {
+    let o = sipr(&["-rxsf", "x.xml", "-rxsn", "uas", "127.0.0.1:1"]);
+    assert_code(&o, 2);
+    assert!(stderr(&o).contains("'-rxsf' and '-rxsn' cannot be used together"));
+    // SIPp never reaches the out-of-call branch in mixed mode: refused loudly.
+    let o = sipr(&["-rxsn", "uas", "-oocsn", "ooc_default", "127.0.0.1:1"]);
+    assert_code(&o, 2);
+    assert!(
+        stderr(&o).contains("'-rxsf'/'-rxsn' and '-oocsf'/'-oocsn' cannot be used together"),
+        "{}",
+        stderr(&o)
+    );
+    // The main scenario must originate calls, the receive one answer them —
+    // what SIPp's help promises and never enforces.
+    let o = sipr(&["-sn", "uas", "-rxsn", "uas", "-timeout", "1"]);
+    assert_code(&o, 255);
+    assert!(
+        stderr(&o).contains("the main scenario must be a client-mode scenario"),
+        "{}",
+        stderr(&o)
+    );
+    let o = sipr(&["-sn", "uac", "-rxsn", "uac", "127.0.0.1:1"]);
+    assert_code(&o, 255);
+    assert!(
+        stderr(&o).contains("the receive scenario must be a server-mode scenario"),
+        "{}",
+        stderr(&o)
+    );
+    let o = sipr(&["-rxsn", "nope", "127.0.0.1:1"]);
+    assert_code(&o, 255);
+    assert!(stderr(&o).contains("unknown embedded scenario 'nope'"));
+    let o = sipr(&["-rxsf", "/nonexistent/rx.xml", "127.0.0.1:1"]);
+    assert_code(&o, 255);
+    assert!(stderr(&o).contains("cannot read receive scenario file"));
+}
+
+/// A bare `[fieldN]` reads the first `-inf` file, in the receive scenario
+/// too; `-rxinf` alone does not provide one (SIPp's `default_file` is only
+/// set by `-inf`, so it errors "No injection file was specified!").
+#[test]
+fn receive_scenario_with_a_bare_field_needs_an_inf_file() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let xml = dir.join(format!("sipr-cli-rx-field-{pid}.xml"));
+    let csv = dir.join(format!("sipr-cli-rx-{pid}.csv"));
+    std::fs::write(
+        &xml,
+        r#"<scenario name="rx-with-field">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]RxTag[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    X-User: [field0]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>"#,
+    )
+    .expect("write scenario");
+    std::fs::write(&csv, "SEQUENTIAL\nalice;\n").expect("write csv");
+    let o = sipr(&[
+        "-sn",
+        "uac",
+        "-rxsf",
+        xml.to_str().expect("utf8"),
+        "-rxinf",
+        csv.to_str().expect("utf8"),
+        "127.0.0.1:1",
+    ]);
+    assert_code(&o, 255);
+    let err = stderr(&o);
+    assert!(err.contains("No injection file was specified!"), "{err}");
+    // A named file that was never loaded is refused as for the main scenario.
+    std::fs::write(
+        &xml,
+        r#"<scenario name="rx-with-named-field">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]RxTag[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    X-User: [field0 file=missing.csv]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>"#,
+    )
+    .expect("write scenario");
+    let o = sipr(&[
+        "-sn",
+        "uac",
+        "-rxsf",
+        xml.to_str().expect("utf8"),
+        "-rxinf",
+        csv.to_str().expect("utf8"),
+        "127.0.0.1:1",
+    ]);
+    let _ = std::fs::remove_file(&xml);
+    let _ = std::fs::remove_file(&csv);
+    assert_code(&o, 255);
+    let err = stderr(&o);
+    assert!(
+        err.contains("no injection file named 'missing.csv' was given"),
+        "{err}"
+    );
+}
+
+#[test]
+fn check_mode_lints_the_receive_scenario_too() {
+    let o = sipr(&["--check", "-sn", "uac", "-rxsn", "uas"]);
+    assert_code(&o, 0);
+    let out = stdout(&o);
+    assert!(out.contains("scenario 'Basic Sipstone UAC'"), "{out}");
+    assert!(
+        out.contains("receive scenario 'Basic UAS responder': role=UAS"),
+        "{out}"
+    );
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("sipr-cli-rx-bad-{}.xml", std::process::id()));
+    std::fs::write(
+        &path,
+        "<scenario name=\"bad-rx\">\n  <recv request=\"INVITE\"/>\n  <bogus/>\n</scenario>\n",
+    )
+    .expect("write scenario");
+    let o = sipr(&[
+        "--check",
+        "-sn",
+        "uac",
+        "-rxsf",
+        path.to_str().expect("utf8"),
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_code(&o, 1);
+    assert!(stderr(&o).contains("bogus"), "{}", stderr(&o));
+}

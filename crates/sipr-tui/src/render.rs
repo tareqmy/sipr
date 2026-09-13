@@ -2,7 +2,7 @@
 //! here — everything is unit-testable, and the interactive shell in
 //! `terminal.rs` stays as thin as possible.
 
-use sipr_stats::Snapshot;
+use sipr_stats::{Display, Snapshot};
 
 use crate::style::Palette;
 
@@ -57,7 +57,7 @@ fn title_line(snap: &Snapshot, screen_name: &str, pal: &Palette) -> String {
         "{name} {} | {} [{}] | {screen_name} ",
         env!("CARGO_PKG_VERSION"),
         snap.scenario,
-        if snap.uas { "UAS" } else { "UAC" },
+        role_tag(snap),
     );
     // Dash count is computed from the VISIBLE width (escape codes are zero-
     // width), so the rule reaches the same column with or without color.
@@ -109,6 +109,19 @@ pub fn render_with(snap: &Snapshot, screen: Screen, pal: &Palette) -> Vec<String
     lines.push(String::new());
     lines.push(footer(pal));
     lines
+}
+
+/// The bracketed role tag of the title line: the displayed scenario's role,
+/// plus which scenario is displayed when more than one is loaded (SIPp's
+/// "Sipp Mixed Mode - main|rx" header, and `set display ooc`).
+fn role_tag(snap: &Snapshot) -> String {
+    let role = if snap.uas { "UAS" } else { "UAC" };
+    match (&snap.display, snap.mixed) {
+        (Display::Main, false) => role.to_owned(),
+        (Display::Main, true) => format!("{role}, mixed mode: main"),
+        (Display::OutOfCall(_), _) => format!("{role}, ooc"),
+        (Display::Receive(_), _) => format!("{role}, mixed mode: rx"),
+    }
 }
 
 fn render_main(snap: &Snapshot, pal: &Palette) -> Vec<String> {
@@ -188,9 +201,9 @@ fn render_main(snap: &Snapshot, pal: &Palette) -> Vec<String> {
 }
 
 fn render_scenario(snap: &Snapshot, pal: &Palette) -> Vec<String> {
-    // `set display ooc`: the page shows the out-of-call scenario's steps.
-    let screen = match &snap.display_ooc {
-        Some(name) => format!("scenario (ooc: {name})"),
+    // `set display ooc|rx`: the page shows that scenario's steps.
+    let screen = match snap.display.secondary_name() {
+        Some(name) => format!("scenario ({}: {name})", snap.display.label()),
         None => "scenario".to_owned(),
     };
     let mut out = vec![title_line(snap, &screen, pal), String::new()];

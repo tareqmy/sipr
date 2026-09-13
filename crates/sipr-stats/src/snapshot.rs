@@ -48,13 +48,53 @@ pub struct RtdRow {
     pub max_ms: u64,
 }
 
+/// Which scenario the screens show (SIPp `display_scenario`, switched with
+/// `set display main|ooc|rx`). Every counter in the snapshot — the main
+/// screen, the statistics and repartition screens and the scenario page —
+/// belongs to the displayed scenario, as SIPp's `screen.cpp` reads
+/// `display_scenario->stats` throughout.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Display {
+    /// The main scenario.
+    #[default]
+    Main,
+    /// The out-of-call scenario (`-oocsf`/`-oocsn`), by name.
+    OutOfCall(String),
+    /// The mixed-mode receive scenario (`-rxsf`/`-rxsn`), by name.
+    Receive(String),
+}
+
+impl Display {
+    /// SIPp's `set display` word for this choice: `main`, `ooc` or `rx`.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::OutOfCall(_) => "ooc",
+            Self::Receive(_) => "rx",
+        }
+    }
+
+    /// The displayed secondary scenario's name, `None` for the main one.
+    #[must_use]
+    pub fn secondary_name(&self) -> Option<&str> {
+        match self {
+            Self::Main => None,
+            Self::OutOfCall(name) | Self::Receive(name) => Some(name),
+        }
+    }
+}
+
 /// Everything a redraw needs.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
-    /// Scenario name.
+    /// Name of the displayed scenario (see [`Display`]).
     pub scenario: String,
-    /// True when answering calls (UAS).
+    /// True when the displayed scenario answers calls (UAS).
     pub uas: bool,
+    /// Mixed mode (`-rxsf`/`-rxsn`): a receive scenario is loaded next to
+    /// the main one (SIPp's "Sipp Mixed Mode" header).
+    pub mixed: bool,
     /// Wall-clock elapsed.
     pub elapsed: Duration,
     /// Live calls right now.
@@ -121,11 +161,8 @@ pub struct Snapshot {
     pub call_length_rows: Vec<(String, u64)>,
     /// Per-step rows for the scenario screen.
     pub steps: Vec<StepRow>,
-    /// `set display ooc`: the scenario screen shows the out-of-call
-    /// scenario named here, and `steps` are its rows (the counters above
-    /// stay the main scenario's, as SIPp's `display_scenario` only swaps
-    /// the scenario page).
-    pub display_ooc: Option<String>,
+    /// Which scenario every counter and row above belongs to.
+    pub display: Display,
     /// `set hide true|false` (SIPp `do_hide`, default true): whether
     /// hidden steps stay off the scenario screen.
     pub hide: bool,

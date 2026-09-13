@@ -81,6 +81,11 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   ESC-framed twin socket.
 - Closed-loop `-users N` mode with `[userid]`/`[users]` and per-user USER-mode
   injection (line = user id − 1).
+- A second scenario next to the main one: out-of-call (`-oocsf`/`-oocsn`,
+  answering requests of no known call) or mixed-mode receive
+  (`-rxsf`/`-rxsn` + `-rxinf`, terminating the calls the peer originates
+  while the main scenario originates ours), with `set display ooc|rx` over
+  the control socket.
 - IPv6 targets (`[::1]`, `[2001:db8::1]:5060`, bare `::1`) with automatic v6
   binding; `[local_ip]`/`[remote_ip]` are bracketed in URIs and Via.
 - UAC and UAS roles; open-loop pacing (`-r/-rp/-l/-m`) with rate smoothing

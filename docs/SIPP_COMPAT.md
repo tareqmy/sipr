@@ -91,8 +91,11 @@ C++ and record below).
 
 Scenario/mode: `-sf <file>` `-sn uac|uas|ooc_default|ooc_dummy` `-sd` (dump
 embedded) `-oocsf <file>` / `-oocsn ooc_default|ooc_dummy` (out-of-call
-scenario, client mode only, M33) `--check` (sipr addition: lint scenario —
-and the ooc one — and exit).
+scenario, client mode only, M33) `-rxsf <file>` / `-rxsn uas|…` (mixed
+mode: a server-mode receive scenario next to the client-mode main one,
+M34) `-rxinf <file>` (injection files loaded after the `-inf` ones, for
+`[fieldN file=NAME]` in either scenario) `--check` (sipr addition: lint
+scenario — and the ooc/rx one — and exit).
 Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 `-d <pause ms default>` `-users` (v1.x closed loop) `-rate_increase <n>`
 `-rate_max <n>` `-rate_interval <time>` `-no_rate_quit` `-rate_scale <n>`
@@ -196,17 +199,58 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `-oocsn` are mutually exclusive. SIPp's `open_calls` counts main-scenario
   calls only, so ooc calls never count toward `-l`, `-users` or `-m`, and
   the run ends when the main calls are done — lingering ooc calls (the
-  default's 4 s timewait) are dropped. `set display ooc|main` swaps only
-  the scenario page (SIPp `display_scenario`); the statistics stay the
-  main scenario's, and `-trace_stat` never writes an ooc CSV (SIPp's
-  `stattask::report` dumps `main_scenario->stats` only). Two SIPp
+  default's 4 s timewait) are dropped. `set display ooc|main` swaps
+  *every* screen — the main counters, the statistics and repartition
+  screens and the scenario page — to that scenario, as SIPp's `screen.cpp`
+  reads `display_scenario->stats` throughout (v0.22.0 had only the
+  scenario page follow; corrected with M34); `-trace_stat` never writes an
+  ooc CSV (SIPp's `stattask::report` dumps `main_scenario->stats` only)
+  and the exit code always reflects the main scenario. Two SIPp
   behaviours seen in the interop runs and *not* reproduced: on exit SIPp
   aborts its lingering ooc calls with a BYE (its generic established-call
   abort, `sipp_exit`); and a SIPp **UAS** spawns a main-scenario call for
   *any* unmapped message, responses included — the 200 answering its own
   out-of-call OPTIONS fails a call and eats its `-m` budget — where a sipr
-  UAS keeps discarding unmapped responses. `-rxsf`/`-rxinf` (`MODE_MIXED`,
-  `rx_scenario`) are queued as M34 in `docs/MILESTONES.md`.
+  UAS keeps discarding unmapped responses. Mixed mode (`-rxsf`) is the
+  next note.
+- Mixed mode `-rxsf <file>` / `-rxsn <name>` + `-rxinf` (M34; verified in
+  `sipp.cpp` ~l.174-197, 1778-1790, 1584-1605, 2140-2148, 556-561, 1182,
+  `socket.cpp` ~l.1184-1195, `screen.cpp` ~l.83-90, 242-245, 294, 710,
+  796): a second, server-mode scenario terminates the calls the peer
+  originates towards a client-mode main scenario. SIPp quirks worth
+  knowing: (1) in SIPp 3.7 **only `-rxsf` works** — the option table
+  spells the embedded variant `rxrn` while the parser expects `rxsn`, so
+  `-rxsn` is an unknown option and `-rxrn` an "Internal error" (the help
+  text's `-snrx`/`-sfrx` exist nowhere); sipr accepts `-rxsn` as the
+  parser intends and `-rxrn` not at all. (2) `-rxinf` registers the CSV in
+  the shared file map under its basename, but the `rx_default_file` it
+  sets is never read: a bare `[fieldN]` in the rx scenario means the first
+  `-inf` file ("No injection file was specified!" without one) and
+  `[fieldN file=name.csv]` reaches a `-rxinf` file by name — sipr does the
+  same, loading `-rxinf` files after the `-inf` ones into one table.
+  (3) SIPp enforces none of its help text's "rx MUST be server-mode, main
+  MUST be client-mode"; sipr does, at startup, and also refuses
+  `<sendCmd>`/`<recvCmd>` in the rx scenario and `-rxs*` together with
+  `-oocs*` (`process_message` takes the `MODE_MIXED` arm first, so an ooc
+  scenario never fires in mixed mode). (4) Dispatch: SIPp spawns an rx
+  call for *any* unmapped message, responses included and even while
+  quitting (that check is commented out), logging nothing; sipr spawns for
+  unmapped *requests* only — no user id, injection lines drawn like a UAS
+  call's, counted as an incoming call on the rx stats, a sipr-only line in
+  the error trace — and keeps discarding unmapped responses as its UAS
+  does. (5) Rx calls never count toward `-l`/`-users`/`-m`
+  (`call_generation_task.cpp` and the main loop look at `main_scenario`),
+  so the run ends with the main calls and lingering rx calls are dropped:
+  a `timewait` at the end of the main scenario is how a mixed-mode side
+  stays up for the peer's last call (the interop tests do this). (6) `set
+  display rx|main` switches every screen, see the ooc note; SIPp's header
+  reads "Sipp Mixed Mode - main|rx". (7) Not reproduced: SIPp's exit code
+  comes from whichever scenario is *displayed* at exit (`sipp.cpp`
+  ~l.1182) — sipr's always reflects the main scenario — and SIPp's exit
+  abort BYEs lingering rx calls. (8) `<init>`: SIPp never runs the rx
+  scenario's; sipr has no `<init>` support at all (an unknown element is a
+  hard error), so there was nothing to decide. `-trace_stat` stays
+  main-only.
 - A matched recv cancels the pending retransmission of the last send
   (`next_retrans = 0`) — including a matched *provisional*. SIPp's own code
   carries a TODO admitting this can erroneously stop retransmission (e.g.

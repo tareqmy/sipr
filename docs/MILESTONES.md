@@ -604,8 +604,8 @@ scenario screen), `socket.cpp` `process_key` (`1`..`9` screens).
       `hidden_steps_and_display_labels_reach_the_stats_api` (`display`
       label and `hidden` flag in `/stats`; `set hide false` over `/command`
       flips `hide`).
-- [x] Deferred: `set display rx` (no rx scenario in sipr; `set display
-      ooc` shipped with M33), `-hide` CLI default.
+- [x] Deferred: `-hide` CLI default. (`set display ooc` shipped with M33,
+      `set display rx` with M34.)
 
 ## M23 — SRTP (SDES) ✅
 
@@ -1067,7 +1067,7 @@ screens all read `display_scenario->stats`); `call_generation_task.cpp`
 ~l.106-130 (`-l`/`-users` measured on `main_scenario`). No docs page and
 no regress test mentions mixed mode.
 
-- [ ] `-rxsf <file>` / `-rxsn <name>`: a second, independently compiled
+- [x] `-rxsf <file>` / `-rxsn <name>`: a second, independently compiled
       server-mode scenario next to the main one (own variable table, own
       per-step stats and repartitions). Generalise M33's `OocScenario`
       into one secondary-scenario type carrying a role (ooc | rx) so the
@@ -1082,7 +1082,7 @@ no regress test mentions mixed mode.
       scenario, and `-rxs*` may not be combined with `-oocs*` (SIPp
       silently never reaches the ooc branch in mixed mode — a loud
       refusal beats a scenario that never fires).
-- [ ] Dispatch in `engine.rs` (`on_packet`, next to `spawn_ooc_call`): in
+- [x] Dispatch in `engine.rs` (`on_packet`, next to `spawn_ooc_call`): in
       mixed mode an unmapped *request* creates a call on the rx scenario
       keyed by the incoming Call-ID, remote = the packet source (or
       `-rsa`), no user id, replying on the per-IP/per-call socket the
@@ -1093,26 +1093,23 @@ no regress test mentions mixed mode.
       to reproduce) — sipr keeps discarding and counting them; record it.
       No warning line (SIPp logs none) but a `-trace_err`-level debug
       line is fine.
-- [ ] Rx calls never count toward `-m`/`-l`/`-users` (`live_main`) and
+- [x] Rx calls never count toward `-m`/`-l`/`-users` (`live_main`) and
       never end the run; the run ends when the main calls are done and
       lingering rx calls are dropped (SIPp's exit abort may BYE an
       established one; not reproduced, as with M33). Exit code: SIPp
       derives it from whichever scenario is displayed at exit — sipr
       keeps the main scenario's counters and records the divergence.
-- [ ] `-rxinf <file>` (repeatable): registers the CSV in the shared
+- [x] `-rxinf <file>` (repeatable): registers the CSV in the shared
       injection-file table under its basename, reachable from either
       scenario with `[fieldN file=<basename>]`. A bare `[fieldN]` in the
       rx scenario resolves to the first `-inf` file, as in SIPp, and is a
       startup error without one (SIPp's wording). Rx calls draw lines the
       way sipr's UAS calls do (SEQUENTIAL/RANDOM; USER-mode files behave
       as they do for a UAS today); `[userid]` renders 0.
-- [ ] `<init>` in the rx scenario: SIPp never runs it. Decide before
-      coding and record the choice in SIPP_COMPAT §6 — recommended: run
-      it once at startup like the main scenario's and note the
-      divergence, since a silently skipped section is the failure mode
-      AGENTS.md forbids; the alternative is a load-time warning that it
-      is ignored as in SIPp.
-- [ ] TUI + control: `set display rx|ooc|main` over the control socket
+- [x] `<init>` in the rx scenario: SIPp never runs it — and sipr has no
+      `<init>` support at all (an unknown element is a hard error), so
+      there was nothing to decide; recorded in SIPP_COMPAT §6.
+- [x] TUI + control: `set display rx|ooc|main` over the control socket
       (HTTP `/stats` `display` gains `rx`); the screen header reads SIPp's
       mixed-mode lines. **Align the display semantics with SIPp**: its
       main counters, statistics screen and repartition screens all follow
@@ -1123,23 +1120,27 @@ no regress test mentions mixed mode.
       update the M33 wording in SIPP_COMPAT §6, CONTROL_API and the
       snapshot doc comment. `-trace_stat`/`-stf` stay main-only (SIPp
       `stattask::report`).
-- [ ] `--check` lints the rx scenario with the same rules and prints its
+- [x] `--check` lints the rx scenario with the same rules and prints its
       IR after the main (and ooc) one; unknown elements are hard errors.
-- [ ] Tests: CLI unit + binary (`-rxsf`/`-rxsn` parse and conflict, the
-      four startup checks, `-rxinf` without `-inf` + bare `[fieldN]`
-      fatal); e2e `uac_terminates_incoming_calls_with_rx_scenario` (sipr
-      UAC on the main scenario against a peer; the peer sends a fresh
-      INVITE mid-run; the rx `uas` scenario answers it through
-      100/180/200/ACK/BYE/200 and the main flow is clean; both scenarios'
-      counters checked; without `-rxs*` the INVITE is discarded and
-      counted), `rx_scenario_reads_rxinf_by_file_name`,
-      `set_display_rx_swaps_the_screens` (counters follow the displayed
-      scenario); interop: real sipp `-sf uac -rxsf uas` vs sipr in the
-      same configuration, each side originating one call to the other and
-      terminating the other's, both transcripts compared against SIPp
-      3.7.x — and the mirror with sipr on the receiving end of a plain
-      sipp UAC.
-- [ ] Docs: SIPP_COMPAT §3 flags and §6 behaviour note (SIPp's
+- [x] Tests: CLI unit (`mixed_mode_flags_parse_and_conflict`) + binary
+      (`mixed_mode_flags_conflict_and_roles_are_checked`,
+      `receive_scenario_with_a_bare_field_needs_an_inf_file`,
+      `check_mode_lints_the_receive_scenario_too`); e2e
+      `uac_terminates_incoming_calls_with_rx_scenario` (sipr UAC on the
+      main scenario against a peer that originates an INVITE mid-run; the
+      rx `uas` scenario answers 180/200 and the 200 to the BYE with the
+      copied headers, the main flow is clean; without `-rxs*` the INVITE
+      is discarded and counted), `rx_scenario_reads_rxinf_by_file_name`
+      (named `-rxinf` field plus a bare `[fieldN]` from the first `-inf`),
+      `set_display_rx_swaps_the_screens` (role, steps and counters follow;
+      the M33 ooc display test updated to the corrected semantics);
+      interop `real_sipp_and_sipr_terminate_each_others_calls_in_mixed_mode`
+      (both sides `uac` + `-rxsf`/`-rxsn uas`, three calls each way, a
+      timewait on the main scenario keeping each side up for the peer's
+      last call) and `sipr_receive_scenario_answers_a_plain_real_sipp_uac`
+      (sipr mixed between a sipp UAS and a sipp UAC), both green against
+      SIPp 3.7.x.
+- [x] Docs: SIPP_COMPAT §3 flags and §6 behaviour note (SIPp's
       `-rxsn`/`-rxrn` breakage, `-rxinf` files unread by SIPp, no rx init,
       unmapped responses, the exit-code quirk, the corrected display
       semantics), CONTROL_API, ARCHITECTURE "two scenarios, one engine" →
