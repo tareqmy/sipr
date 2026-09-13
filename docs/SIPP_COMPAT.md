@@ -205,8 +205,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   abort, `sipp_exit`); and a SIPp **UAS** spawns a main-scenario call for
   *any* unmapped message, responses included — the 200 answering its own
   out-of-call OPTIONS fails a call and eats its `-m` budget — where a sipr
-  UAS keeps discarding unmapped responses. Out of scope: `-rxsf`/`-rxinf`
-  (`MODE_MIXED`, `rx_scenario`), a separate item if ever wanted.
+  UAS keeps discarding unmapped responses. `-rxsf`/`-rxinf` (`MODE_MIXED`,
+  `rx_scenario`) are queued as M34 in `docs/MILESTONES.md`.
 - A matched recv cancels the pending retransmission of the last send
   (`next_retrans = 0`) — including a matched *provisional*. SIPp's own code
   carries a TODO admitting this can erroneously stop retransmission (e.g.
