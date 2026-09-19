@@ -4,6 +4,37 @@ All notable changes to sipr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- rustls updated to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake messages
+  accepted across encryption level boundaries).
+
+### Added
+
+- Release automation modelled on gitwig's: a tag-triggered `CD` workflow
+  that builds static Linux (x86_64, arm64), macOS (Intel, Apple Silicon)
+  and Windows binaries, publishes the GitHub release, and, when the
+  matching secret is present, publishes the crates to crates.io, updates
+  the `tareqmy/homebrew-tap` formula, and pushes a Chocolatey package.
+- Install and uninstall scripts for macOS/Linux (`scripts/install.sh`) and
+  Windows (`scripts/install.ps1`), a Nix flake, a reference Homebrew
+  formula, and `docs/INSTALLATION.md` covering every method.
+- `cargo-deny` policy (`deny.toml`) checked in CI, and a CI portability job
+  building and testing on macOS and Windows.
+- `SECURITY.md` and `CONTRIBUTING.md`.
+
+### Changed
+
+- TLS PEM files (`-tls_cert`, `-tls_key`, `-tls_ca`, `-tls_crl`) are now parsed
+  with `rustls-pki-types`, the crate rustls itself uses, replacing the
+  unmaintained `rustls-pemfile` (RUSTSEC-2025-0134). Same formats, and a
+  malformed file is now reported with its name.
+- README rewritten to describe sipr's relationship to SIPp neutrally, state
+  the benchmark numbers `benches/BASELINES.md` actually records, and list
+  every deliberate compatibility gap.
+
 ## [0.26.0] — 2026-09-19
 
 ### Added

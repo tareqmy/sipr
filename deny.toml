@@ -1,0 +1,38 @@
+# cargo-deny policy: licenses, advisories, and sources for every dependency.
+# CI runs `cargo deny check`; run it locally with `make deny`.
+
+[advisories]
+unmaintained = "workspace"
+unsound = "workspace"
+ignore = [
+    # `time` 0.3.45 (dev-dependency only, via rcgen's test certificates): the
+    # fix in 0.3.47 needs Rust 1.88, above the 1.85 floor. The flaw is stack
+    # exhaustion when parsing hostile RFC 2822 date strings, which rcgen never
+    # does. Drop this entry when the MSRV reaches 1.88.
+    { id = "RUSTSEC-2026-0009", reason = "dev-only, unreachable code path, fix is above MSRV" },
+]
+
+[licenses]
+# Every dependency must be usable under one of these. sipr itself is MIT.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -39,6 +39,10 @@ fmt-check: ## Check formatting without changing files
 clippy: ## Lint with clippy, warnings denied
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
+.PHONY: deny
+deny: ## Check dependency licenses, advisories, and sources (cargo-deny)
+	$(CARGO) deny check
+
 .PHONY: check
 check: fmt-check clippy test ## Run every CI gate locally (fmt + clippy + test)
 	@echo "all gates passed"
@@ -80,6 +84,16 @@ bench: release ## Loopback throughput: sipr-UAC vs sipr-UAS at $(RATE) cps
 	UAS=$$!; sleep 0.4; \
 	$(BIN) -sn uac -r $(RATE) -m $(CALLS) -d 10 -timeout 120 127.0.0.1:$(PORT); \
 	wait $$UAS; tail -1 /tmp/sipr-bench-uas.log
+
+# ---- releasing ---------------------------------------------------------
+
+.PHONY: publish
+publish: ## Publish every crate to crates.io in dependency order (CD does this on tag)
+	$(CARGO) publish --workspace --locked
+
+.PHONY: publish-dry-run
+publish-dry-run: ## Check that every crate packages cleanly, without publishing
+	$(CARGO) publish --workspace --locked --dry-run
 
 # ---- housekeeping ------------------------------------------------------
 

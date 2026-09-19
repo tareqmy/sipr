@@ -21,6 +21,7 @@ All of these must pass from the repo root; CI runs the same commands:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo deny check      # dependency licenses, advisories, sources (cargo install cargo-deny)
 ```
 
 Changes to engine, net, or scenario code also need the interop suite against

@@ -1,87 +1,95 @@
 # Releasing sipr
 
-A short, repeatable checklist for cutting a release. sipr is a Cargo
-workspace of eight library crates plus the `sipr` binary; publishing to
-crates.io means publishing each crate in dependency order.
+Releases are cut by pushing a `vX.Y.Z` tag. The `CD` workflow
+(`.github/workflows/cd.yml`) then builds the binaries, publishes the GitHub
+release, and pushes to crates.io, the Homebrew tap and Chocolatey. The manual
+part is the pre-flight, the version bump, and the tag.
 
 ## 1. Pre-flight
 
-Everything must be green (this is exactly what CI runs):
+Everything must be green (this is what CI runs on every push):
 
 ```sh
 make check            # fmt-check + clippy -D warnings + tests
+make deny             # cargo-deny: dependency licenses, advisories, sources
 ```
 
-Then run the one gate CI can't fully cover without a SIPp binary — the
-interop suite against real SIPp, both directions:
+Then the gate CI can only run with a SIPp binary, both directions:
 
 ```sh
-make interop          # uses SIPP_BIN (defaults to ~/development/cprojects/sipp/sipp)
-# or: SIPP_BIN=$(command -v sipp) cargo test --test interop -- --nocapture
+make interop          # SIPP_BIN defaults to ~/development/cprojects/sipp/sipp
 ```
 
-Expect all four flows green: sipr-UAC ↔ sipp-UAS, sipp-UAC ↔ sipr-UAS.
+If SIPp is not built locally, push to master first and wait for the `interop`
+and `sctp` CI jobs; the tag must not go on a commit CI has not validated.
+
+Optionally confirm that every crate still packages cleanly (no network
+writes, but it builds each crate):
+
+```sh
+make publish-dry-run
+```
 
 ## 2. Version + changelog
 
-1. Bump `version` in the root `Cargo.toml` `[workspace.package]` and the
-   internal-dependency versions in `[workspace.dependencies]` (they must
-   match — they're pinned so the crates are publishable).
-2. Move the `[Unreleased]` items in `CHANGELOG.md` under a new dated
-   version heading; update the compare/tag links at the bottom.
-3. Commit: `git commit -am "release: v0.1.0"`.
+The version lives in four places; they must agree:
 
-## 3. Tag
+1. `version` in the root `Cargo.toml` `[workspace.package]`, and the pinned
+   internal-dependency versions in `[workspace.dependencies]` (they are
+   pinned so the crates are publishable).
+2. `.version` — the plain version without `v`, no trailing newline. The
+   install scripts read it from `master` to find the latest release.
+3. `Formula/sipr.rb` and `dist/chocolatey/sipr.nuspec` +
+   `tools/chocolateyinstall.ps1` — reference copies; CD rewrites the live
+   ones with real checksums, but keep these on the same version.
+4. `CHANGELOG.md`: move the `[Unreleased]` items under a new dated heading
+   and add the compare link at the bottom.
+
+Then:
 
 ```sh
-git tag -a v0.1.0 -m "sipr v0.1.0"
+git commit -am "release: v0.27.0"
+git tag -a v0.27.0 -m "sipr v0.27.0"
 git push origin master --tags
 ```
 
-## 4. Publish to crates.io (optional)
+## 3. What CD does on the tag
 
-Publishing is optional — the binary builds fine from source without it.
-If you do publish, the crates must go up in dependency order, because
-each depends on the previous ones already being on the registry:
+1. Creates a draft GitHub release.
+2. Builds `sipr` for `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
+   (static), `x86_64-apple-darwin`, `aarch64-apple-darwin`, and
+   `x86_64-pc-windows-msvc`, and uploads
+   `sipr-vX.Y.Z-<target>.tar.gz` (`.zip` on Windows) to the draft.
+3. Publishes the release once every asset is up.
+4. In parallel, `cargo publish --workspace` pushes the nine crates to
+   crates.io in dependency order — only when `CARGO_REGISTRY_TOKEN` is set.
+5. After the release is public, rewrites `Formula/sipr.rb` in
+   `tareqmy/homebrew-tap` with the new version and checksums — only when
+   `TAP_GITHUB_TOKEN` is set.
+6. Packs and pushes the Chocolatey package — only when `CHOCO_API_KEY` is set.
 
-```
-sipr-auth        # no internal deps
-sipr-net         # no internal deps
-sipr-scenario    # no internal deps
-sipr-stats       # no internal deps
-sipr-media       # depends on auth
-sipr-control     # depends on stats
-sipr-tui         # depends on stats
-sipr-engine      # depends on scenario, net, auth, stats, media, control
-sipr             # the binary — depends on all
-```
+Each publish step skips with a workflow warning when its secret is missing,
+so a release without them still produces the GitHub release and binaries.
 
-Dry-run each first (requires network / a crates.io token):
+## 4. One-time setup (repository secrets)
 
-```sh
-cargo publish -p sipr-auth --dry-run
-cargo publish -p sipr-auth
-# ...repeat down the list, waiting for each to index before the next...
-cargo publish            # the binary, from the workspace root
-```
+Settings → Secrets and variables → Actions:
 
-Offline sanity check that a crate packages cleanly (no registry needed
-for the zero-dependency leaf crates):
+| Secret | Used for | Where to get it |
+|---|---|---|
+| `CARGO_REGISTRY_TOKEN` | crates.io publish | crates.io → Account Settings → API Tokens, scope `publish-new` + `publish-update` |
+| `TAP_GITHUB_TOKEN` | pushing the formula to `tareqmy/homebrew-tap` | a fine-grained PAT with *Contents: write* on the tap repo only |
+| `CHOCO_API_KEY` | Chocolatey push | chocolatey.org → account → API key |
 
-```sh
-cargo package -p sipr-auth --allow-dirty
-```
+The crate names `sipr` and `sipr-*` must be free on crates.io at first
+publish (they were, as of 2026-09-19). The Homebrew tap already exists and
+serves other formulas; CD adds `Formula/sipr.rb` next to them.
 
-Note: the crate names must be available on crates.io. If `sipr` or any
-`sipr-*` name is taken, rename before publishing (a repo-wide find/replace
-on the crate name plus its `[workspace.dependencies]` key).
+## 5. After the workflow
 
-## 5. Binary artifacts (optional)
-
-For a GitHub release, attach a stripped release binary:
-
-```sh
-cargo build --release
-strip target/release/sipr        # optional, smaller binary
-# upload target/release/sipr to the GitHub release for v0.1.0
-```
+- Check the release page: five assets, notes pointing at the changelog.
+- `brew update && brew upgrade sipr` on a Mac, and the shell installer on a
+  Linux box, should both land the new version.
+- If a step failed, fix it and re-run the job from the Actions tab; the
+  workflow is idempotent (existing release and assets are reused or
+  overwritten with `--clobber`).

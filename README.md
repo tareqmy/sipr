@@ -33,8 +33,22 @@ covering kernel drops); the exact runs are in `benches/BASELINES.md`.
 
 ## Install
 
-sipr builds from source with a stock Rust toolchain (1.85+), no system
-libraries required (TLS is pure-Rust `rustls` — no OpenSSL):
+Prebuilt binaries for macOS, Linux (static) and Windows come with every
+release. The full list of methods is in [docs/INSTALLATION.md](docs/INSTALLATION.md).
+
+```sh
+brew tap tareqmy/tap && brew install sipr                                   # Homebrew (macOS, Linux)
+curl -fsSL https://raw.githubusercontent.com/tareqmy/sipr/master/scripts/install.sh | sh   # shell script
+cargo install sipr                                                          # from crates.io
+nix run github:tareqmy/sipr                                                 # Nix flake
+```
+
+```powershell
+irm https://raw.githubusercontent.com/tareqmy/sipr/master/scripts/install.ps1 | iex   # Windows
+```
+
+Or from source with a stock Rust toolchain (1.85+), no system libraries
+required (TLS is pure-Rust `rustls`, no OpenSSL):
 
 ```sh
 git clone https://github.com/tareqmy/sipr && cd sipr
@@ -144,8 +158,8 @@ root for media.
 ## Documentation
 
 - `PLAN.md` — architecture and roadmap
-- `docs/` — architecture, SIPp compatibility surface, conventions, testing,
-  glossary, milestones
+- `docs/` — installation, architecture, SIPp compatibility surface,
+  conventions, testing, releasing, glossary, milestones
 - `AGENTS.md` / `CLAUDE.md` — instructions for AI agents contributing to the repo
 
 sipr is developed with the help of AI coding agents working from the plan and

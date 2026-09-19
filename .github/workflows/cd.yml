@@ -1,0 +1,239 @@
+name: CD
+
+# Runs on every `v*` tag: builds release binaries for each target, publishes a
+# GitHub release with them, then (each gated on its secret being present)
+# publishes the crates to crates.io, updates the Homebrew tap, and pushes the
+# Chocolatey package. See docs/RELEASING.md for the release procedure and the
+# secrets this workflow needs.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create Draft Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Draft Release
+        run: |
+          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release already exists"
+          else
+            gh release create "${{ github.ref_name }}" --draft --title "${{ github.ref_name }}" \
+              --notes "sipr ${{ github.ref_name }} — see CHANGELOG.md for details." \
+              --repo "${{ github.repository }}"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    name: Upload Assets - ${{ matrix.target }}
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install musl-tools (musl targets only)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf ../../../sipr-${{ github.ref_name }}-${{ matrix.target }}.tar.gz sipr
+
+      - name: Package binary (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../sipr-${{ github.ref_name }}-${{ matrix.target }}.zip sipr.exe
+
+      - name: Upload Asset to Draft Release
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            gh release upload "${{ github.ref_name }}" "sipr-${{ github.ref_name }}-${{ matrix.target }}.zip" --clobber --repo "${{ github.repository }}"
+          else
+            gh release upload "${{ github.ref_name }}" "sipr-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" --clobber --repo "${{ github.repository }}"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-release:
+    name: Publish Release
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish GitHub Release
+        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-cargo:
+    name: Publish to Crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check Token Presence
+        id: check-token
+        run: |
+          if [ -z "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN secret is not set. Skipping Crates.io publication."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Install Rust toolchain
+        if: steps.check-token.outputs.skip == 'false'
+        uses: dtolnay/rust-toolchain@stable
+      # The workspace is nine crates with internal dependencies; `--workspace`
+      # publishes them in dependency order and waits for each to land in the
+      # index before the next (cargo 1.90+).
+      - name: Cargo Publish
+        if: steps.check-token.outputs.skip == 'false'
+        run: cargo publish --workspace --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+  publish-homebrew:
+    name: Publish to Homebrew Tap
+    needs: publish-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Token Presence
+        id: check-token
+        run: |
+          if [ -z "${{ secrets.TAP_GITHUB_TOKEN }}" ]; then
+            echo "::warning::TAP_GITHUB_TOKEN secret is not set. Skipping Homebrew tap update."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Calculate Hash and Update Formula
+        if: steps.check-token.outputs.skip == 'false'
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION_NUM="${VERSION#v}"
+          DL="https://github.com/tareqmy/sipr/releases/download/${VERSION}"
+
+          git clone "https://oauth2:${{ secrets.TAP_GITHUB_TOKEN }}@github.com/tareqmy/homebrew-tap.git" homebrew-tap
+
+          for t in x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            curl -fsSLO "${DL}/sipr-${VERSION}-${t}.tar.gz"
+          done
+          MAC_INTEL_SHA=$(sha256sum sipr-${VERSION}-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+          MAC_ARM_SHA=$(sha256sum sipr-${VERSION}-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+          LINUX_INTEL_SHA=$(sha256sum sipr-${VERSION}-x86_64-unknown-linux-musl.tar.gz | cut -d' ' -f1)
+          LINUX_ARM_SHA=$(sha256sum sipr-${VERSION}-aarch64-unknown-linux-musl.tar.gz | cut -d' ' -f1)
+
+          mkdir -p homebrew-tap/Formula
+          cat <<EOT > homebrew-tap/Formula/sipr.rb
+          class Sipr < Formula
+            desc "SIP testing tool and traffic generator in Rust, compatible with SIPp scenarios"
+            homepage "https://github.com/tareqmy/sipr"
+            version "${VERSION_NUM}"
+            license "MIT"
+
+            if OS.mac?
+              if Hardware::CPU.intel?
+                url "https://github.com/tareqmy/sipr/releases/download/v#{version}/sipr-v#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${MAC_INTEL_SHA}"
+              elsif Hardware::CPU.arm?
+                url "https://github.com/tareqmy/sipr/releases/download/v#{version}/sipr-v#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${MAC_ARM_SHA}"
+              end
+            elsif OS.linux?
+              if Hardware::CPU.intel?
+                url "https://github.com/tareqmy/sipr/releases/download/v#{version}/sipr-v#{version}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${LINUX_INTEL_SHA}"
+              elsif Hardware::CPU.arm?
+                url "https://github.com/tareqmy/sipr/releases/download/v#{version}/sipr-v#{version}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${LINUX_ARM_SHA}"
+              end
+            end
+
+            def install
+              bin.install "sipr"
+            end
+
+            test do
+              assert_match "sipr", shell_output("#{bin}/sipr --version")
+            end
+          end
+          EOT
+
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/sipr.rb
+          git commit -m "Update sipr to ${VERSION}" || echo "No changes to commit"
+          git push origin main || git push origin master || echo "No changes to push"
+
+  publish-chocolatey:
+    name: Publish to Chocolatey
+    needs: publish-release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Check Token Presence
+        id: check-token
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.CHOCO_API_KEY }}" ]; then
+            echo "::warning::CHOCO_API_KEY secret is not set. Skipping Chocolatey publication."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Calculate Hash and Update Files
+        if: steps.check-token.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+
+          $url = "https://github.com/tareqmy/sipr/releases/download/${{ github.ref_name }}/sipr-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile "sipr.zip"
+          $hash = (Get-FileHash "sipr.zip" -Algorithm SHA256).Hash.ToLower()
+
+          $nuspec = "dist/chocolatey/sipr.nuspec"
+          (Get-Content $nuspec) -replace '<version>[^<]+</version>', "<version>$version</version>" | Set-Content $nuspec
+
+          $install_script = "dist/chocolatey/tools/chocolateyinstall.ps1"
+          (Get-Content $install_script) -replace 'v\d+\.\d+\.\d+', "v$version" -replace 'WINDOWS_ZIP_SHA256', $hash | Set-Content $install_script
+
+      - name: Pack and Push Package
+        if: steps.check-token.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          cd dist/chocolatey
+          choco pack
+          choco push (Get-ChildItem *.nupkg).FullName --api-key ${{ secrets.CHOCO_API_KEY }} --source https://push.chocolatey.org/

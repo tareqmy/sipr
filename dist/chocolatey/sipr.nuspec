@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>sipr</id>
+    <version>0.26.0</version>
+    <title>sipr</title>
+    <authors>tareqmy</authors>
+    <projectUrl>https://github.com/tareqmy/sipr</projectUrl>
+    <licenseUrl>https://github.com/tareqmy/sipr/blob/master/LICENSE</licenseUrl>
+    <iconUrl>https://cdn.jsdelivr.net/gh/tareqmy/sipr@master/brand/logo/mark-512.png</iconUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/tareqmy/sipr</projectSourceUrl>
+    <docsUrl>https://github.com/tareqmy/sipr/blob/master/README.md</docsUrl>
+    <bugTrackerUrl>https://github.com/tareqmy/sipr/issues</bugTrackerUrl>
+    <tags>sip voip sipp load-testing telephony rust CLI</tags>
+    <summary>SIP testing tool and traffic generator, compatible with SIPp scenarios</summary>
+    <description>
+sipr plays SIP call flows described in SIPp's XML scenario format, as caller or callee, at a controlled call rate, with a live terminal dashboard. It takes the same scenario files and command-line flags as SIPp.
+    </description>
+    <releaseNotes>https://github.com/tareqmy/sipr/blob/master/CHANGELOG.md</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

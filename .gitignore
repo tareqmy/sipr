@@ -5,3 +5,6 @@
 *_errors.log
 *_messages.log
 *_logs.log
+# Nix build output symlink
+result
+.DS_Store
