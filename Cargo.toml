@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["tareqmy"]
@@ -17,14 +17,14 @@ categories = ["network-programming", "command-line-utilities", "development-tool
 # Internal crates (path + version so each is publishable to crates.io).
 # External crates from the sanctioned set (docs/CONVENTIONS.md §Dependencies)
 # are added here when a milestone first needs them.
-sipr-scenario = { path = "crates/sipr-scenario", version = "0.24.0" }
-sipr-net = { path = "crates/sipr-net", version = "0.24.0" }
-sipr-engine = { path = "crates/sipr-engine", version = "0.24.0" }
-sipr-auth = { path = "crates/sipr-auth", version = "0.24.0" }
-sipr-stats = { path = "crates/sipr-stats", version = "0.24.0" }
-sipr-tui = { path = "crates/sipr-tui", version = "0.24.0" }
-sipr-media = { path = "crates/sipr-media", version = "0.24.0" }
-sipr-control = { path = "crates/sipr-control", version = "0.24.0" }
+sipr-scenario = { path = "crates/sipr-scenario", version = "0.25.0" }
+sipr-net = { path = "crates/sipr-net", version = "0.25.0" }
+sipr-engine = { path = "crates/sipr-engine", version = "0.25.0" }
+sipr-auth = { path = "crates/sipr-auth", version = "0.25.0" }
+sipr-stats = { path = "crates/sipr-stats", version = "0.25.0" }
+sipr-tui = { path = "crates/sipr-tui", version = "0.25.0" }
+sipr-media = { path = "crates/sipr-media", version = "0.25.0" }
+sipr-control = { path = "crates/sipr-control", version = "0.25.0" }
 # TLS (M13): rustls with the `ring` provider, NOT the default `aws-lc-rs` —
 # ring builds with `cc` alone (no cmake, no system OpenSSL), keeping the
 # build portable (docs/CONVENTIONS.md §Dependencies).

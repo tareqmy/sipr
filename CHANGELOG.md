@@ -4,6 +4,21 @@ All notable changes to sipr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] — 2026-09-19
+
+### Added
+
+- **Manual transactions** (M36): `start_txn` and `ack_txn` on `<send>`,
+  `response_txn` on `<recv>`. A recv so named matches only a response
+  whose top Via branch is the one its request carried, which tells
+  concurrent transactions of the same method apart. SIPp's placement and
+  usage errors are reported with its wording, requests naming a
+  transaction leave the CSeq-method guard list, and late responses to a
+  named transaction are handled as SIPp does: a provisional is ignored, a
+  final one for an INVITE transaction gets the recorded ACK sent again,
+  and a repeat of the final already taken is ignored. `--check` lists the
+  transactions. Verified against real sipp both ways.
+
 ## [0.24.0] — 2026-09-19
 
 ### Added
