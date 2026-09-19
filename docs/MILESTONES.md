@@ -1396,7 +1396,7 @@ remote: `setdest` moves the traffic, not the keywords);
 `docs/scenarios/actions.rst` "External commands" and "setdest" (incl.
 the IPv6-without-brackets warning: brackets would be read as a keyword).
 
-- [ ] Scenario: `<exec command="…"/>` compiles to `Action::ExecCommand
+- [x] Scenario: `<exec command="…"/>` compiles to `Action::ExecCommand
       (MsgTemplate)` (mutually exclusive with the other `exec`
       attributes, as today); `<setdest host= port= protocol=/>` to
       `Action::SetDest { host, port, protocol: MsgTemplate }` with the
@@ -1404,18 +1404,20 @@ the IPv6-without-brackets warning: brackets would be read as a keyword).
       SIPp's wording) and unknown attributes warning. Both run from
       `<recv>`, `<nop>`, `<send>` actions like any other; `--check` dumps
       them. The DTD's `sample` and the standalone `index` stay rejected.
-- [ ] Engine, `exec command=`: render the template (all keywords, the
+- [x] Engine, `exec command=`: render the template (all keywords, the
       call's variables), then hand the string to an exec runner — one
-      background thread that spawns `sh -c <cmd>` (`cmd /C` on Windows)
-      with inherited stdio and reaps each child when it exits, so the
-      engine thread never forks, waits or blocks and no zombies
-      accumulate under load. Fire-and-forget like SIPp: no exit status,
-      no effect on the call; a spawn failure is one error-trace line
-      ("system call error for <cmd>", SIPp's text) and nothing more. The
-      runner drains before the process exits (SIPp's grandchildren
-      outlive it — record the difference). Spawn happens off the engine
-      thread; the only hot-path cost is the render.
-- [ ] Engine, `<setdest>`: render the three values; validate exactly as
+      background thread (`sipr-engine/src/exec.rs`) that spawns `sh -c
+      <cmd>` (`cmd /C` on Windows) with inherited stdout/stderr, stdin
+      closed, and reaps each child when it exits, so the engine thread
+      never forks, waits or blocks and no zombies accumulate under load.
+      Fire-and-forget like SIPp: no exit status, no effect on the call; a
+      spawn failure is one stderr warning ("system call error for <cmd>",
+      SIPp's text — the runner thread has no error trace) and nothing
+      more. Dropping the runner at the end of the run drains the queue
+      (every command still starts) without waiting for running commands,
+      as SIPp's grandchildren outlive it. The only hot-path cost is the
+      render.
+- [x] Engine, `<setdest>`: render the three values; validate exactly as
       SIPp (port numeric; protocol one of the four, case-insensitive;
       protocol == the run's transport; TLS refused; TCP/SCTP only in the
       per-call modes `tn`/`sn` — the call's own connection is closed and
@@ -1428,10 +1430,12 @@ the IPv6-without-brackets warning: brackets would be read as a keyword).
       literal IP costs no I/O; a host name is resolved with a blocking
       lookup on the engine thread, SIPp's documented stall — an
       error-trace line notes it the first time. IPv6 literals bare, as
-      in SIPp (bracketed ones read as keywords). `-rsa`: verify in
-      `send_raw` whether the sending address still wins after a
-      `setdest` and match it.
-- [ ] Tests: scenario unit (both actions compile; missing `setdest`
+      in SIPp (bracketed ones read as keywords). `-rsa`: verified —
+      SIPp copies the sending address into `remote_sockaddr` at start-up
+      and `setdest` overwrites the call's peer, so setdest wins; sipr
+      overwrites `call.remote` the same way. A call that has not sent
+      yet is simply retargeted (its first send dials the new peer).
+- [x] Tests: scenario unit (both actions compile; missing `setdest`
       attributes error; `exec command=` with a media attribute still
       errors); engine unit (setdest validation messages; protocol
       parsing incl. case); e2e `exec_command_runs_a_shell_per_matching_
@@ -1451,8 +1455,23 @@ the IPv6-without-brackets warning: brackets would be read as a keyword).
       a sipr UAS that answers with a Contact pointing at a second sipr
       UAS port, and by sipr against the same with sipp on the second
       port; and an `exec command=` scenario on both, each side's
-      `>> file` output compared.
-- [ ] Docs: SIPP_COMPAT §1 (actions table: `exec command=`, `setdest`),
+      `>> file` output compared. Deviations from the plan, all recorded
+      in SIPP_COMPAT §6: the zombie check is one `ps` after the calls
+      (the runner reaps within 100 ms, so a poll can catch a child in
+      between); the TLS refusal is a unit test (no certificates needed);
+      the setdest scenarios `setdest` in a `<nop>` after the ACK so the
+      redirecting peer sees INVITE and ACK and the second peer only the
+      BYE (SIPp's `-sn uas`-style peers need that shape); real sipp's
+      hook writes blank lines (`[last_*]` timing) so the interop test
+      compares line counts on the sipp side and content on the sipr side.
+- [x] Found on the way: `ereg search_in="body"` and `search_in="var"
+      variable=` were missing (SIPp's setdest idiom needs `var`) — added;
+      `[next_url]` in SIPp needs `rrs="true"` on the recv to carry the
+      Contact (sipr does not — left as is); SIPp's `[last_*]` inside a
+      recv's own actions still name the previous message (sipr: the one
+      just received — left as is); SIPp's docs example `echo [last_From]`
+      needs quoting under any shell. All in SIPP_COMPAT §6.
+- [x] Docs: SIPP_COMPAT §1 (actions table: `exec command=`, `setdest`),
       the v1.x tier paragraph, §6 note (fire-and-forget exec, the fatal
       → per-call divergence, blocking resolution, keywords unchanged by
       setdest); ARCHITECTURE (the exec runner thread next to the media

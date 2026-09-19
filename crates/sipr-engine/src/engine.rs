@@ -671,6 +671,17 @@ impl CallSocket {
         }
     }
 
+    /// Another call holds this socket too (the pool keeps only weak refs).
+    fn shared(&self) -> bool {
+        match self {
+            Self::Udp(s) => Arc::strong_count(s) > 1,
+            Self::Tcp(c) => Arc::strong_count(c) > 1,
+            Self::Tls(c) => Arc::strong_count(c) > 1,
+            #[cfg(feature = "sctp")]
+            Self::Sctp(c) => Arc::strong_count(c) > 1,
+        }
+    }
+
     fn downgrade(&self) -> WeakCallSocket {
         match self {
             Self::Udp(s) => WeakCallSocket::Udp(Arc::downgrade(s)),
@@ -880,6 +891,10 @@ struct Engine<'s> {
     /// The last screen requested via a control-socket digit key, with a
     /// sequence number (the TUI applies each once).
     screen_request: Option<(u64, u8)>,
+    /// `exec command=` runner thread, started on the first command.
+    exec_runner: Option<crate::exec::ExecRunner>,
+    /// The blocking-DNS note for `<setdest host=…>` was logged once.
+    setdest_dns_warned: bool,
 }
 
 impl<'s> Engine<'s> {
@@ -1446,6 +1461,8 @@ impl<'s> Engine<'s> {
             last_ramp: Instant::now(),
             hide: true,
             screen_request: None,
+            exec_runner: None,
+            setdest_dns_warned: false,
         })
     }
 
@@ -3050,9 +3067,108 @@ impl<'s> Engine<'s> {
                 crate::actions::ActionOutcome::RtpEchoCmd(cmd) => {
                     self.on_rtp_echo(call_id, &cmd);
                 }
+                crate::actions::ActionOutcome::ExecCommand(command) => {
+                    self.exec_runner
+                        .get_or_insert_with(crate::exec::ExecRunner::start)
+                        .run(command);
+                }
+                crate::actions::ActionOutcome::SetDest {
+                    host,
+                    port,
+                    protocol,
+                } => {
+                    if let Err(why) = self.apply_setdest(call_id, &host, &port, &protocol) {
+                        self.call_stats(call_id).failed_other += 1;
+                        self.log_err(&format!("call {call_id} failed: setdest: {why}"));
+                        self.remove_call(call_id);
+                        return true;
+                    }
+                }
             }
         }
         false
+    }
+
+    /// `<setdest>` (SIPp `E_AT_SET_DEST`, `call.cpp` ~l.5841-5935): move the
+    /// rest of this call's traffic to another peer. Every check SIPp makes
+    /// is made here with its wording — but a failure ends the call, not the
+    /// run. UDP retargets the call; per-call TCP/SCTP closes the call's
+    /// connection and dials the new peer, a failure spending one
+    /// `-max_reconnect` credit. `[remote_ip]`/`[remote_port]` keep the
+    /// nominal remote, as SIPp's globals do.
+    fn apply_setdest(
+        &mut self,
+        call_id: &str,
+        host: &str,
+        port: &str,
+        protocol: &str,
+    ) -> Result<(), String> {
+        let wire = setdest_protocol(protocol, self.config.transport)?;
+        let port = setdest_port(port)?;
+        if host.parse::<IpAddr>().is_err() && !self.setdest_dns_warned {
+            self.setdest_dns_warned = true;
+            self.log_err(
+                "setdest: resolving a host name blocks the engine thread while it runs \
+                 (SIPp's getaddrinfo does the same)",
+            );
+        }
+        let new_remote = resolve_setdest_host(host, port)?;
+        let Some(call) = self.calls.get(call_id) else {
+            return Ok(());
+        };
+        if wire == SetDestWire::Udp || call.socket.is_none() {
+            // No connection to move: the next send goes (and, per-call,
+            // dials) to the new peer.
+            if let Some(call) = self.calls.get_mut(call_id) {
+                call.remote = new_remote;
+            }
+            return Ok(());
+        }
+        if call.socket.as_ref().is_some_and(CallSocket::shared) {
+            return Err(
+                "Can not change destinations for a TCP/SCTP socket that has more than one user."
+                    .to_owned(),
+            );
+        }
+        let dialed = match &self.transport {
+            Transport::Tcp(t) => t
+                .connect_call(new_remote)
+                .map(|c| CallSocket::Tcp(Arc::new(c))),
+            #[cfg(feature = "sctp")]
+            Transport::Sctp(t) => t
+                .connect_call(new_remote)
+                .map(|c| CallSocket::Sctp(Arc::new(c))),
+            // Refused above (TLS) or moved without a dial (UDP).
+            _ => return Ok(()),
+        };
+        match dialed {
+            Ok(socket) => {
+                self.call_socket_pool.push(socket.downgrade());
+                if let Some(call) = self.calls.get_mut(call_id) {
+                    call.socket = Some(socket);
+                    call.remote = new_remote;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // SIPp: a warning and one reconnection credit; out of
+                // credits it is "Max number of reconnections reached".
+                if !self.reconnect_allowed() {
+                    let msg = "Max number of reconnections reached".to_owned();
+                    eprintln!("sipr: error: {msg}");
+                    self.log_err(&msg);
+                    self.fatal = Some(msg.clone());
+                    self.fail_all("connection lost");
+                    self.hard_stop = true;
+                    return Err(msg);
+                }
+                if self.reconnects_left > 0 {
+                    self.reconnects_left -= 1;
+                }
+                self.log_err("Unable to connect a TCP/SCTP/TLS socket");
+                Err(format!("cannot connect to {new_remote}: {e}"))
+            }
+        }
     }
 
     /// `exec rtp_echo=start…|update…|stop…`: this call echoes (S)RTP on
@@ -4999,6 +5115,72 @@ fn resolve_media_file(file: &str, scenario_dir: Option<&std::path::Path>) -> std
 }
 
 /// Reject scenarios that need features beyond M3, loudly and up front.
+/// The wire a `<setdest protocol=>` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetDestWire {
+    Udp,
+    Tcp,
+    Tls,
+    Sctp,
+}
+
+/// SIPp's `setdest` protocol checks: one of the four names in either case,
+/// the run's own transport, never TLS, and TCP/SCTP only in the per-call
+/// (`-t tn|sn`, "multisocket") modes.
+fn setdest_protocol(protocol: &str, transport: TransportKind) -> Result<SetDestWire, String> {
+    let wire = match protocol.to_ascii_lowercase().as_str() {
+        "udp" => SetDestWire::Udp,
+        "tcp" => SetDestWire::Tcp,
+        "tls" => SetDestWire::Tls,
+        "sctp" => SetDestWire::Sctp,
+        _ => return Err(format!("Unknown transport for setdest: '{protocol}'")),
+    };
+    let running = match transport {
+        TransportKind::UdpMono | TransportKind::UdpPerCall | TransportKind::UdpPerIp => {
+            SetDestWire::Udp
+        }
+        TransportKind::TcpMono | TransportKind::TcpPerCall => SetDestWire::Tcp,
+        TransportKind::TlsMono | TransportKind::TlsPerCall => SetDestWire::Tls,
+        TransportKind::SctpMono | TransportKind::SctpPerCall => SetDestWire::Sctp,
+    };
+    if wire != running {
+        return Err("Can not switch protocols during setdest.".to_owned());
+    }
+    if wire == SetDestWire::Tls {
+        return Err("Changing destinations is not supported for TLS.".to_owned());
+    }
+    if matches!(wire, SetDestWire::Tcp | SetDestWire::Sctp) && !transport.per_call() {
+        return Err("Changing destinations for TCP or SCTP requires multisocket mode.".to_owned());
+    }
+    Ok(wire)
+}
+
+/// SIPp parses the port with `strtod` and rejects trailing text.
+fn setdest_port(port: &str) -> Result<u16, String> {
+    let text = port.trim();
+    let invalid = || format!("Invalid port for setdest: {port}");
+    let number: f64 = text.parse().map_err(|_| invalid())?;
+    if number.fract() != 0.0 || !(0.0..=f64::from(u16::MAX)).contains(&number) {
+        return Err(invalid());
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(number as u16)
+}
+
+/// An IP literal costs nothing; a host name is a blocking lookup (SIPp's
+/// `gai_getsockaddr`, documented to stall).
+fn resolve_setdest_host(host: &str, port: u16) -> Result<SocketAddr, String> {
+    if let Ok(ip) = host.trim().parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    use std::net::ToSocketAddrs;
+    (host.trim(), port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .ok_or_else(|| format!("Unknown host '{host}' for setdest"))
+}
+
 fn validate_for_engine(scenario: &Scenario) -> Result<(), EngineError> {
     // As of M6 the engine executes the full v1 surface; the only things left
     // to reject are pause distributions the sampler does not implement.
@@ -5429,6 +5611,52 @@ mod tests {
             methods[4].as_deref(),
             Some("BYE"),
             "INVITE and ACK named a transaction"
+        );
+    }
+
+    #[test]
+    fn setdest_checks_follow_sipp() {
+        use TransportKind as T;
+        assert_eq!(setdest_protocol("udp", T::UdpMono), Ok(SetDestWire::Udp));
+        assert_eq!(setdest_protocol("UDP", T::UdpPerCall), Ok(SetDestWire::Udp));
+        assert_eq!(setdest_protocol("tcp", T::TcpPerCall), Ok(SetDestWire::Tcp));
+        assert_eq!(
+            setdest_protocol("bogus", T::UdpMono),
+            Err("Unknown transport for setdest: 'bogus'".to_owned())
+        );
+        assert_eq!(
+            setdest_protocol("tcp", T::UdpMono),
+            Err("Can not switch protocols during setdest.".to_owned())
+        );
+        assert_eq!(
+            setdest_protocol("tls", T::TlsPerCall),
+            Err("Changing destinations is not supported for TLS.".to_owned())
+        );
+        assert_eq!(
+            setdest_protocol("tcp", T::TcpMono),
+            Err("Changing destinations for TCP or SCTP requires multisocket mode.".to_owned())
+        );
+        assert_eq!(setdest_port("5060"), Ok(5060));
+        assert_eq!(setdest_port(" 5062 "), Ok(5062));
+        for bad in ["5060x", "", "70000", "-1", "50.5"] {
+            assert_eq!(
+                setdest_port(bad),
+                Err(format!("Invalid port for setdest: {bad}")),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            resolve_setdest_host("127.0.0.1", 5080),
+            Ok(SocketAddr::from(([127, 0, 0, 1], 5080)))
+        );
+        assert_eq!(
+            resolve_setdest_host("::1", 5080).map(|a| a.port()),
+            Ok(5080),
+            "bare IPv6 literal"
+        );
+        assert_eq!(
+            resolve_setdest_host("no-such-host.invalid", 5080),
+            Err("Unknown host 'no-such-host.invalid' for setdest".to_owned())
         );
     }
 }

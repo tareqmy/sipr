@@ -309,6 +309,10 @@ pub enum SearchIn {
     Msg,
     /// Match against one header's value(s).
     Hdr,
+    /// Match against the message body only.
+    Body,
+    /// Match against a variable's text (`search_in="var" variable=`).
+    Var(VarId),
 }
 
 /// Comparison operator of the `test` action.
@@ -596,6 +600,20 @@ pub enum Action {
     },
     /// Internal command.
     ExecInt(IntCmd),
+    /// `exec command="…"`: run the rendered text through a shell,
+    /// fire-and-forget (SIPp double-forks and never waits).
+    ExecCommand(MsgTemplate),
+    /// `<setdest host= port= protocol=/>`: send the rest of this call's
+    /// messages to another peer (each value renders at run time).
+    SetDest {
+        /// Host name or IP literal (IPv6 bare, as SIPp: brackets would be a
+        /// keyword).
+        host: MsgTemplate,
+        /// Port number.
+        port: MsgTemplate,
+        /// `udp|tcp|tls|sctp`; must be the run's transport.
+        protocol: MsgTemplate,
+    },
     /// `exec play_pcap_audio|video|image="file"`: replay a capture's UDP
     /// payloads to the peer's media endpoint (learned from its SDP). The
     /// file is resolved and parsed once by the engine at startup; `file` is

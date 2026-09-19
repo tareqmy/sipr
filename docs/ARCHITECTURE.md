@@ -29,6 +29,11 @@ Dependency direction (must stay acyclic):
 The control front ends (UDP socket, HTTP server) are threads that only send
 `ControlRequest`s into the engine's channel and read the shared once-a-second
 snapshot — the same rule as the TUI: nothing outside the loop touches a call.
+The `exec command=` runner (`sipr-engine/src/exec.rs`, started on the first
+command) is a thread that receives rendered command strings over a channel,
+spawns each through a shell and reaps the children it started; the engine
+thread never forks, waits or blocks on an external process.
+
 The media thread (`sipr-media::replay`) follows the same rule as every other
 thread: it owns its sockets, receives owned stream specs over a channel, and
 reports back with events — it never touches engine state.

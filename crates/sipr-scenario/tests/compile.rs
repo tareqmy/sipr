@@ -1090,3 +1090,78 @@ fn transaction_usage_is_validated_like_sipp() {
         "Transaction a is a non-INVITE transaction with an ACK!",
     );
 }
+
+// ---- exec command= and setdest (M37) ---------------------------------------
+
+#[test]
+fn exec_command_and_setdest_compile() {
+    let xml = wrap(&format!(
+        r#"{invite}
+           <recv response="200">
+             <action>
+               <exec command="echo [last_From:] >> from_list.log"/>
+               <assignstr assign_to="url" value="[next_url]"/>
+               <ereg regexp="sip:.*@([0-9.]+):([0-9]+)" search_in="var" variable="url"
+                     check_it="true" assign_to="dummy,host,port"/>
+               <setdest host="[$host]" port="[$port]" protocol="udp"/>
+             </action>
+           </recv>
+           <Reference variables="dummy"/>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let actions: Vec<&Action> = sc.all_actions().collect();
+    assert!(
+        matches!(actions[0], Action::ExecCommand(_)),
+        "{:?}",
+        actions[0]
+    );
+    assert!(
+        matches!(actions[3], Action::SetDest { .. }),
+        "{:?}",
+        actions[3]
+    );
+    let dump = sc.dump();
+    assert!(dump.contains("actions=4"), "{dump}");
+}
+
+#[test]
+fn setdest_needs_all_three_parameters_and_exec_command_stays_exclusive() {
+    let missing = wrap(&format!(
+        r#"{invite}
+           <recv response="200">
+             <action><setdest host="10.0.0.1" protocol="udp"/></action>
+           </recv>"#,
+        invite = send_invite()
+    ));
+    let errs = errors(&missing);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("setdest is missing the required 'port' parameter.")),
+        "{errs:?}"
+    );
+    let combined = wrap(&format!(
+        r#"{invite}
+           <recv response="200">
+             <action><exec command="true" play_dtmf="1"/></action>
+           </recv>"#,
+        invite = send_invite()
+    ));
+    let errs = errors(&combined);
+    assert!(errs.iter().any(|e| e.contains("only one of")), "{errs:?}");
+    let empty = wrap(&format!(
+        r#"{invite}
+           <recv response="200">
+             <action><exec command="  "/></action>
+           </recv>"#,
+        invite = send_invite()
+    ));
+    let errs = errors(&empty);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("exec command= needs a command to run")),
+        "{errs:?}"
+    );
+}

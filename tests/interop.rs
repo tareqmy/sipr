@@ -3642,3 +3642,334 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
     assert!(!stderr.contains("unexpected 1"), "{stderr}");
     let _ = wait_with_timeout(&mut sipp_uas.0, Duration::from_secs(15));
 }
+
+// ---- exec command= and setdest against real sipp (M37) --------------------
+
+const SIPP_XML_HEADER: &str =
+    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n";
+
+/// A UAS that runs `echo [last_From:] >> from_list.log` per INVITE.
+fn exec_uas_xml() -> String {
+    format!(
+        r#"{SIPP_XML_HEADER}<scenario name="exec-uas">
+  <recv request="INVITE">
+    <action>
+      <exec command="echo '[last_From:]' >> from_list.log"/>
+    </action>
+  </recv>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>
+"#
+    )
+}
+
+/// The UAC of SIPp's setdest example: after the ACK, `ereg` the host and
+/// port out of `[next_url]` and `setdest` there; the BYE goes to that peer.
+fn setdest_uac_xml() -> String {
+    format!(
+        r#"{SIPP_XML_HEADER}<scenario name="setdest-uac">
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Subject: Performance Test
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200" rtd="true" rrs="true"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Subject: Performance Test
+    Content-Length: 0
+
+  ]]></send>
+  <nop>
+    <action>
+      <assignstr assign_to="url" value="[next_url]"/>
+      <ereg regexp="sip:.*@([0-9A-Za-z\.]+):([0-9]+)" search_in="var" variable="url"
+            check_it="true" assign_to="dummy,host,port"/>
+      <setdest host="[$host]" port="[$port]" protocol="udp"/>
+    </action>
+  </nop>
+  <pause milliseconds="100"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Subject: Performance Test
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200" crlf="true"/>
+  <Reference variables="dummy"/>
+</scenario>
+"#
+    )
+}
+
+/// The first peer: answers the INVITE with a Contact on `redirect_port`,
+/// takes the ACK, and that is the whole call for it.
+fn redirecting_uas_xml(redirect_port: u16) -> String {
+    format!(
+        r#"{SIPP_XML_HEADER}<scenario name="redirecting-uas">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[service]@127.0.0.1:{redirect_port}>
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+</scenario>
+"#
+    )
+}
+
+/// The second peer: only ever sees the BYE.
+fn bye_uas_xml() -> String {
+    format!(
+        r#"{SIPP_XML_HEADER}<scenario name="bye-uas">
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>
+"#
+    )
+}
+
+/// Spawn a UAS (sipp or sipr) on `port` with `-m calls` in `dir`.
+fn spawn_uas_bin(
+    bin: &std::path::Path,
+    xml: &std::path::Path,
+    port: u16,
+    calls: u32,
+    dir: &std::path::Path,
+) -> Reaper {
+    Reaper(
+        Command::new(bin)
+            .current_dir(dir)
+            .args([
+                "-sf",
+                xml.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                &calls.to_string(),
+                "-timeout",
+                "30",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uas"),
+    )
+}
+
+/// `exec command=` on both sides: real sipp's UAC into a sipr UAS running
+/// the echo hook, and sipr's UAC into a sipp UAS running it. Each side's
+/// `from_list.log` gets one line per call (the hook ran once per INVITE,
+/// through a shell, in the UAS's directory); sipr's lines carry the From
+/// header, sipp's are empty — see below.
+#[test]
+fn exec_command_writes_the_same_hook_output_as_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::exec_command_writes_the_same_hook_output_as_real_sipp — no sipp."
+        );
+        return;
+    };
+    let sipr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let mut logs = Vec::new();
+    for (uas_bin, uac_bin, uac_extra) in [
+        (&sipr, &sipp, vec!["-timeout", "20s"]),
+        (&sipp, &sipr, vec!["-timeout", "20", "-bg"]),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xml = dir.path().join("exec-uas.xml");
+        std::fs::write(&xml, exec_uas_xml()).expect("write uas");
+        let port = free_port();
+        let mut uas = spawn_uas_bin(uas_bin, &xml, port, 3, dir.path());
+        std::thread::sleep(Duration::from_millis(400));
+        let mut args = vec![
+            "-sn".to_owned(),
+            "uac".to_owned(),
+            "-i".to_owned(),
+            "127.0.0.1".to_owned(),
+            "-r".to_owned(),
+            "10".to_owned(),
+            "-m".to_owned(),
+            "3".to_owned(),
+            "-d".to_owned(),
+            "100".to_owned(),
+        ];
+        args.extend(uac_extra.iter().map(|s| (*s).to_owned()));
+        args.push(format!("127.0.0.1:{port}"));
+        let mut uac = Reaper(
+            Command::new(uac_bin)
+                .current_dir(dir.path())
+                .args(&args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn uac"),
+        );
+        assert_eq!(
+            wait_with_timeout(&mut uac.0, Duration::from_secs(25)),
+            Some(0),
+            "uac exit"
+        );
+        let code = wait_with_timeout(&mut uas.0, Duration::from_secs(15));
+        let stderr = child_stderr(&mut uas.0);
+        assert_eq!(code, Some(0), "uas exit; stderr:\n{stderr}");
+        let log = std::fs::read_to_string(dir.path().join("from_list.log")).unwrap_or_default();
+        let listing: Vec<String> = std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            log.lines().count(),
+            3,
+            "uas {}: log {log:?}; dir {listing:?}; uas stderr:\n{stderr}\nsipp errors:\n{}",
+            uas_bin.display(),
+            sipp_error_log(dir.path())
+        );
+        // Real sipp writes three *empty* lines here: `[last_From:]` renders
+        // nothing inside the recv's own actions, because SIPp stores the
+        // received message for `[last_*]` only after running them
+        // (SIPP_COMPAT §6). sipr has the header at that point.
+        if uas_bin == &sipr {
+            assert!(
+                log.lines()
+                    .all(|l| l.starts_with("From: ") && l.contains("@127.0.0.1:")),
+                "uas {}: log {log:?}",
+                uas_bin.display()
+            );
+        }
+        logs.push(log);
+    }
+}
+
+/// SIPp's own setdest idiom both ways: a UAC redirected by the 200's
+/// Contact sends its BYE to a second peer. sipp UAC against sipr peers,
+/// sipr UAC against sipp peers; every call completes on every side.
+#[test]
+fn setdest_redirects_to_a_second_peer_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::setdest_redirects_to_a_second_peer_like_real_sipp — no sipp.");
+        return;
+    };
+    let sipr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    for (peer_bin, uac_bin, uac_extra) in [
+        (&sipr, &sipp, vec!["-timeout", "20s"]),
+        (&sipp, &sipr, vec!["-timeout", "20", "-bg"]),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let port1 = free_port();
+        let port2 = free_port();
+        let uas1_xml = dir.path().join("redirecting-uas.xml");
+        let uas2_xml = dir.path().join("bye-uas.xml");
+        let uac_xml = dir.path().join("setdest-uac.xml");
+        std::fs::write(&uas1_xml, redirecting_uas_xml(port2)).expect("write uas1");
+        std::fs::write(&uas2_xml, bye_uas_xml()).expect("write uas2");
+        std::fs::write(&uac_xml, setdest_uac_xml()).expect("write uac");
+        let mut uas1 = spawn_uas_bin(peer_bin, &uas1_xml, port1, 3, dir.path());
+        let mut uas2 = spawn_uas_bin(peer_bin, &uas2_xml, port2, 3, dir.path());
+        std::thread::sleep(Duration::from_millis(500));
+        let mut args = vec![
+            "-sf".to_owned(),
+            uac_xml.to_str().expect("utf8").to_owned(),
+            "-i".to_owned(),
+            "127.0.0.1".to_owned(),
+            "-r".to_owned(),
+            "10".to_owned(),
+            "-m".to_owned(),
+            "3".to_owned(),
+            "-trace_err".to_owned(),
+        ];
+        args.extend(uac_extra.iter().map(|s| (*s).to_owned()));
+        args.push(format!("127.0.0.1:{port1}"));
+        let mut uac = Reaper(
+            Command::new(uac_bin)
+                .current_dir(dir.path())
+                .args(&args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn uac"),
+        );
+        let uac_code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+        let uac_err = child_stderr(&mut uac.0);
+        assert_eq!(
+            uac_code,
+            Some(0),
+            "uac exit; stderr:\n{uac_err}\nsipp errors:\n{}",
+            sipp_error_log(dir.path())
+        );
+        for (name, uas) in [("redirecting", &mut uas1), ("bye", &mut uas2)] {
+            let code = wait_with_timeout(&mut uas.0, Duration::from_secs(15));
+            let stderr = child_stderr(&mut uas.0);
+            assert_eq!(code, Some(0), "{name} peer exit; stderr:\n{stderr}");
+        }
+    }
+}

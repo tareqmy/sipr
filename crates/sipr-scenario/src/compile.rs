@@ -971,6 +971,7 @@ impl Compiler {
                         "regexp",
                         "search_in",
                         "header",
+                        "variable",
                         "start_line",
                         "check_it",
                         "assign_to",
@@ -988,11 +989,22 @@ impl Compiler {
                 let search_in = match el.attr("search_in").unwrap_or("msg") {
                     "msg" => SearchIn::Msg,
                     "hdr" => SearchIn::Hdr,
+                    "body" => SearchIn::Body,
+                    // SIPp `xp_get_var("variable", "ereg")`: required.
+                    "var" => match el.attr("variable") {
+                        Some(name) => {
+                            let name = name.to_owned();
+                            SearchIn::Var(self.var_reads(&name))
+                        }
+                        None => {
+                            self.diags
+                                .error(Some(line), "ereg with search_in=\"var\" needs 'variable'");
+                            SearchIn::Msg
+                        }
+                    },
                     other => {
-                        self.diags.error(
-                            Some(line),
-                            format!("search_in must be msg|hdr, got '{other}'"),
-                        );
+                        self.diags
+                            .error(Some(line), format!("Unknown search_in value {other}"));
                         SearchIn::Msg
                     }
                 };
@@ -1264,12 +1276,13 @@ impl Compiler {
                 if let Some(action) = self.parse_play_pcap(el) {
                     return action;
                 }
-                if el.attr("command").is_some() {
-                    self.diags.error(
-                        Some(line),
-                        "exec command= (external process) is not supported yet — v1.x",
-                    );
-                    return None;
+                if let Some(command) = el.attr("command") {
+                    if command.trim().is_empty() {
+                        self.diags
+                            .error(Some(line), "exec command= needs a command to run");
+                        return None;
+                    }
+                    return Some(Action::ExecCommand(self.templ(command, line)));
                 }
                 let cmd = match el.attr("int_cmd").unwrap_or("stop_call") {
                     "stop_now" => IntCmd::StopNow,
@@ -1314,7 +1327,31 @@ impl Compiler {
                     value: self.templ(&value, line),
                 })
             }
-            "sample" | "setdest" | "index" => {
+            "setdest" => {
+                self.warn_unknown_attrs(el, &["host", "port", "protocol"]);
+                // SIPp `xp_get_string`: each is required.
+                let mut value = |name: &str| -> Option<MsgTemplate> {
+                    match el.attr(name) {
+                        Some(v) => Some(self.templ(v, line)),
+                        None => {
+                            self.diags.error(
+                                Some(line),
+                                format!("setdest is missing the required '{name}' parameter."),
+                            );
+                            None
+                        }
+                    }
+                };
+                let host = value("host");
+                let port = value("port");
+                let protocol = value("protocol");
+                Some(Action::SetDest {
+                    host: host?,
+                    port: port?,
+                    protocol: protocol?,
+                })
+            }
+            "sample" | "index" => {
                 self.diags.error(
                     Some(line),
                     format!(

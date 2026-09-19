@@ -32,18 +32,20 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 
 ### v1 actions (inside `<action>` on recv/nop)
 
-`ereg` (with `assign_to`, `check_it`, `header`, `regexp`, `search_in`,
-`start_line`), `log`, `warning`, `error`, `assign`, `assignstr`, `strcmp`,
+`ereg` (with `assign_to`, `check_it`, `header`, `regexp`, `search_in`
+= `msg|hdr|body|var`, `variable`, `start_line`), `log`, `warning`, `error`, `assign`, `assignstr`, `strcmp`,
 `verifyauth` (with `assign_to`, `username`, `password`), `pauserestore`
 (`value`/`variable`), `closecon`, `test`, `add`, `subtract`, `multiply`, `divide`, `todouble`, `jump`, `trim`,
 `gettimeofday`, `urlencode`, `urldecode`, `jump` (`value`/`variable`; the
 `_unexp.main` label, `_unexp.retaddr` and `_unexp.pausedaddr` recipe),
-`exec` with `int_cmd` only (`stop_now`, `stop_gracefully`, `stop_call`).
+`exec` with `int_cmd` (`stop_now`, `stop_gracefully`, `stop_call`) or
+`command=` (an external shell command, M37), `setdest` (`host`, `port`,
+`protocol`; M37, §6).
 
 ### v1.x tier (fast follow)
 
-`sample`, `setdest`, `exec command=` (external process). Manual
-transactions (`start_txn`/`ack_txn`/`response_txn`) shipped in M36. `index` as a
+`sample`. Manual transactions (`start_txn`/`ack_txn`/`response_txn`)
+shipped in M36, `exec command=` and `setdest` in M37. `index` as a
 standalone action stays out — sipr builds the index from `-infindex` at load,
 not from a scenario action. Extended 3PCC (`-master`/`-slave`/`-slave_cfg` with
 `dest=`/`src=` peer routing) also stays out; classic `-3pcc` is supported.
@@ -1009,5 +1011,65 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   datagram bytes) with one addition: a `<send>` carrying both
   `start_txn` and `ack_txn` is an error (SIPp silently takes
   `start_txn`). Verified against real sipp both ways.
+- `exec command=` and `<setdest>` (M37; verified in `scenario.cpp`
+  ~l.265-270 `xp_get_string` ("%s is missing the required '%s'
+  parameter."), ~l.1596-1600, ~l.1637-1640; `call.cpp` ~l.6144-6178,
+  ~l.5841-5935, ~l.2741; `socket.cpp` ~l.2588; `docs/scenarios/actions.rst`):
+  `exec command="…"` renders the text like a message (keywords, `[$var]`)
+  and runs it through `system()` in a double-forked grandchild — SIPp
+  never waits for it and never sees its status, stdio is inherited (the
+  `>> file` idiom; output lands on the curses screen too) and a
+  `system()` failure is the grandchild's WARNING "system call error for
+  %s". sipr matches the contract from one runner thread that spawns `sh
+  -c` (`cmd /C` on Windows) with stdin closed and reaps its children as
+  they exit — the engine thread never forks or blocks, no zombie
+  accumulates under load — and prints the same warning to stderr on a
+  spawn failure; commands still running at exit are left to finish, as
+  SIPp's grandchildren are. `<setdest host= port= protocol=/>`: all three
+  required, all three rendered at run time; the port must be numeric
+  ("Invalid port for setdest: %s"), the protocol `udp|tcp|tls|sctp` in
+  either case ("Unknown transport for setdest: '%s'") and the run's own
+  ("Can not switch protocols during setdest."); TLS is refused ("Changing
+  destinations is not supported for TLS."), TCP/SCTP need the per-call
+  modes `-t tn|sn` ("Changing destinations for TCP or SCTP requires
+  multisocket mode.") and a connection no other call shares ("Can not
+  change destinations for a TCP/SCTP socket that has more than one
+  user."); the host goes through a **blocking** `getaddrinfo` ("Unknown
+  host '%s' for setdest"); UDP then retargets the call's peer, TCP/SCTP
+  close the call's connection and dial the new peer, a failure logging
+  "Unable to connect a TCP/SCTP/TLS socket" and spending one
+  `-max_reconnect` credit ("Max number of reconnections reached" when
+  none is left). `[remote_ip]`/`[remote_port]` keep rendering the global
+  remote — setdest moves the traffic, not the keywords — and it
+  overrides `-rsa` for that call (SIPp copies the sending address into
+  `remote_sockaddr` at start-up and setdest overwrites the peer). sipr
+  matches every check and its wording, with two deliberate differences:
+  (1) each `setdest` error **fails the call, not the run** (the same
+  choice as for "Jump statement out of range"), logged as `call … failed:
+  setdest: <SIPp text>`; (2) an IP literal costs no I/O, and the first
+  host name resolved logs a note that the lookup blocks the engine
+  thread. IPv6 literals go bare, as SIPp documents (brackets read as a
+  keyword). A call that has not sent yet (per-call modes) is simply
+  retargeted; its first send dials the new peer. Verified against real
+  sipp both ways. Found on the way: (a) `ereg search_in="body"` and
+  `search_in="var" variable="…"` (`scenario.cpp` ~l.1396-1401, `call.cpp`
+  ~l.5739-5760: the body, or the variable's text, is the haystack) were
+  missing and are now supported — SIPp's setdest idiom needs `var`;
+  `case_indep`, `occurrence` and `check_it_inverse` on `ereg` are still
+  not. (b) `[next_url]` (`call.cpp` ~l.5570-5580): SIPp copies the
+  Contact into `next_req_url` only for a recv with `rrs="true"`;
+  otherwise the keyword falls back to the last *received* request's URI,
+  which a UAC never has — so the documented setdest example silently
+  depends on `rrs="true"` on the `recv response="200"`. sipr renders the
+  last received Contact regardless of `rrs` (pre-existing, left as is:
+  it is what the example intends). (c) `[last_*]` inside the actions of
+  the recv that just matched (`call.cpp` ~l.5517 `executeAction` before
+  ~l.5641 `last_recv_msg = …`): SIPp still names the *previous* received
+  message — empty on a call's first recv — so SIPp's own
+  `<exec command="echo [last_From] >> from_list.log"/>` example writes
+  blank lines; sipr's `[last_*]` name the message just received
+  (pre-existing, left as is; the interop test accepts both). (d) The
+  example's unquoted From also breaks under any shell (`<`, `>` and `;`
+  are redirections and a command separator) — quote it.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

@@ -6190,3 +6190,440 @@ fn late_final_response_to_a_named_invite_transaction_is_acked_again() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- exec command= and setdest (M37) ---------------------------------------
+
+/// A UAS scenario that runs a shell command for every INVITE it answers.
+/// The From value is quoted: it holds `<`, `>` and `;`, which a shell
+/// would read as redirections and a command break (SIPp's docs show the
+/// unquoted form, which fails the same way under sipp).
+fn exec_uas_scenario() -> String {
+    r#"<scenario name="exec-uas">
+  <recv request="INVITE">
+    <action>
+      <exec command="echo '[last_From:]' >> from_list.log"/>
+    </action>
+  </recv>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>"#
+        .to_owned()
+}
+
+/// Zombie children of `pid` right now (`ps`: state `Z`).
+fn zombie_children_of(pid: u32) -> usize {
+    let out = Command::new("ps")
+        .args(["-A", "-o", "ppid=,stat="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| {
+            let mut parts = l.split_whitespace();
+            parts.next() == Some(&pid.to_string())
+                && parts.next().is_some_and(|st| st.starts_with('Z'))
+        })
+        .count()
+}
+
+#[test]
+fn exec_command_runs_a_shell_per_matching_message() {
+    // Three calls into a sipr UAS whose INVITE recv runs `echo … >> file`:
+    // the file gets one From line per call, the command's shell runs with
+    // sipr's cwd, and the runner reaps its children as it goes (no zombie
+    // is ever seen hanging off the UAS while it runs).
+    let dir = std::env::temp_dir().join(format!("sipr-exec-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sc_path = dir.join("exec-uas.xml");
+    std::fs::write(&sc_path, exec_uas_scenario()).expect("write scenario");
+    let port = free_port();
+    let mut uas = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .args([
+            "-sf",
+            sc_path.to_str().expect("utf8"),
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-m",
+            "3",
+            "-timeout",
+            "20",
+            "-bg",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn uas");
+    let uas_pid = uas.id();
+    std::thread::sleep(Duration::from_millis(300));
+    let mut uac = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .args([
+            "-sn",
+            "uac",
+            "-i",
+            "127.0.0.1",
+            "-r",
+            "2",
+            "-m",
+            "3",
+            "-d",
+            "100",
+            "-timeout",
+            "15",
+            "-bg",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn uac");
+    let uac_code = wait_exit(&mut uac, Duration::from_secs(20));
+    assert_eq!(uac_code, Some(0), "uac");
+    // Every echo has long exited; the runner reaps within 100 ms.
+    std::thread::sleep(Duration::from_millis(400));
+    let zombies = zombie_children_of(uas_pid);
+    let uas_code = wait_exit(&mut uas, Duration::from_secs(20));
+    assert_eq!(uas_code, Some(0), "uas");
+    assert_eq!(zombies, 0, "the exec runner reaps its children");
+    let log = std::fs::read_to_string(dir.join("from_list.log")).expect("from_list.log");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 3, "{log}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.starts_with("From: ") && l.contains("<sip:sipr@127.0.0.1:")),
+        "{log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// INVITE/200/ACK to the peer, then `setdest` to the host and port the 200's
+/// Contact named, then BYE there. Every request reports what
+/// `[remote_ip]:[remote_port]` render.
+fn setdest_uac_scenario(protocol: &str) -> String {
+    format!(
+        r#"<scenario name="setdest">
+  <send retrans="500"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:sipr@[local_ip]:[local_port];transport=[transport]>
+    X-Remote: [remote_ip]:[remote_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="180" optional="true"/>
+  <recv response="200" rrs="true"/>
+  <send><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    X-Remote: [remote_ip]:[remote_port]
+    Content-Length: 0
+
+  ]]></send>
+  <nop>
+    <action>
+      <assignstr assign_to="url" value="[next_url]"/>
+      <log message="setdest: url=[$url] next_url=[next_url]"/>
+      <ereg regexp="sip:.*@([0-9.]+):([0-9]+)" search_in="var" variable="url"
+            check_it="true" assign_to="dummy,host,port"/>
+      <setdest host="[$host]" port="[$port]" protocol="{protocol}"/>
+    </action>
+  </nop>
+  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    X-Remote: [remote_ip]:[remote_port]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <Reference variables="dummy"/>
+</scenario>"#
+    )
+}
+
+/// Run sipr on `scenario` from a fresh temp dir with `-trace_err`; returns
+/// the output and the error trace (for assertion messages).
+fn run_sipr_traced(tag: &str, scenario: &str, args: &[&str]) -> (std::process::Output, String) {
+    let dir = std::env::temp_dir().join(format!("sipr-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sc_path = dir.join("scenario.xml");
+    std::fs::write(&sc_path, scenario).expect("write scenario");
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .arg("-sf")
+        .arg(&sc_path)
+        .arg("-trace_err")
+        .args(args)
+        .output()
+        .expect("run sipr");
+    let errors_log = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_errors.log"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    (out, errors_log)
+}
+
+/// `mirror_response` with its Contact replaced by one naming `contact_port`
+/// (the redirect the scenario follows).
+fn ok_with_contact(msg: &Inbound, contact_port: u16) -> Vec<u8> {
+    let ok = String::from_utf8(mirror_response(msg, "200 OK", true)).expect("utf8");
+    let (headers, body) = ok.split_once("\r\n\r\n").expect("header end");
+    let mut out: Vec<String> = headers
+        .split("\r\n")
+        .filter(|l| !l.to_ascii_lowercase().starts_with("contact:"))
+        .map(ToOwned::to_owned)
+        .collect();
+    out.push(format!("Contact: <sip:svc@127.0.0.1:{contact_port}>"));
+    format!("{}\r\n\r\n{body}", out.join("\r\n")).into_bytes()
+}
+
+/// What a socket saw: `(method, X-Remote)` per request, in order.
+type Seen = Vec<(String, String)>;
+
+fn seen_entry(msg: &Inbound) -> (String, String) {
+    (
+        msg.method().unwrap_or_default().to_owned(),
+        msg.header("X-Remote").unwrap_or_default().trim().to_owned(),
+    )
+}
+
+#[test]
+fn setdest_redirects_the_rest_of_the_call_over_udp() {
+    // Socket 1 answers the INVITE with a Contact on socket 2; after the ACK
+    // the scenario `setdest`s there, so the BYE lands on socket 2 — while
+    // `[remote_ip]:[remote_port]` in it still name socket 1 (SIPp's
+    // globals are untouched by setdest).
+    let sock2 = UdpSocket::bind("127.0.0.1:0").expect("bind 2");
+    let port2 = sock2.local_addr().expect("addr").port();
+    sock2
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let second = std::thread::spawn(move || {
+        let mut seen: Seen = Vec::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock2.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            seen.push(seen_entry(&msg));
+            if msg.method() == Some("BYE") {
+                let _ = sock2.send_to(&mirror_response(&msg, "200 OK", false), from);
+            }
+        }
+        seen
+    });
+    let sock1 = UdpSocket::bind("127.0.0.1:0").expect("bind 1");
+    let addr1 = sock1.local_addr().expect("addr");
+    sock1
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let first = std::thread::spawn(move || {
+        let mut seen: Seen = Vec::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock1.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            seen.push(seen_entry(&msg));
+            if msg.method() == Some("INVITE") {
+                let _ = sock1.send_to(&ok_with_contact(&msg, port2), from);
+            }
+        }
+        seen
+    });
+    let (out, errors_log) = run_sipr_traced(
+        "setdest-udp",
+        &setdest_uac_scenario("udp"),
+        &["-m", "1", "-timeout", "10", "-bg", &addr1.to_string()],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr:\n{err}\nerrors:\n{errors_log}"
+    );
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    let nominal = addr1.to_string();
+    let on_first = first.join().expect("first");
+    let on_second = second.join().expect("second");
+    assert_eq!(
+        on_first,
+        [
+            ("INVITE".to_owned(), nominal.clone()),
+            ("ACK".to_owned(), nominal.clone())
+        ],
+        "socket 1"
+    );
+    assert_eq!(
+        on_second,
+        [("BYE".to_owned(), nominal)],
+        "socket 2: redirected BYE, keywords unchanged"
+    );
+}
+
+/// A TCP listener that answers like the UDP sockets above: accepts one
+/// connection, replies 200 (with `contact_port` in the Contact) to an
+/// INVITE and 200 to a BYE, and records `(method, X-Remote)`.
+fn spawn_setdest_tcp_listener(
+    contact_port: Option<u16>,
+    idle: Duration,
+) -> (SocketAddr, std::thread::JoinHandle<Seen>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+    let addr = listener.local_addr().expect("addr");
+    listener.set_nonblocking(false).expect("blocking");
+    let handle = std::thread::spawn(move || {
+        let mut seen: Seen = Vec::new();
+        let Ok((mut stream, _)) = listener.accept() else {
+            return seen;
+        };
+        stream.set_read_timeout(Some(idle)).ok();
+        let mut framer = TcpFramer::new();
+        let mut buf = [0u8; 16_384];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    framer.push(&buf[..n]);
+                    while let Some(raw) = framer.next_message() {
+                        let Ok(msg) = Inbound::parse(&raw) else {
+                            continue;
+                        };
+                        seen.push(seen_entry(&msg));
+                        match msg.method() {
+                            Some("INVITE") => {
+                                let ok = contact_port.map_or_else(
+                                    || mirror_response(&msg, "200 OK", true),
+                                    |p| ok_with_contact(&msg, p),
+                                );
+                                let _ = stream.write_all(&ok);
+                            }
+                            Some("BYE") => {
+                                let _ = stream.write_all(&mirror_response(&msg, "200 OK", false));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        seen
+    });
+    (addr, handle)
+}
+
+#[test]
+fn setdest_over_per_call_tcp_reconnects_to_the_new_peer() {
+    // `-t tn`: the call's own connection is closed and re-dialled to the
+    // Contact's host and port; the BYE arrives on the second listener.
+    let (addr2, second) = spawn_setdest_tcp_listener(None, Duration::from_secs(3));
+    let (addr1, first) = spawn_setdest_tcp_listener(Some(addr2.port()), Duration::from_secs(3));
+    let (out, errors_log) = run_sipr_traced(
+        "setdest-tcp",
+        &setdest_uac_scenario("tcp"),
+        &[
+            "-t",
+            "tn",
+            "-m",
+            "1",
+            "-timeout",
+            "10",
+            "-bg",
+            &addr1.to_string(),
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr:\n{err}\nerrors:\n{errors_log}"
+    );
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    let nominal = addr1.to_string();
+    let methods = |seen: &Seen| seen.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>();
+    let on_first = first.join().expect("first");
+    let on_second = second.join().expect("second");
+    assert_eq!(methods(&on_first), ["INVITE", "ACK"], "{on_first:?}");
+    assert_eq!(on_second, [("BYE".to_owned(), nominal)], "{on_second:?}");
+}
+
+#[test]
+fn setdest_is_refused_where_sipp_refuses_it() {
+    // Mono TCP (`-t t1`): SIPp aborts the whole run with "Changing
+    // destinations for TCP or SCTP requires multisocket mode."; sipr fails
+    // that call with the same words and keeps running.
+    let (addr, _uas) = spawn_setdest_tcp_listener(Some(5090), Duration::from_secs(3));
+    let dir = std::env::temp_dir().join(format!("sipr-setdest-refused-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sc_path = dir.join("setdest.xml");
+    std::fs::write(&sc_path, setdest_uac_scenario("tcp")).expect("write scenario");
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .args([
+            "-sf",
+            sc_path.to_str().expect("utf8"),
+            "-t",
+            "t1",
+            "-m",
+            "1",
+            "-trace_err",
+            "-timeout",
+            "10",
+            "-bg",
+            &addr.to_string(),
+        ])
+        .output()
+        .expect("run sipr");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "one failed call: {err}");
+    assert!(err.contains("successful 0 failed 1"), "{err}");
+    let errors_log = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_errors.log"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("read log"))
+        .expect("an errors log");
+    assert!(
+        errors_log
+            .contains("setdest: Changing destinations for TCP or SCTP requires multisocket mode."),
+        "{errors_log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

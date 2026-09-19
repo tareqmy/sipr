@@ -106,6 +106,18 @@ pub enum ActionOutcome {
     PauseRestore(f64),
     /// `<closecon/>`. Not terminal.
     CloseCon,
+    /// `exec command=`: the rendered shell command. Not terminal.
+    ExecCommand(String),
+    /// `<setdest>`: the rendered host, port and protocol. Not terminal
+    /// (a rejected one fails the call from the engine side).
+    SetDest {
+        /// Host name or IP literal.
+        host: String,
+        /// Port text (validated by the engine).
+        port: String,
+        /// Protocol text (validated by the engine).
+        protocol: String,
+    },
 }
 
 /// Run every action in order, mutating the store and collecting outcomes.
@@ -153,6 +165,8 @@ fn run_actions_impl(
                 | ActionOutcome::RtpEchoCmd(_)
                 | ActionOutcome::PauseRestore(_)
                 | ActionOutcome::CloseCon
+                | ActionOutcome::ExecCommand(_)
+                | ActionOutcome::SetDest { .. }
         );
         out.push(outcome);
         if terminal {
@@ -204,9 +218,11 @@ fn run_one(
             check_it,
             assign_to,
         } => {
-            let haystack = match cmd_text {
-                Some(text) => cmd_haystack(*search_in, header.as_deref(), *start_line, text),
-                None => ereg_haystack(*search_in, header.as_deref(), *start_line, last_msg),
+            let haystack = match (search_in, cmd_text) {
+                // SIPp E_LP_VAR: the variable's text is the haystack.
+                (SearchIn::Var(id), _) => store.get(*id).as_str(),
+                (_, Some(text)) => cmd_haystack(*search_in, header.as_deref(), *start_line, text),
+                (_, None) => ereg_haystack(*search_in, header.as_deref(), *start_line, last_msg),
             };
             // SIPp: a `hdr` search whose header is absent fails the call
             // outright under check_it (E_AR_HDR_NOT_FOUND), whatever the
@@ -374,6 +390,18 @@ fn run_one(
         Action::PlayDtmf(t) => ActionOutcome::PlayDtmf(render_with_store(t, store, base_ctx)),
         Action::RtpEchoState(on) => ActionOutcome::RtpEcho(*on),
         Action::RtpEcho(cmd) => ActionOutcome::RtpEchoCmd(cmd.clone()),
+        Action::ExecCommand(command) => {
+            ActionOutcome::ExecCommand(render_with_store(command, store, base_ctx))
+        }
+        Action::SetDest {
+            host,
+            port,
+            protocol,
+        } => ActionOutcome::SetDest {
+            host: render_with_store(host, store, base_ctx),
+            port: render_with_store(port, store, base_ctx),
+            protocol: render_with_store(protocol, store, base_ctx),
+        },
         Action::ExecInt(cmd) => match cmd {
             sipr_scenario::model::IntCmd::StopCall => {
                 ActionOutcome::FailCall("exec stop_call".into())
@@ -452,7 +480,7 @@ fn verify_auth(
 /// message (SIPp runs the same `extractSubMessage` on the command blob).
 fn cmd_haystack(search_in: SearchIn, header: Option<&str>, start_line: bool, text: &str) -> String {
     match search_in {
-        SearchIn::Msg => text.to_owned(),
+        SearchIn::Msg | SearchIn::Body | SearchIn::Var(_) => text.to_owned(),
         SearchIn::Hdr => header_haystack(text, header.unwrap_or(""), start_line),
     }
 }
@@ -495,7 +523,8 @@ fn ereg_haystack(
     };
     match search_in {
         SearchIn::Hdr => header_haystack(&msg.reconstruct(), header.unwrap_or(""), start_line),
-        SearchIn::Msg => {
+        SearchIn::Body => String::from_utf8_lossy(msg.body()).into_owned(),
+        SearchIn::Msg | SearchIn::Var(_) => {
             if start_line {
                 msg.start_line().to_owned()
             } else {

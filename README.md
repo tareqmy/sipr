@@ -83,6 +83,9 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   injection (line = user id − 1); `<User variables>` persist per user id
   across its calls and `<Global variables>` across the run (seed one with
   `-set VAR VALUE`), with SIPp's id retirement on `set users` shrinks.
+- `exec command=` hooks (a shell per matching message, fire-and-forget as
+  in SIPp) and `<setdest>` (redirect the rest of a call to another host
+  and port, over UDP or per-call TCP).
 - Manual transactions (`start_txn`/`ack_txn`/`response_txn`): a `recv` tied
   to the Via branch of one sent request, with SIPp's handling of late
   responses to it (provisional ignored, the ACK re-sent, a repeated final
