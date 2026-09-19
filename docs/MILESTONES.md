@@ -1357,3 +1357,104 @@ an `ack_txn` ACK carries its own branch, as in SIPp.
       matching order, the out-of-window rules, `[branch]` unchanged);
       ARCHITECTURE §4 (per-call transaction slots next to the retrans
       context); README feature bullet.
+
+### M37 — `exec command=` (external process) and `<setdest>`
+
+The two remaining v1.x-tier actions. Both are hard errors in sipr's
+compiler today ("exec command= (external process) is not supported yet",
+"action <setdest> is not supported yet"), so SIPp's documented hook and
+redirect idioms — `<exec command="echo [last_From] >> from_list.log"/>`,
+`<setdest host="[$host]" port="[$port]" protocol="[$transport]"/>` after
+an `ereg` over `[next_url]` — fail to load.
+
+Behavioral oracle: `scenario.cpp` ~l.1596-1600 (`setdest`: `host`,
+`port`, `protocol`, each a message template — `xp_get_string` — so
+keywords and `[$var]` render at run time), ~l.1637-1640 (`exec
+command="…"` is a message template too; the DTD, `sipp.dtd` ~l.90-95,
+lists `command`, `int_cmd`, `play_pcap*`, `rtp_stream`, `rtp_echo`);
+`call.cpp` ~l.6144-6178 (`E_AT_EXECUTE_CMD`: the rendered command runs
+through a double `fork()` and `system()` — a shell — the parent reaps
+only the intermediate child and **never waits for the command nor sees
+its status**; the grandchild logs "system call error for %s" when
+`system()` itself fails; stdin/stdout/stderr are inherited, which is why
+the `>> file` idiom works and why output lands on the curses screen),
+~l.5841-5935 (`E_AT_SET_DEST`: render host, port, protocol; port must be
+numeric ("Invalid port for setdest: %s"); protocol is `udp|tcp|tls|sctp`
+in either case ("Unknown transport for setdest: '%s'"); it must equal
+the call's transport ("Can not switch protocols during setdest."); TLS
+is refused ("Changing destinations is not supported for TLS."); TCP/SCTP
+need per-call sockets ("Changing destinations for TCP or SCTP requires
+multisocket mode.") and a socket nobody else shares ("Can not change
+destinations for a TCP/SCTP socket that has more than one user."); the
+host is resolved with a **blocking** `getaddrinfo` ("Unknown host '%s'
+for setdest"); UDP then just retargets the call's peer; TCP/SCTP close
+the call's connection and `reconnect()`, a failure logging "Unable to
+connect a TCP/SCTP/TLS socket" and spending one `-max_reconnect` credit
+— all of those are SIPp `ERROR`s, i.e. fatal for the whole run),
+~l.2741 (`[remote_ip]`/`[remote_port]` keep rendering the global
+remote: `setdest` moves the traffic, not the keywords);
+`docs/scenarios/actions.rst` "External commands" and "setdest" (incl.
+the IPv6-without-brackets warning: brackets would be read as a keyword).
+
+- [ ] Scenario: `<exec command="…"/>` compiles to `Action::ExecCommand
+      (MsgTemplate)` (mutually exclusive with the other `exec`
+      attributes, as today); `<setdest host= port= protocol=/>` to
+      `Action::SetDest { host, port, protocol: MsgTemplate }` with the
+      three attributes required (`xp_get_string` is fatal without them;
+      SIPp's wording) and unknown attributes warning. Both run from
+      `<recv>`, `<nop>`, `<send>` actions like any other; `--check` dumps
+      them. The DTD's `sample` and the standalone `index` stay rejected.
+- [ ] Engine, `exec command=`: render the template (all keywords, the
+      call's variables), then hand the string to an exec runner — one
+      background thread that spawns `sh -c <cmd>` (`cmd /C` on Windows)
+      with inherited stdio and reaps each child when it exits, so the
+      engine thread never forks, waits or blocks and no zombies
+      accumulate under load. Fire-and-forget like SIPp: no exit status,
+      no effect on the call; a spawn failure is one error-trace line
+      ("system call error for <cmd>", SIPp's text) and nothing more. The
+      runner drains before the process exits (SIPp's grandchildren
+      outlive it — record the difference). Spawn happens off the engine
+      thread; the only hot-path cost is the render.
+- [ ] Engine, `<setdest>`: render the three values; validate exactly as
+      SIPp (port numeric; protocol one of the four, case-insensitive;
+      protocol == the run's transport; TLS refused; TCP/SCTP only in the
+      per-call modes `tn`/`sn` — the call's own connection is closed and
+      re-dialled to the new peer, a failure counting against
+      `-max_reconnect` and failing the call with SIPp's "Unable to
+      connect" warning) — but, as with "Jump statement out of range",
+      **fail the call, not the run** (record). UDP retargets the call's
+      `remote` only: `[remote_ip]`/`[remote_port]` and the digest URI keep
+      the nominal remote (`render_remote`), as SIPp's globals do. A
+      literal IP costs no I/O; a host name is resolved with a blocking
+      lookup on the engine thread, SIPp's documented stall — an
+      error-trace line notes it the first time. IPv6 literals bare, as
+      in SIPp (bracketed ones read as keywords). `-rsa`: verify in
+      `send_raw` whether the sending address still wins after a
+      `setdest` and match it.
+- [ ] Tests: scenario unit (both actions compile; missing `setdest`
+      attributes error; `exec command=` with a media attribute still
+      errors); engine unit (setdest validation messages; protocol
+      parsing incl. case); e2e `exec_command_runs_a_shell_per_matching_
+      message` (a UAS scenario `echo [last_From] >> from_list.log` on
+      each INVITE against 3 sipr UAC calls: the file holds the three From
+      headers, sipr exits 0, no zombie — check `ps` shows no defunct
+      children of sipr while it runs), `setdest_redirects_the_rest_of_
+      the_call_over_udp` (the scripted UAS answers the INVITE with a
+      Contact on a second socket; the scenario `ereg`s host and port out
+      of `[next_url]`, `setdest`s, and the BYE arrives on the second
+      socket while `[remote_ip]:[remote_port]` in it still name the
+      first), `setdest_over_per_call_tcp_reconnects` (`-t tn`: the BYE
+      arrives on a second TCP listener) and `setdest_is_refused_where_
+      sipp_refuses_it` (mono TCP → the call fails with SIPp's wording;
+      TLS likewise; the run goes on); interop: SIPp's own setdest example
+      shape (`[next_url]` → `ereg` → `setdest`) run by real sipp against
+      a sipr UAS that answers with a Contact pointing at a second sipr
+      UAS port, and by sipr against the same with sipp on the second
+      port; and an `exec command=` scenario on both, each side's
+      `>> file` output compared.
+- [ ] Docs: SIPP_COMPAT §1 (actions table: `exec command=`, `setdest`),
+      the v1.x tier paragraph, §6 note (fire-and-forget exec, the fatal
+      → per-call divergence, blocking resolution, keywords unchanged by
+      setdest); ARCHITECTURE (the exec runner thread next to the media
+      threads); README feature bullet; CONVENTIONS if the runner needs a
+      dependency (it should not — `std::process` suffices).
