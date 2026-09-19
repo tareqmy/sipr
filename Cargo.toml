@@ -29,7 +29,9 @@ sipr-control = { path = "crates/sipr-control", version = "0.26.0" }
 # ring builds with `cc` alone (no cmake, no system OpenSSL), keeping the
 # build portable (docs/CONVENTIONS.md §Dependencies).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pemfile = "2"
+# PEM parsing for -tls_cert/-tls_key/-tls_ca/-tls_crl comes from the same
+# crate rustls uses for its types; `rustls-pemfile` is unmaintained (RUSTSEC-2025-0134).
+rustls-pki-types = { version = "1", features = ["std"] }
 # SCTP (`-t s1|sn`, cargo feature `sctp`): std has no SCTP; socket2 opens
 # SOCK_STREAM/IPPROTO_SCTP sockets safely (docs/CONVENTIONS.md §Dependencies).
 socket2 = "0.6"
@@ -60,6 +62,13 @@ license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
+# Keep the crates.io package to what builds and documents the binary: no brand
+# assets, agent instructions, packaging metadata, or CI.
+exclude = [
+    ".claude/", ".github/", "benches/", "brand/", "dist/", "docs/", "scripts/",
+    "Formula/", "AGENTS.md", "CLAUDE.md", "PLAN.md", ".version", "deny.toml",
+    "flake.nix", "flake.lock", "Makefile",
+]
 
 [dependencies]
 sipr-scenario = { workspace = true }

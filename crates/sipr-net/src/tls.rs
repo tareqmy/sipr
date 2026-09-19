@@ -28,6 +28,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore, ServerConfig};
 
@@ -555,8 +556,9 @@ fn load_certs(path: &Path) -> std::io::Result<Vec<CertificateDer<'static>>> {
             format!("cannot read TLS certificate file {}: {e}", path.display()),
         )
     })?;
-    let certs: Vec<_> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(file)).collect::<Result<_, _>>()?;
+    let certs: Vec<_> = CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(file))
+        .collect::<Result<_, pem::Error>>()
+        .map_err(|e| pem_error(path, "certificate", e))?;
     if certs.is_empty() {
         return Err(std::io::Error::other(format!(
             "no certificates found in {}",
@@ -575,12 +577,21 @@ fn load_key(path: &Path) -> std::io::Result<PrivateKeyDer<'static>> {
             format!("cannot read TLS key file {}: {e}", path.display()),
         )
     })?;
-    rustls_pemfile::private_key(&mut std::io::BufReader::new(file))?.ok_or_else(|| {
-        std::io::Error::other(format!(
+    PrivateKeyDer::from_pem_reader(&mut std::io::BufReader::new(file)).map_err(|e| match e {
+        pem::Error::NoItemsFound => std::io::Error::other(format!(
             "no private key found in {} (encrypted keys are not supported)",
             path.display()
-        ))
+        )),
+        other => pem_error(path, "key", other),
     })
+}
+
+/// A PEM parse failure, named after the file it came from.
+fn pem_error(path: &Path, what: &str, err: pem::Error) -> std::io::Error {
+    std::io::Error::other(format!(
+        "malformed TLS {what} file {}: {err}",
+        path.display()
+    ))
 }
 
 /// CA roots from `-tls_ca` (empty store when only `-tls_crl` was given —
@@ -603,7 +614,9 @@ fn load_crls(path: &Path) -> std::io::Result<Vec<CertificateRevocationListDer<'s
             format!("cannot read TLS CRL file {}: {e}", path.display()),
         )
     })?;
-    rustls_pemfile::crls(&mut std::io::BufReader::new(file)).collect::<Result<_, _>>()
+    CertificateRevocationListDer::pem_reader_iter(&mut std::io::BufReader::new(file))
+        .collect::<Result<_, pem::Error>>()
+        .map_err(|e| pem_error(path, "CRL", e))
 }
 
 /// Whether `-tls_ca`/`-tls_crl` switched peer verification on (SIPp's rule).
