@@ -5883,3 +5883,310 @@ fn set_users_retires_and_reuses_ids_like_sipp() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- manual transactions (M36) --------------------------------------------
+
+/// Two INVITEs in flight at once, each naming its transaction; the 200s are
+/// received by name — `second` first — and each ACK names its transaction.
+fn overlapping_invites_scenario() -> String {
+    let invite = |cseq: u32, txn: &str| {
+        format!(
+            r#"  <send retrans="500" start_txn="{txn}"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: {cseq} INVITE
+    Contact: <sip:sipr@[local_ip]:[local_port]>
+    X-Txn: {txn}
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+"#
+        )
+    };
+    let ack = |cseq: u32, txn: &str| {
+        format!(
+            r#"  <recv response="200" response_txn="{txn}"/>
+  <send ack_txn="{txn}"><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: {cseq} ACK
+    Content-Length: 0
+
+  ]]></send>
+"#
+        )
+    };
+    format!(
+        r#"<scenario name="overlap">
+{}{}{}{}  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 3 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#,
+        invite(1, "first"),
+        invite(2, "second"),
+        ack(2, "second"),
+        ack(1, "first"),
+    )
+}
+
+/// A UAS for [`overlapping_invites_scenario`]: once both INVITEs are in, it
+/// answers them 200 in `answer_order` (by `X-Txn`) and records the CSeq
+/// number of every ACK, in arrival order.
+fn spawn_overlap_uas(
+    answer_order: [&'static str; 2],
+    idle: Duration,
+) -> (SocketAddr, std::thread::JoinHandle<Vec<u32>>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(idle)).expect("timeout");
+    let handle = std::thread::spawn(move || {
+        let mut invites: Vec<(String, Vec<u8>)> = Vec::new(); // (txn, 200)
+        let mut answered = false;
+        let mut acks = Vec::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let txn = msg.header("X-Txn").unwrap_or_default().trim().to_owned();
+                    if invites.iter().all(|(t, _)| *t != txn) {
+                        invites.push((txn, mirror_response(&msg, "200 OK", true)));
+                    }
+                    if invites.len() == 2 && !answered {
+                        answered = true;
+                        for want in answer_order {
+                            if let Some((_, ok)) = invites.iter().find(|(t, _)| t == want) {
+                                let _ = sock.send_to(ok, from);
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                    }
+                }
+                Some("ACK") => {
+                    if let Some((n, _)) = msg.cseq() {
+                        acks.push(n);
+                    }
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        acks
+    });
+    (addr, handle)
+}
+
+#[test]
+fn response_txn_matches_the_right_invite_of_two_overlapping_ones() {
+    let sc_path = std::env::temp_dir().join(format!("sipr-overlap-{}.xml", std::process::id()));
+    std::fs::write(&sc_path, overlapping_invites_scenario()).expect("write scenario");
+
+    // The peer answers `second` first, as the scenario expects: each 200 is
+    // taken by the recv naming its transaction (same code, same CSeq
+    // method — only the branch tells them apart) and each ACK follows.
+    let (addr, uas) = spawn_overlap_uas(["second", "first"], Duration::from_secs(3));
+    let out = run_sipr(&[
+        "-sf",
+        sc_path.to_str().expect("utf8"),
+        "-m",
+        "1",
+        "-d",
+        "20",
+        "-timeout",
+        "10",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    let acks = uas.join().expect("uas thread");
+    assert_eq!(
+        acks,
+        [2, 1],
+        "ACK for `second` (CSeq 2) first, then `first`"
+    );
+
+    // The other order: the 200 for `first` arrives while the scenario
+    // waits for `second`'s. Nothing accepts a response of another
+    // transaction, so the call fails on it — SIPp's rule ("matches only
+    // responses to the message sent with start_txn").
+    let (addr, uas) = spawn_overlap_uas(["first", "second"], Duration::from_secs(3));
+    let out = run_sipr(&[
+        "-sf",
+        sc_path.to_str().expect("utf8"),
+        "-m",
+        "1",
+        "-d",
+        "20",
+        "-timeout",
+        "10",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&sc_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("successful 0 failed 1"), "{err}");
+    assert!(err.contains("unexpected"), "{err}");
+    let acks = uas.join().expect("uas thread");
+    assert!(acks.is_empty(), "no transaction was acknowledged: {acks:?}");
+}
+
+/// INVITE `a` by name, then an INFO round trip, a pause and a BYE. The peer
+/// sends a late 180 and a late copy of the INVITE's 200 during the pause.
+fn late_final_scenario() -> String {
+    r#"<scenario name="late-final">
+  <send retrans="500" start_txn="a"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:sipr@[local_ip]:[local_port]>
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="180" optional="true" response_txn="a"/>
+  <recv response="200" response_txn="a"/>
+  <send ack_txn="a"><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Content-Length: 0
+
+  ]]></send>
+  <send retrans="500"><![CDATA[
+    INFO sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 INFO
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <pause milliseconds="600"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 3 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#
+        .to_owned()
+}
+
+#[test]
+fn late_final_response_to_a_named_invite_transaction_is_acked_again() {
+    // After the INFO's 200 the peer sends the INVITE's 180 (late) and its
+    // 200 again (as if the ACK were lost). Neither is a retransmission of
+    // the last message received, so the generic dedupe does not apply:
+    // the named transaction does — the 180 (which has an optional recv of
+    // its own, as SIPp requires) is ignored, the 200 gets the ACK again,
+    // and the call goes on to its BYE.
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut invite_ok: Option<Vec<u8>> = None;
+        let mut invite_ringing: Option<Vec<u8>> = None;
+        let mut acks = 0u32;
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let ok = mirror_response(&msg, "200 OK", true);
+                    invite_ringing = Some(mirror_response(&msg, "180 Ringing", true));
+                    let _ = sock.send_to(&ok, from);
+                    invite_ok = Some(ok);
+                }
+                Some("ACK") => acks += 1,
+                Some("INFO") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                    std::thread::sleep(Duration::from_millis(100));
+                    if let Some(ringing) = &invite_ringing {
+                        let _ = sock.send_to(ringing, from);
+                    }
+                    if let Some(ok) = &invite_ok {
+                        let _ = sock.send_to(ok, from);
+                    }
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        acks
+    });
+
+    let dir = std::env::temp_dir().join(format!("sipr-late-final-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sc_path = dir.join("late-final.xml");
+    std::fs::write(&sc_path, late_final_scenario()).expect("write scenario");
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .args([
+            "-sf",
+            sc_path.to_str().expect("utf8"),
+            "-m",
+            "1",
+            "-trace_err",
+            "-timeout",
+            "10",
+            "-bg",
+            &addr.to_string(),
+        ])
+        .output()
+        .expect("run sipr");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    let acks = uas.join().expect("uas thread");
+    assert_eq!(acks, 2, "the ACK was sent again for the late 200");
+    let errors_log = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_errors.log"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("read log"))
+        .expect("an errors log");
+    assert!(
+        errors_log.contains("Ignoring provisional UDP message for transaction a"),
+        "{errors_log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

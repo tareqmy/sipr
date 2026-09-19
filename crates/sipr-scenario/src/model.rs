@@ -9,6 +9,19 @@ use crate::template::{Keyword, MsgTemplate, Span};
 pub type StepIndex = usize;
 /// Index into the scenario's variable table.
 pub type VarId = usize;
+/// Index into [`Scenario::transactions`].
+pub type TxnId = usize;
+
+/// A manual transaction (`start_txn`/`ack_txn`/`response_txn`): a name
+/// for the Via branch of one sent request, so a `recv` can be tied to that
+/// request instead of to "any response with this CSeq method".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transaction {
+    /// The name the attributes share.
+    pub name: String,
+    /// Started by an INVITE (must be acknowledged with `ack_txn`).
+    pub is_invite: bool,
+}
 
 /// Which side of the call this scenario plays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +186,11 @@ pub struct SendStep {
     pub retrans_ms: Option<u64>,
     /// `lost`: simulated loss percentage.
     pub lost_pct: Option<f64>,
+    /// `start_txn`: remember this request's Via branch under that name.
+    pub start_txn: Option<TxnId>,
+    /// `ack_txn`: this ACK answers that transaction's final response (and
+    /// is re-sent when the response is retransmitted).
+    pub ack_txn: Option<TxnId>,
     /// Actions attached to the send.
     pub actions: Vec<Action>,
     /// Shared attributes.
@@ -203,6 +221,9 @@ pub struct RecvStep {
     /// `ignoresdp`: do not learn the remote media endpoint from this
     /// message's SDP (media milestones).
     pub ignore_sdp: bool,
+    /// `response_txn`: match only a response whose Via branch is the one
+    /// that transaction's `start_txn` request carried.
+    pub response_txn: Option<TxnId>,
     /// Actions run when the message matches.
     pub actions: Vec<Action>,
     /// Shared attributes.
@@ -635,6 +656,8 @@ pub struct Scenario {
     pub steps: Vec<Step>,
     /// Variable table.
     pub vars: VarTable,
+    /// Manual transactions, by [`TxnId`].
+    pub transactions: Vec<Transaction>,
     /// `ResponseTimeRepartition` bucket bounds (ms).
     pub response_time_repartition: Vec<u64>,
     /// `CallLengthRepartition` bucket bounds (ms).
@@ -743,6 +766,21 @@ impl Scenario {
                 let _ = writeln!(out, "  {} variables: {}", scope.label(), names.join(", "));
             }
         }
+        if !self.transactions.is_empty() {
+            let names: Vec<String> = self
+                .transactions
+                .iter()
+                .map(|t| {
+                    let kind = if t.is_invite { "INVITE" } else { "non-INVITE" };
+                    format!("{} ({kind})", t.name)
+                })
+                .collect();
+            let _ = writeln!(out, "  transactions: {}", names.join(", "));
+        }
+        let txn_name = |id: Option<TxnId>| {
+            id.and_then(|id| self.transactions.get(id))
+                .map_or("?", |t| t.name.as_str())
+        };
         for (i, step) in self.steps.iter().enumerate() {
             let line = match step {
                 Step::Send(s) => {
@@ -750,6 +788,12 @@ impl Scenario {
                     let mut extra = String::new();
                     if let Some(ms) = s.retrans_ms {
                         let _ = write!(extra, " retrans={ms}ms");
+                    }
+                    if s.start_txn.is_some() {
+                        let _ = write!(extra, " start_txn={}", txn_name(s.start_txn));
+                    }
+                    if s.ack_txn.is_some() {
+                        let _ = write!(extra, " ack_txn={}", txn_name(s.ack_txn));
                     }
                     if !s.actions.is_empty() {
                         let _ = write!(extra, " actions={}", s.actions.len());
@@ -767,6 +811,9 @@ impl Scenario {
                     }
                     if r.auth {
                         extra.push_str(" auth");
+                    }
+                    if r.response_txn.is_some() {
+                        let _ = write!(extra, " response_txn={}", txn_name(r.response_txn));
                     }
                     if r.record_route_set {
                         extra.push_str(" rrs");

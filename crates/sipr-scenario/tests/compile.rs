@@ -927,3 +927,166 @@ fn reference_to_an_undeclared_variable_still_errors() {
         errors(&xml)
     );
 }
+
+// ---- manual transactions (M36) --------------------------------------------
+
+/// INVITE/200/ACK by name plus a plain BYE; `invite_attr`/`ack_attr`/
+/// `recv_attr` let each test misplace one attribute.
+fn txn_scenario(invite_attr: &str, recv_attr: &str, ack_attr: &str) -> String {
+    wrap(&format!(
+        r#"<send {invite_attr}><![CDATA[
+             INVITE sip:s@[remote_ip] SIP/2.0
+             Call-ID: [call_id]
+
+           ]]></send>
+           <recv response="200" {recv_attr}/>
+           <send {ack_attr}><![CDATA[
+             ACK sip:s@[remote_ip] SIP/2.0
+             Call-ID: [call_id]
+
+           ]]></send>
+           <send><![CDATA[
+             BYE sip:s@[remote_ip] SIP/2.0
+             Call-ID: [call_id]
+
+           ]]></send>
+           <recv response="200"/>"#
+    ))
+}
+
+#[test]
+fn transaction_attributes_compile_and_resolve() {
+    let xml = txn_scenario(r#"start_txn="a""#, r#"response_txn="a""#, r#"ack_txn="a""#);
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    assert_eq!(sc.transactions.len(), 1);
+    assert_eq!(sc.transactions[0].name, "a");
+    assert!(sc.transactions[0].is_invite);
+    let Step::Send(invite) = &sc.steps[0] else {
+        panic!("step 0")
+    };
+    assert_eq!(invite.start_txn, Some(0));
+    assert_eq!(invite.ack_txn, None);
+    let Step::Recv(ok) = &sc.steps[1] else {
+        panic!("step 1")
+    };
+    assert_eq!(ok.response_txn, Some(0));
+    let Step::Send(ack) = &sc.steps[2] else {
+        panic!("step 2")
+    };
+    assert_eq!(ack.ack_txn, Some(0));
+    let Step::Recv(bye_ok) = &sc.steps[4] else {
+        panic!("step 4")
+    };
+    assert_eq!(bye_ok.response_txn, None);
+    let dump = sc.dump();
+    assert!(dump.contains("transactions: a (INVITE)"), "{dump}");
+    assert!(dump.contains("start_txn=a"), "{dump}");
+    assert!(dump.contains("response_txn=a"), "{dump}");
+    assert!(dump.contains("ack_txn=a"), "{dump}");
+}
+
+#[test]
+fn transaction_attributes_are_rejected_where_sipp_rejects_them() {
+    let has = |xml: &str, needle: &str| {
+        let errs = errors(xml);
+        assert!(
+            errs.iter().any(|e| e.contains(needle)),
+            "want {needle:?} in {errs:?}"
+        );
+    };
+    // start_txn on an ACK, ack_txn on a non-ACK.
+    has(
+        &txn_scenario(
+            r#"start_txn="a""#,
+            r#"response_txn="a""#,
+            r#"start_txn="a""#,
+        ),
+        "An ACK message can not start a transaction!",
+    );
+    has(
+        &txn_scenario(r#"ack_txn="a""#, r#"response_txn="a""#, r#"ack_txn="a""#),
+        "The ack_txn attribute is valid only for ACK messages!",
+    );
+    // response_txn on a send, or on a received request.
+    has(
+        &txn_scenario(
+            r#"start_txn="a" response_txn="a""#,
+            r#"response_txn="a""#,
+            r#"ack_txn="a""#,
+        ),
+        "response_txn can only be used for received messages.",
+    );
+    let on_request = wrap(&format!(
+        r#"<recv request="INVITE" response_txn="a"/>
+           {ok}"#,
+        ok = r#"<send><![CDATA[
+             SIP/2.0 200 OK
+             Call-ID: [call_id]
+
+           ]]></send>"#
+    ));
+    has(
+        &on_request,
+        "response_txn can only be used for received responses.",
+    );
+    // A response can neither start nor ACK a transaction.
+    let response_starts = wrap(
+        r#"<recv request="INVITE"/>
+           <send start_txn="a"><![CDATA[
+             SIP/2.0 200 OK
+             Call-ID: [call_id]
+
+           ]]></send>"#,
+    );
+    has(&response_starts, "Responses can not start a transaction");
+    let response_acks = response_starts.replace("start_txn", "ack_txn");
+    has(&response_acks, "Responses can not ACK a transaction");
+    // Names follow SIPp's variable-name rules.
+    has(
+        &txn_scenario(r#"start_txn="""#, r#"response_txn="a""#, r#"ack_txn="a""#),
+        "Variable names may not be empty for start transaction",
+    );
+    has(
+        &txn_scenario(
+            r#"start_txn="a""#,
+            r#"response_txn="a,b""#,
+            r#"ack_txn="a""#,
+        ),
+        "Variable names may not contain $ or , for transaction response",
+    );
+}
+
+#[test]
+fn transaction_usage_is_validated_like_sipp() {
+    let has = |xml: &str, needle: &str| {
+        let errs = errors(xml);
+        assert!(
+            errs.iter().any(|e| e.contains(needle)),
+            "want {needle:?} in {errs:?}"
+        );
+    };
+    // Answered but never started.
+    has(
+        &txn_scenario("", r#"response_txn="a""#, ""),
+        "Transaction a is never started!",
+    );
+    // Started but never answered.
+    has(
+        &txn_scenario(r#"start_txn="a""#, "", r#"ack_txn="a""#),
+        "Transaction a has no responses defined!",
+    );
+    // An INVITE transaction needs its ACK …
+    has(
+        &txn_scenario(r#"start_txn="a""#, r#"response_txn="a""#, ""),
+        "Transaction a is an INVITE transaction without an ACK!",
+    );
+    // … and a non-INVITE one must not have one.
+    let options = txn_scenario(r#"start_txn="a""#, r#"response_txn="a""#, r#"ack_txn="a""#)
+        .replace("INVITE sip:s", "OPTIONS sip:s");
+    has(
+        &options,
+        "Transaction a is a non-INVITE transaction with an ACK!",
+    );
+}

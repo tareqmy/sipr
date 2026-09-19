@@ -12,7 +12,7 @@ use crate::diag::{Diagnostic, Diagnostics};
 use crate::model::{
     Action, ArithOp, CompareOp, Expect, IntCmd, JumpTarget, MediaKind, Operand, PauseSpec,
     RecvStep, Role, RtpEchoCmd, RtpEchoVerb, RtpSource, RtpStreamCmd, Scenario, SearchIn, SendStep,
-    Step, StepCommon, StepIndex, VarId, VarScope, VarTable,
+    Step, StepCommon, StepIndex, Transaction, TxnId, VarId, VarScope, VarTable,
 };
 use crate::template::{self, Keyword, MsgTemplate};
 use crate::xml::{self, Element, Node};
@@ -56,6 +56,7 @@ pub fn compile(source_name: &str, xml_text: &str) -> CompileOutcome {
         var_written: Vec::new(),
         var_first_line: Vec::new(),
         cur_line: 0,
+        txns: Vec::new(),
         steps: Vec::new(),
         labels: HashMap::new(),
         pending: Vec::new(),
@@ -80,6 +81,37 @@ enum Slot {
     Ontimeout,
 }
 
+/// One named transaction while compiling (SIPp `txnControlInfo`).
+struct TxnControl {
+    name: String,
+    is_invite: bool,
+    started: u32,
+    responses: u32,
+    acks: u32,
+}
+
+/// How a step refers to a transaction (SIPp `get_txn`'s flags).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TxnUse {
+    /// `start_txn` on a request; `is_invite` when that request is an INVITE.
+    Start { is_invite: bool },
+    /// `ack_txn` on an ACK.
+    Ack,
+    /// `response_txn` on a `recv response=`.
+    Response,
+}
+
+impl TxnUse {
+    /// SIPp's wording for the name checks ("… for start transaction").
+    fn what(self) -> &'static str {
+        match self {
+            Self::Start { .. } => "start transaction",
+            Self::Ack => "ack transaction",
+            Self::Response => "transaction response",
+        }
+    }
+}
+
 struct Compiler {
     diags: Diagnostics,
     vars: VarTable,
@@ -89,6 +121,9 @@ struct Compiler {
     var_first_line: Vec<u32>,
     /// Line of the top-level element being compiled.
     cur_line: u32,
+    /// Manual transactions in declaration order (SIPp `txnMap`), with the
+    /// use counts `validate_txn_usage` checks.
+    txns: Vec<TxnControl>,
     steps: Vec<Step>,
     labels: HashMap<String, StepIndex>,
     pending: Vec<Pending>,
@@ -228,6 +263,139 @@ impl Compiler {
         t
     }
 
+    /// Register one use of a named transaction (SIPp `scenario::get_txn`):
+    /// the first mention creates it, later ones bump the use counts that
+    /// `finish()` validates.
+    fn txn(&mut self, name: &str, usage: TxnUse, line: u32) -> Option<TxnId> {
+        if name.is_empty() {
+            self.diags.error(
+                Some(line),
+                format!("Variable names may not be empty for {}", usage.what()),
+            );
+            return None;
+        }
+        if name.contains(['$', ',']) {
+            self.diags.error(
+                Some(line),
+                format!("Variable names may not contain $ or , for {}", usage.what()),
+            );
+            return None;
+        }
+        let id = match self.txns.iter().position(|t| t.name == name) {
+            Some(id) => id,
+            None => {
+                self.txns.push(TxnControl {
+                    name: name.to_owned(),
+                    is_invite: false,
+                    started: 0,
+                    responses: 0,
+                    acks: 0,
+                });
+                self.txns.len() - 1
+            }
+        };
+        let txn = &mut self.txns[id];
+        match usage {
+            TxnUse::Start { is_invite } => {
+                txn.started += 1;
+                txn.is_invite = is_invite;
+            }
+            TxnUse::Ack => txn.acks += 1,
+            TxnUse::Response => txn.responses += 1,
+        }
+        Some(id)
+    }
+
+    /// SIPp `validate_txn_usage`: every transaction must be started and
+    /// answered, an INVITE one acknowledged, a non-INVITE one not.
+    fn validate_txn_usage(&mut self) {
+        let findings: Vec<String> = self
+            .txns
+            .iter()
+            .flat_map(|t| {
+                let mut out = Vec::new();
+                if t.started == 0 {
+                    out.push(format!("Transaction {} is never started!", t.name));
+                } else if t.responses == 0 {
+                    out.push(format!("Transaction {} has no responses defined!", t.name));
+                }
+                if t.is_invite && t.acks == 0 {
+                    out.push(format!(
+                        "Transaction {} is an INVITE transaction without an ACK!",
+                        t.name
+                    ));
+                }
+                if !t.is_invite && t.acks > 0 {
+                    out.push(format!(
+                        "Transaction {} is a non-INVITE transaction with an ACK!",
+                        t.name
+                    ));
+                }
+                out
+            })
+            .collect();
+        for message in findings {
+            self.diags.error(None, message);
+        }
+    }
+
+    /// The `start_txn`/`ack_txn` attributes of a `<send>` (SIPp
+    /// `scenario.cpp` ~l.878-910): only a request may start a transaction,
+    /// only an ACK may acknowledge one, and a response may do neither.
+    fn parse_send_txns(
+        &mut self,
+        el: &Element,
+        first_word: &str,
+    ) -> (Option<TxnId>, Option<TxnId>) {
+        let is_response = first_word == "SIP/2.0";
+        let is_ack = first_word == "ACK";
+        if el.attr("response_txn").is_some() {
+            self.diags.error(
+                Some(el.line),
+                "response_txn can only be used for received messages.",
+            );
+        }
+        let start = el.attr("start_txn").map(ToOwned::to_owned);
+        let ack = el.attr("ack_txn").map(ToOwned::to_owned);
+        if start.is_some() && ack.is_some() {
+            self.diags.error(
+                Some(el.line),
+                "<send> cannot have both 'start_txn' and 'ack_txn'",
+            );
+            return (None, None);
+        }
+        let start_txn = start.and_then(|name| {
+            if is_response {
+                self.diags
+                    .error(Some(el.line), "Responses can not start a transaction");
+                return None;
+            }
+            if is_ack {
+                self.diags
+                    .error(Some(el.line), "An ACK message can not start a transaction!");
+                return None;
+            }
+            let is_invite = first_word == "INVITE";
+            self.txn(&name, TxnUse::Start { is_invite }, el.line)
+        });
+        let ack_txn = ack.and_then(|name| {
+            if is_response {
+                self.diags
+                    .error(Some(el.line), "Responses can not ACK a transaction");
+                return None;
+            }
+            if !is_ack {
+                self.diags.error(
+                    Some(el.line),
+                    "The ack_txn attribute is valid only for ACK messages!",
+                );
+                return None;
+            }
+            self.txn(&name, TxnUse::Ack, el.line)
+        });
+        (start_txn, ack_txn)
+    }
+
     fn compile_root(&mut self, root: &Element, source_name: &str) {
         if root.name != "scenario" {
             self.diags.error(
@@ -293,16 +461,9 @@ impl Compiler {
             "retrans",
             "lost",
             "start_txn",
-            "ack_txn", // + common
+            "ack_txn",
+            "response_txn", // rejected below with SIPp's wording, not as unknown
         ];
-        for txn in ["start_txn", "ack_txn"] {
-            if el.attr(txn).is_some() {
-                self.diags.error(
-                    Some(el.line),
-                    format!("attribute '{txn}' (manual transactions) is not supported yet — v1.x"),
-                );
-            }
-        }
         let common = self.parse_common(el, ATTRS);
         let retrans_ms = self.parse_num_attr(el, "retrans");
         let lost_pct = self.parse_num_attr(el, "lost");
@@ -336,11 +497,19 @@ impl Compiler {
             self.diags
                 .error(Some(el.line), "<send> has no message body");
         }
+        let first_word = normalized
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let (start_txn, ack_txn) = self.parse_send_txns(el, &first_word);
         let tmpl = self.templ(&normalized, cdata_line);
         self.steps.push(Step::Send(SendStep {
             template: tmpl,
             retrans_ms,
             lost_pct,
+            start_txn,
+            ack_txn,
             actions,
             common,
         }));
@@ -361,12 +530,6 @@ impl Compiler {
             "ignoresdp",
             "ignosesdp", // sic: the DTD spells it this way
         ];
-        if el.attr("response_txn").is_some() {
-            self.diags.error(
-                Some(el.line),
-                "attribute 'response_txn' (manual transactions) is not supported yet — v1.x",
-            );
-        }
         // The DTD misspells it `ignosesdp`; SIPp accepts both.
         let ignore_sdp =
             self.parse_bool_attr(el, "ignoresdp") || self.parse_bool_attr(el, "ignosesdp");
@@ -385,6 +548,22 @@ impl Compiler {
                 self.diags
                     .error(Some(el.line), "<recv> needs either 'response' or 'request'");
                 Expect::Response(String::new())
+            }
+        };
+        // `response_txn` ties the recv to a started transaction; SIPp allows
+        // it on received responses only (`scenario.cpp` ~l.923-932).
+        let response_txn = match (el.attr("response_txn"), &expect) {
+            (None, _) => None,
+            (Some(name), Expect::Response(_)) => {
+                let name = name.to_owned();
+                self.txn(&name, TxnUse::Response, el.line)
+            }
+            (Some(_), Expect::Request(_)) => {
+                self.diags.error(
+                    Some(el.line),
+                    "response_txn can only be used for received responses.",
+                );
+                None
             }
         };
         let ontimeout_label = el.attr("ontimeout").map(ToOwned::to_owned);
@@ -435,6 +614,7 @@ impl Compiler {
             auth: self.parse_bool_attr(el, "auth"),
             lost_pct: self.parse_num_attr(el, "lost"),
             ignore_sdp,
+            response_txn,
             actions,
             common,
         };
@@ -1444,6 +1624,7 @@ impl Compiler {
                 format!("jump to message index {dest} is out of range (0..{max})"),
             );
         }
+        self.validate_txn_usage();
         // Role detection.
         let role = self.steps.iter().find_map(|s| match s {
             Step::Send(_) => Some(Role::Uac),
@@ -1492,6 +1673,14 @@ impl Compiler {
                 unexp_retaddr: self.vars.find("_unexp.retaddr"),
                 unexp_pausedaddr: self.vars.find("_unexp.pausedaddr"),
                 vars: self.vars,
+                transactions: self
+                    .txns
+                    .into_iter()
+                    .map(|t| Transaction {
+                        name: t.name,
+                        is_invite: t.is_invite,
+                    })
+                    .collect(),
             })
         };
         CompileOutcome {

@@ -589,3 +589,36 @@ fn user_and_global_elements_are_rejected_when_they_disagree_across_scenarios() {
         "{err}"
     );
 }
+
+#[test]
+fn check_mode_prints_the_transactions() {
+    let sc = TempScenario::new(
+        "txn-check.xml",
+        r#"<scenario name="txn">
+             <send start_txn="invite"><![CDATA[
+               INVITE sip:[service]@[remote_ip] SIP/2.0
+               Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+               Call-ID: [call_id]
+
+             ]]></send>
+             <recv response="200" response_txn="invite"/>
+             <send ack_txn="invite"><![CDATA[
+               ACK sip:[service]@[remote_ip] SIP/2.0
+               Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+               Call-ID: [call_id]
+
+             ]]></send>
+           </scenario>"#,
+    );
+    let o = sipr(&["-sf", sc.path(), "--check"]);
+    assert_code(&o, 0);
+    let out = stdout(&o);
+    assert!(out.contains("transactions: invite (INVITE)"), "{out}");
+    assert!(out.contains("send start_txn=invite"), "{out}");
+    assert!(
+        out.contains("recv response=200 response_txn=invite"),
+        "{out}"
+    );
+    assert!(out.contains("send ack_txn=invite"), "{out}");
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+}

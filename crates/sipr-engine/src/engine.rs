@@ -31,7 +31,7 @@ use sipr_net::{SctpCallConn, SctpTransport};
 use sipr_scenario::inject::{InjectMode, InjectionFile};
 use sipr_scenario::model::{
     Action, Expect, MediaKind, PauseSpec, RecvStep, Role, RtpEchoCmd, RtpEchoVerb, RtpSource,
-    RtpStreamCmd, Scenario, Step, StepCommon,
+    RtpStreamCmd, Scenario, SendStep, Step, StepCommon, TxnId,
 };
 use sipr_scenario::template::{CryptoKw, Keyword, MsgTemplate, Span};
 
@@ -370,6 +370,17 @@ struct RetransCtx {
     timer: TimerId,
 }
 
+/// A call's view of one manual transaction (SIPp `txnInstanceInfo`).
+#[derive(Debug, Clone, Default)]
+struct TxnInstance {
+    /// The Via branch of the `start_txn` request, once it was sent.
+    branch: Option<String>,
+    /// Hash of the last response matched for it: a repeat is ignored.
+    final_hash: Option<u64>,
+    /// The `ack_txn` step's index, once sent (re-sent on a late final).
+    ack_index: Option<usize>,
+}
+
 struct CallState {
     number: u64,
     /// Where this call's messages go (per-call for UAS; `-target` for UAC).
@@ -393,6 +404,8 @@ struct CallState {
     field_lines: Vec<Option<usize>>,
     /// Per-call variable store.
     store: crate::actions::VarStore,
+    /// One slot per manual transaction of the call's scenario.
+    txns: Vec<TxnInstance>,
     /// Named counters (`counter` step attribute).
     counters: std::collections::HashMap<String, u64>,
     /// Stable client nonce for digest auth.
@@ -1994,17 +2007,132 @@ impl<'s> Engine<'s> {
     }
 
     /// The recv-window scan against the scenario a call runs.
-    fn scan_call(
+    /// Render a send step for a call: the message bytes and where they go
+    /// (`None` when the call is gone). Also used to re-send a recorded ACK
+    /// out of order, so it must not touch the call's state.
+    fn render_send(
         &self,
-        secondary: bool,
-        window_start: usize,
-        waiting: bool,
+        call_id: &str,
+        index: usize,
+        send: &SendStep,
+    ) -> Option<Result<(Vec<u8>, SocketAddr), crate::render::RenderError>> {
+        let call = self.calls.get(call_id)?;
+        let scenario = self.scenario_of(call_id);
+        let first = template_first_word(&send.template).unwrap_or_default();
+        let is_req = first != "SIP/2.0";
+        let remote_ip = call.render_remote.ip().to_string();
+        let digest_uri = self.digest_uri(call.render_remote);
+        let var_ctx = crate::render::VarCtx {
+            store: &call.store,
+            vars: &scenario.vars,
+            challenge: call.challenge.as_ref(),
+            auth_user: self.config.auth_user.as_deref().unwrap_or(""),
+            auth_password: self.config.auth_password.as_deref().unwrap_or(""),
+            cnonce: &call.cnonce,
+            method: if is_req { &first } else { "REGISTER" },
+            digest_uri: &digest_uri,
+        };
+        let ctx = RenderCtx {
+            service: &self.config.service,
+            remote_ip: &remote_ip,
+            remote_port: call.render_remote.port(),
+            local_ip: &self.local_ip_str,
+            server_ip: self.server_ip_of(call),
+            local_port: self.call_local_port(call),
+            media_ip: &self.media_ip_str,
+            media_port: self.media_port,
+            rtpstream_ports: rtpstream_ports(call),
+            crypto: Some(&call.crypto),
+            transport: self.transport_token,
+            call_id,
+            call_number: call.number,
+            user_id: call.user_id.map_or(0, |u| u as u64),
+            users_total: self.config.users.map_or(0, |n| n as u64),
+            pid: self.pid,
+            cseq: call.cseq,
+            msg_index: index,
+            peer_tag: call.peer_tag.as_deref(),
+            routes: &call.routes,
+            last: call.last_recv.as_ref(),
+            var_ctx: Some(var_ctx),
+            fields: crate::render::FieldSource {
+                files: &self.inf_files,
+                lines: &call.field_lines,
+            },
+        };
+        Some(render(&send.template, &ctx).map(|buf| (buf, call.remote)))
+    }
+
+    /// Send a step's message again, out of order (SIPp `sendBuffer(
+    /// createSendingMessage(...))` for a late final's ACK).
+    fn resend_step(&mut self, call_id: &str, index: usize) {
+        let Some(Step::Send(send)) = self.scenario_of(call_id).steps.get(index) else {
+            return;
+        };
+        let Some(Ok((buf, remote))) = self.render_send(call_id, index, send) else {
+            return;
+        };
+        if self.send_for_call(call_id, &buf, remote, None).is_ok() {
+            self.call_stats(call_id).retrans_sent += 1;
+            self.trace_send(&buf, remote);
+        }
+    }
+
+    /// A response for a named transaction the call already moved past
+    /// (SIPp `call::process_incoming` ~l.5395-5430): a provisional is
+    /// ignored, a final one for an INVITE transaction gets the recorded ACK
+    /// again, a repeat of the final response already taken is ignored with
+    /// SIPp's warning. Returns false when none applies (then it is an
+    /// unexpected message like any other).
+    fn on_old_transaction_response(
+        &mut self,
+        call_id: &str,
+        txn: TxnId,
         msg: &Inbound,
-    ) -> Scan {
+        msg_hash: u64,
+    ) -> bool {
+        let name = self
+            .scenario_of(call_id)
+            .transactions
+            .get(txn)
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        let transport = self.transport_token;
+        let (ack_index, final_hash) = self
+            .calls
+            .get(call_id)
+            .and_then(|c| c.txns.get(txn))
+            .map_or((None, None), |x| (x.ack_index, x.final_hash));
+        let code = msg.status_code().unwrap_or(0);
+        if (100..200).contains(&code) {
+            self.log_err(&format!(
+                "Ignoring provisional {transport} message for transaction {name}"
+            ));
+            return true;
+        }
+        if let Some(ack_index) = ack_index {
+            self.resend_step(call_id, ack_index);
+            return true;
+        }
+        if final_hash == Some(msg_hash) {
+            self.log_err(&format!(
+                "Ignoring final {transport} message for transaction {name} (hash {msg_hash})"
+            ));
+            return true;
+        }
+        false
+    }
+
+    fn scan_call(&self, call_id: &str, window_start: usize, waiting: bool, msg: &Inbound) -> Scan {
+        let (secondary, txns) = self
+            .calls
+            .get(call_id)
+            .map_or((false, &[][..]), |c| (c.secondary, c.txns.as_slice()));
         match self.secondary.as_ref() {
             Some(o) if secondary => scan_for_match(
                 o.scenario,
                 &o.expected_cseq_method,
+                txns,
                 window_start,
                 waiting,
                 msg,
@@ -2012,6 +2140,7 @@ impl<'s> Engine<'s> {
             _ => scan_for_match(
                 self.scenario,
                 &self.expected_cseq_method,
+                txns,
                 window_start,
                 waiting,
                 msg,
@@ -2029,6 +2158,7 @@ impl<'s> Engine<'s> {
         let cnonce = self.make_cnonce(number);
         let field_lines = self.assign_field_lines(user_id);
         let store = self.new_store(false, user_id);
+        let txns = vec![TxnInstance::default(); self.scenario.transactions.len()];
         self.calls.insert(
             call_id.clone(),
             new_call(
@@ -2037,6 +2167,7 @@ impl<'s> Engine<'s> {
                 target,
                 self.config.base_cseq,
                 store,
+                txns,
                 cnonce,
                 field_lines,
                 user_id,
@@ -2171,57 +2302,13 @@ impl<'s> Engine<'s> {
                         self.remove_call(call_id);
                         return;
                     }
-                    let (buf, remote) = {
-                        let Some(call) = self.calls.get(call_id) else {
+                    let (buf, remote) = match self.render_send(call_id, index, send) {
+                        Some(Ok(rendered)) => rendered,
+                        Some(Err(e)) => {
+                            self.fail_call(call_id, &format!("render failed: {e}"));
                             return;
-                        };
-                        let remote_ip = call.render_remote.ip().to_string();
-                        let digest_uri = self.digest_uri(call.render_remote);
-                        let var_ctx = crate::render::VarCtx {
-                            store: &call.store,
-                            vars: &scenario.vars,
-                            challenge: call.challenge.as_ref(),
-                            auth_user: self.config.auth_user.as_deref().unwrap_or(""),
-                            auth_password: self.config.auth_password.as_deref().unwrap_or(""),
-                            cnonce: &call.cnonce,
-                            method: if is_req { &first } else { "REGISTER" },
-                            digest_uri: &digest_uri,
-                        };
-                        let ctx = RenderCtx {
-                            service: &self.config.service,
-                            remote_ip: &remote_ip,
-                            remote_port: call.render_remote.port(),
-                            local_ip: &self.local_ip_str,
-                            server_ip: self.server_ip_of(call),
-                            local_port: self.call_local_port(call),
-                            media_ip: &self.media_ip_str,
-                            media_port: self.media_port,
-                            rtpstream_ports: rtpstream_ports(call),
-                            crypto: Some(&call.crypto),
-                            transport: self.transport_token,
-                            call_id,
-                            call_number: call.number,
-                            user_id: call.user_id.map_or(0, |u| u as u64),
-                            users_total: self.config.users.map_or(0, |n| n as u64),
-                            pid: self.pid,
-                            cseq: call.cseq,
-                            msg_index: index,
-                            peer_tag: call.peer_tag.as_deref(),
-                            routes: &call.routes,
-                            last: call.last_recv.as_ref(),
-                            var_ctx: Some(var_ctx),
-                            fields: crate::render::FieldSource {
-                                files: &self.inf_files,
-                                lines: &call.field_lines,
-                            },
-                        };
-                        match render(&send.template, &ctx) {
-                            Ok(buf) => (buf, call.remote),
-                            Err(e) => {
-                                self.fail_call(call_id, &format!("render failed: {e}"));
-                                return;
-                            }
                         }
+                        None => return,
                     };
                     // Run this send's actions (rare, but SIPp allows them).
                     if !send.actions.is_empty()
@@ -2260,6 +2347,19 @@ impl<'s> Engine<'s> {
                     );
                     if method_is_new_txn {
                         call.cseq = call.cseq.wrapping_add(1);
+                    }
+                    // Manual transactions (SIPp call.cpp ~l.2110-2116): a
+                    // `start_txn` send names its Via branch, an `ack_txn`
+                    // send records where its ACK lives.
+                    if let Some(t) = send.start_txn
+                        && let Some(slot) = call.txns.get_mut(t)
+                    {
+                        slot.branch = sent_via_branch(&buf);
+                    }
+                    if let Some(t) = send.ack_txn
+                        && let Some(slot) = call.txns.get_mut(t)
+                    {
+                        slot.ack_index = Some(index);
                     }
                     call.last_sent = Some(buf.clone());
                     // Replace any pending retransmission with this send's.
@@ -2512,7 +2612,7 @@ impl<'s> Engine<'s> {
             if self.scenario.role == Role::Uas
                 && msg.method().is_some()
                 && matches!(
-                    scan_for_match(self.scenario, &self.expected_cseq_method, 0, true, msg),
+                    scan_for_match(self.scenario, &self.expected_cseq_method, &[], 0, true, msg),
                     Scan::Forward(_)
                 )
             {
@@ -2522,6 +2622,7 @@ impl<'s> Engine<'s> {
                 // Incoming (UAS) calls have no user id.
                 let field_lines = self.assign_field_lines(None);
                 let store = self.new_store(false, None);
+                let txns = vec![TxnInstance::default(); self.scenario.transactions.len()];
                 self.calls.insert(
                     call_id.clone(),
                     new_call(
@@ -2530,6 +2631,7 @@ impl<'s> Engine<'s> {
                         packet.from,
                         self.config.base_cseq,
                         store,
+                        txns,
                         cnonce,
                         field_lines,
                         None,
@@ -2603,9 +2705,18 @@ impl<'s> Engine<'s> {
             self.stats_of(secondary).unexpected += 1;
             return;
         }
-        let scan = self.scan_call(secondary, window_start, waiting || window_start == 0, msg);
+        let msg_hash = hash_bytes(&packet.raw);
+        let scan = match self.scan_call(&call_id, window_start, waiting || window_start == 0, msg) {
+            Scan::OldTxn(txn) => {
+                if self.on_old_transaction_response(&call_id, txn, msg, msg_hash) {
+                    return;
+                }
+                Scan::NoMatch
+            }
+            other => other,
+        };
         match scan {
-            Scan::Forward(si) => self.on_matched(&call_id, si, msg, key),
+            Scan::Forward(si) => self.on_matched(&call_id, si, msg, msg_hash, key),
             Scan::Old => {
                 // Late/repeated optional (e.g. another 180): absorbed.
                 self.stats_of(secondary).messages_matched += 1;
@@ -2613,7 +2724,7 @@ impl<'s> Engine<'s> {
                     call.last_recv_key = Some(key);
                 }
             }
-            Scan::NoMatch => {
+            Scan::NoMatch | Scan::OldTxn(_) => {
                 if self.try_unexpected_jump(&call_id, packet) {
                     return;
                 }
@@ -2659,6 +2770,7 @@ impl<'s> Engine<'s> {
         if kind == SecondaryKind::OutOfCall {
             self.stats.auto_answered += 1;
         }
+        let txns = vec![TxnInstance::default(); o.scenario.transactions.len()];
         let cnonce = self.make_cnonce(number);
         let store = self.new_store(true, None);
         let mut call = new_call(
@@ -2667,6 +2779,7 @@ impl<'s> Engine<'s> {
             packet.from,
             self.config.base_cseq,
             store,
+            txns,
             cnonce,
             field_lines,
             None,
@@ -2694,6 +2807,7 @@ impl<'s> Engine<'s> {
         call_id: &str,
         si: usize,
         msg: &Inbound,
+        msg_hash: u64,
         key: (String, String, String),
     ) {
         let stats = self.call_stats(call_id);
@@ -2702,9 +2816,14 @@ impl<'s> Engine<'s> {
             s.recv += 1;
         }
         let scenario = self.scenario_of(call_id);
-        let (rrs, ignore_sdp, common) = match &scenario.steps[si] {
-            Step::Recv(r) => (r.record_route_set, r.ignore_sdp, r.common.clone()),
-            _ => (false, false, StepCommon::default()),
+        let (rrs, ignore_sdp, response_txn, common) = match &scenario.steps[si] {
+            Step::Recv(r) => (
+                r.record_route_set,
+                r.ignore_sdp,
+                r.response_txn,
+                r.common.clone(),
+            ),
+            _ => (false, false, None, StepCommon::default()),
         };
         let has_media = self.media.is_some();
         let now = Instant::now();
@@ -2720,6 +2839,13 @@ impl<'s> Engine<'s> {
             self.timers.cancel(t);
         }
         call.generation += 1;
+        // SIPp: the response taken for a named transaction is "the final
+        // response" — a later copy of it is recognised by hash.
+        if let Some(t) = response_txn
+            && let Some(slot) = call.txns.get_mut(t)
+        {
+            slot.final_hash = Some(msg_hash);
+        }
         if let Some(tag) = if msg.status_code().is_some() {
             msg.to_tag()
         } else {
@@ -4339,6 +4465,7 @@ fn new_call(
     render_remote: SocketAddr,
     base_cseq: u32,
     store: crate::actions::VarStore,
+    txns: Vec<TxnInstance>,
     cnonce: String,
     field_lines: Vec<Option<usize>>,
     user_id: Option<usize>,
@@ -4357,6 +4484,7 @@ fn new_call(
         rtd_starts: Vec::new(),
         field_lines,
         store,
+        txns,
         counters: std::collections::HashMap::new(),
         cnonce,
         challenge: None,
@@ -4444,6 +4572,9 @@ enum Scan {
     Forward(usize),
     /// Matched an already-passed optional (contiguous block behind us).
     Old,
+    /// A response for a named transaction behind the contiguous block —
+    /// SIPp's "reply to an old transaction" (call.cpp ~l.5395).
+    OldTxn(TxnId),
     NoMatch,
 }
 
@@ -4451,6 +4582,7 @@ enum Scan {
 fn scan_for_match(
     scenario: &Scenario,
     expected_cseq_method: &[Option<String>],
+    txns: &[TxnInstance],
     window_start: usize,
     waiting: bool,
     msg: &Inbound,
@@ -4465,7 +4597,7 @@ fn scan_for_match(
                     i += 1;
                 }
                 Step::Recv(r) => {
-                    if recv_matches(r, expected_cseq_method.get(i), i, msg) {
+                    if recv_matches(r, expected_cseq_method.get(i), txns, i, msg) {
                         return Scan::Forward(i);
                     }
                     if r.optional {
@@ -4480,6 +4612,8 @@ fn scan_for_match(
     }
     // Backward: contiguous optional block behind the window may re-match
     // (late 180 after the 200 advanced us, a repeated provisional...).
+    // Further back, only a recv tied to a named transaction can still
+    // claim a response — by branch — as an "old transaction" reply.
     let mut i = window_start;
     let mut contig = true;
     while i > 0 {
@@ -4490,22 +4624,63 @@ fn scan_for_match(
                 if !r.optional {
                     contig = false;
                 }
-                if contig && recv_matches(r, expected_cseq_method.get(i), i, msg) {
-                    return Scan::Old;
+                if contig {
+                    if recv_matches(r, expected_cseq_method.get(i), txns, i, msg) {
+                        return Scan::Old;
+                    }
+                } else if let Some(txn) = r.response_txn
+                    && recv_matches(r, expected_cseq_method.get(i), txns, i, msg)
+                {
+                    return Scan::OldTxn(txn);
                 }
             }
             _ => contig = false,
         }
-        if !contig {
+        if !contig && scenario.transactions.is_empty() {
             break;
         }
     }
     Scan::NoMatch
 }
 
+/// The `branch=` of the topmost Via in a message we rendered (SIPp
+/// `extract_transaction`: the value up to `;`, `,` or whitespace).
+fn sent_via_branch(buf: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(buf).ok()?;
+    for line in text.split("\r\n").skip(1) {
+        if line.is_empty() {
+            return None;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if !(name.eq_ignore_ascii_case("Via") || name.eq_ignore_ascii_case("v")) {
+            continue;
+        }
+        let (_, rest) = value.split_once(";branch=")?;
+        let branch: String = rest
+            .chars()
+            .take_while(|c| !matches!(c, ';' | ',') && !c.is_whitespace())
+            .collect();
+        return Some(branch);
+    }
+    None
+}
+
+/// SIPp's `hash(msg)` stand-in: a hash of the datagram, to recognise a
+/// repeated final response of a named transaction.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut hasher = DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
 fn recv_matches(
     step: &RecvStep,
     expected_method: Option<&Option<String>>,
+    txns: &[TxnInstance],
     index: usize,
     msg: &Inbound,
 ) -> bool {
@@ -4530,6 +4705,14 @@ fn recv_matches(
             };
             if !code_matches {
                 return false;
+            }
+            // A named transaction matches by Via branch alone (SIPp
+            // `matches_scenario`: before, and instead of, the rules below).
+            if let Some(t) = step.response_txn {
+                return txns
+                    .get(t)
+                    .and_then(|x| x.branch.as_deref())
+                    .is_some_and(|branch| msg.top_via_branch() == Some(branch));
             }
             // SIPp guard: beyond index 0, the response's CSeq method must
             // match the nearest preceding request (call.cpp
@@ -4577,7 +4760,11 @@ fn precompute_cseq_methods(scenario: &Scenario) -> Vec<Option<String>> {
     let mut out = Vec::with_capacity(scenario.steps.len());
     let mut list: Option<String> = None;
     for step in &scenario.steps {
+        // A request that names a transaction is matched by branch, not by
+        // CSeq method, so SIPp leaves it out of the method list.
         if let Step::Send(s) = step
+            && s.start_txn.is_none()
+            && s.ack_txn.is_none()
             && let Some(word) = template_first_word(&s.template)
             && word != "SIP/2.0"
         {
@@ -4901,12 +5088,12 @@ mod tests {
         let methods = precompute_cseq_methods(&sc);
         // Window starts at step 1 (recv 100 opt). A 200 must land on step 4.
         assert!(matches!(
-            scan_for_match(&sc, &methods, 1, true, &response(200, "INVITE", true)),
+            scan_for_match(&sc, &methods, &[], 1, true, &response(200, "INVITE", true)),
             Scan::Forward(4)
         ));
         // A 183 lands on its own optional step 3.
         assert!(matches!(
-            scan_for_match(&sc, &methods, 1, true, &response(183, "INVITE", false)),
+            scan_for_match(&sc, &methods, &[], 1, true, &response(183, "INVITE", false)),
             Scan::Forward(3)
         ));
     }
@@ -4919,16 +5106,16 @@ mod tests {
         // over every method sent so far ("INVITEACKBYE"): a late 200 for
         // the INVITE still matches, and so does the BYE's 200 …
         assert!(matches!(
-            scan_for_match(&sc, &methods, 8, true, &response(200, "INVITE", true)),
+            scan_for_match(&sc, &methods, &[], 8, true, &response(200, "INVITE", true)),
             Scan::Forward(8)
         ));
         assert!(matches!(
-            scan_for_match(&sc, &methods, 8, true, &response(200, "BYE", true)),
+            scan_for_match(&sc, &methods, &[], 8, true, &response(200, "BYE", true)),
             Scan::Forward(8)
         ));
         // … but a response to a method never sent cannot.
         assert!(matches!(
-            scan_for_match(&sc, &methods, 8, true, &response(200, "OPTIONS", true)),
+            scan_for_match(&sc, &methods, &[], 8, true, &response(200, "OPTIONS", true)),
             Scan::NoMatch
         ));
     }
@@ -4941,19 +5128,26 @@ mod tests {
         // 200 (step 4). A distinct out-of-order 180 hits the contiguous
         // optional block behind the window.
         assert!(matches!(
-            scan_for_match(&sc, &methods, 4, true, &response(180, "INVITE", false)),
+            scan_for_match(&sc, &methods, &[], 4, true, &response(180, "INVITE", false)),
             Scan::Old
         ));
         // Once past the mandatory 200 (ACK sent, window start 5), contig is
         // broken by the mandatory step: a late 180 is unexpected — verified
         // against call.cpp's backward loop (contig dies at OPTIONAL_FALSE).
         assert!(matches!(
-            scan_for_match(&sc, &methods, 5, false, &response(180, "INVITE", false)),
+            scan_for_match(
+                &sc,
+                &methods,
+                &[],
+                5,
+                false,
+                &response(180, "INVITE", false)
+            ),
             Scan::NoMatch
         ));
         // And a random 486 never matches backward.
         assert!(matches!(
-            scan_for_match(&sc, &methods, 4, true, &response(486, "INVITE", false)),
+            scan_for_match(&sc, &methods, &[], 4, true, &response(486, "INVITE", false)),
             Scan::NoMatch
         ));
     }
@@ -4996,28 +5190,28 @@ mod tests {
             .unwrap()
         };
         assert!(matches!(
-            scan_for_match(&sc, &methods, 0, true, &request("INFO")),
+            scan_for_match(&sc, &methods, &[], 0, true, &request("INFO")),
             Scan::Forward(0)
         ));
         assert!(matches!(
-            scan_for_match(&sc, &methods, 0, true, &request("OPTIONS")),
+            scan_for_match(&sc, &methods, &[], 0, true, &request("OPTIONS")),
             Scan::Forward(0)
         ));
         assert!(matches!(
-            scan_for_match(&sc, &methods, 0, true, &request("BYE")),
+            scan_for_match(&sc, &methods, &[], 0, true, &request("BYE")),
             Scan::NoMatch
         ));
         // Responses: the regex runs over the decimal code, unanchored.
         assert!(matches!(
-            scan_for_match(&sc, &methods, 3, true, &response(183, "INVITE", false)),
+            scan_for_match(&sc, &methods, &[], 3, true, &response(183, "INVITE", false)),
             Scan::Forward(3)
         ));
         assert!(matches!(
-            scan_for_match(&sc, &methods, 3, true, &response(200, "INVITE", true)),
+            scan_for_match(&sc, &methods, &[], 3, true, &response(200, "INVITE", true)),
             Scan::Forward(4)
         ));
         assert!(matches!(
-            scan_for_match(&sc, &methods, 3, true, &response(486, "INVITE", true)),
+            scan_for_match(&sc, &methods, &[], 3, true, &response(486, "INVITE", true)),
             Scan::NoMatch
         ));
         let digits = |n: u16| {
@@ -5038,7 +5232,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            scan_for_match(&sc, &methods, 1, true, &bye),
+            scan_for_match(&sc, &methods, &[], 1, true, &bye),
             Scan::NoMatch
         ));
     }
@@ -5115,5 +5309,126 @@ mod tests {
         assert_eq!(r.exit_code(), 0);
         r.failed = 1;
         assert_eq!(r.exit_code(), 1);
+    }
+
+    /// INVITE `a`, its 200 and ACK by name, then a plain BYE/200.
+    fn txn_scenario() -> Scenario {
+        let xml = r#"<scenario name="txn">
+  <send start_txn="a"><![CDATA[
+    INVITE sip:s@[remote_ip] SIP/2.0
+    Via: SIP/2.0/UDP [local_ip]:[local_port];branch=[branch]
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+
+  ]]></send>
+  <recv response="200" response_txn="a"/>
+  <send ack_txn="a"><![CDATA[
+    ACK sip:s@[remote_ip] SIP/2.0
+    Via: SIP/2.0/UDP [local_ip]:[local_port];branch=[branch]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+
+  ]]></send>
+  <send><![CDATA[
+    BYE sip:s@[remote_ip] SIP/2.0
+    Via: SIP/2.0/UDP [local_ip]:[local_port];branch=[branch]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#;
+        sipr_scenario::compile("txn", xml).scenario.unwrap()
+    }
+
+    fn slot(branch: &str) -> Vec<TxnInstance> {
+        vec![TxnInstance {
+            branch: Some(branch.to_owned()),
+            final_hash: None,
+            ack_index: None,
+        }]
+    }
+
+    #[test]
+    fn sent_via_branch_reads_the_top_via_up_to_a_separator() {
+        let msg = b"INVITE sip:x SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bK-1-2-3;rport\r\n\
+                    Via: SIP/2.0/UDP g;branch=other\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(sent_via_branch(msg).as_deref(), Some("z9hG4bK-1-2-3"));
+        let compact = b"ACK sip:x SIP/2.0\r\nv: SIP/2.0/UDP h;branch=z9hG4bK-9,x\r\n\r\n";
+        assert_eq!(sent_via_branch(compact).as_deref(), Some("z9hG4bK-9"));
+        assert_eq!(
+            sent_via_branch(b"SIP/2.0 200 OK\r\nTo: <sip:b>\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn response_txn_matches_by_branch_alone() {
+        let sc = txn_scenario();
+        let methods = precompute_cseq_methods(&sc);
+        // The helper's responses carry branch z9hG4bK-1.
+        let ok = response(200, "INVITE", true);
+        assert!(matches!(
+            scan_for_match(&sc, &methods, &slot("z9hG4bK-1"), 1, true, &ok),
+            Scan::Forward(1)
+        ));
+        // Same code, same CSeq method, another branch: not this transaction.
+        assert!(matches!(
+            scan_for_match(&sc, &methods, &slot("z9hG4bK-2"), 1, true, &ok),
+            Scan::NoMatch
+        ));
+        // The branch decides even when the CSeq method looks wrong …
+        assert!(matches!(
+            scan_for_match(
+                &sc,
+                &methods,
+                &slot("z9hG4bK-1"),
+                1,
+                true,
+                &response(200, "BYE", true)
+            ),
+            Scan::Forward(1)
+        ));
+        // … and a transaction never sent (no branch yet) matches nothing.
+        assert!(matches!(
+            scan_for_match(&sc, &methods, &[TxnInstance::default()], 1, true, &ok),
+            Scan::NoMatch
+        ));
+    }
+
+    #[test]
+    fn a_late_reply_to_a_named_transaction_is_flagged_behind_the_window() {
+        let sc = txn_scenario();
+        let methods = precompute_cseq_methods(&sc);
+        // Waiting for the BYE's 200 (step 4): the INVITE's 200 comes again.
+        // Its method is not in the guard list (named requests stay out of
+        // it), so it cannot land on step 4; the branch finds transaction a.
+        assert!(matches!(
+            scan_for_match(
+                &sc,
+                &methods,
+                &slot("z9hG4bK-1"),
+                4,
+                true,
+                &response(200, "INVITE", true)
+            ),
+            Scan::OldTxn(0)
+        ));
+        assert!(matches!(
+            scan_for_match(
+                &sc,
+                &methods,
+                &slot("z9hG4bK-1"),
+                4,
+                true,
+                &response(200, "BYE", true)
+            ),
+            Scan::Forward(4)
+        ));
+        assert_eq!(
+            methods[4].as_deref(),
+            Some("BYE"),
+            "INVITE and ACK named a transaction"
+        );
     }
 }

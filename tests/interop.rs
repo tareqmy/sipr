@@ -3421,3 +3421,224 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
         .collect();
     assert_eq!(sipr_globals, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "{by_sipr:?}");
 }
+
+// ---- manual transactions against real sipp (M36) -------------------------
+
+/// SIPp's basic UAC flow with every transaction named: the INVITE and its
+/// ACK by `invite`, the BYE by `bye`. Runs unchanged on sipp and sipr.
+fn txn_uac_xml() -> &'static str {
+    r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<scenario name="txn-uac">
+  <send retrans="500" start_txn="invite"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Subject: Performance Test
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+    s=-
+    c=IN IP[media_ip_type] [media_ip]
+    t=0 0
+    m=audio [media_port] RTP/AVP 0
+    a=rtpmap:0 PCMU/8000
+
+  ]]></send>
+  <recv response="100" optional="true" response_txn="invite"/>
+  <recv response="180" optional="true" response_txn="invite"/>
+  <recv response="200" rtd="true" response_txn="invite"/>
+  <send ack_txn="invite"><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Subject: Performance Test
+    Content-Length: 0
+
+  ]]></send>
+  <pause/>
+  <send retrans="500" start_txn="bye"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Subject: Performance Test
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200" crlf="true" response_txn="bye"/>
+</scenario>
+"#
+}
+
+/// The named-transaction UAC flow run by real sipp against a sipr UAS and
+/// by sipr against a sipp UAS: every response is taken by the transaction
+/// it belongs to and both sides finish every call cleanly.
+#[test]
+fn manual_transactions_complete_against_real_sipp_both_ways() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::manual_transactions_complete_against_real_sipp_both_ways — no sipp."
+        );
+        return;
+    };
+    let read_stderr = |child: &mut Child| {
+        child
+            .stderr
+            .take()
+            .map(|mut s| {
+                use std::io::Read;
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            })
+            .unwrap_or_default()
+    };
+
+    // sipp UAC → sipr UAS.
+    let dir_a = tempfile::tempdir().expect("tempdir");
+    let xml_a = dir_a.path().join("txn-uac.xml");
+    std::fs::write(&xml_a, txn_uac_xml()).expect("write scenario");
+    let port = free_port();
+    let mut sipr_uas = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .current_dir(dir_a.path())
+            .args([
+                "-sn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "4",
+                "-timeout",
+                "30",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipr uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut sipp_uac = Reaper(
+        Command::new(&sipp)
+            .current_dir(dir_a.path())
+            .args([
+                "-sf",
+                xml_a.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-r",
+                "10",
+                "-m",
+                "4",
+                "-d",
+                "200",
+                "-timeout",
+                "20s",
+                "-trace_err",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uac"),
+    );
+    let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
+    assert_eq!(
+        sipp_code,
+        Some(0),
+        "sipp uac must exit 0; sipp errors:\n{}",
+        sipp_error_log(dir_a.path())
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_uas.0, Duration::from_secs(15));
+    let stderr = read_stderr(&mut sipr_uas.0);
+    assert_eq!(
+        sipr_code,
+        Some(0),
+        "sipr uas must exit 0; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("successful 4 failed 0"), "{stderr}");
+
+    // sipr UAC → sipp UAS.
+    let dir_b = tempfile::tempdir().expect("tempdir");
+    let xml_b = dir_b.path().join("txn-uac.xml");
+    std::fs::write(&xml_b, txn_uac_xml()).expect("write scenario");
+    let port = free_port();
+    let mut sipp_uas = Reaper(
+        Command::new(&sipp)
+            .current_dir(dir_b.path())
+            .args([
+                "-sn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "4",
+                "-timeout",
+                "30",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut sipr_uac = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .current_dir(dir_b.path())
+            .args([
+                "-sf",
+                xml_b.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-r",
+                "10",
+                "-m",
+                "4",
+                "-d",
+                "200",
+                "-timeout",
+                "20",
+                "-bg",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipr uac"),
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_uac.0, Duration::from_secs(25));
+    let stderr = read_stderr(&mut sipr_uac.0);
+    assert_eq!(
+        sipr_code,
+        Some(0),
+        "sipr uac must exit 0; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("successful 4 failed 0"), "{stderr}");
+    assert!(!stderr.contains("unexpected 1"), "{stderr}");
+    let _ = wait_with_timeout(&mut sipp_uas.0, Duration::from_secs(15));
+}

@@ -1300,16 +1300,18 @@ response's hash becomes `txnResp`); `docs/scenarios/ownscenarios.rst`
 unchanged by transactions (`E_Message_Branch`, `z9hG4bK-pid-number-index`):
 an `ack_txn` ACK carries its own branch, as in SIPp.
 
-- [ ] Scenario: the three attributes parse into a per-scenario
-      transaction table (`Scenario::transactions`: name, `is_invite`,
-      counts) and per-step `start_txn: Option<TxnId>` /
+- [x] Scenario: the three attributes parse into a per-scenario
+      transaction table (`Scenario::transactions`: name, `is_invite`;
+      the use counts live in the compiler) and per-step `start_txn: Option<TxnId>` /
       `ack_txn: Option<TxnId>` on `SendStep`, `response_txn: Option<TxnId>`
       on `RecvStep`, ids resolved at compile time. All of SIPp's placement
       errors above with its wording; `validate_txn_usage` at `finish()`.
       A request step with `start_txn`/`ack_txn` stays out of the
       CSeq-method guard list (`precompute_cseq_methods` follows suit). The
-      IR dump shows `txn=name` / `ack_txn=name` / `response_txn=name`.
-- [ ] Engine: per-call `txns: Vec<TxnInstance>` (`branch: Option<String>`,
+      IR dump shows `start_txn=name` / `ack_txn=name` / `response_txn=name`
+      and a `transactions:` line. sipr addition: `start_txn` and `ack_txn`
+      on the same `<send>` is an error (SIPp silently takes the first).
+- [x] Engine: per-call `txns: Vec<TxnInstance>` (`branch: Option<String>`,
       `final_hash: Option<u64>`, `ack_index: Option<StepIndex>`), sized
       from the scenario table (empty when unused — no cost for the common
       case). On send: a `start_txn` step stores the rendered message's
@@ -1322,9 +1324,12 @@ an `ack_txn` ACK carries its own branch, as in SIPp.
       final to an INVITE transaction re-sends the recorded ACK, a repeat
       of the accepted final response (same hash — use the message bytes'
       hash) ignored with SIPp's WARNING; the accepted final's hash is
-      stored. Everything without `response_txn` behaves exactly as today.
-- [ ] `--check` prints the transaction table; embedded scenarios untouched.
-- [ ] Tests: scenario unit (the attributes compile and resolve; each
+      stored. Everything without `response_txn` behaves exactly as today
+      (`Scan::OldTxn`, `on_old_transaction_response`, `resend_step` over
+      the extracted `render_send`; the backward scan only walks past the
+      contiguous optional block when the scenario names transactions).
+- [x] `--check` prints the transaction table; embedded scenarios untouched.
+- [x] Tests: scenario unit (the attributes compile and resolve; each
       placement error and each `validate_txn_usage` error with SIPp's
       wording; a `start_txn` request leaves the method list); engine unit
       (branch extraction from a rendered Via with parameters and commas;
@@ -1337,12 +1342,17 @@ an `ack_txn` ACK carries its own branch, as in SIPp.
       right one and both ACKs (`ack_txn`) go out; without the attributes
       the same flow mis-matches, proving the point) and
       `late_final_response_to_a_named_invite_transaction_is_acked_again`
-      (the UAS retransmits the 200 after the call moved on; sipr re-sends
-      the recorded ACK and does not fail the call); interop: SIPp's own
-      transaction scenario shape run by real sipp against a sipr UAS and
-      by sipr against a sipp UAS (the `-trace_msg` logs show the same
-      ACK branches and no "unexpected message" on either side).
-- [ ] Docs: SIPP_COMPAT §1 (`send`: `start_txn`, `ack_txn`; `recv`:
+      (after an INFO round trip the UAS sends a late 180 and the INVITE's
+      200 again; sipr ignores the 180 with SIPp's trace line, re-sends the
+      recorded ACK and does not fail the call — neither is a repeat of the
+      last message received, so the generic dedupe cannot be what saves
+      it); interop `manual_transactions_complete_against_real_sipp_both_ways`
+      (SIPp's basic UAC flow with every transaction named, run by real
+      sipp against a sipr UAS and by sipr against a sipp UAS: every call
+      completes on both sides, nothing unexpected). The overlapping
+      e2e also proves the strictness: with the peer answering `first`
+      first, the call fails on that response, as in SIPp.
+- [x] Docs: SIPP_COMPAT §1 (`send`: `start_txn`, `ack_txn`; `recv`:
       `response_txn`), the v1.x tier paragraph, §6 note (branch-based
       matching order, the out-of-window rules, `[branch]` unchanged);
       ARCHITECTURE §4 (per-call transaction slots next to the retrans

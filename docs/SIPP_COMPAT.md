@@ -15,8 +15,8 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 | Element | Attributes (v1) | Notes |
 |---|---|---|
 | `scenario` | `name` | |
-| `send` | common⁺, `retrans`, `lost`, `crlf` | CDATA body = message template |
-| `recv` | common⁺, `response`, `request`, `optional`, `timeout`, `ontimeout`, `rrs`, `auth`, `lost`, `regexp_match` | |
+| `send` | common⁺, `retrans`, `lost`, `crlf`, `start_txn`, `ack_txn` | CDATA body = message template; the `_txn` attrs name a transaction (M36, §6) |
+| `recv` | common⁺, `response`, `request`, `optional`, `timeout`, `ontimeout`, `rrs`, `auth`, `lost`, `regexp_match`, `response_txn` | |
 | `pause` | common⁺, `milliseconds`, `variable`, `distribution`, `sanity_check` | uniform/normal/exp distributions |
 | `nop` | common⁺, `display` | carries actions |
 | `label` | `id` | jump target; validated at compile |
@@ -42,8 +42,8 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 
 ### v1.x tier (fast follow)
 
-`sample`, `setdest`, `exec command=` (external process),
-`start_txn`/`ack_txn`/`response_txn` (manual transaction naming). `index` as a
+`sample`, `setdest`, `exec command=` (external process). Manual
+transactions (`start_txn`/`ack_txn`/`response_txn`) shipped in M36. `index` as a
 standalone action stays out — sipr builds the index from `-infindex` at load,
 not from a scenario action. Extended 3PCC (`-master`/`-slave`/`-slave_cfg` with
 `dest=`/`src=` peer routing) also stays out; classic `-3pcc` is supported.
@@ -972,5 +972,42 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   double is `""` (the source calls it a bug), so `strcmp`/`trim`/
   `urlencode` on a numeric variable see nothing there; sipr gives them
   the `%lf` text.
+- Manual transactions (M36; verified in `scenario.cpp` ~l.343-400
+  `get_txn`, ~l.878-931, ~l.588-602 `validate_txn_usage`; `call.cpp`
+  ~l.1128, ~l.2110-2116, ~l.4431-4450 `extract_transaction`,
+  ~l.4581-4587 `matches_scenario`, ~l.5395-5430, ~l.5502-5504;
+  `docs/scenarios/ownscenarios.rst`): `start_txn="n"` on a sent request
+  stores the top Via `branch` of the message as sent (up to `;`, `,` or
+  whitespace) under `n`; `ack_txn="n"` on a sent ACK records that ACK's
+  step; `response_txn="n"` on a `recv response=` matches **only** a
+  response whose top Via branch equals the stored one — that check
+  replaces both the first-step rule and the CSeq-method guard, and a
+  request that names a transaction is left out of the CSeq-method list
+  the other recvs use. Placement is strict, with these fatal texts: "An
+  ACK message can not start a transaction!", "The ack_txn attribute is
+  valid only for ACK messages!", "Responses can not start a transaction",
+  "Responses can not ACK a transaction", "response_txn can only be used
+  for received messages." (on a send), "… for received responses." (on
+  `recv request=`); names obey the variable-name rules ("Variable names
+  may not be empty / contain $ or , for start transaction | ack
+  transaction | transaction response"); after parsing,
+  `validate_txn_usage`: "Transaction n is never started!", "… has no
+  responses defined!", "… is an INVITE transaction without an ACK!",
+  "… is a non-INVITE transaction with an ACK!". A response for a named
+  transaction that arrives once the call has moved past its recv (an
+  "old transaction" reply, found by branch anywhere behind the window):
+  a 1xx is ignored ("Ignoring provisional <transport> message for
+  transaction n", a trace line), a final one for an INVITE transaction
+  gets the recorded `ack_txn` ACK re-rendered and sent again, and a
+  repeat of the final response already taken (same message hash) is
+  ignored with a WARNING ("Ignoring final <transport> message for
+  transaction n (hash …)"); anything else is unexpected as usual. The
+  accepted response's hash is stored per transaction. `[branch]` itself
+  knows nothing of transactions (`z9hG4bK-pid-number-index`): an
+  `ack_txn` ACK carries its own branch. sipr matches all of it (the
+  trace/WARNING lines go to the error trace; the hash is over the
+  datagram bytes) with one addition: a `<send>` carrying both
+  `start_txn` and `ack_txn` is an error (SIPp silently takes
+  `start_txn`). Verified against real sipp both ways.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)
