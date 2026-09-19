@@ -365,7 +365,7 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   SIPp routes by the socket the message came in on). Reliable transports carry
   NO SIP retransmissions (RFC 3261 §18.2), so `retrans=`/`-max_retrans` are
   ignored under `t1`. Per-call connections (`tn`) are M28 below,
-  reconnection after a drop M30. Not yet: `-t ui`.
+  reconnection after a drop M30, one socket per injected IP (`-t ui`) M31.
 - Message framing fix surfaced by TCP: every SIP message must end with the
   header/body separator (`\r\n\r\n`) even with no body (RFC 3261 §7). sipr's
   CDATA normalization trimmed the trailing blank line for body-less messages
@@ -951,15 +951,26 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   table is lost. (5) A `<Global>` read but never set in a scenario is no
   diagnostic (its value may come from `-set` or the other scenario); a
   `<User>` one still is the usual error, since only the main scenario's
-  own actions could set it. Found on the way (pre-existing, **not**
-  changed in M35 — flagged for a decision): (a) SIPp renders a double
-  variable with `%lf` (`call.cpp` ~l.3973: `[$n]` after `<add>` is
-  `3.000000`), sipr prints integers without a fraction (`3`); (b) SIPp's
-  scheduler runs one message step per call per turn (`call::run` returns
-  after a `<nop>`'s `next()`), sipr runs a call until its first blocking
-  step — so two calls started in the same tick interleave their action
-  steps differently (both `<nop>`s before either `<send>` in SIPp), which
-  only shows through shared (global) variables. The M35 interop test
-  normalises both.
+  own actions could set it. Found on the way: (a) variable value
+  semantics, fixed right after M35 (v0.24.0) — see the next note; (b)
+  SIPp's scheduler runs one message step per call per turn (`call::run`
+  returns after a `<nop>`'s `next()`), sipr runs a call until its first
+  blocking step — so two calls started in the same tick interleave their
+  action steps differently (both `<nop>`s before either `<send>` in
+  SIPp), which only shows through shared (global) variables. Left as is;
+  the M35 interop test normalises it.
+- Variable value semantics (v0.24.0; verified in `variables.cpp` ~l.33-46
+  `CCallVariable::isSet`, `call.cpp` ~l.3968-3978 `E_Message_Variable`,
+  ~l.1933 `call::next`, ~l.2241 `condexec`): a variable "is set" when it
+  is a string or regexp capture (even empty), a **non-zero** double, or a
+  **true** bool. `[$var]` writes nothing for an unset variable, a double
+  as `%lf` (`3.000000`, `-2.000000`), a true bool as `true`; so a zero
+  counter and a false `<test>` result render empty. `test="var"` on a
+  message and `condexec` ask the same `isSet`. sipr now matches all of
+  it (it used to print `3`, `false` and `0`, and treated a `"0"`/`"false"`
+  string as not set). Not matched on purpose: SIPp's `getString()` of a
+  double is `""` (the source calls it a bug), so `strcmp`/`trim`/
+  `urlencode` on a numeric variable see nothing there; sipr gives them
+  the `%lf` text.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

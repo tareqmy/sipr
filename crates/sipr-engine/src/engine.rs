@@ -4207,14 +4207,11 @@ fn step_common(step: &Step) -> Option<&StepCommon> {
 
 /// SIPp `test`/`condexec` truthiness: a variable counts as true when it is
 /// set and not numerically zero / boolean false.
+/// `test="var"` on a message (SIPp `call::next`): the branch is taken when
+/// the variable `isSet` — a string once assigned, a double when non-zero,
+/// a bool when true.
 fn test_truthy(v: &crate::actions::Value) -> bool {
-    use crate::actions::Value;
-    match v {
-        Value::Unset => false,
-        Value::Bool(b) => *b,
-        Value::Num(n) => *n != 0.0,
-        Value::Str(s) => !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false"),
-    }
+    v.is_set()
 }
 
 /// Short display label for a step (scenario screen rows).

@@ -1246,11 +1246,12 @@ and absent from the DTD and the docs; the regress suite never uses them).
       retired, with their counters continuing); interop: the same
       counter scenario run by real sipp against a sipr UAS and by sipr
       against a sipp UAS, the header sequences compared.
-- [x] Found on the way, recorded in SIPP_COMPAT §6 and left as they were
-      (a decision for later, both pre-date M35): SIPp renders double
-      variables as `%lf` (`3.000000`, sipr `3`), and SIPp's one-step-per-
-      call-per-turn scheduler interleaves same-tick calls' `<nop>`
-      actions before their sends, visible only through globals.
+- [x] Found on the way, recorded in SIPP_COMPAT §6: SIPp renders double
+      variables as `%lf` (`3.000000`, sipr printed `3`) and treats a zero
+      double / false bool as unset — fixed in v0.24.0 right after M35;
+      and SIPp's one-step-per-call-per-turn scheduler interleaves
+      same-tick calls' `<nop>` actions before their sends, visible only
+      through globals — left as is.
 - [x] Docs: SIPP_COMPAT §1 (the two elements), §3 (`-set`), §6 note (scope chain,
       declaration-order divergence, private user layer for id-less calls,
       retirement rules, `dump variables`); ARCHITECTURE variable-store

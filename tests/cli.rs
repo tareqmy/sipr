@@ -483,9 +483,11 @@ fn check_mode_lints_the_receive_scenario_too() {
 }
 
 /// A UAC scenario with one `<User>` and two `<Global>` variables (M35).
-fn scoped_scenario() -> TempScenario {
+/// `name` keeps the temp file distinct per test (they run in parallel and
+/// `TempScenario` deletes its file on drop).
+fn scoped_scenario(name: &str) -> TempScenario {
     TempScenario::new(
-        "scoped.xml",
+        name,
         r#"<scenario name="scoped">
              <Global variables="region,per_run"/>
              <User variables="per_user"/>
@@ -510,7 +512,7 @@ fn scoped_scenario() -> TempScenario {
 
 #[test]
 fn check_mode_prints_the_variable_scopes() {
-    let sc = scoped_scenario();
+    let sc = scoped_scenario("scoped-check.xml");
     let o = sipr(&["-sf", sc.path(), "--check"]);
     assert_code(&o, 0);
     let out = stdout(&o);
@@ -522,7 +524,7 @@ fn check_mode_prints_the_variable_scopes() {
 
 #[test]
 fn set_of_an_undeclared_global_is_fatal_with_sipps_wording() {
-    let sc = scoped_scenario();
+    let sc = scoped_scenario("scoped-set.xml");
     let o = sipr(&[
         "-sf",
         sc.path(),
@@ -550,7 +552,7 @@ fn user_and_global_elements_are_rejected_when_they_disagree_across_scenarios() {
     // The main and the receive scenario share one user and one global name
     // space (SIPp's `userVariables`/`globalVariables`); scoping one name two
     // ways is a start-up error rather than SIPp's silent first-wins.
-    let main = scoped_scenario();
+    let main = scoped_scenario("scoped-main.xml");
     let rx = TempScenario::new(
         "rx-scoped.xml",
         r#"<scenario name="rx">

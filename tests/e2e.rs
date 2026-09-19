@@ -5706,10 +5706,13 @@ fn spawn_counter_uas(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<Vec
                     }
                     let header =
                         |name: &str| msg.header(name).unwrap_or_default().trim().to_owned();
+                    // Doubles render as SIPp's `%lf` ("2.000000").
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let count = |name: &str| header(name).parse::<f64>().map_or(0, |n| n as u32);
                     seen.push(CounterCall {
                         user: header("X-User"),
-                        per_user: header("X-User-Count").parse().unwrap_or(0),
-                        per_run: header("X-Run-Count").parse().unwrap_or(0),
+                        per_user: count("X-User-Count"),
+                        per_run: count("X-Run-Count"),
                         region: header("X-Region"),
                     });
                     let ok = mirror_response(&msg, "200 OK", true);

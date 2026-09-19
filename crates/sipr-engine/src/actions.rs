@@ -27,10 +27,17 @@ pub enum Value {
 }
 
 impl Value {
-    /// True when the variable has been set to anything.
+    /// SIPp `CCallVariable::isSet`: a string or regexp capture counts once
+    /// assigned, a double only when non-zero, a bool only when true. This
+    /// is what `test=`/`condexec=` on a message and `[$var]` rendering ask.
     #[must_use]
     pub fn is_set(&self) -> bool {
-        !matches!(self, Self::Unset)
+        match self {
+            Self::Unset => false,
+            Self::Str(_) => true,
+            Self::Num(n) => *n != 0.0,
+            Self::Bool(b) => *b,
+        }
     }
 
     /// Numeric view, coercing strings and bools like SIPp.
@@ -44,27 +51,19 @@ impl Value {
         }
     }
 
-    /// String view for keyword substitution.
+    /// Text view, as SIPp writes a variable into a message
+    /// (`call.cpp` `E_Message_Variable`): a string as is, a double with
+    /// `%lf` (`3.000000`), a true bool as `true`, and nothing at all when
+    /// the variable is not set — so a zero double and a false bool render
+    /// empty.
     #[must_use]
     pub fn as_str(&self) -> String {
         match self {
             Self::Str(s) => s.clone(),
-            Self::Num(n) => format_num(*n),
-            Self::Bool(b) => b.to_string(),
-            Self::Unset => String::new(),
+            Self::Num(n) if *n != 0.0 => format!("{n:.6}"),
+            Self::Bool(true) => "true".to_owned(),
+            Self::Num(_) | Self::Bool(false) | Self::Unset => String::new(),
         }
-    }
-}
-
-/// Format a double the way SIPp prints variables: integers without a fraction.
-fn format_num(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e15 {
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            (n as i64).to_string()
-        }
-    } else {
-        n.to_string()
     }
 }
 
@@ -544,12 +543,23 @@ mod tests {
     #[test]
     fn value_coercions() {
         assert_eq!(Value::Str("42".into()).as_num(), 42.0);
-        assert_eq!(Value::Num(3.0).as_str(), "3");
-        assert_eq!(Value::Num(3.5).as_str(), "3.5");
+        assert_eq!(Value::Num(3.0).as_str(), "3.000000", "SIPp %lf");
+        assert_eq!(Value::Num(3.5).as_str(), "3.500000");
+        assert_eq!(Value::Num(-2.0).as_str(), "-2.000000");
+        assert_eq!(
+            Value::Num(0.0).as_str(),
+            "",
+            "a zero double is unset in SIPp"
+        );
+        assert_eq!(Value::Bool(true).as_str(), "true");
+        assert_eq!(Value::Bool(false).as_str(), "");
         assert_eq!(Value::Bool(true).as_num(), 1.0);
         assert_eq!(Value::Unset.as_str(), "");
         assert!(!Value::Unset.is_set());
-        assert!(Value::Num(0.0).is_set());
+        assert!(!Value::Num(0.0).is_set());
+        assert!(Value::Num(0.5).is_set());
+        assert!(!Value::Bool(false).is_set());
+        assert!(Value::Str(String::new()).is_set());
     }
 
     /// SIPp's `extractSubMessage`: `[$1]` of `ereg regexp=".*" search_in="hdr"
