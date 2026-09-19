@@ -124,6 +124,8 @@ pub struct EngineConfig {
     /// `-users N`: closed-loop mode — keep N concurrent calls, each holding a
     /// 1-based user id (drives `[userid]`/`[users]` and USER injection files).
     pub users: Option<usize>,
+    /// `-set VARIABLE VALUE`: initial values of `<Global>` variables.
+    pub global_sets: Vec<(String, String)>,
     /// `-tls_*` options; required when `transport` is [`TransportKind::TlsMono`].
     pub tls: Option<sipr_net::TlsConfig>,
     /// `-mi`: media address for `[media_ip]` and the RTP sockets (default:
@@ -787,8 +789,29 @@ struct Engine<'s> {
     twin: Option<TwinChannel>,
     /// Twin commands that arrived before a call was ready to consume them.
     pending_cmds: std::collections::VecDeque<String>,
-    /// `-users` closed loop: the pool of free user ids (1..=N).
+    /// `-users` closed loop: the pool of free user ids. SIPp's `freeUsers`
+    /// order — filled 1..=N at start-up, taken from the back, returned to
+    /// the front — so the first call is user N's and a returning id waits
+    /// its turn behind the ones still free.
     free_users: std::collections::VecDeque<usize>,
+    /// Ids parked by a shrink (`set users`): a call that ends while more
+    /// calls are live than the target retires its id here (SIPp
+    /// `retiredUsers`); the next growth takes them back, oldest first,
+    /// before creating fresh ids.
+    retired_users: std::collections::VecDeque<usize>,
+    /// The next never-used user id a growth may create.
+    next_user_id: usize,
+    /// The user- and global-scoped names of both scenarios, and each
+    /// scenario's variable layout in that space.
+    var_space: crate::vars::VarSpace,
+    main_layout: std::rc::Rc<crate::vars::VarLayout>,
+    secondary_layout: Option<std::rc::Rc<crate::vars::VarLayout>>,
+    /// `<Global variables=…/>`: one table for the run.
+    global_vars: crate::vars::SharedTable,
+    /// `<User variables=…/>`: one table per user id, created when the id
+    /// is first handed out and kept for the run (SIPp `userVarMap`), so a
+    /// retired id that returns still has its values.
+    user_vars: HashMap<usize, crate::vars::SharedTable>,
     rng: sipr_net::rng::Rng,
     /// Per-step: CSeq method a response recv must carry (SIPp guard).
     expected_cseq_method: Vec<Option<String>>,
@@ -853,6 +876,21 @@ impl<'s> Engine<'s> {
         config: &EngineConfig,
         ui: Option<UiChannels>,
     ) -> Result<Self, EngineError> {
+        // Variable scopes and `-set` are checked before any socket opens.
+        let var_space = crate::vars::VarSpace::new(&secondary.map_or_else(
+            || vec![&scenario.vars],
+            |(_, sc)| vec![&scenario.vars, &sc.vars],
+        ));
+        if let [name, ..] = var_space.conflicts() {
+            return Err(EngineError(format!(
+                "variable '{name}' is <User> in one scenario and <Global> in the other: \
+                 the two share one user and one global name space, as in SIPp"
+            )));
+        }
+        let global_vars = var_space.global_table();
+        seed_globals(&var_space, &global_vars, &config.global_sets)?;
+        let main_layout = var_space.layout(&scenario.vars);
+        let secondary_layout = secondary.map(|(_, sc)| var_space.layout(&sc.vars));
         let (tx, rx) = channel::<Event>();
         let snapshot_tx = ui.map(|ui| {
             // Forward UI key presses into the event loop.
@@ -1342,6 +1380,13 @@ impl<'s> Engine<'s> {
             free_users: config
                 .users
                 .map_or_else(Default::default, |n| (1..=n).collect()),
+            retired_users: std::collections::VecDeque::new(),
+            next_user_id: config.users.unwrap_or(0) + 1,
+            var_space,
+            main_layout,
+            secondary_layout,
+            global_vars,
+            user_vars: HashMap::new(),
             rng: sipr_net::rng::Rng::new(config.seed ^ 0x51B8_0003),
             expected_cseq_method: precompute_cseq_methods(scenario),
             control,
@@ -1692,15 +1737,21 @@ impl<'s> Engine<'s> {
         self.hard_stop = true;
     }
 
-    /// `set users N` at runtime (SIPp `CallGenerationTask::set_users`): new
-    /// ids join the free pool, a smaller target lets excess calls finish
-    /// without replacement, and traffic is un-paused.
+    /// `set users N` at runtime (SIPp `CallGenerationTask::set_users`): a
+    /// growth re-activates retired ids first (oldest first, with their
+    /// variables), then creates fresh ones; a shrink touches no pool — the
+    /// excess calls finish without replacement and retire their ids as they
+    /// do (see [`Self::return_user`]). Traffic is un-paused either way.
     fn set_users(&mut self, target: usize) {
-        let current = self.config.users.unwrap_or(0);
-        for id in current + 1..=target {
-            self.free_users.push_back(id);
+        let mut users = self.config.users.unwrap_or(0);
+        while users < target {
+            let id = self.retired_users.pop_back().unwrap_or_else(|| {
+                self.next_user_id += 1;
+                self.next_user_id - 1
+            });
+            self.free_users.push_front(id);
+            users += 1;
         }
-        self.free_users.retain(|id| *id <= target);
         self.config.users = Some(target);
         self.paused = false;
         self.refill_users();
@@ -1782,6 +1833,7 @@ impl<'s> Engine<'s> {
             }
             ControlCmd::SetHide(on) => self.hide = *on,
             ControlCmd::Trace { log, on } => self.set_trace(log, *on)?,
+            ControlCmd::Dump(what) if what == "variables" => self.dump_variables(),
             ControlCmd::Dump(what) => {
                 if what != "tasks" {
                     return Err(format!("dump {what} is not supported by sipr"));
@@ -1976,6 +2028,7 @@ impl<'s> Engine<'s> {
         let call_id = self.make_call_id(number);
         let cnonce = self.make_cnonce(number);
         let field_lines = self.assign_field_lines(user_id);
+        let store = self.new_store(false, user_id);
         self.calls.insert(
             call_id.clone(),
             new_call(
@@ -1983,7 +2036,7 @@ impl<'s> Engine<'s> {
                 self.config.remote_sending_addr.unwrap_or(target),
                 target,
                 self.config.base_cseq,
-                &self.scenario.vars,
+                store,
                 cnonce,
                 field_lines,
                 user_id,
@@ -1999,7 +2052,7 @@ impl<'s> Engine<'s> {
             return;
         };
         while self.live_main() < n && !self.done_creating() {
-            let Some(uid) = self.free_users.pop_front() else {
+            let Some(uid) = self.free_users.pop_back() else {
                 break;
             };
             self.start_call(Some(uid));
@@ -2375,7 +2428,7 @@ impl<'s> Engine<'s> {
                 Some(v) => self
                     .calls
                     .get(call_id)
-                    .is_some_and(|c| test_truthy(c.store.get(v))),
+                    .is_some_and(|c| test_truthy(&c.store.get(v))),
                 None => true,
             };
             let chance_ok = common.chance.is_none_or(|c| self.rng.next_f64() < c);
@@ -2468,6 +2521,7 @@ impl<'s> Engine<'s> {
                 let cnonce = self.make_cnonce(number);
                 // Incoming (UAS) calls have no user id.
                 let field_lines = self.assign_field_lines(None);
+                let store = self.new_store(false, None);
                 self.calls.insert(
                     call_id.clone(),
                     new_call(
@@ -2475,7 +2529,7 @@ impl<'s> Engine<'s> {
                         self.config.remote_sending_addr.unwrap_or(packet.from),
                         packet.from,
                         self.config.base_cseq,
-                        &self.scenario.vars,
+                        store,
                         cnonce,
                         field_lines,
                         None,
@@ -2602,17 +2656,17 @@ impl<'s> Engine<'s> {
         };
         o.stats.incoming_created += 1;
         let number = o.stats.created();
-        let vars = &o.scenario.vars;
         if kind == SecondaryKind::OutOfCall {
             self.stats.auto_answered += 1;
         }
         let cnonce = self.make_cnonce(number);
+        let store = self.new_store(true, None);
         let mut call = new_call(
             number,
             self.config.remote_sending_addr.unwrap_or(packet.from),
             packet.from,
             self.config.base_cseq,
-            vars,
+            store,
             cnonce,
             field_lines,
             None,
@@ -3897,6 +3951,32 @@ impl<'s> Engine<'s> {
         }
     }
 
+    /// `dump variables` (SIPp `AllocVariableTable::dump` on the displayed
+    /// scenario): the names per table level — global 0, user 1, call 2 —
+    /// into the error trace.
+    fn dump_variables(&mut self) {
+        let displayed = match self.secondary.as_ref() {
+            Some(o) if self.display_secondary => o.scenario,
+            _ => self.scenario,
+        };
+        let call_names: Vec<String> = displayed
+            .vars
+            .in_scope(sipr_scenario::model::VarScope::Call)
+            .map(|(_, name)| name.to_owned())
+            .collect();
+        let levels = [
+            (0, self.var_space.global_names().to_vec()),
+            (1, self.var_space.user_names().to_vec()),
+            (2, call_names),
+        ];
+        for (level, names) in levels {
+            self.log_err(&format!("{} level {level} variables:", names.len()));
+            for name in names {
+                self.log_err(&name);
+            }
+        }
+    }
+
     fn log_err(&mut self, line: &str) {
         if let Some(f) = self.trace_err.as_mut() {
             f.write(&format!("{line}\n"));
@@ -4049,14 +4129,46 @@ impl<'s> Engine<'s> {
         self.call_echoes.retain(|(id, _), _| id != call_id);
     }
 
-    /// Return a finished call's user id to the free pool (`-users` mode), so a
-    /// replacement call can reuse it.
+    /// A finished call's user id goes back to the free pool, or — while more
+    /// calls are live than `set users` now allows — to the retired list
+    /// (SIPp `CallGenerationTask::free_user`: `CurrentCall >
+    /// open_calls_allowed` after the call left the count). Whichever ids
+    /// happen to be live keep running; nothing is dropped by number.
     fn return_user(&mut self, call: &CallState) {
-        if let Some(uid) = call.user_id
-            && self.config.users.is_some_and(|target| uid <= target)
-        {
-            self.free_users.push_back(uid);
+        let Some(uid) = call.user_id else {
+            return;
+        };
+        if self.live_main() > self.config.users.unwrap_or(0) {
+            self.retired_users.push_front(uid);
+        } else {
+            self.free_users.push_front(uid);
         }
+    }
+
+    /// The user's variable table, created on its first call and kept for
+    /// the run.
+    fn user_table(&mut self, uid: usize) -> crate::vars::SharedTable {
+        if let Some(table) = self.user_vars.get(&uid) {
+            return table.clone();
+        }
+        let table = self.var_space.user_table();
+        self.user_vars.insert(uid, table.clone());
+        table
+    }
+
+    /// A new call's variable store: its scenario's layout over the shared
+    /// globals and either its user's table or, with no user id (UAS, ooc,
+    /// rx calls), a private one — SIPp's fresh `VariableTable(userVariables)`.
+    fn new_store(&mut self, secondary: bool, user_id: Option<usize>) -> crate::actions::VarStore {
+        let layout = match (&self.secondary_layout, secondary) {
+            (Some(layout), true) => layout.clone(),
+            _ => self.main_layout.clone(),
+        };
+        let user = match user_id {
+            Some(uid) => self.user_table(uid),
+            None => self.var_space.user_table(),
+        };
+        crate::actions::VarStore::new(layout, user, self.global_vars.clone())
     }
 
     fn fail_call(&mut self, call_id: &str, reason: &str) {
@@ -4197,6 +4309,31 @@ fn build_sctp_transport(
     ))
 }
 
+/// `-set VARIABLE VALUE` (SIPp `sipp.cpp` `SIPP_OPTION_VAR`): seed the
+/// globals before the run. A name no scenario declared `<Global>` is fatal
+/// with SIPp's wording, plus the declared names for help.
+fn seed_globals(
+    space: &crate::vars::VarSpace,
+    globals: &crate::vars::SharedTable,
+    sets: &[(String, String)],
+) -> Result<(), EngineError> {
+    for (name, value) in sets {
+        let Some(slot) = space.global_slot(name) else {
+            let declared = if space.global_names().is_empty() {
+                "none".to_owned()
+            } else {
+                space.global_names().join(", ")
+            };
+            return Err(EngineError(format!(
+                "Can not set the global variable {name}, because it does not exist \
+                 (declared <Global> variables: {declared})"
+            )));
+        };
+        globals.set(slot, crate::actions::Value::Str(value.clone()));
+    }
+    Ok(())
+}
+
 /// Fresh call state.
 #[allow(clippy::too_many_arguments)]
 fn new_call(
@@ -4204,7 +4341,7 @@ fn new_call(
     remote: SocketAddr,
     render_remote: SocketAddr,
     base_cseq: u32,
-    vars: &sipr_scenario::model::VarTable,
+    store: crate::actions::VarStore,
     cnonce: String,
     field_lines: Vec<Option<usize>>,
     user_id: Option<usize>,
@@ -4222,7 +4359,7 @@ fn new_call(
         last_sent: None,
         rtd_starts: Vec::new(),
         field_lines,
-        store: crate::actions::VarStore::new(vars),
+        store,
         counters: std::collections::HashMap::new(),
         cnonce,
         challenge: None,

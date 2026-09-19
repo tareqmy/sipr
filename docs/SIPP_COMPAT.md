@@ -22,6 +22,8 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 | `label` | `id` | jump target; validated at compile |
 | `timewait` | `milliseconds` | end-of-call linger |
 | `Reference` | `variables` | suppress unused-var warnings |
+| `Global` | `variables` | comma list of run-wide variables (M35, §6) |
+| `User` | `variables` | comma list of per-user-id variables (M35, §6) |
 | `ResponseTimeRepartition` | `value` | ms bucket list |
 | `CallLengthRepartition` | `value` | ms bucket list |
 
@@ -97,7 +99,8 @@ M34) `-rxinf <file>` (injection files loaded after the `-inf` ones, for
 `[fieldN file=NAME]` in either scenario) `--check` (sipr addition: lint
 scenario — and the ooc/rx one — and exit).
 Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
-`-d <pause ms default>` `-users` (v1.x closed loop) `-rate_increase <n>`
+`-d <pause ms default>` `-users` (v1.x closed loop) `-set <variable>
+<value>` (seed a `<Global>` variable, M35) `-rate_increase <n>`
 `-rate_max <n>` `-rate_interval <time>` `-no_rate_quit` `-rate_scale <n>`
 (M20 ramps).
 Network: `-p <local port>` `-i <local ip>` `-t u1|un|ui|t1|tn|l1|ln` (UDP /
@@ -393,10 +396,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   are mutually exclusive. USER-mode `-inf` files resolve line = userId-1
   (SIPp `nextLine(userId)`); `[userid]` renders the id, `[users]` the count.
   The count changes at runtime through `set users N` (control socket, HTTP
-  `/control`) and the `+ - * /` keys (M17); new ids join the free pool and
-  a smaller target lets the excess calls finish without replacement.
-  Not supported yet: per-user persistent variables (SIPp's `userVarMap`,
-  `<User variables=…/>`) and `<Global variables=…/>` — queued as M35.
+  `/control`) and the `+ - * /` keys (M17); see the M35 note below for the
+  id bookkeeping and the per-user variables.
 - IPv6 (M12, verified in `call.cpp` `E_Message_Local_IP`/`E_Message_Remote_IP`
   → `local_ip_w_brackets`/`remote_ip_w_brackets` vs `E_Message_Media_IP` →
   raw `media_ip`): `[local_ip]`/`[remote_ip]` render the address bracketed when
@@ -901,5 +902,64 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   Linux with the `sctp` module has a stack; macOS and Windows report "SCTP
   is not supported on this host". Verified in Linux CI against a sipp built
   with `USE_SCTP`; the development host cannot run it.
+- Variable scopes and dynamic users (M35; verified in `variables.cpp`
+  ~l.187-210, ~l.284-330, ~l.342-351, `scenario.cpp` ~l.718, ~l.756-790,
+  `sipp.cpp` ~l.1449-1450, ~l.1738-1744, ~l.2123-2126, `call.cpp`
+  ~l.1100-1115, ~l.1296, `call_generation_task.cpp` ~l.144-145,
+  ~l.252-293, `socket.cpp` ~l.289-290): SIPp keeps three chained variable
+  tables — the call's own, `userVarMap[userId]` (one per user id, created
+  at start-up for 1..N and by `set_users` growth, never freed) and one
+  `globalVariables` — and `<User variables="a,b"/>` / `<Global
+  variables="c"/>` allocate the names at the user / global level. Both
+  levels are process-wide: every scenario (`-sf`, `-oocsf`, `-rxsf`)
+  hangs its `allocVars` off the same `userVariables`, so one name is one
+  slot across scenarios. A call with a user id parents its table on the
+  user's; a call without one (UAS, ooc, rx, plain rate mode) gets a fresh
+  private table, so "user" variables are per call there. `-set VAR VALUE`
+  seeds a global (fatal "Can not set the global variable VAR, because it
+  does not exist." when no scenario declared it — and, in SIPp, when it
+  comes *before* `-sf` on the command line, since the scenario loads as
+  its flag is parsed). `dump variables` prints the displayed scenario's
+  names per level (0 global, 1 user, 2 call) as WARNINGs. User ids: the
+  free pool is filled 1..N and served from the **back**, so the first
+  call is user N's; a finished call's id goes to the front of the pool
+  (behind the still-free ones) — or, when more calls are live than `set
+  users` now allows, to `retiredUsers`; the next growth takes retired ids
+  back first (oldest first, with their variables), then creates fresh
+  ones; a shrink touches no pool.
+  sipr matches all of it — scopes resolved at compile time into a
+  per-scenario layout over one user table per id and one global table,
+  the private user layer for id-less calls, `-set` (checked after all
+  scenarios load, so flag order does not matter), `dump variables` into
+  the error trace with SIPp's line format, and the exact pool order —
+  with these deliberate divergences: (1) a name used *before* its
+  `<User>`/`<Global>` declaration is already call-scoped in SIPp
+  (`AllocVariableTable::find` checks the scenario's own map first) and the
+  declaration silently creates a second, differently scoped variable of
+  the same name; sipr scopes every use as declared and **warns** (so
+  `--check` fails) naming the earlier use. (2) A name one scenario
+  declares `<User>` and another `<Global>` is a start-up error in sipr
+  (SIPp: whichever level allocated first wins, silently). (3) Each
+  scenario must declare its own scopes — a bare use of `g` in the rx
+  scenario does not inherit the main scenario's `<Global>` declaration
+  (SIPp resolves it through the shared parent tables; sipr compiles each
+  file on its own). (4) On a growth that needs fresh ids SIPp uses
+  `users + 1` counting from the *current target*, which after a shrink
+  collides with ids still live (e.g. 3 → 1 → 3 while the calls of 2 and 3
+  are up hands id 2 out twice and replaces user 2's table); sipr creates
+  never-used ids instead (4, 5, …), so an id is live at most once and no
+  table is lost. (5) A `<Global>` read but never set in a scenario is no
+  diagnostic (its value may come from `-set` or the other scenario); a
+  `<User>` one still is the usual error, since only the main scenario's
+  own actions could set it. Found on the way (pre-existing, **not**
+  changed in M35 — flagged for a decision): (a) SIPp renders a double
+  variable with `%lf` (`call.cpp` ~l.3973: `[$n]` after `<add>` is
+  `3.000000`), sipr prints integers without a fraction (`3`); (b) SIPp's
+  scheduler runs one message step per call per turn (`call::run` returns
+  after a `<nop>`'s `next()`), sipr runs a call until its first blocking
+  step — so two calls started in the same tick interleave their action
+  steps differently (both `<nop>`s before either `<send>` in SIPp), which
+  only shows through shared (global) variables. The M35 interop test
+  normalises both.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)

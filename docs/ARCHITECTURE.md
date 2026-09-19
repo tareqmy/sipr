@@ -119,10 +119,20 @@ template slots → sendto. On this path:
 ## 4. Call state machine essentials
 
 Per-call state: scenario index (position in the flat `Vec<Step>` IR), variable
-store (`Vec<Option<Value>>`, indexed — variable names resolve to indices at
-compile), dialog state (local/remote tag, CSeq counters both directions, route
+store, dialog state (local/remote tag, CSeq counters both directions, route
 set, remote target), last-received message per `[last_*]`, RTD start timestamps,
 retransmission context for the in-flight `send`, and per-step counters.
+
+Variables live in three layers, SIPp's table chain (`sipr-engine/src/vars.rs`):
+the call's own `Vec<Value>`, its user's table (one per user id, created when
+the id is first handed out and kept for the run — `<User variables>`), and the
+one global table (`<Global variables>`). Names resolve to ids at compile time
+and each id's scope is fixed then; at engine start a `VarSpace` unions the
+user and global names of every loaded scenario and gives each scenario a
+`VarLayout` (id → layer + index), so a read or write is one match and one
+index, never a search. The shared layers are `Rc<RefCell<…>>` (single engine
+thread, a borrow never outlives one expression); a call with no user id gets a
+private user layer, as in SIPp.
 
 Execution loop for a call: advance through IR steps until blocked (waiting on
 recv/pause/timer), then park. `optional="true"` recv steps form a *window*: an

@@ -80,7 +80,9 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
 - Classic 3PCC (`-3pcc HOST:PORT`) with `<sendCmd>`/`<recvCmd>` over an
   ESC-framed twin socket.
 - Closed-loop `-users N` mode with `[userid]`/`[users]` and per-user USER-mode
-  injection (line = user id − 1).
+  injection (line = user id − 1); `<User variables>` persist per user id
+  across its calls and `<Global variables>` across the run (seed one with
+  `-set VAR VALUE`), with SIPp's id retirement on `set users` shrinks.
 - A second scenario next to the main one: out-of-call (`-oocsf`/`-oocsn`,
   answering requests of no known call) or mixed-mode receive
   (`-rxsf`/`-rxsn` + `-rxinf`, terminating the calls the peer originates

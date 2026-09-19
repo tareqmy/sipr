@@ -19,20 +19,82 @@ pub enum Role {
     Uas,
 }
 
-/// Per-call variable table: names interned to indices at compile time.
+/// How long a variable's value lives (SIPp's variable table levels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VarScope {
+    /// One value per call, gone when the call ends (the default).
+    #[default]
+    Call,
+    /// `<User variables="…"/>`: one value per user id, kept for the run, so
+    /// a user's next call sees what its previous call left.
+    User,
+    /// `<Global variables="…"/>`: one value for the whole process, shared by
+    /// every call of every scenario.
+    Global,
+}
+
+impl VarScope {
+    /// The element that declares this scope, or "call" for the default.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::User => "user",
+            Self::Global => "global",
+        }
+    }
+
+    /// SIPp's table level: global 0, user 1, call 2 (`dump variables`).
+    #[must_use]
+    pub fn level(self) -> u8 {
+        match self {
+            Self::Global => 0,
+            Self::User => 1,
+            Self::Call => 2,
+        }
+    }
+}
+
+/// The scenario's variable table: names interned to indices at compile
+/// time, each carrying the scope its declaration gave it.
 #[derive(Debug, Default, Clone)]
 pub struct VarTable {
     names: Vec<String>,
+    scopes: Vec<VarScope>,
 }
 
 impl VarTable {
-    /// Intern `name`, returning its id.
+    /// Intern `name` (call-scoped until a declaration says otherwise),
+    /// returning its id.
     pub fn intern(&mut self, name: &str) -> VarId {
         if let Some(i) = self.names.iter().position(|n| n == name) {
             return i;
         }
         self.names.push(name.to_owned());
+        self.scopes.push(VarScope::Call);
         self.names.len() - 1
+    }
+
+    /// The scope of a variable id (call for an unknown id).
+    #[must_use]
+    pub fn scope(&self, id: VarId) -> VarScope {
+        self.scopes.get(id).copied().unwrap_or_default()
+    }
+
+    /// Give a variable a scope (`<User>`/`<Global>` declarations).
+    pub fn set_scope(&mut self, id: VarId, scope: VarScope) {
+        if let Some(slot) = self.scopes.get_mut(id) {
+            *slot = scope;
+        }
+    }
+
+    /// The `(id, name)` of every variable in `scope`, in id order.
+    pub fn in_scope(&self, scope: VarScope) -> impl Iterator<Item = (VarId, &str)> {
+        self.names
+            .iter()
+            .enumerate()
+            .filter(move |(id, _)| self.scope(*id) == scope)
+            .map(|(id, name)| (id, name.as_str()))
     }
 
     /// The id of `name`, if the scenario ever mentioned it.
@@ -675,6 +737,12 @@ impl Scenario {
             self.steps.len(),
             self.vars.len()
         );
+        for scope in [VarScope::User, VarScope::Global] {
+            let names: Vec<&str> = self.vars.in_scope(scope).map(|(_, n)| n).collect();
+            if !names.is_empty() {
+                let _ = writeln!(out, "  {} variables: {}", scope.label(), names.join(", "));
+            }
+        }
         for (i, step) in self.steps.iter().enumerate() {
             let line = match step {
                 Step::Send(s) => {

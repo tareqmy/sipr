@@ -754,3 +754,176 @@ fn unexp_handler_pauserestore_jump_variable_and_closecon_compile() {
     ));
     assert!(errors(&literal).is_empty());
 }
+
+// ---- <User>/<Global> variable scopes (M35) --------------------------------
+
+fn counter_scenario(declarations: &str) -> String {
+    wrap(&format!(
+        r#"{declarations}
+           <nop>
+             <action>
+               <add assign_to="per_user" value="1"/>
+               <add assign_to="per_run" value="1"/>
+               <assignstr assign_to="per_call" value="7"/>
+             </action>
+           </nop>
+           <send><![CDATA[
+             INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+             Call-ID: [call_id]
+             X-User: [$per_user]
+             X-Run: [$per_run]
+             X-Call: [$per_call]
+
+           ]]></send>
+           <recv response="200"/>"#
+    ))
+}
+
+#[test]
+fn user_and_global_declarations_scope_the_variables() {
+    use sipr_scenario::model::VarScope;
+    let xml = counter_scenario(
+        r#"<User variables="per_user"/>
+           <Global variables="per_run"/>"#,
+    );
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let scope = |name: &str| sc.vars.scope(sc.vars.find(name).expect(name));
+    assert_eq!(scope("per_user"), VarScope::User);
+    assert_eq!(scope("per_run"), VarScope::Global);
+    assert_eq!(scope("per_call"), VarScope::Call);
+    let user: Vec<&str> = sc.vars.in_scope(VarScope::User).map(|(_, n)| n).collect();
+    assert_eq!(user, ["per_user"]);
+    let dump = sc.dump();
+    assert!(dump.contains("user variables: per_user"), "{dump}");
+    assert!(dump.contains("global variables: per_run"), "{dump}");
+}
+
+#[test]
+fn a_comma_list_declares_several_and_a_repeat_is_harmless() {
+    use sipr_scenario::model::VarScope;
+    let xml = counter_scenario(
+        r#"<Global variables="per_user, per_run"/>
+           <Global variables="per_run"/>"#,
+    );
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let global: Vec<&str> = sc.vars.in_scope(VarScope::Global).map(|(_, n)| n).collect();
+    assert_eq!(global, ["per_user", "per_run"]);
+}
+
+#[test]
+fn a_use_before_the_declaration_warns_and_still_scopes_it() {
+    use sipr_scenario::model::VarScope;
+    // SIPp would silently split `per_run` into a call-scoped variable (the
+    // earlier use) and a global one; sipr scopes it globally and says so.
+    let xml = wrap(&format!(
+        r#"{invite}
+           <recv response="200">
+             <action><add assign_to="per_run" value="1"/></action>
+           </recv>
+           <Global variables="per_run"/>
+           <Reference variables="per_run"/>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    let warnings: Vec<&str> = out
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("'per_run' is used at line 6 before this <Global> declaration"),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings[0].contains("sipr makes every use global"),
+        "{warnings:?}"
+    );
+    let sc = out.scenario.expect("compiles");
+    assert_eq!(
+        sc.vars.scope(sc.vars.find("per_run").unwrap()),
+        VarScope::Global
+    );
+}
+
+#[test]
+fn a_name_declared_both_user_and_global_is_an_error() {
+    let xml = counter_scenario(
+        r#"<User variables="per_user"/>
+           <Global variables="per_user"/>"#,
+    );
+    assert!(
+        errors(&xml)
+            .iter()
+            .any(|e| e.contains("'per_user' is declared both <User> and <Global>")),
+        "{:?}",
+        errors(&xml)
+    );
+}
+
+#[test]
+fn scope_declarations_need_a_variables_attribute() {
+    let xml = counter_scenario(r#"<User/><Global variables="per_run" bogus="1"/>"#);
+    let out = compile("test", &xml);
+    let messages: Vec<&str> = out.diagnostics.iter().map(|d| d.message.as_str()).collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("<User> requires a 'variables' attribute")
+                || m.contains("<User> needs a 'variables' attribute")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("bogus")),
+        "unknown attributes warn: {messages:?}"
+    );
+}
+
+#[test]
+fn a_global_read_but_never_set_here_is_no_finding() {
+    // Its value may come from `-set` or from the other scenario.
+    let xml = wrap(
+        r#"<Global variables="from_cli"/>
+           <send><![CDATA[
+             INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+             Call-ID: [call_id]
+             X-Cfg: [$from_cli]
+
+           ]]></send>
+           <recv response="200"/>"#,
+    );
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    // A user variable has no such source: read-but-never-set stays an error.
+    let user = xml.replace("<Global ", "<User ");
+    assert!(
+        errors(&user)
+            .iter()
+            .any(|e| e.contains("'from_cli' is read but never set")),
+        "{:?}",
+        errors(&user)
+    );
+}
+
+#[test]
+fn reference_to_an_undeclared_variable_still_errors() {
+    let xml = wrap(&format!(
+        r#"<Global variables="per_run"/>
+           {invite}
+           <recv response="200"/>
+           <Reference variables="nope"/>"#,
+        invite = send_invite()
+    ));
+    assert!(
+        errors(&xml)
+            .iter()
+            .any(|e| e.contains("'nope' is read but never set")),
+        "{:?}",
+        errors(&xml)
+    );
+}

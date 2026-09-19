@@ -481,3 +481,109 @@ fn check_mode_lints_the_receive_scenario_too() {
     assert_code(&o, 1);
     assert!(stderr(&o).contains("bogus"), "{}", stderr(&o));
 }
+
+/// A UAC scenario with one `<User>` and two `<Global>` variables (M35).
+fn scoped_scenario() -> TempScenario {
+    TempScenario::new(
+        "scoped.xml",
+        r#"<scenario name="scoped">
+             <Global variables="region,per_run"/>
+             <User variables="per_user"/>
+             <nop>
+               <action>
+                 <add assign_to="per_user" value="1"/>
+                 <add assign_to="per_run" value="1"/>
+               </action>
+             </nop>
+             <send><![CDATA[
+               INVITE sip:[service]@[remote_ip] SIP/2.0
+               Call-ID: [call_id]
+               X-Region: [$region]
+               X-User-Count: [$per_user]
+               X-Run-Count: [$per_run]
+
+             ]]></send>
+             <recv response="200"/>
+           </scenario>"#,
+    )
+}
+
+#[test]
+fn check_mode_prints_the_variable_scopes() {
+    let sc = scoped_scenario();
+    let o = sipr(&["-sf", sc.path(), "--check"]);
+    assert_code(&o, 0);
+    let out = stdout(&o);
+    assert!(out.contains("3 variables"), "{out}");
+    assert!(out.contains("user variables: per_user"), "{out}");
+    assert!(out.contains("global variables: region, per_run"), "{out}");
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+}
+
+#[test]
+fn set_of_an_undeclared_global_is_fatal_with_sipps_wording() {
+    let sc = scoped_scenario();
+    let o = sipr(&[
+        "-sf",
+        sc.path(),
+        "-set",
+        "nope",
+        "1",
+        "-timeout",
+        "1",
+        "127.0.0.1:5060",
+    ]);
+    assert_code(&o, 255);
+    let err = stderr(&o);
+    assert!(
+        err.contains("Can not set the global variable nope, because it does not exist"),
+        "{err}"
+    );
+    assert!(
+        err.contains("declared <Global> variables: region, per_run"),
+        "{err}"
+    );
+}
+
+#[test]
+fn user_and_global_elements_are_rejected_when_they_disagree_across_scenarios() {
+    // The main and the receive scenario share one user and one global name
+    // space (SIPp's `userVariables`/`globalVariables`); scoping one name two
+    // ways is a start-up error rather than SIPp's silent first-wins.
+    let main = scoped_scenario();
+    let rx = TempScenario::new(
+        "rx-scoped.xml",
+        r#"<scenario name="rx">
+             <User variables="per_run"/>
+             <recv request="INVITE">
+               <action><add assign_to="per_run" value="1"/></action>
+             </recv>
+             <send><![CDATA[
+               SIP/2.0 200 OK
+               [last_Via:]
+               [last_From:]
+               [last_To:];tag=[pid]SIPpTag01[call_number]
+               [last_Call-ID:]
+               [last_CSeq:]
+               Content-Length: 0
+
+             ]]></send>
+             <Reference variables="per_run"/>
+           </scenario>"#,
+    );
+    let o = sipr(&[
+        "-sf",
+        main.path(),
+        "-rxsf",
+        rx.path(),
+        "-timeout",
+        "1",
+        "127.0.0.1:5060",
+    ]);
+    assert_code(&o, 255);
+    let err = stderr(&o);
+    assert!(
+        err.contains("variable 'per_run' is <User> in one scenario and <Global> in the other"),
+        "{err}"
+    );
+}

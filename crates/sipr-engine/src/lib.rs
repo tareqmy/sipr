@@ -9,6 +9,7 @@
 mod actions;
 mod engine;
 mod render;
+mod vars;
 
 pub use engine::{
     EngineConfig, EngineControl, EngineError, RunReport, SecondaryKind, TransportKind, UiChannels,

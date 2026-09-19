@@ -5615,3 +5615,268 @@ fn set_display_rx_swaps_the_screens() {
     assert_eq!(code, Some(0), "stderr:\n{err}");
     assert!(err.contains("successful 6 failed 0"), "{err}");
 }
+
+// ---- <User>/<Global> variable scopes and user-id retirement (M35) ---------
+
+/// A UAC scenario that counts its calls per user (`<User>`) and per run
+/// (`<Global>`) and reports both, the user id and a `-set`-able global in
+/// INVITE headers.
+fn counter_uac_scenario() -> String {
+    r#"<scenario name="counters">
+  <Global variables="per_run,region"/>
+  <User variables="per_user"/>
+  <nop>
+    <action>
+      <add assign_to="per_user" value="1"/>
+      <add assign_to="per_run" value="1"/>
+    </action>
+  </nop>
+  <send retrans="500"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:u[userid]@[local_ip]:[local_port]>;tag=[pid]c[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:u[userid]@[local_ip]:[local_port]>
+    X-User: [userid]
+    X-User-Count: [$per_user]
+    X-Run-Count: [$per_run]
+    X-Region: [$region]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:u[userid]@[local_ip]:[local_port]>;tag=[pid]c[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Content-Length: 0
+
+  ]]></send>
+  <pause/>
+  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:u[userid]@[local_ip]:[local_port]>;tag=[pid]c[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#
+        .to_owned()
+}
+
+/// One INVITE as the counter scenario reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CounterCall {
+    user: String,
+    per_user: u32,
+    per_run: u32,
+    region: String,
+}
+
+/// A UAS that answers the counter scenario and records each distinct
+/// INVITE's headers in arrival order.
+fn spawn_counter_uas(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<Vec<CounterCall>>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(idle)).expect("timeout");
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut answered: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let branch = msg.top_via_branch().unwrap_or_default().to_owned();
+                    if let Some(ok) = answered.get(&branch) {
+                        let _ = sock.send_to(ok, from);
+                        continue;
+                    }
+                    let header =
+                        |name: &str| msg.header(name).unwrap_or_default().trim().to_owned();
+                    seen.push(CounterCall {
+                        user: header("X-User"),
+                        per_user: header("X-User-Count").parse().unwrap_or(0),
+                        per_run: header("X-Run-Count").parse().unwrap_or(0),
+                        region: header("X-Region"),
+                    });
+                    let ok = mirror_response(&msg, "200 OK", true);
+                    answered.insert(branch, ok.clone());
+                    let _ = sock.send_to(&ok, from);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        seen
+    });
+    (addr, handle)
+}
+
+/// Every user's per-user counter runs 1, 2, 3… over its calls, and the
+/// global counter runs 1..=n over all calls in order.
+fn assert_counters_are_consistent(calls: &[CounterCall]) {
+    let runs: Vec<u32> = calls.iter().map(|c| c.per_run).collect();
+    let expected: Vec<u32> = (1..=u32::try_from(calls.len()).expect("small")).collect();
+    assert_eq!(runs, expected, "global counter in call order: {calls:?}");
+    let mut per_user: HashMap<&str, Vec<u32>> = HashMap::new();
+    for c in calls {
+        per_user
+            .entry(c.user.as_str())
+            .or_default()
+            .push(c.per_user);
+    }
+    for (user, counts) in &per_user {
+        let expected: Vec<u32> = (1..=u32::try_from(counts.len()).expect("small")).collect();
+        assert_eq!(
+            counts, &expected,
+            "user {user}'s counter across its calls: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn user_variables_persist_across_a_users_calls() {
+    // -users 2 -m 6: each user runs three calls. A <User> counter carries
+    // from one call of a user to its next (1, 2, 3 per user), a <Global>
+    // one across every call (1..6), and `-set region eu` seeds a global.
+    let (addr, uas) = spawn_counter_uas(Duration::from_secs(4));
+    let sc_path = std::env::temp_dir().join(format!("sipr-uservars-{}.xml", std::process::id()));
+    std::fs::write(&sc_path, counter_uac_scenario()).expect("write scenario");
+    let out = run_sipr(&[
+        "-sf",
+        sc_path.to_str().expect("utf8"),
+        "-users",
+        "2",
+        "-m",
+        "6",
+        "-d",
+        "20",
+        "-set",
+        "region",
+        "eu",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&sc_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 6 failed 0"), "{err}");
+
+    let calls = uas.join().expect("uas thread");
+    assert_eq!(calls.len(), 6, "{calls:?}");
+    assert_counters_are_consistent(&calls);
+    let users: Vec<&str> = calls.iter().map(|c| c.user.as_str()).collect();
+    // SIPp hands out the free ids from the back of the pool: user 2 first.
+    assert_eq!(&users[..2], ["2", "1"], "{calls:?}");
+    assert_eq!(users.iter().filter(|u| **u == "1").count(), 3, "{calls:?}");
+    assert!(
+        calls.iter().all(|c| c.region == "eu"),
+        "-set seeds the global: {calls:?}"
+    );
+}
+
+#[test]
+fn set_users_retires_and_reuses_ids_like_sipp() {
+    // -users 3, then `set users 1` while all three calls are up: the first
+    // call to end retires its id (more calls live than allowed), the other
+    // two return to the free pool (SIPp free_user). `set users 3` later
+    // takes the retired id back — with its counter — and creates one fresh
+    // id for the remaining slot, so four ids appear in all; nothing is
+    // dropped by number. `dump variables` lists the scopes meanwhile.
+    let (addr, uas) = spawn_counter_uas(Duration::from_secs(5));
+    let dir = std::env::temp_dir().join(format!("sipr-retire-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sc_path = dir.join("counters.xml");
+    std::fs::write(&sc_path, counter_uac_scenario()).expect("write scenario");
+    let cp = free_port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .args([
+            "-sf",
+            sc_path.to_str().expect("utf8"),
+            "-users",
+            "3",
+            "-m",
+            "9",
+            "-d",
+            "1500",
+            "-cp",
+            &cp.to_string(),
+            "-trace_err",
+            "-timeout",
+            "40",
+            "-bg",
+            &addr.to_string(),
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sipr");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let ctl = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let target = SocketAddr::from(([127, 0, 0, 1], cp));
+    // All three calls are up (they pause 1.5 s before the BYE).
+    std::thread::sleep(Duration::from_millis(600));
+    ctl.send_to(b"cset users 1\n", target).expect("send");
+    // ~3.2 s: the three initial calls are over, one replacement is running.
+    std::thread::sleep(Duration::from_millis(2600));
+    ctl.send_to(b"cset users 3\n", target).expect("send");
+    ctl.send_to(b"cdump variables\n", target).expect("send");
+    let code = wait_exit(&mut child, Duration::from_secs(30));
+    let err = reader.join().expect("stderr");
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 9 failed 0"), "{err}");
+
+    let calls = uas.join().expect("uas thread");
+    assert_eq!(calls.len(), 9, "{calls:?}");
+    assert_counters_are_consistent(&calls);
+    let users: Vec<&str> = calls.iter().map(|c| c.user.as_str()).collect();
+    assert_eq!(&users[..3], ["3", "2", "1"], "SIPp's pool order: {calls:?}");
+    let mut distinct = users.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct,
+        ["1", "2", "3", "4"],
+        "one fresh id after the regrow: {calls:?}"
+    );
+    // User 3's call ended first while three were live against a target of
+    // one: retired, then reactivated by the regrow with its counter intact.
+    assert!(
+        users.iter().filter(|u| **u == "3").count() >= 2,
+        "the retired id returns: {calls:?}"
+    );
+
+    let errors_log = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_errors.log"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("read log"))
+        .expect("an errors log");
+    assert!(
+        errors_log.contains("2 level 0 variables:\nper_run\nregion\n1 level 1 variables:\nper_user\n0 level 2 variables:\n"),
+        "dump variables output:\n{errors_log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -3105,3 +3105,319 @@ fn sipr_receive_scenario_answers_a_plain_real_sipp_uac() {
     assert!(stderr.contains("successful 3 failed 0"), "{stderr}");
     assert!(stderr.contains(" unexpected 0 "), "{stderr}");
 }
+
+// ---- <User>/<Global> variables against real sipp (M35) -------------------
+
+/// The counter scenario as a UAC: a `<User>` counter, a `<Global>` counter,
+/// both reported with `[userid]` in INVITE headers. The same file drives
+/// real sipp and sipr.
+fn counter_uac_xml() -> &'static str {
+    r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<scenario name="counters">
+  <Global variables="per_run"/>
+  <User variables="per_user"/>
+  <nop>
+    <action>
+      <add assign_to="per_user" value="1"/>
+      <add assign_to="per_run" value="1"/>
+    </action>
+  </nop>
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:u[userid]@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:u[userid]@[local_ip]:[local_port]
+    X-User: [userid]
+    X-User-Count: [$per_user]
+    X-Run-Count: [$per_run]
+    Max-Forwards: 70
+    Subject: Performance Test
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+    s=-
+    c=IN IP[media_ip_type] [media_ip]
+    t=0 0
+    m=audio [media_port] RTP/AVP 0
+    a=rtpmap:0 PCMU/8000
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200" rtd="true"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:u[userid]@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:u[userid]@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Subject: Performance Test
+    Content-Length: 0
+
+  ]]></send>
+  <pause/>
+  <send retrans="500"><![CDATA[
+    BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:u[userid]@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Contact: sip:u[userid]@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Subject: Performance Test
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200" crlf="true"/>
+</scenario>
+"#
+}
+
+/// `(X-User, X-User-Count, X-Run-Count)` of every INVITE in a `-trace_msg`
+/// log (sipp's or sipr's), in order, retransmissions folded.
+fn counter_headers_in_message_log(dir: &std::path::Path) -> Vec<(String, String, String)> {
+    let log: String = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_messages.log"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .collect();
+    let mut calls: Vec<(String, String, String)> = Vec::new();
+    for block in log.split("INVITE sip:").skip(1) {
+        let header = |name: &str| {
+            block
+                .lines()
+                .take_while(|l| !l.trim().is_empty())
+                .find_map(|l| l.strip_prefix(name))
+                .map(|v| v.trim_start_matches(':').trim().to_owned())
+                .unwrap_or_default()
+        };
+        let call = (
+            header("X-User"),
+            header("X-User-Count"),
+            header("X-Run-Count"),
+        );
+        if !calls.contains(&call) {
+            calls.push(call);
+        }
+    }
+    calls
+}
+
+/// The counter scenario run by real sipp (`-users 2 -m 6`) against a sipr
+/// UAS, and by sipr against a sipp UAS: both sides hand out user ids the
+/// same way (user 2 first, then alternating) and keep the per-user counter
+/// per user id (1, 2, 3 for each) and the global one across the run (each
+/// of 1..6 once). Two things are normalised before comparing, both
+/// pre-existing and recorded in SIPP_COMPAT §6: sipp renders a double as
+/// `%lf` ("2.000000", sipr "2"), and sipp's scheduler runs one step per
+/// call per turn, so when two calls start in the same tick both `<nop>`s
+/// run before either INVITE renders and the first two INVITEs both carry
+/// global 2 (sipr runs a call to its first blocking step, so they carry
+/// 1 and 2).
+#[test]
+fn user_and_global_variables_count_the_same_as_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::user_and_global_variables_count_the_same_as_real_sipp — no sipp."
+        );
+        return;
+    };
+    let read_stderr = |child: &mut Child| {
+        child
+            .stderr
+            .take()
+            .map(|mut s| {
+                use std::io::Read;
+                let mut buf = String::new();
+                let _ = s.read_to_string(&mut buf);
+                buf
+            })
+            .unwrap_or_default()
+    };
+
+    // sipp UAC → sipr UAS.
+    let dir_a = tempfile::tempdir().expect("tempdir");
+    let xml_a = dir_a.path().join("counters.xml");
+    std::fs::write(&xml_a, counter_uac_xml()).expect("write scenario");
+    let port = free_port();
+    let mut sipr_uas = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .current_dir(dir_a.path())
+            .args([
+                "-sn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "6",
+                "-timeout",
+                "30",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipr uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut sipp_uac = Reaper(
+        Command::new(&sipp)
+            .current_dir(dir_a.path())
+            .args([
+                "-sf",
+                xml_a.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-users",
+                "2",
+                "-m",
+                "6",
+                "-d",
+                "200",
+                "-timeout",
+                "20s",
+                "-trace_msg",
+                "-trace_err",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uac"),
+    );
+    let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
+    assert_eq!(
+        sipp_code,
+        Some(0),
+        "sipp uac must exit 0; sipp errors:\n{}",
+        sipp_error_log(dir_a.path())
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_uas.0, Duration::from_secs(15));
+    let stderr = read_stderr(&mut sipr_uas.0);
+    assert_eq!(
+        sipr_code,
+        Some(0),
+        "sipr uas must exit 0; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("successful 6 failed 0"), "{stderr}");
+    let by_sipp = counter_headers_in_message_log(dir_a.path());
+
+    // sipr UAC → sipp UAS.
+    let dir_b = tempfile::tempdir().expect("tempdir");
+    let xml_b = dir_b.path().join("counters.xml");
+    std::fs::write(&xml_b, counter_uac_xml()).expect("write scenario");
+    let port = free_port();
+    let mut sipp_uas = Reaper(
+        Command::new(&sipp)
+            .current_dir(dir_b.path())
+            .args([
+                "-sn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "6",
+                "-timeout",
+                "30",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipp uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut sipr_uac = Reaper(
+        Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .current_dir(dir_b.path())
+            .args([
+                "-sf",
+                xml_b.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-users",
+                "2",
+                "-m",
+                "6",
+                "-d",
+                "200",
+                "-timeout",
+                "20",
+                "-trace_msg",
+                "-bg",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sipr uac"),
+    );
+    let sipr_code = wait_with_timeout(&mut sipr_uac.0, Duration::from_secs(25));
+    let stderr = read_stderr(&mut sipr_uac.0);
+    assert_eq!(
+        sipr_code,
+        Some(0),
+        "sipr uac must exit 0; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("successful 6 failed 0"), "{stderr}");
+    let _ = wait_with_timeout(&mut sipp_uas.0, Duration::from_secs(15));
+    let by_sipr = counter_headers_in_message_log(dir_b.path());
+
+    for (who, calls) in [("real sipp", &by_sipp), ("sipr", &by_sipr)] {
+        let num = |s: &str| s.parse::<f64>().unwrap_or(-1.0);
+        let users: Vec<&str> = calls.iter().map(|(u, _, _)| u.as_str()).collect();
+        assert_eq!(
+            users,
+            ["2", "1", "2", "1", "2", "1"],
+            "{who}: user order {calls:?}"
+        );
+        for user in ["1", "2"] {
+            let counts: Vec<f64> = calls
+                .iter()
+                .filter(|(u, _, _)| u == user)
+                .map(|(_, c, _)| num(c))
+                .collect();
+            assert_eq!(
+                counts,
+                [1.0, 2.0, 3.0],
+                "{who}: user {user}'s counter {calls:?}"
+            );
+        }
+        // The global counter never goes back and has counted every call
+        // by the last one; sipr reads 1..6 exactly (sipp 2, 2, 3, 4, 5, 6 —
+        // see above).
+        let globals: Vec<f64> = calls.iter().map(|(_, _, r)| num(r)).collect();
+        assert!(
+            globals.windows(2).all(|w| w[0] <= w[1]),
+            "{who}: global counter {calls:?}"
+        );
+        assert_eq!(
+            globals.last(),
+            Some(&6.0),
+            "{who}: global counter {calls:?}"
+        );
+    }
+    let sipr_globals: Vec<f64> = by_sipr
+        .iter()
+        .map(|(_, _, r)| r.parse::<f64>().unwrap_or(-1.0))
+        .collect();
+    assert_eq!(sipr_globals, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "{by_sipr:?}");
+}

@@ -177,6 +177,8 @@ pub struct Cli {
     pub inf: Vec<std::path::PathBuf>,
     /// `-infindex FILE FIELD`: build a `<lookup>` index; repeatable.
     pub inf_index: Vec<(String, usize)>,
+    /// `-set VARIABLE VALUE`: initial value of a `<Global>` variable; repeatable.
+    pub set_vars: Vec<(String, String)>,
     /// `-3pcc HOST:PORT`: classic 3PCC twin control socket.
     pub three_pcc: Option<String>,
     /// `-users N`: closed-loop mode with N constant concurrent users.
@@ -257,6 +259,7 @@ impl Default for Cli {
             max_retrans: None,
             inf: Vec::new(),
             inf_index: Vec::new(),
+            set_vars: Vec::new(),
             three_pcc: None,
             users: None,
             tls_cert: PathBuf::from("cacert.pem"),
@@ -610,6 +613,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "Injection file (CSV) loaded after the -inf ones, for [fieldN file=NAME] in either scenario; repeatable",
     ),
     (
+        "set",
+        true,
+        "VARIABLE VALUE",
+        "Set the <Global variables=> variable VARIABLE to VALUE before the run; repeatable",
+    ),
+    (
         "infindex",
         true,
         "FILE FIELD",
@@ -699,7 +708,18 @@ where
             "v" | "version" => return Ok(Invocation::Version),
             _ => {}
         }
-        // -infindex is the one two-argument flag: FILE then FIELD.
+        // -set takes two arguments: VARIABLE then VALUE.
+        if name == "set" {
+            let variable = inline_value
+                .or_else(|| args.next())
+                .ok_or_else(|| "option '-set' requires VARIABLE and VALUE".to_owned())?;
+            let value = args
+                .next()
+                .ok_or_else(|| "option '-set' requires a VALUE after VARIABLE".to_owned())?;
+            cli.set_vars.push((variable, value));
+            continue;
+        }
+        // -infindex is the other two-argument flag: FILE then FIELD.
         if name == "infindex" {
             let file = inline_value
                 .or_else(|| args.next())
@@ -1344,5 +1364,24 @@ mod tests {
         assert_eq!(edit_distance("trace_mgs", "trace_msg"), 2);
         assert_eq!(edit_distance("sn", "sn"), 0);
         assert!(closest_flag("zzzzzzzzzz").is_none());
+    }
+
+    #[test]
+    fn set_takes_a_variable_and_a_value_and_repeats() {
+        let c = cli(&[
+            "-sn", "uac", "-set", "region", "eu", "-set", "tier", "gold", "host",
+        ]);
+        assert_eq!(
+            c.set_vars,
+            vec![
+                ("region".to_owned(), "eu".to_owned()),
+                ("tier".to_owned(), "gold".to_owned())
+            ]
+        );
+        assert_eq!(c.target.as_deref(), Some("host"));
+        let err = run(&["-set", "region"]).unwrap_err();
+        assert!(err.contains("requires a VALUE after VARIABLE"), "{err}");
+        let err = run(&["-set"]).unwrap_err();
+        assert!(err.contains("requires VARIABLE and VALUE"), "{err}");
     }
 }

@@ -38,6 +38,7 @@ fn uas_config() -> EngineConfig {
         inf_files: Vec::new(),
         rx_inf_files: Vec::new(),
         inf_index: Vec::new(),
+        global_sets: Vec::new(),
         transport: sipr_engine::TransportKind::UdpMono,
         max_socket: 50_000,
         remote_sending_addr: None,

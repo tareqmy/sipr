@@ -235,7 +235,7 @@ on a machine with sipp to close them.
       (`tests/e2e.rs::users_closed_loop_binds_user_to_injection_line`: three
       users each run twice under `-users 3 -m 6`, each `[field0]` matching its
       `[userid]`). SIPP_COMPAT §6.
-- [x] Deferred: per-user persistent variables (queued as M35; runtime
+- [x] Deferred: per-user persistent variables (shipped as M35; runtime
       user-count changes shipped with the control socket, M17).
 
 ## M12 — IPv6 ✅
@@ -1184,17 +1184,20 @@ while `CurrentCall > open_calls_allowed`, else returns it to the pool);
 (declares `Reference` only — `Global`/`User` are accepted by the parser
 and absent from the DTD and the docs; the regress suite never uses them).
 
-- [ ] Scenario: `<Global variables="a,b"/>` and `<User variables="x"/>`
+- [x] Scenario: `<Global variables="a,b"/>` and `<User variables="x"/>`
       elements (`variables` required; unknown attributes warn). Each
       variable id carries a scope — `Call` (default), `User`, `Global` —
-      resolved at compile time so the hot path never searches; `Scenario`
-      exposes the per-scope name lists and `dump()` prints them. SIPp's
-      declaration-order quirk (a use before the declaration stays
-      call-scoped): sipr applies the scope to the whole scenario and
-      emits a warning naming the earlier use, so `--check` catches what
-      SIPp silently gets wrong — record the divergence in SIPP_COMPAT §6.
-      `<Reference>` keeps rejecting unknown names.
-- [ ] Engine: a layered variable store — the call's own store, the user's
+      (`VarTable::scope`/`in_scope`, `VarScope`) resolved at compile time
+      so the hot path never searches; `dump()` prints the user and global
+      name lists. SIPp's declaration-order quirk (a use before the
+      declaration stays call-scoped): sipr applies the scope to the whole
+      scenario and warns naming the line of the earlier use, so `--check`
+      catches what SIPp silently gets wrong (SIPP_COMPAT §6). A name
+      declared both `<User>` and `<Global>` is an error. `<Reference>`
+      keeps rejecting unknown names. A `<Global>` read but never set is
+      no diagnostic (`-set` or the other scenario may set it); a `<User>`
+      one stays the usual error.
+- [x] Engine: a layered variable store (`sipr-engine/src/vars.rs`) — the call's own store, the user's
       store (by user id, owned by the engine, created when the id is
       first handed out and kept for the run, SIPp's `userVarMap`) and one
       global store shared by every call of both scenarios (the secondary
@@ -1204,21 +1207,32 @@ and absent from the DTD and the docs; the regress suite never uses them).
       `urlencode`/`urldecode`, `todouble`, `jump variable=`) and `[$var]`
       rendering go through it by scope. Calls with no user id get a
       private "user" layer, as SIPp. Single engine thread: no locks, no
-      allocation per access beyond what call-scoped variables do today.
-- [ ] User-id bookkeeping like SIPp's: growth takes retired ids first (so
+      allocation per access beyond what call-scoped variables do today
+      (`VarStore::get` returns a `VarRef` borrowing the layer; the shared
+      layers are `Rc<RefCell<…>>`). A `VarSpace` unions the user and
+      global names of both scenarios so one name is one slot across them
+      (SIPp's shared `userVariables`/`globalVariables`); a name scoped
+      differently by the two is a start-up error. Also shipped: SIPp's
+      `-set VARIABLE VALUE` (seeds a `<Global>`; fatal with SIPp's
+      wording, plus the declared names, when none declares it).
+- [x] User-id bookkeeping like SIPp's: growth takes retired ids first (so
       a returning user sees its old variables), then fresh ones; a shrink
       does not touch the pool — a finishing call's id is retired while
       the live count exceeds the target and returned otherwise (SIPp
       `free_user`), so whichever users happen to be live keep their ids
-      and injection lines. Today sipr drops ids above the target
-      regardless of liveness; align and record. `[users]` keeps rendering
+      and injection lines. sipr used to drop ids above the target
+      regardless of liveness; now aligned, including SIPp's pool order
+      (filled 1..N, served from the back — the first call is user N's —
+      returned to the front). One divergence, recorded: fresh ids on a
+      growth are never-used numbers, not SIPp's `users + 1` that can
+      collide with a live id after a shrink. `[users]` keeps rendering
       the current count.
-- [ ] Control: `dump variables` — SIPp prints the displayed scenario's
-      variable names by scope (`AllocVariableTable::dump`); implement it
-      into the error trace (it warns "unsupported" today) or record why
-      not.
-- [ ] `--check` prints the scopes; embedded scenarios untouched.
-- [ ] Tests: scenario unit (both elements parse; scopes resolve; a use
+- [x] Control: `dump variables` — SIPp prints the displayed scenario's
+      variable names by scope (`AllocVariableTable::dump`); implemented
+      into the error trace with SIPp's lines (`N level 0 variables:` …
+      global, user, call).
+- [x] `--check` prints the scopes; embedded scenarios untouched.
+- [x] Tests: scenario unit (both elements parse; scopes resolve; a use
       before the declaration warns; `<Reference>` to an undeclared name
       still errors); engine unit (a user variable survives into the same
       user's next call, a global one is visible to every call, a call
@@ -1232,7 +1246,12 @@ and absent from the DTD and the docs; the regress suite never uses them).
       retired, with their counters continuing); interop: the same
       counter scenario run by real sipp against a sipr UAS and by sipr
       against a sipp UAS, the header sequences compared.
-- [ ] Docs: SIPP_COMPAT §1 (the two elements), §6 note (scope chain,
+- [x] Found on the way, recorded in SIPP_COMPAT §6 and left as they were
+      (a decision for later, both pre-date M35): SIPp renders double
+      variables as `%lf` (`3.000000`, sipr `3`), and SIPp's one-step-per-
+      call-per-turn scheduler interleaves same-tick calls' `<nop>`
+      actions before their sends, visible only through globals.
+- [x] Docs: SIPP_COMPAT §1 (the two elements), §3 (`-set`), §6 note (scope chain,
       declaration-order divergence, private user layer for id-less calls,
       retirement rules, `dump variables`); ARCHITECTURE variable-store
       paragraph; README feature bullet; the M11 deferral updated.

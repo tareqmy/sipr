@@ -187,6 +187,7 @@ fn run(cli: &Cli) -> ExitCode {
         inf_files: cli.inf.clone(),
         rx_inf_files: cli.rxinf.clone(),
         inf_index: cli.inf_index.clone(),
+        global_sets: cli.set_vars.clone(),
         transport: match cli.transport {
             crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
             crate::cli::Transport::UdpPerCall => sipr_engine::TransportKind::UdpPerCall,

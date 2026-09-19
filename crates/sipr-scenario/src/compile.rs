@@ -12,10 +12,19 @@ use crate::diag::{Diagnostic, Diagnostics};
 use crate::model::{
     Action, ArithOp, CompareOp, Expect, IntCmd, JumpTarget, MediaKind, Operand, PauseSpec,
     RecvStep, Role, RtpEchoCmd, RtpEchoVerb, RtpSource, RtpStreamCmd, Scenario, SearchIn, SendStep,
-    Step, StepCommon, StepIndex, VarId, VarTable,
+    Step, StepCommon, StepIndex, VarId, VarScope, VarTable,
 };
 use crate::template::{self, Keyword, MsgTemplate};
 use crate::xml::{self, Element, Node};
+
+/// The declaring element of a non-call scope (call has none).
+fn element_for(scope: VarScope) -> &'static str {
+    match scope {
+        VarScope::Global => "Global",
+        VarScope::User => "User",
+        VarScope::Call => "scenario",
+    }
+}
 
 /// Result of a compilation: the scenario (unless errors) plus diagnostics.
 #[derive(Debug)]
@@ -45,6 +54,8 @@ pub fn compile(source_name: &str, xml_text: &str) -> CompileOutcome {
         vars: VarTable::default(),
         var_read: Vec::new(),
         var_written: Vec::new(),
+        var_first_line: Vec::new(),
+        cur_line: 0,
         steps: Vec::new(),
         labels: HashMap::new(),
         pending: Vec::new(),
@@ -74,6 +85,10 @@ struct Compiler {
     vars: VarTable,
     var_read: Vec<bool>,
     var_written: Vec<bool>,
+    /// Line of the top-level element that first mentioned each variable.
+    var_first_line: Vec<u32>,
+    /// Line of the top-level element being compiled.
+    cur_line: u32,
     steps: Vec<Step>,
     labels: HashMap<String, StepIndex>,
     pending: Vec<Pending>,
@@ -88,8 +103,54 @@ impl Compiler {
         if id >= self.var_read.len() {
             self.var_read.push(false);
             self.var_written.push(false);
+            self.var_first_line.push(self.cur_line);
         }
         id
+    }
+
+    /// `<Global variables="a,b"/>` / `<User variables="x"/>`: give the named
+    /// variables a scope. SIPp resolves scopes by declaration order — a name
+    /// used *before* its declaration is already call-scoped and stays so —
+    /// which silently splits one name into two variables; sipr applies the
+    /// scope to the whole scenario and warns about the earlier use.
+    fn compile_scope_declaration(&mut self, el: &Element, scope: VarScope) {
+        self.warn_unknown_attrs(el, &["variables"]);
+        let Some(list) = self.require_attr(el, "variables") else {
+            return;
+        };
+        for name in list.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            let earlier = self.vars.find(name);
+            let id = self.var(name);
+            let current = self.vars.scope(id);
+            if current != VarScope::Call && current != scope {
+                self.diags.error(
+                    Some(el.line),
+                    format!(
+                        "variable '{name}' is declared both <{}> and <{}>",
+                        element_for(current),
+                        element_for(scope)
+                    ),
+                );
+                continue;
+            }
+            if let Some(id) = earlier
+                && current == VarScope::Call
+            {
+                self.diags.warn(
+                    Some(el.line),
+                    format!(
+                        "variable '{name}' is used at line {} before this <{}> declaration: \
+                         SIPp would keep that use call-scoped and create a second, {} '{name}' \
+                         here; sipr makes every use {} — move the declaration above the first use",
+                        self.var_first_line.get(id).copied().unwrap_or(0),
+                        element_for(scope),
+                        scope.label(),
+                        scope.label()
+                    ),
+                );
+            }
+            self.vars.set_scope(id, scope);
+        }
     }
 
     fn var_reads(&mut self, name: &str) -> VarId {
@@ -187,6 +248,7 @@ impl Compiler {
     }
 
     fn compile_element(&mut self, el: &Element) {
+        self.cur_line = el.line;
         match el.name.as_str() {
             "send" => self.compile_send(el),
             "recv" => self.compile_recv(el),
@@ -202,6 +264,8 @@ impl Compiler {
                 self.warn_unknown_attrs(el, &["value"]);
                 self.call_length_repartition = self.parse_bucket_list(el);
             }
+            "Global" => self.compile_scope_declaration(el, VarScope::Global),
+            "User" => self.compile_scope_declaration(el, VarScope::User),
             "Reference" => {
                 self.warn_unknown_attrs(el, &["variables"]);
                 let vars = el.attr("variables").unwrap_or_default().to_owned();
@@ -1394,8 +1458,10 @@ impl Compiler {
         for id in 0..self.vars.len() {
             let name = self.vars.name(id).to_owned();
             // `_unexp.retaddr` / `_unexp.pausedaddr` are written by the
-            // engine on an `_unexp.main` jump, not by an action.
-            let engine_set = name.starts_with("_unexp.");
+            // engine on an `_unexp.main` jump, not by an action. A global's
+            // value may come from `-set` or from the other scenario's
+            // actions, so "never set here" is no finding for it.
+            let engine_set = name.starts_with("_unexp.") || self.vars.scope(id) == VarScope::Global;
             match (self.var_read[id], self.var_written[id] || engine_set) {
                 (true, false) => self.diags.error(
                     None,

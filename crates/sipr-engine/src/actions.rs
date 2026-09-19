@@ -6,9 +6,7 @@
 //! everything else is arithmetic/string/control over the store.
 
 use sipr_net::Inbound;
-use sipr_scenario::model::{
-    Action, ArithOp, CompareOp, JumpTarget, Operand, SearchIn, VarId, VarTable,
-};
+use sipr_scenario::model::{Action, ArithOp, CompareOp, JumpTarget, Operand, SearchIn};
 use sipr_scenario::template::MsgTemplate;
 
 use crate::render::{RenderCtx, render_to_string};
@@ -70,40 +68,7 @@ fn format_num(n: f64) -> String {
     }
 }
 
-/// Per-call variable store.
-#[derive(Debug, Clone)]
-pub struct VarStore {
-    slots: Vec<Value>,
-}
-
-impl VarStore {
-    /// Store sized for a scenario's variable table.
-    #[must_use]
-    pub fn new(vars: &VarTable) -> Self {
-        Self {
-            slots: vec![Value::Unset; vars.len()],
-        }
-    }
-
-    /// Read a variable (Unset if out of range).
-    #[must_use]
-    pub fn get(&self, id: VarId) -> &Value {
-        self.slots.get(id).unwrap_or(&Value::Unset)
-    }
-
-    /// Write a variable (ignored if out of range — compiler guarantees range).
-    pub fn set(&mut self, id: VarId, value: Value) {
-        if let Some(slot) = self.slots.get_mut(id) {
-            *slot = value;
-        }
-    }
-
-    /// Is this variable set? (backs `test`/`condexec`).
-    #[must_use]
-    pub fn is_set(&self, id: VarId) -> bool {
-        self.get(id).is_set()
-    }
-}
+pub use crate::vars::VarStore;
 
 /// What an action asked the engine to do next.
 #[derive(Debug, Clone, PartialEq)]
@@ -295,7 +260,8 @@ fn run_one(
             assign_to,
             variable,
         } => {
-            store.set(*assign_to, store.get(*variable).clone());
+            let value = store.get(*variable).clone();
+            store.set(*assign_to, value);
             ActionOutcome::Continue
         }
         Action::AssignStr { assign_to, value } => {
@@ -360,7 +326,8 @@ fn run_one(
             assign_to,
             variable,
         } => {
-            store.set(*assign_to, Value::Num(store.get(*variable).as_num()));
+            let number = store.get(*variable).as_num();
+            store.set(*assign_to, Value::Num(number));
             ActionOutcome::Continue
         }
         Action::Jump { dest } => ActionOutcome::Jump(match dest {
