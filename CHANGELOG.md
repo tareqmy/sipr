@@ -4,6 +4,30 @@ All notable changes to sipr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] — 2026-09-19
+
+### Added
+
+- **`exec command=`** (M37): run a shell command from an action, with
+  keywords and variables rendered into it. Fire-and-forget as in SIPp, but
+  spawned and reaped by one runner thread, so the engine never forks or
+  blocks and no zombies accumulate under load.
+- **`<setdest host= port= protocol=/>`** (M37): send the rest of a call
+  to another peer — retargeting over UDP, re-dialling the call's own
+  connection over per-call TCP — with every check SIPp makes and its
+  wording. A rejected `setdest` fails that call rather than the run.
+  `[remote_ip]`/`[remote_port]` keep the nominal remote, as in SIPp.
+- `ereg search_in="body"` and `search_in="var" variable="…"`, which
+  SIPp's documented setdest idiom relies on.
+
+### Notes
+
+- Three SIPp behaviors met on the way are recorded in
+  `docs/SIPP_COMPAT.md` §6 and deliberately not copied: `[next_url]`
+  needs `rrs="true"` to carry the Contact in SIPp, `[last_*]` inside a
+  recv's own actions still name the previous message there, and SIPp's
+  `echo [last_From]` example breaks under any shell without quoting.
+
 ## [0.25.0] — 2026-09-19
 
 ### Added
