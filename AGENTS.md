@@ -67,7 +67,7 @@ acceptance tests.
   are hard errors (silently skipping a step would change the call flow);
   unknown *attributes and keywords* produce a loud warning with file:line
   context; `--check` treats any diagnostic, warnings included, as failure.
-  Silent skips are the worst SIPp failure mode; we do not inherit it.
+  Silent skips are a SIPp failure mode we deliberately do not inherit.
 - **Hot path discipline** (per-message send/recv code): no allocations beyond
   template slot filling, no locks held across `.await`, no synchronous I/O, no
   regex compilation. Message templates are pre-tokenized at scenario load; if you
@@ -122,9 +122,9 @@ Core refactoring strategies:
   of nesting the happy path inside `if` pyramids.
 - **Favor composition over inheritance.** In Rust terms: no god-objects or
   deep trait hierarchies — inject small, focused types (services, strategies)
-  to handle specific behaviors, and keep trait bounds narrow. `call.cpp` in
-  SIPp grew to 300KB by absorbing every concern; the crate boundaries exist so
-  that never happens here.
+  to handle specific behaviors, and keep trait bounds narrow. SIPp's `call.cpp`
+  absorbed most concerns over the years; the crate boundaries exist so that
+  does not happen here.
 
 ## Workflow
 

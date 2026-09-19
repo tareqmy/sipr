@@ -11,15 +11,25 @@
 
 # sipr
 
-A SIPp-like SIP testing tool and traffic generator, written in Rust.
+A SIP testing tool and traffic generator written in Rust, compatible with
+[SIPp](https://github.com/SIPp/sipp) scenarios.
 
-sipr plays SIP call flows described in SIPp-compatible XML scenarios — as caller
+sipr plays SIP call flows described in SIPp's XML scenario format — as caller
 (UAC) or callee (UAS) — at a controlled call rate, with a live terminal
-dashboard. Think `sipp -sn uac -r 50`, rebuilt in safe, dependency-free Rust.
+dashboard. It takes the same scenario files and the same command-line flags as
+SIPp, so `sipr -sn uac -r 50` does what `sipp -sn uac -r 50` does.
 
-**Status: v1 feature-complete for signaling over UDP, TCP, and TLS.** In loopback benchmarks
-it sustains tens of thousands of calls per second with zero failures — see
-`benches/BASELINES.md`.
+sipr is an independent implementation, not a fork. SIPp remains the reference
+tool for this format, and its documentation and behavior are what sipr is
+tested against; every release runs an interoperability suite with a real SIPp
+on the other end of the call. sipr exists for people who want that workflow
+in a single static binary with no system libraries, and it is not intended
+to replace SIPp.
+
+**Status: v1 feature-complete for signaling over UDP, TCP, and TLS.** In
+loopback runs on a shared cloud sandbox it has sustained about 5000 calls per
+second (50,000 calls, all completed, with a small number of retransmissions
+covering kernel drops); the exact runs are in `benches/BASELINES.md`.
 
 ## Install
 
@@ -138,10 +148,27 @@ root for media.
   glossary, milestones
 - `AGENTS.md` / `CLAUDE.md` — instructions for AI agents contributing to the repo
 
-## Not yet (post-v1 roadmap)
+sipr is developed with the help of AI coding agents working from the plan and
+the instructions above; the SIPp C++ source is read as the behavioral
+reference and the interop suite is the check that the result matches.
 
-SIPp's SCTP socket options (`-multihome`, `-heartbeat`, `-pathmaxret`,
-`-pmtu`, `-assocmaxret`, `-gracefulclose`) — out of reach without libsctp.
+## Not yet
+
+Parts of SIPp that sipr does not implement, and where that is deliberate:
+
+- The `<sample>` action (statistical pauses) and the standalone `<index>`
+  action (sipr builds injection indexes from `-infindex` at load time).
+- Extended 3PCC (`-master`/`-slave`/`-slave_cfg`, `sendCmd dest=`,
+  `recvCmd src=`); classic `-3pcc` is supported.
+- `PRINTF=` virtual-line injection files.
+- `<rtp_echo variable=…>` (only `value="0|1"`), and bracketed `-key` values.
+- WebSocket transport (`-t ws`).
+- SIPp's SCTP socket options (`-multihome`, `-heartbeat`, `-pathmaxret`,
+  `-pmtu`, `-assocmaxret`, `-gracefulclose`) — out of reach without libsctp.
+
+None of these is ignored: a scenario element or flag from this list is
+rejected up front with a message naming it. `docs/SIPP_COMPAT.md` lists the
+exact supported surface.
 
 ## Brand
 
@@ -154,7 +181,11 @@ color mapping live in [`brand/`](brand/); the live dashboard uses those colors
 
 Licensed under the [MIT License](LICENSE).
 
-Note: sipr is an independent clean-room reimplementation. The original SIPp is
-GPL-licensed; no SIPp source is copied into this project — only its scenario
-format and observable behavior are reproduced, which are not themselves subject
-to copyright.
+sipr is an independent implementation. SIPp is GPL-licensed, and no SIPp C++
+source is copied into this project: its code was read to learn the behavior,
+which was then implemented separately. The four embedded default scenarios
+(`uac`, `uas`, `ooc_default`, `ooc_dummy`) deliberately mirror SIPp's default
+scenarios step for step, including the message bodies, so that the two tools
+interoperate out of the box with `-sn`; they are otherwise rewritten. The
+scenario format, keywords, and command-line flags are reproduced as an
+interface so existing SIPp scenarios keep working.

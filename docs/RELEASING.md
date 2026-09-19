@@ -1,7 +1,7 @@
 # Releasing sipr
 
 A short, repeatable checklist for cutting a release. sipr is a Cargo
-workspace of six library crates plus the `sipr` binary; publishing to
+workspace of eight library crates plus the `sipr` binary; publishing to
 crates.io means publishing each crate in dependency order.
 
 ## 1. Pre-flight
@@ -49,8 +49,10 @@ sipr-auth        # no internal deps
 sipr-net         # no internal deps
 sipr-scenario    # no internal deps
 sipr-stats       # no internal deps
-sipr-engine      # depends on scenario, net, stats, auth
+sipr-media       # depends on auth
+sipr-control     # depends on stats
 sipr-tui         # depends on stats
+sipr-engine      # depends on scenario, net, auth, stats, media, control
 sipr             # the binary — depends on all
 ```
 

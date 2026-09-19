@@ -11,7 +11,6 @@ Update this file when the number moves materially (docs/TESTING.md §5).
 
 Notes: at M3 the far end (single-threaded Python) is the likely bottleneck
 above ~2000 cps, not sipr; a sipr-UAS peer (M4) will let us probe higher.
-Reference point: stock SIPp is typically cited at ~1–3k cps per instance.
 
 ## M4: sipr ↔ sipr self-test (both ends real)
 

@@ -2,7 +2,7 @@
 //!
 //! From `brand/README.md`: rust → 208, sage → green (65), taupe → bright
 //! black. Each field is either an ANSI escape or an empty string; a
-//! [`Palette::plain`] with all-empty fields renders byte-identically to the
+//! [`Palette::PLAIN`] with all-empty fields renders byte-identically to the
 //! uncolored screens, which is what the pure-render unit tests assert against.
 
 /// Semantic ANSI colors for the dashboard.
