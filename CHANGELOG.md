@@ -4,6 +4,32 @@ All notable changes to sipr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] — 2026-09-19
+
+### Added
+
+- **Dynamic users** (M35): `<User variables="…"/>` and
+  `<Global variables="…"/>` give variables a life beyond the call — one
+  table per user id, kept for the run, and one for the whole process,
+  shared by both scenarios — resolved at compile time into a layered
+  store with no allocation on the hot path. `set users` now follows
+  SIPp's id bookkeeping exactly: the pool is served from the back, a call
+  ending while more calls are live than the target retires its id, and a
+  later growth reactivates retired ids (with their variables) before
+  creating fresh ones. SIPp's `-set VARIABLE VALUE` seeds a global;
+  `dump variables` over the control socket lists the scopes; `--check`
+  prints them. Verified against real sipp both ways.
+
+### Fixed
+
+- Variable values now render and test exactly as in SIPp: a double is
+  written with `%lf` (`3.000000`, sipr used to print `3`), a true bool as
+  `true`, and a zero double, a false bool or an unset variable as
+  nothing at all; `test="var"` and `condexec` on a message take the same
+  "is set" view (a `"0"` or `"false"` string is set, a zero counter is
+  not). Scenarios that compared a rendered counter against `3` should
+  compare against `3.000000` — that is what SIPp sends.
+
 ## [0.23.0] — 2026-09-13
 
 ### Added
