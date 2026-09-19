@@ -1256,3 +1256,94 @@ and absent from the DTD and the docs; the regress suite never uses them).
       declaration-order divergence, private user layer for id-less calls,
       retirement rules, `dump variables`); ARCHITECTURE variable-store
       paragraph; README feature bullet; the M11 deferral updated.
+
+### M36 — Manual transactions: `start_txn`, `ack_txn`, `response_txn`
+
+Today sipr matches a response to the call's outstanding request by CSeq
+method (`expected_cseq_method`, SIPp's `recv_response_for_cseq_method_list`
+guard), which cannot tell two concurrent transactions of the same method
+apart — a re-INVITE racing the initial INVITE's late 200, an UPDATE
+overlapping another, forked provisional responses. SIPp's manual
+transactions name a request's Via branch so the scenario can say exactly
+which transaction a `recv` answers. sipr's compiler rejects the three
+attributes today ("not supported yet — v1.x").
+
+Behavioral oracle: `scenario.cpp` ~l.343-400 (`get_txn`: names may not be
+empty or contain `$`/`,`; one `txnControlInfo` per name with `started`/
+`responses`/`acks` counts and `isInvite`), ~l.878-931 (a `send` request
+may carry `start_txn` (not an ACK: "An ACK message can not start a
+transaction!") or `ack_txn` (only an ACK: "The ack_txn attribute is valid
+only for ACK messages!"); a `send` *response* may carry neither
+("Responses can not start a transaction" / "Responses can not ACK a
+transaction"); `response_txn` only on `recv response=` ("response_txn can
+only be used for received messages." on a send, "… for received
+responses." on `recv request=`); a request with `start_txn`/`ack_txn` is
+**not** added to the CSeq-method list), ~l.588-602 (`validate_txn_usage`:
+"Transaction %s is never started!", "… has no responses defined!", "… is
+an INVITE transaction without an ACK!", "… is a non-INVITE transaction
+with an ACK!"); `call.cpp` ~l.1128 (per-call `txnInstanceInfo`: `txnID`,
+`txnResp` hash, `ackIndex`), ~l.2110-2116 (on send: `start_txn` stores the
+sent message's top-Via `branch` (`extract_transaction`, ~l.4431-4450,
+up to `;`/`,`/space), `ack_txn` records the ACK's message index),
+~l.4581-4587 (`matches_scenario`: a `recv` with `response_txn` matches
+only when the response's top-Via branch equals the stored one — before
+and instead of the CSeq-method guard; `index == 0` and the method list
+apply only without it), ~l.5395-5430 (a matching response for a `recv`
+that is *not* the current step — an old transaction: a 1xx is ignored
+with "Ignoring provisional %s message for transaction %s"; a final
+response to an INVITE transaction re-sends the recorded ACK
+(`ackIndex`); a final response to a non-INVITE transaction whose hash
+equals the stored `txnResp` is ignored with a WARNING "Ignoring final %s
+message for transaction %s (hash %lu)"), ~l.5502-5504 (the accepted
+response's hash becomes `txnResp`); `docs/scenarios/ownscenarios.rst`
+"start_txn"/"ack_txn"/"response_txn" rows. Note `[branch]` itself is
+unchanged by transactions (`E_Message_Branch`, `z9hG4bK-pid-number-index`):
+an `ack_txn` ACK carries its own branch, as in SIPp.
+
+- [ ] Scenario: the three attributes parse into a per-scenario
+      transaction table (`Scenario::transactions`: name, `is_invite`,
+      counts) and per-step `start_txn: Option<TxnId>` /
+      `ack_txn: Option<TxnId>` on `SendStep`, `response_txn: Option<TxnId>`
+      on `RecvStep`, ids resolved at compile time. All of SIPp's placement
+      errors above with its wording; `validate_txn_usage` at `finish()`.
+      A request step with `start_txn`/`ack_txn` stays out of the
+      CSeq-method guard list (`precompute_cseq_methods` follows suit). The
+      IR dump shows `txn=name` / `ack_txn=name` / `response_txn=name`.
+- [ ] Engine: per-call `txns: Vec<TxnInstance>` (`branch: Option<String>`,
+      `final_hash: Option<u64>`, `ack_index: Option<StepIndex>`), sized
+      from the scenario table (empty when unused — no cost for the common
+      case). On send: a `start_txn` step stores the rendered message's
+      top-Via branch, an `ack_txn` step its index. On receive
+      (`scan_for_match`/`recv_matches`): a `response_txn` recv matches a
+      response only by branch (parsed once per inbound message, alongside
+      the CSeq method); the first-step and CSeq-method rules apply only
+      to recvs without it. Out-of-window responses to a *named*
+      transaction follow SIPp: provisional ignored (error-trace line),
+      final to an INVITE transaction re-sends the recorded ACK, a repeat
+      of the accepted final response (same hash — use the message bytes'
+      hash) ignored with SIPp's WARNING; the accepted final's hash is
+      stored. Everything without `response_txn` behaves exactly as today.
+- [ ] `--check` prints the transaction table; embedded scenarios untouched.
+- [ ] Tests: scenario unit (the attributes compile and resolve; each
+      placement error and each `validate_txn_usage` error with SIPp's
+      wording; a `start_txn` request leaves the method list); engine unit
+      (branch extraction from a rendered Via with parameters and commas;
+      `recv_matches` with a `response_txn` accepts the branch and rejects
+      a same-method response from another branch); e2e
+      `response_txn_matches_the_right_invite_of_two_overlapping_ones` (a
+      UAC sends INVITE `start_txn="a"`, then a re-INVITE `start_txn="b"`
+      before `a`'s 200 arrives; the scripted UAS answers `b` first — the
+      scenario's `recv response="200" response_txn="a"` waits for the
+      right one and both ACKs (`ack_txn`) go out; without the attributes
+      the same flow mis-matches, proving the point) and
+      `late_final_response_to_a_named_invite_transaction_is_acked_again`
+      (the UAS retransmits the 200 after the call moved on; sipr re-sends
+      the recorded ACK and does not fail the call); interop: SIPp's own
+      transaction scenario shape run by real sipp against a sipr UAS and
+      by sipr against a sipp UAS (the `-trace_msg` logs show the same
+      ACK branches and no "unexpected message" on either side).
+- [ ] Docs: SIPP_COMPAT §1 (`send`: `start_txn`, `ack_txn`; `recv`:
+      `response_txn`), the v1.x tier paragraph, §6 note (branch-based
+      matching order, the out-of-window rules, `[branch]` unchanged);
+      ARCHITECTURE §4 (per-call transaction slots next to the retrans
+      context); README feature bullet.
