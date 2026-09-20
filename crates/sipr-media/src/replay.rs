@@ -790,11 +790,14 @@ mod tests {
         };
         let echo = EchoServer::start("127.0.0.1".parse().unwrap(), base, 2048).unwrap();
         let remote: SocketAddr = format!("127.0.0.1:{}", echo.media_port).parse().unwrap();
+        // A 100 ms packet interval: each check looks for the previous
+        // packet's echo, and a loaded CI host can take more than 20 ms to
+        // schedule the echo thread.
         let params = RtpParams {
             payload_type: 8,
             bytes_per_packet: 4,
-            ms_per_packet: 20,
-            ticks_per_packet: 160,
+            ms_per_packet: 100,
+            ticks_per_packet: 800,
             video: false,
         };
         let src = RtpSource::new(Arc::from(&[0xAAu8; 4][..]), params, 8, 7, 0);

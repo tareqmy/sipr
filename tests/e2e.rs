@@ -2588,7 +2588,21 @@ fn control_socket_speaks_sipp_protocol() {
 /// Minimal HTTP client for the API tests.
 fn http(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
     use std::net::TcpStream;
-    let mut s = TcpStream::connect(addr).expect("connect");
+    // The API listener may still be starting on a slow host: retry a
+    // refused connection for a few seconds before giving up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut s = loop {
+        match TcpStream::connect(addr) {
+            Ok(s) => break s,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("connect {addr}: {e}"),
+        }
+    };
     s.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
     let req = format!(
@@ -3611,8 +3625,16 @@ fn second_local_ipv4() -> Option<std::net::Ipv4Addr> {
     probe.connect("10.255.255.255:9").ok()?;
     match probe.local_addr().ok()?.ip() {
         std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => {
-            // It must also be bindable (a VPN default route is not).
-            UdpSocket::bind((v4, 0)).ok().map(|_| v4)
+            // It must also be bindable (a VPN default route is not) and
+            // reachable from itself: some CI hosts (Windows runners) list
+            // an address that sends to it fail with "network unreachable".
+            let sock = UdpSocket::bind((v4, 0)).ok()?;
+            let me = sock.local_addr().ok()?;
+            sock.set_read_timeout(Some(Duration::from_millis(500)))
+                .ok()?;
+            sock.send_to(b"probe", me).ok()?;
+            let mut buf = [0u8; 8];
+            sock.recv_from(&mut buf).ok().map(|_| v4)
         }
         _ => None,
     }
@@ -6232,6 +6254,7 @@ fn exec_uas_scenario() -> String {
 }
 
 /// Zombie children of `pid` right now (`ps`: state `Z`).
+#[cfg(unix)]
 fn zombie_children_of(pid: u32) -> usize {
     let out = Command::new("ps")
         .args(["-A", "-o", "ppid=,stat="])
@@ -6248,6 +6271,7 @@ fn zombie_children_of(pid: u32) -> usize {
 }
 
 #[test]
+#[cfg(unix)] // the scenario's command is sh syntax and the zombie check uses ps
 fn exec_command_runs_a_shell_per_matching_message() {
     // Three calls into a sipr UAS whose INVITE recv runs `echo … >> file`:
     // the file gets one From line per call, the command's shell runs with
