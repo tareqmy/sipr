@@ -145,7 +145,13 @@ pub enum StepKind {
         /// Method or status code.
         name: String,
     },
-    /// Anything else (pause, nop, label, …): no columns.
+    /// A pause or timewait: `Pause_Sessions` and `Pause_Unexp`.
+    Pause,
+    /// A 3PCC `sendCmd`: `SendCmd`.
+    SendCmd,
+    /// A 3PCC `recvCmd`: `RecvCmd` and `RecvCmd_Timeout`.
+    RecvCmd,
+    /// Anything else (nop, label): no columns.
     Other,
 }
 
@@ -605,6 +611,15 @@ impl StatSet {
                         "{i}_{name}_Recv{d}{i}_{name}_Retrans{d}{i}_{name}_Timeout{d}{i}_{name}_Unexp{d}"
                     );
                 }
+                StepKind::Pause => {
+                    let _ = write!(out, "{i}_Pause_Sessions{d}{i}_Pause_Unexp{d}");
+                }
+                StepKind::SendCmd => {
+                    let _ = write!(out, "{i}_SendCmd{d}");
+                }
+                StepKind::RecvCmd => {
+                    let _ = write!(out, "{i}_RecvCmd{d}{i}_RecvCmd_Timeout{d}");
+                }
                 StepKind::Other => {}
             }
         }
@@ -639,6 +654,15 @@ impl StatSet {
                         "{}{d}{}{d}{}{d}{}{d}",
                         st.recv, st.retrans, st.timeouts, st.unexpected
                     );
+                }
+                StepKind::Pause => {
+                    let _ = write!(out, "{}{d}{}{d}", st.sessions, st.unexpected);
+                }
+                StepKind::SendCmd => {
+                    let _ = write!(out, "{}{d}", st.sent);
+                }
+                StepKind::RecvCmd => {
+                    let _ = write!(out, "{}{d}{}{d}", st.recv, st.timeouts);
                 }
                 StepKind::Other => {}
             }
@@ -1013,24 +1037,32 @@ mod tests {
                 retrans: true,
             },
             StepKind::Recv { name: "200".into() },
-            StepKind::Other,
+            StepKind::Pause,
             StepKind::Send {
                 name: "200".into(),
                 retrans: false,
             },
+            StepKind::SendCmd,
+            StepKind::RecvCmd,
+            StepKind::Other,
         ]);
-        s.set_step_hidden(vec![false, false, false, true]);
+        s.init_steps((0..7).map(|i| format!("s{i}")).collect());
+        s.set_step_hidden(vec![false, false, false, true, false, false, false]);
         assert_eq!(
             s.counts_header(),
             "CurrentTime;ElapsedTime;0_INVITE_Sent;0_INVITE_Retrans;0_INVITE_Timeout;\
-             1_200_Recv;1_200_Retrans;1_200_Timeout;1_200_Unexp;\n"
+             1_200_Recv;1_200_Retrans;1_200_Timeout;1_200_Unexp;2_Pause_Sessions;\
+             2_Pause_Unexp;4_SendCmd;5_RecvCmd;5_RecvCmd_Timeout;\n"
         );
         s.steps[0].sent = 3;
         s.steps[0].retrans = 1;
         s.steps[1].recv = 2;
         s.steps[1].unexpected = 1;
+        s.steps[2].sessions = 3;
+        s.steps[4].sent = 2;
+        s.steps[5].recv = 2;
         let row = s.counts_row();
-        assert!(row.ends_with(";3;1;0;2;0;0;1;\n"), "{row}");
+        assert!(row.ends_with(";3;1;0;2;0;0;1;3;0;2;2;0;\n"), "{row}");
         assert_eq!(row.split(';').count(), s.counts_header().split(';').count());
     }
 

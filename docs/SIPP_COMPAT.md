@@ -1203,7 +1203,10 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `<scenario>_<pid>_counts.csv`: `CurrentTime;ElapsedTime` (the latter
   `hh:mm:ss:uuuuuu`) then per visible step `<index>_<name>_Sent`,
   `_Retrans` and, for a send with `retrans=`, `_Timeout`; for a recv
-  `_Recv`, `_Retrans`, `_Timeout`, `_Unexp` — `<name>` the method or
+  `_Recv`, `_Retrans`, `_Timeout`, `_Unexp`; for a pause or timewait
+  `<index>_Pause_Sessions` (times entered) and `_Pause_Unexp`; for a
+  3PCC `sendCmd` `<index>_SendCmd`, for a `recvCmd` `<index>_RecvCmd` and
+  `_RecvCmd_Timeout`; nothing for a nop or label — `<name>` the method or
   status code, `<index>` the step's position counting every step (SIPp's
   message index counts pauses and nops too). SIPp's `_Lost` columns
   appear only with `-lost` (M42). `-trace_error_codes` writes

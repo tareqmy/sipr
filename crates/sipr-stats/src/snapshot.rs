@@ -18,6 +18,9 @@ pub struct StepStats {
     pub timeouts: u64,
     /// Unexpected messages while parked at this step.
     pub unexpected: u64,
+    /// Times a pause step was entered (SIPp `sessions`, the
+    /// `-trace_counts` `Pause_Sessions` column).
+    pub sessions: u64,
 }
 
 /// One row of the scenario screen: a step label plus its counters.

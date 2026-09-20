@@ -2608,6 +2608,10 @@ impl<'s> Engine<'s> {
                 Step::Pause { spec, common } => {
                     let dur = self.sample_pause(spec, call_id);
                     let jump = self.jump_target(common, index, call_id);
+                    // SIPp `curmsg->sessions++` on entering the pause.
+                    if let Some(s) = self.call_stats(call_id).step_mut(index) {
+                        s.sessions += 1;
+                    }
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
@@ -2650,6 +2654,10 @@ impl<'s> Engine<'s> {
                     if let Some(Err(e)) = result {
                         self.fail_call(call_id, &format!("3PCC <sendCmd> failed: {e}"));
                         return;
+                    }
+                    // SIPp `M_nbCmdSent` (the `-trace_counts` SendCmd column).
+                    if let Some(s) = self.call_stats(call_id).step_mut(index) {
+                        s.sent += 1;
                     }
                     let jump = self.jump_target(common, index, call_id);
                     if let Some(call) = self.calls.get_mut(call_id) {
@@ -3870,6 +3878,10 @@ impl<'s> Engine<'s> {
         common: &StepCommon,
         cmd: &str,
     ) -> bool {
+        // SIPp `M_nbCmdRecv` (the `-trace_counts` RecvCmd column).
+        if let Some(s) = self.call_stats(call_id).step_mut(index) {
+            s.recv += 1;
+        }
         if !actions.is_empty() && self.run_step_actions_inner(call_id, actions, index, Some(cmd)) {
             return true; // actions jumped/failed/stopped
         }
@@ -4686,7 +4698,12 @@ fn step_kind(step: &Step) -> sipr_stats::StepKind {
                 Expect::Request(m) => m.clone(),
             },
         },
-        _ => sipr_stats::StepKind::Other,
+        // SIPp gives every pause (a bare one carries its default
+        // distribution) and a timewait the Pause columns.
+        Step::Pause { .. } | Step::Timewait { .. } => sipr_stats::StepKind::Pause,
+        Step::SendCmd { .. } => sipr_stats::StepKind::SendCmd,
+        Step::RecvCmd { .. } => sipr_stats::StepKind::RecvCmd,
+        Step::Nop { .. } | Step::Label { .. } => sipr_stats::StepKind::Other,
     }
 }
 
