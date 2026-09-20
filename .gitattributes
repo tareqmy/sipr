@@ -1,0 +1,7 @@
+# Every text file is checked out with LF on every OS. The embedded scenario
+# assets are include_str!'d and compared byte for byte (and printed by -sd),
+# the install scripts must run under sh, and their .sha256 files cover the
+# exact bytes; a CRLF checkout on Windows broke all three.
+* text=auto eol=lf
+*.png binary
+*.woff2 binary

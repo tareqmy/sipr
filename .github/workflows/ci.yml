@@ -53,7 +53,7 @@ jobs:
       # race for ports. One at a time they are deterministic. This job is
       # about portability, not speed.
       - name: Tests
-        run: cargo test --workspace -- --test-threads=1
+        run: cargo test --workspace --no-fail-fast -- --test-threads=1
 
   # The interop oracle is SIPp 3.7 built from source (as on the development
   # host); the distro package is 3.6 and lacks the TLS/PCAP/SCTP surface the
