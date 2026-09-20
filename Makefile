@@ -88,8 +88,8 @@ bench: release ## Loopback throughput: sipr-UAC vs sipr-UAS at $(RATE) cps
 # ---- releasing ---------------------------------------------------------
 
 .PHONY: publish
-publish: ## Publish every crate to crates.io in dependency order (CD does this on tag)
-	$(CARGO) publish --workspace --locked
+publish: ## Publish every crate not yet on crates.io, in dependency order (CD does this on tag)
+	scripts/publish-crates.sh
 
 .PHONY: publish-dry-run
 publish-dry-run: ## Check that every crate packages cleanly, without publishing

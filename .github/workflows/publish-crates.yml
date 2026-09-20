@@ -1,0 +1,35 @@
+# Publish (or resume publishing) a tagged release's crates to crates.io.
+#
+# CD does this on every tag; this workflow exists for when that step failed
+# part-way (crates.io rate limits, a transient error) and the tag's own
+# workflow file cannot be changed after the fact. It runs the script from the
+# branch it is dispatched on against the sources of the given tag.
+name: Publish crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.27.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.tag }} to Crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+          path: release
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish missing crates
+        working-directory: release
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: ../scripts/publish-crates.sh

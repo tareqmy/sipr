@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The release workflow publishes crates one at a time, skipping versions
+  already on crates.io, so a partial publish resumes instead of failing on
+  the first already-published crate. A manually triggered "Publish crates"
+  workflow does the same for any existing tag.
+
 ## [0.27.0] — 2026-09-20
 
 ### Security

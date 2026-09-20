@@ -114,12 +114,14 @@ jobs:
       - name: Install Rust toolchain
         if: steps.check-token.outputs.skip == 'false'
         uses: dtolnay/rust-toolchain@stable
-      # The workspace is nine crates with internal dependencies; `--workspace`
-      # publishes them in dependency order and waits for each to land in the
-      # index before the next (cargo 1.90+).
+      # Per crate, in dependency order, skipping versions already on crates.io,
+      # so a partial failure (crates.io rate-limits new crate names) resumes
+      # on rerun or via the "Publish crates" workflow.
       - name: Cargo Publish
         if: steps.check-token.outputs.skip == 'false'
-        run: cargo publish --workspace --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: scripts/publish-crates.sh
 
   publish-homebrew:
     name: Publish to Homebrew Tap

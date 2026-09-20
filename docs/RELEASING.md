@@ -61,8 +61,9 @@ git push origin master --tags
    `x86_64-pc-windows-msvc`, and uploads
    `sipr-vX.Y.Z-<target>.tar.gz` (`.zip` on Windows) to the draft.
 3. Publishes the release once every asset is up.
-4. In parallel, `cargo publish --workspace` pushes the nine crates to
-   crates.io in dependency order — only when `CARGO_REGISTRY_TOKEN` is set.
+4. In parallel, `scripts/publish-crates.sh` pushes the nine crates to
+   crates.io in dependency order, skipping any version already there — only
+   when `CARGO_REGISTRY_TOKEN` is set.
 5. After the release is public, rewrites `Formula/sipr.rb` in
    `tareqmy/homebrew-tap` with the new version and checksums — only when
    `TAP_GITHUB_TOKEN` is set.
@@ -84,6 +85,20 @@ Settings → Secrets and variables → Actions:
 The crate names `sipr` and `sipr-*` must be free on crates.io at first
 publish (they were, as of 2026-09-19). The Homebrew tap already exists and
 serves other formulas; CD adds `Formula/sipr.rb` next to them.
+
+### If the crates.io step fails part-way
+
+crates.io rate-limits brand-new crate names (five per ten minutes), and the
+tag's workflow file cannot be edited after the fact. Run the **Publish
+crates** workflow from `master` with the tag name; it checks out the tag's
+sources and publishes only the crates still missing:
+
+```sh
+gh workflow run publish-crates.yml -f tag=v0.27.0
+```
+
+The same script works locally after `cargo login`: `make publish` from a
+checkout of the tag.
 
 ## 5. After the workflow
 
