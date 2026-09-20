@@ -107,7 +107,12 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(text, "one\ntwo\n");
+        // Both commands ran (through a shell, since `>>` is a shell feature).
+        // They are fire-and-forget and run concurrently, so their order in
+        // the file is not guaranteed — only that each appended once.
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.sort_unstable();
+        assert_eq!(lines, ["one", "two"]);
         drop(runner);
         let _ = std::fs::remove_dir_all(&dir);
     }
