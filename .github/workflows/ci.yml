@@ -47,8 +47,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --workspace --locked
+      # The e2e suite spawns a sipr process per test; on the 3-core macOS
+      # runners full parallelism starves the pacers, so cap the threads.
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=4
 
   # The interop oracle is SIPp 3.7 built from source (as on the development
   # host); the distro package is 3.6 and lacks the TLS/PCAP/SCTP surface the

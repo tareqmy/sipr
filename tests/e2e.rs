@@ -3260,11 +3260,18 @@ fn hidden_steps_and_display_labels_reach_the_stats_api() {
         &addr.to_string(),
     ]);
     let api = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut ready = false;
     for _ in 0..50 {
         if std::net::TcpStream::connect(api).is_ok() {
+            ready = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if !ready {
+        let _ = child.kill();
+        let err = stderr.join().expect("stderr");
+        panic!("HTTP API never came up; sipr stderr:\n{err}");
     }
     std::thread::sleep(Duration::from_millis(1500));
     let (st, body) = http(api, "GET", "/stats", "");
@@ -3625,16 +3632,23 @@ fn second_local_ipv4() -> Option<std::net::Ipv4Addr> {
     probe.connect("10.255.255.255:9").ok()?;
     match probe.local_addr().ok()?.ip() {
         std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => {
-            // It must also be bindable (a VPN default route is not) and
-            // reachable from itself: some CI hosts (Windows runners) list
-            // an address that sends to it fail with "network unreachable".
-            let sock = UdpSocket::bind((v4, 0)).ok()?;
-            let me = sock.local_addr().ok()?;
-            sock.set_read_timeout(Some(Duration::from_millis(500)))
-                .ok()?;
-            sock.send_to(b"probe", me).ok()?;
+            // It must also be bindable (a VPN default route is not), and
+            // traffic must flow between a loopback-bound socket and one
+            // bound on it, both ways — that is what the per-IP tests do.
+            // Windows' strong host model refuses that on the CI runners
+            // ("network unreachable"), so those tests skip there.
+            let lan_sock = UdpSocket::bind((v4, 0)).ok()?;
+            let lo_sock = UdpSocket::bind("127.0.0.1:0").ok()?;
+            let lan_addr = lan_sock.local_addr().ok()?;
+            let lo_addr = lo_sock.local_addr().ok()?;
+            let wait = Some(Duration::from_millis(500));
+            lan_sock.set_read_timeout(wait).ok()?;
+            lo_sock.set_read_timeout(wait).ok()?;
             let mut buf = [0u8; 8];
-            sock.recv_from(&mut buf).ok().map(|_| v4)
+            lo_sock.send_to(b"probe", lan_addr).ok()?;
+            lan_sock.recv_from(&mut buf).ok()?;
+            lan_sock.send_to(b"probe", lo_addr).ok()?;
+            lo_sock.recv_from(&mut buf).ok().map(|_| v4)
         }
         _ => None,
     }
@@ -5248,7 +5262,9 @@ fn uac_answers_out_of_call_options_with_ooc_scenario() {
 /// reads `display_scenario->stats` throughout).
 #[test]
 fn set_display_ooc_swaps_the_scenario_screen() {
-    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let (addr, _uas) = // A patient UAS and exit wait: the shared macOS CI runners can
+    // starve the 1 cps pacer for seconds at a time.
+    spawn_uas(Duration::from_secs(10));
     let cp = free_port();
     let port = free_port();
     let (mut child, stderr) = spawn_sipr_bg(&[
@@ -5311,7 +5327,7 @@ fn set_display_ooc_swaps_the_scenario_screen() {
     assert!(body.contains("\"label\":\"send INVITE\""), "{body}");
     assert!(!body.contains("\"created\":0,"), "{body}");
 
-    let code = wait_exit(&mut child, Duration::from_secs(15));
+    let code = wait_exit(&mut child, Duration::from_secs(30));
     let err = stderr.join().expect("stderr");
     assert_eq!(code, Some(0), "stderr:\n{err}");
     assert!(err.contains("successful 6 failed 0"), "{err}");
@@ -5563,7 +5579,9 @@ fn rx_scenario_reads_rxinf_by_file_name() {
 /// `set display main` swaps them back; `mixed` is on throughout.
 #[test]
 fn set_display_rx_swaps_the_screens() {
-    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let (addr, _uas) = // A patient UAS and exit wait: the shared macOS CI runners can
+    // starve the 1 cps pacer for seconds at a time.
+    spawn_uas(Duration::from_secs(10));
     let cp = free_port();
     let port = free_port();
     let (mut child, stderr) = spawn_sipr_bg(&[
@@ -5632,7 +5650,7 @@ fn set_display_rx_swaps_the_screens() {
     assert!(body.contains("\"label\":\"send INVITE\""), "{body}");
     assert!(!body.contains("\"created\":0,"), "{body}");
 
-    let code = wait_exit(&mut child, Duration::from_secs(15));
+    let code = wait_exit(&mut child, Duration::from_secs(30));
     let err = stderr.join().expect("stderr");
     assert_eq!(code, Some(0), "stderr:\n{err}");
     assert!(err.contains("successful 6 failed 0"), "{err}");
