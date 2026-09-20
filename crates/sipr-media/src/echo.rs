@@ -135,10 +135,24 @@ fn echo_loop(
 mod tests {
     use super::*;
 
+    /// An even port the echo server can start probing from. It may be in
+    /// use (rounding an ephemeral port down to even lands on whatever the
+    /// previous socket got, on Windows); the server probes past that.
     fn even_free_base() -> u16 {
         let s = UdpSocket::bind("127.0.0.1:0").unwrap();
         let p = s.local_addr().unwrap().port();
         (p & !1).max(1024)
+    }
+
+    /// An even port bound and held by the returned socket.
+    fn held_even_port() -> (u16, UdpSocket) {
+        for _ in 0..100 {
+            let base = even_free_base();
+            if let Ok(sock) = UdpSocket::bind(("127.0.0.1", base)) {
+                return (base, sock);
+            }
+        }
+        panic!("no even port could be bound");
     }
 
     #[test]
@@ -189,8 +203,7 @@ mod tests {
 
     #[test]
     fn probes_past_a_taken_port() {
-        let base = even_free_base();
-        let _taken = UdpSocket::bind(("127.0.0.1", base)).unwrap();
+        let (base, _taken) = held_even_port();
         let echo = EchoServer::start("127.0.0.1".parse().unwrap(), base, 512).unwrap();
         assert!(echo.media_port > base);
         assert_eq!(echo.media_port % 2, 0);
