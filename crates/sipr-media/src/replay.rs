@@ -520,8 +520,9 @@ mod tests {
         (s, a)
     }
 
-    /// A base port such that both `base` and `base + 1` are free right now.
-    fn adjacent_free_pair() -> u16 {
+    /// Two sockets bound on adjacent ports `base` and `base + 1`, held so
+    /// no other test thread can take either before they are used.
+    fn bound_adjacent_pair() -> (UdpSocket, UdpSocket) {
         for _ in 0..100 {
             let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
             let base = probe.local_addr().unwrap().port();
@@ -529,13 +530,22 @@ mod tests {
             if base == u16::MAX {
                 continue;
             }
-            let a = UdpSocket::bind(("127.0.0.1", base));
-            let b = UdpSocket::bind(("127.0.0.1", base + 1));
-            if a.is_ok() && b.is_ok() {
-                return base;
+            if let (Ok(a), Ok(b)) = (
+                UdpSocket::bind(("127.0.0.1", base)),
+                UdpSocket::bind(("127.0.0.1", base + 1)),
+            ) {
+                return (a, b);
             }
         }
         panic!("no adjacent free port pair found");
+    }
+
+    /// A base port such that `base` and `base + 1` were free a moment ago.
+    /// Another thread may grab one before the caller binds (Windows hands
+    /// out ephemeral ports sequentially), so callers retry on `AddrInUse`.
+    fn adjacent_free_pair() -> u16 {
+        let (a, _b) = bound_adjacent_pair();
+        a.local_addr().unwrap().port()
     }
 
     fn spec(call: &str, stream: Arc<PcapStream>, remote: SocketAddr) -> StreamSpec {
@@ -582,9 +592,7 @@ mod tests {
 
     #[test]
     fn multi_port_capture_uses_remote_plus_offset() {
-        let remote_base = adjacent_free_pair();
-        let rtp_sock = UdpSocket::bind(("127.0.0.1", remote_base)).unwrap();
-        let rtcp_sock = UdpSocket::bind(("127.0.0.1", remote_base + 1)).unwrap();
+        let (rtp_sock, rtcp_sock) = bound_adjacent_pair();
         let rtp_addr = rtp_sock.local_addr().unwrap();
         rtp_sock
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -605,11 +613,18 @@ mod tests {
         let stream = Arc::new(parse(&build::pcap_file(1, &frames)).unwrap());
         let (ev_tx, _ev_rx) = channel();
         let player = MediaPlayer::start(ev_tx);
-        // Local port 0 for each offset would be 0 and 1: pick a real base.
-        let base = adjacent_free_pair();
-        let mut s = spec("c2", stream, rtp_addr);
-        s.local_port = base;
-        player.play(s).unwrap();
+        // Local port 0 for each offset would be 0 and 1: pick a real base,
+        // retrying if another test thread took one of the two ports first.
+        let base = loop {
+            let base = adjacent_free_pair();
+            let mut s = spec("c2", Arc::clone(&stream), rtp_addr);
+            s.local_port = base;
+            match player.play(s) {
+                Ok(()) => break base,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(e) => panic!("play: {e}"),
+            }
+        };
         let mut buf = [0u8; 64];
         let (n, from) = rtp_sock.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"rtp");
