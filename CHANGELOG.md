@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-09-20
+
 ### Changed
 
 - The release workflow publishes crates one at a time, skipping versions
@@ -529,6 +531,7 @@ library — no external crates.
   `docs/SIPP_COMPAT.md` §6.
 
 [Unreleased]: https://github.com/tareqmy/sipr/compare/v0.27.0...HEAD
+[0.27.1]: https://github.com/tareqmy/sipr/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/tareqmy/sipr/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/tareqmy/sipr/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/tareqmy/sipr/compare/v0.24.0...v0.25.0
