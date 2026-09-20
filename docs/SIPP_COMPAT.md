@@ -861,10 +861,13 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   start-up and opens `elapsed × rate / rate_period − calls_since` calls per
   run, so with `-r 1 -rp 1000` the **first call comes at t ≈ 1 s**, not at
   t = 0 (`-r 10` → 100 ms, `-r 1 -rp 2000` → 2 s); each rate change (`+`/`-`,
-  the control socket) re-anchors the clock and the count. sipr's carry-based
-  pacer produces the same first-call time and the same steady-state
-  spacing; it does not re-anchor on a rate change (the fractional carry
-  survives), a sub-interval difference.
+  the control socket) re-anchors the clock and the count. sipr's pacer
+  credits `rate × elapsed / rate_period` per tick from the wall clock (a
+  tick that arrives late credits the interval it covers, so a loaded host
+  never silently runs below the requested rate) and produces the same
+  first-call time and the same steady-state spacing; it does not re-anchor
+  on a rate change (the fractional carry survives), a sub-interval
+  difference.
 - `-t ui` / `-ip_field` / `[server_ip]` (M31; verified in `sipp.cpp`
   ~l.316 and ~l.1996 (`peripfield` default 0; `-inf` required; UDP only),
   ~l.1572 (`ip_file` = the first `-inf`), `socket.cpp` `open_connections`

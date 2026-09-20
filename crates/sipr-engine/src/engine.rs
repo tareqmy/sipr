@@ -841,8 +841,10 @@ struct Engine<'s> {
     expected_cseq_method: Vec<Option<String>>,
     control: EngineControl,
     pacer_carry: f64,
-    /// Fraction of the rate period each pacer tick represents.
-    tick_ratio: f64,
+    /// When the pacer last credited calls: pacing is by elapsed wall time,
+    /// as in SIPp, so a tick that arrives late (a loaded host oversleeping)
+    /// credits the whole interval it covers rather than a nominal one.
+    last_pacer_tick: Instant,
     paused: bool,
     snapshot_tx: Option<std::sync::mpsc::Sender<sipr_stats::Snapshot>>,
     /// (when, created-count) at the last snapshot, for the period rate.
@@ -1419,7 +1421,7 @@ impl<'s> Engine<'s> {
             expected_cseq_method: precompute_cseq_methods(scenario),
             control,
             pacer_carry: 0.0,
-            tick_ratio: tick.as_secs_f64() / config.rate_period.as_secs_f64(),
+            last_pacer_tick: Instant::now(),
             paused: false,
             snapshot_tx,
             last_snapshot: (Instant::now(), 0),
@@ -1956,7 +1958,11 @@ impl<'s> Engine<'s> {
     // ---- pacing --------------------------------------------------------
 
     fn on_pacer_tick(&mut self) {
+        let now = Instant::now();
+        let since_last = now.duration_since(self.last_pacer_tick);
+        self.last_pacer_tick = now;
         // Users mode is closed-loop (event-driven via refill_users), not paced.
+        // A paused run credits nothing for the time it was paused.
         if self.config.users.is_some()
             || self.scenario.role == Role::Uas
             || self.paused
@@ -1964,7 +1970,7 @@ impl<'s> Engine<'s> {
         {
             return;
         }
-        self.pacer_carry += self.control.rate() * self.tick_ratio;
+        self.pacer_carry += pacer_credit(self.control.rate(), since_last, self.config.rate_period);
         // Non-queuing cap: what cannot start this period is forgotten, not
         // deferred (SIPp -l semantics; SIPP_COMPAT §6).
         let mut budget = self.pacer_carry.floor();
@@ -4962,6 +4968,18 @@ fn media_port_layout(scenario: &Scenario) -> [(bool, u16); 3] {
     layout
 }
 
+/// Calls the pacer earns for `elapsed` wall time at `rate` calls per
+/// `rate_period` (SIPp's `elapsed × rate / rate_period`, applied
+/// incrementally). Elapsed time, not tick count, so a late tick still
+/// credits the interval it covers.
+fn pacer_credit(rate: f64, elapsed: Duration, rate_period: Duration) -> f64 {
+    let period = rate_period.as_secs_f64();
+    if period <= 0.0 {
+        return 0.0;
+    }
+    rate * elapsed.as_secs_f64() / period
+}
+
 /// One ramp tick (SIPp `ratetask::run`): the new rate, and whether the
 /// cap was exceeded and `rate_quit` asks to stop. Reaching the cap exactly
 /// does not quit; only the tick that would go past it does.
@@ -5657,6 +5675,29 @@ mod tests {
         assert_eq!(
             resolve_setdest_host("no-such-host.invalid", 5080),
             Err("Unknown host 'no-such-host.invalid' for setdest".to_owned())
+        );
+    }
+
+    #[test]
+    fn pacer_credit_follows_elapsed_time_not_tick_count() {
+        let period = Duration::from_millis(1000);
+        // A nominal 20 ms tick at 1 cps earns 0.02 of a call ...
+        let nominal = pacer_credit(1.0, Duration::from_millis(20), period);
+        assert!((nominal - 0.02).abs() < 1e-9);
+        // ... and a tick that arrives 200 ms late earns the whole interval,
+        // so a starved host does not silently run below the requested rate.
+        let late = pacer_credit(1.0, Duration::from_millis(220), period);
+        assert!((late - 0.22).abs() < 1e-9);
+        // -rp scales it: 50 calls per 2 s period over 100 ms is 2.5 calls.
+        let rp = pacer_credit(
+            50.0,
+            Duration::from_millis(100),
+            Duration::from_millis(2000),
+        );
+        assert!((rp - 2.5).abs() < 1e-9);
+        assert_eq!(
+            pacer_credit(10.0, Duration::from_millis(10), Duration::ZERO),
+            0.0
         );
     }
 }

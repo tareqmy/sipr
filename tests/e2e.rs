@@ -2519,8 +2519,11 @@ fn wait_exit(child: &mut std::process::Child, limit: Duration) -> Option<i32> {
 fn control_socket_speaks_sipp_protocol() {
     let (addr, uas) = spawn_uas(Duration::from_secs(3));
     let cp = free_port();
+    let api_port = free_port();
     // 1 cps for 40 calls would take 40 s; "set rate 200" over the control
     // socket must finish it in a few, and "q" must drain rather than abort.
+    // The HTTP API is the readiness signal: a control datagram sent before
+    // sipr has bound its socket is silently lost (UDP).
     let (mut child, stderr) = spawn_sipr_bg(&[
         "-sn",
         "uac",
@@ -2532,12 +2535,15 @@ fn control_socket_speaks_sipp_protocol() {
         "20",
         "-cp",
         &cp.to_string(),
+        "--sipr-http",
+        &api_port.to_string(),
         "-timeout",
         "30",
         "-bg",
         &addr.to_string(),
     ]);
-    std::thread::sleep(Duration::from_millis(400));
+    let api = SocketAddr::from(([127, 0, 0, 1], api_port));
+    wait_for_api(api, &mut child, "control socket test");
     let ctl = UdpSocket::bind("127.0.0.1:0").expect("bind");
     let target = SocketAddr::from(([127, 0, 0, 1], cp));
     ctl.send_to(b"cset rate 200\n", target).expect("send");
@@ -2556,6 +2562,7 @@ fn control_socket_speaks_sipp_protocol() {
     // A hot key: 'q' drains — the calls already placed complete, exit 0.
     let (addr, _uas) = spawn_uas(Duration::from_secs(3));
     let cp = free_port();
+    let api_port = free_port();
     let (mut child, stderr) = spawn_sipr_bg(&[
         "-sn",
         "uac",
@@ -2567,15 +2574,38 @@ fn control_socket_speaks_sipp_protocol() {
         "20",
         "-cp",
         &cp.to_string(),
+        "--sipr-http",
+        &api_port.to_string(),
         "-timeout",
         "30",
         "-bg",
         &addr.to_string(),
     ]);
-    std::thread::sleep(Duration::from_millis(700));
-    ctl.send_to(b"q\n", SocketAddr::from(([127, 0, 0, 1], cp)))
-        .expect("send");
-    let code = wait_exit(&mut child, Duration::from_secs(10));
+    // Quit once at least one call has been placed (so the drain has
+    // something to complete and the exit code is 0, not 99), and keep
+    // sending 'q' until sipr is gone: a soft quit is idempotent.
+    let api = SocketAddr::from(([127, 0, 0, 1], api_port));
+    wait_for_api(api, &mut child, "hot-key test");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let (_, body) = http(api, "GET", "/stats", "");
+        if !body.contains("\"created\":0,") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let target = SocketAddr::from(([127, 0, 0, 1], cp));
+    let code = loop {
+        let _ = ctl.send_to(b"q\n", target);
+        if let Ok(Some(st)) = child.try_wait() {
+            break st.code();
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
     let err = stderr.join().expect("stderr");
     assert_eq!(code, Some(0), "stderr:\n{err}");
     assert!(err.contains(" failed 0"), "{err}");
@@ -2583,6 +2613,23 @@ fn control_socket_speaks_sipp_protocol() {
         !err.contains("successful 1000 "),
         "should have stopped early:\n{err}"
     );
+}
+
+/// Block until sipr's HTTP API at `api` accepts connections (its sockets
+/// are all bound by then), or fail with sipr's stderr if it exited first.
+fn wait_for_api(api: SocketAddr, child: &mut std::process::Child, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(api).is_ok() {
+            return;
+        }
+        if let Ok(Some(st)) = child.try_wait() {
+            panic!("{what}: sipr exited ({st}) before its API came up");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    panic!("{what}: HTTP API at {api} never came up");
 }
 
 /// Minimal HTTP client for the API tests.
@@ -3274,6 +3321,12 @@ fn hidden_steps_and_display_labels_reach_the_stats_api() {
         panic!("HTTP API never came up; sipr stderr:\n{err}");
     }
     std::thread::sleep(Duration::from_millis(1500));
+    // The call is in its 3 s pause here; a sipr that has already exited
+    // is the bug, and its stderr says why.
+    if let Ok(Some(st)) = child.try_wait() {
+        let err = stderr.join().expect("stderr");
+        panic!("sipr exited early ({st}); stderr:\n{err}");
+    }
     let (st, body) = http(api, "GET", "/stats", "");
     assert_eq!(st, 200, "{body}");
     assert!(body.contains("\"label\":\"place call\""), "{body}");
