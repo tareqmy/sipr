@@ -4453,7 +4453,16 @@ fn short_message_shapes(dir: &std::path::Path) -> Vec<(String, String)> {
                 5 => (cols[1], cols[4]),
                 _ => panic!("unexpected short message line: {line}"),
             };
-            let pair = (dir.to_owned(), start.to_owned());
+            // Each run's UAS listens on its own port, which the request
+            // URIs carry: compare with the port masked.
+            let start = match start.rsplit_once(':') {
+                Some((head, tail)) if tail.starts_with(|c: char| c.is_ascii_digit()) => {
+                    let port_len = tail.bytes().take_while(u8::is_ascii_digit).count();
+                    format!("{head}:PORT{}", &tail[port_len..])
+                }
+                _ => start.to_owned(),
+            };
+            let pair = (dir.to_owned(), start);
             if !out.contains(&pair) {
                 out.push(pair);
             }
