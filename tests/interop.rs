@@ -4223,6 +4223,38 @@ Content-Length: 0
 </scenario>
 "#;
 
+/// The M39 UAC sends two OPTIONS per call, so its responder answers two
+/// (a SIPp UAS scenario ends after its last step; a second request to a
+/// finished call is not answered).
+const M39_KEYWORDS_UAS: &str = r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="options responder, two rounds">
+  <recv request="OPTIONS" crlf="true"/>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]></send>
+  <recv request="OPTIONS" crlf="true"/>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]></send>
+</scenario>
+"#;
+
 /// The M39 keywords both ways: sipr's UAC against real sipp's OPTIONS
 /// responder, and real sipp's UAC running the same file (same `-key`)
 /// against sipr's responder; every call completes on both sides.
@@ -4237,7 +4269,7 @@ fn m39_keywords_both_ways_against_real_sipp() {
     let (uac_code, uas_code, stderr) = run_sf_pair(
         &sipp,
         &sipr,
-        STATISTICAL_PAUSES_UAS,
+        M39_KEYWORDS_UAS,
         M39_KEYWORDS_UAC,
         &key,
         3,
@@ -4250,7 +4282,7 @@ fn m39_keywords_both_ways_against_real_sipp() {
     let (uac_code, uas_code, _) = run_sf_pair(
         &sipr,
         &sipp,
-        STATISTICAL_PAUSES_UAS,
+        M39_KEYWORDS_UAS,
         M39_KEYWORDS_UAC,
         &key,
         3,
