@@ -1490,50 +1490,60 @@ SIPp scenarios and CI wrappers hit them. Each entry states its behavioral
 oracle; read the C++ before implementing, as before. Parity first (M38–M44),
 sipr's own additions after (M45+).
 
-### M38 — Statistical pauses: the seven missing `distribution=` kinds and `<sample>`
+### M38 — Statistical pauses: SIPp's `distribution=` attributes, all kinds, and `<sample>` ✅
 
-The last v1.x-tier item in PLAN.md §3.4. `<pause distribution="…">`
-accepts `fixed`, `uniform`, `normal` and `exponential`; the engine
-rejects `lognormal`, `weibull`, `pareto`, `gpareto`, `gamma`, `negbin` and
-`poisson` ("pause distribution '…' is not implemented yet", `engine.rs`
-`validate_for_engine`), and the `<sample assign_to="…" distribution="…"/>`
-action is a compile error ("action <sample> is not supported yet").
+The last v1.x-tier item in PLAN.md §3.4. Found on the way: sipr's
+`distribution=` took a positional form of its own invention,
+`distribution="uniform(200,3000)"`, and rejected SIPp's real syntax —
+separate attributes, `distribution="uniform" min="200" max="3000"` — so
+every SIPp scenario with a distributed pause failed to load. Beyond that,
+`<pause>` accepted only `fixed`, `uniform`, `normal` and `exponential`;
+the engine rejected `lognormal`, `weibull`, `pareto`, `gpareto`, `gamma`
+and `negbin` ("pause distribution '…' is not implemented yet"; `poisson`
+was listed but SIPp has none), and `<sample>` was a compile error.
 
 Behavioral oracle: `scenario.cpp` ~l.1112 `parse_distribution` (the
 attribute names per kind, read from the source: `fixed` `value`;
 `uniform` `min`/`max`; `normal` and `lognormal` `mean`/`stdev`;
 `exponential` `mean`; `weibull` `lambda`/`k`; `pareto` `k`/`x_m`;
 `gpareto` `shape`/`scale`/`location`; `gamma` `k`/`theta`; `negbin`
-`n`/`p`; `poisson` — verify, `lambda` expected; plus the old-style
-`<pause>` attributes `milliseconds`/`variable`/`distribution` and how
-they combine), the `CSample` subclasses (`CFixed`, `CUniform`,
-`CNormal`, `CLogNormal`, `CExponential`, `CWeibull`, `CPareto`,
-`CGPareto`, `CGamma`, `CNegBin`, `CPoisson`) and their `sample()` /
-`textDescr()`
-(the TUI shows the description), `HAVE_GSL` — SIPp builds these seven
+`n`/`p`; no poisson; plus the old-style `<pause>` spellings —
+`min`/`max` alone, or a bare `normal`/`exponential`/… flag), the
+`CSample` subclasses in `stat.cpp` (`CFixed`, `CUniform`, `CNormal`,
+`CLogNormal`, `CExponential`, `CWeibull`, `CPareto`, `CGPareto`,
+`CGamma`, `CNegBin`) and their `sample()` / `textDescr()`
+(the TUI shows the description), `HAVE_GSL` — SIPp builds all but `fixed`/`uniform`
 only with GSL, so a GSL-less sipp errors "…requires GSL" at parse; that
 is the interop baseline, not a behavior to copy; `actions.cpp`
 `E_AT_ASSIGN_FROM_SAMPLE` (the sample lands in a double variable).
 
-- [ ] Scenario: parse the seven kinds with SIPp's attribute names and
-      validation messages; `<sample>` compiles to `Action::Sample {
-      assign_to, sampler }`, `--check` dumps the description text.
-- [ ] Engine: samplers in-tree over the sanctioned `rand` (no
-      `rand_distr` unless a stated reason lands in the commit): Box–Muller
-      already exists for normal; lognormal = exp(normal); Weibull, Pareto
-      and generalized Pareto by inverse CDF; gamma by Marsaglia–Tsang;
-      Poisson by Knuth
-      (small λ) / transformed rejection; negbin as the gamma–Poisson
-      mixture. Non-positive samples clamp as SIPp's do (verify). Off the
-      hot path: one sample per pause step or action.
-- [ ] Tests: statistical unit tests (sample mean/variance within
-      tolerance over 100k draws, seeded); golden `--check` output for
-      every kind; interop: a scenario with each distribution loads in
-      sipp built with GSL — if the local sipp lacks GSL, the harness
-      asserts sipp's "requires GSL" refusal and skips the timing
-      comparison, recorded as such.
-- [ ] Docs: SIPP_COMPAT §1 (pause attributes, `sample` action) and §6
-      note; README "Not yet" loses `<sample>`; PLAN.md §3.4 v1.x row done.
+- [x] Scenario: parse every kind from SIPp's attribute names with SIPp's
+      validation messages (`sipr-scenario/src/distribution.rs`), the
+      old-style spellings, the `sanity_check` 99th-percentile guard;
+      `<sample>` compiles to `Action::Sample { assign_to, distribution }`;
+      `--check` and the scenario screen show SIPp's `textDescr`. The
+      positional shorthand stays as a documented sipr extension.
+- [x] Engine: samplers in-tree over the existing seeded xorshift
+      generator (`sipr-engine/src/sample.rs`, no new dependency):
+      Box–Muller normal, lognormal = exp(normal), Weibull/Pareto/gpareto by
+      inverse CDF, gamma by Marsaglia–Tsang (with the shape<1 boost),
+      Poisson by exponential arrivals below a mean of 30 and the normal
+      approximation above, negbin as the gamma–Poisson mixture. A sample
+      below 1 is no pause (SIPp's clamp). One draw per pause step or
+      `<sample>`; the action runner takes the engine's RNG.
+- [x] Tests: statistical unit tests (mean/variance/median over 200k
+      seeded draws per kind), parse/describe/percentile unit tests, compile
+      tests for every kind, the old style, `<sample>`, and SIPp's error
+      wording; corpus `statistical_pauses.xml` (+ a negative `poisson`);
+      an e2e run of that scenario with its `--check` dump; interop
+      `statistical_pauses_both_ways_against_real_sipp` (sipr UAC vs sipp
+      UAS and the reverse; a GSL-less sipp's "only available with GSL"
+      refusal skips the sipp-side half visibly). CI builds sipp with
+      `-DUSE_GSL=1` so both halves run there.
+- [x] Docs: SIPP_COMPAT §1 (pause attributes, `sample` action, the v1.x
+      tier paragraph) and §6 note (incl. SIPp's negbin argument swap and
+      the gpareto shape-0 division, both diverged from deliberately);
+      README "Not yet" loses `<sample>`; PLAN.md §3.4 v1.x row; CHANGELOG.
 
 ### M39 — Keyword parity: `-key`, `[fill]`, `[last_message]`, `[clock_tick]` and friends
 

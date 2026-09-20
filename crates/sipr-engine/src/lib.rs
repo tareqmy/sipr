@@ -10,6 +10,7 @@ mod actions;
 mod engine;
 mod exec;
 mod render;
+mod sample;
 mod vars;
 
 pub use engine::{

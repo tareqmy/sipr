@@ -65,7 +65,7 @@
     ]]>
   </send>
 
-  <pause distribution="uniform(200,1000)"/>
+  <pause distribution="uniform" min="200" max="1000"/>
 
   <send retrans="500" rtd="true">
     <![CDATA[

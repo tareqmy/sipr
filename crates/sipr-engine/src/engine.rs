@@ -538,9 +538,7 @@ pub fn run_scenarios(
     config: &EngineConfig,
     ui: Option<UiChannels>,
 ) -> Result<(RunReport, EngineControl), EngineError> {
-    validate_for_engine(scenario)?;
     if let Some((kind, second)) = secondary {
-        validate_for_engine(second)?;
         validate_secondary(kind, scenario, second)?;
     }
     if scenario.role == Role::Uac && config.target.is_none() {
@@ -2590,22 +2588,9 @@ impl<'s> Engine<'s> {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 Duration::from_millis(ms.max(0.0) as u64)
             }
-            PauseSpec::Distribution { kind, params } => {
-                let u = self.rng.next_f64();
-                let ms = match (kind.as_str(), params.as_slice()) {
-                    ("uniform", [a, b]) => u.mul_add(b - a, *a),
-                    ("fixed", [v]) => *v,
-                    ("exponential", [mean]) => -mean * (1.0 - u).ln(),
-                    ("normal", [mean, stddev]) => {
-                        // Box-Muller (one sample is fine here).
-                        let v = self.rng.next_f64().max(f64::MIN_POSITIVE);
-                        let z = (-2.0 * v.ln()).sqrt() * (2.0 * std::f64::consts::PI * u).cos();
-                        z.mul_add(*stddev, *mean)
-                    }
-                    _ => 0.0, // pre-validated out
-                };
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                Duration::from_millis(ms.max(0.0) as u64)
+            PauseSpec::Distribution(d) => {
+                let ms = crate::sample::sample(d, &mut self.rng);
+                Duration::from_millis(crate::sample::pause_millis(ms))
             }
         }
     }
@@ -2943,6 +2928,9 @@ impl<'s> Engine<'s> {
         };
         let remote_ip = call.render_remote.ip().to_string();
         let digest_uri = self.digest_uri(call.render_remote);
+        // Owned so the ctx borrows no `&self` method result: the actions
+        // below draw from `self.rng` while the ctx is alive.
+        let server_ip = self.server_ip_of(call).to_owned();
         let mut store = call.store.clone();
         let snapshot = call.store.clone(); // immutable copy for the base ctx
         let last = call.last_recv.clone();
@@ -2963,7 +2951,7 @@ impl<'s> Engine<'s> {
                 remote_ip: &remote_ip,
                 remote_port: call.render_remote.port(),
                 local_ip: &self.local_ip_str,
-                server_ip: self.server_ip_of(call),
+                server_ip: &server_ip,
                 local_port: self.call_local_port(call),
                 media_ip: &self.media_ip_str,
                 media_port: self.media_port,
@@ -2987,13 +2975,16 @@ impl<'s> Engine<'s> {
                 },
             };
             match cmd_text {
-                Some(text) => crate::actions::run_cmd_actions(actions, &mut store, text, &ctx),
+                Some(text) => {
+                    crate::actions::run_cmd_actions(actions, &mut store, text, &ctx, &mut self.rng)
+                }
                 None => crate::actions::run_actions(
                     actions,
                     &mut store,
                     last.as_ref(),
                     &ctx,
                     self.config.auth_uri.as_deref(),
+                    &mut self.rng,
                 ),
             }
         };
@@ -4496,7 +4487,12 @@ fn step_label(step: &Step) -> String {
                 format!("recv {what}")
             }
         }
-        Step::Pause { .. } => "pause".to_owned(),
+        Step::Pause { spec, .. } => match spec {
+            PauseSpec::Default => "pause".to_owned(),
+            PauseSpec::Fixed(ms) => format!("pause {ms}ms"),
+            PauseSpec::Variable(_) => "pause [$var]".to_owned(),
+            PauseSpec::Distribution(d) => format!("pause {}", d.describe()),
+        },
         Step::Nop { .. } => "nop".to_owned(),
         Step::SendCmd { .. } => "sendCmd".to_owned(),
         Step::RecvCmd { .. } => "recvCmd".to_owned(),
@@ -5199,29 +5195,6 @@ fn resolve_setdest_host(host: &str, port: u16) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("Unknown host '{host}' for setdest"))
 }
 
-fn validate_for_engine(scenario: &Scenario) -> Result<(), EngineError> {
-    // As of M6 the engine executes the full v1 surface; the only things left
-    // to reject are pause distributions the sampler does not implement.
-    // (regexp_match responses now compile to a real matcher.)
-    for (i, step) in scenario.steps.iter().enumerate() {
-        if let Step::Pause {
-            spec: PauseSpec::Distribution { kind, .. },
-            ..
-        } = step
-        {
-            if !matches!(
-                kind.as_str(),
-                "uniform" | "fixed" | "exponential" | "normal"
-            ) {
-                return Err(EngineError(format!(
-                    "step {i}: pause distribution '{kind}' is not implemented yet"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Reject a scenario whose `[fieldN file=…]` names an injection file that was
 /// not loaded (SIPp errors at parse time). A bare name or a numeric index both
 /// count; `None` (the default file) needs at least one `-inf` — the first
@@ -5445,49 +5418,6 @@ mod tests {
         assert_eq!(m[4].as_deref(), Some("INVITE")); // recv 200
         // SIPp concatenates every request method sent so far.
         assert_eq!(m[8].as_deref(), Some("INVITEACKBYE")); // final recv 200
-    }
-
-    #[test]
-    fn validation_accepts_v1_features_including_actions_and_auth() {
-        let uas = sipr_scenario::compile("uas", sipr_scenario::embedded("uas").unwrap())
-            .scenario
-            .unwrap();
-        assert!(validate_for_engine(&uas).is_ok(), "UAS runs as of M4");
-        let with_actions = sipr_scenario::compile(
-            "t",
-            r#"<scenario name="t">
-                 <send><![CDATA[
-                   OPTIONS sip:[service]@[remote_ip] SIP/2.0
-                   Call-ID: [call_id]
-                   [authentication username=u password=p]
-
-                 ]]></send>
-                 <recv response="200">
-                   <action><ereg regexp="([0-9]+)" search_in="msg" assign_to="whole,n"/></action>
-                 </recv>
-               </scenario>"#,
-        )
-        .scenario
-        .unwrap();
-        assert!(
-            validate_for_engine(&with_actions).is_ok(),
-            "actions + [authentication] run as of M6"
-        );
-        assert!(validate_for_engine(&uac()).is_ok());
-        // Still rejected: an unimplemented pause distribution.
-        let bad_dist = sipr_scenario::compile(
-            "t",
-            r#"<scenario name="t">
-                 <send><![CDATA[OPTIONS sip:[service]@[remote_ip] SIP/2.0
-                   Call-ID: [call_id]
-                 ]]></send>
-                 <recv response="200"/>
-                 <pause distribution="weibull(1,2)"/>
-               </scenario>"#,
-        )
-        .scenario
-        .unwrap();
-        assert!(validate_for_engine(&bad_dist).is_err());
     }
 
     #[test]

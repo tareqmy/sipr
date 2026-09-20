@@ -51,8 +51,10 @@ Runs sipr against a **real sipp binary**, both directions:
 
 Locating sipp: `$SIPP_BIN` env var, else `sipp` on PATH, else skip with a
 **visible** `ignored — set SIPP_BIN` marker (never silently green). Build it
-from `../../cprojects/sipp` (`cmake . && make`, or `./build.sh`) or
-`apt/brew install sipp`. Tests bind ephemeral ports on 127.0.0.1 and must run
+from `../../cprojects/sipp` (`cmake . -DUSE_GSL=1 && make`, or
+`./build.sh`; GSL — `libgsl-dev` / `brew install gsl` — is what lets sipp
+run statistical pauses, so the M38 interop test's sipp-side half skips
+visibly without it) or `apt/brew install sipp`. Tests bind ephemeral ports on 127.0.0.1 and must run
 in parallel safely; each test gets its own port pair.
 
 Lessons from driving real sipp in tests (M26): a scenario file handed to

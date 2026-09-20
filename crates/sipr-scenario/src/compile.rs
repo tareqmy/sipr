@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use crate::diag::{Diagnostic, Diagnostics};
+use crate::distribution::Distribution;
 use crate::model::{
     Action, ArithOp, CompareOp, Expect, IntCmd, JumpTarget, MediaKind, Operand, PauseSpec,
     RecvStep, Role, RtpEchoCmd, RtpEchoVerb, RtpSource, RtpStreamCmd, Scenario, SearchIn, SendStep,
@@ -622,13 +623,19 @@ impl Compiler {
     }
 
     fn compile_pause(&mut self, el: &Element) {
-        const ATTRS: &[&str] = &["milliseconds", "variable", "distribution", "sanity_check"];
-        let common = self.parse_common(el, ATTRS);
-        // `sanity_check` only tunes a runtime warning in SIPp; accepted, no-op.
+        let mut attrs = vec!["milliseconds", "variable", "sanity_check"];
+        attrs.extend(crate::distribution::all_param_attrs(true));
+        let common = self.parse_common(el, &attrs);
+        // SIPp's default is a sanity check on; `sanity_check="false"` turns
+        // the 99th-percentile guard off.
+        let sanity_check = match el.attr("sanity_check") {
+            None => true,
+            Some(_) => self.parse_bool_attr(el, "sanity_check"),
+        };
         let ms = el.attr("milliseconds");
         let var = el.attr("variable").map(ToOwned::to_owned);
-        let dist = el.attr("distribution");
-        let spec = match (ms, &var, dist) {
+        let kind = crate::distribution::kind_of(&|name| el.attr(name), true);
+        let spec = match (ms, &var, kind) {
             (None, None, None) => PauseSpec::Default,
             (Some(_), None, None) => match self.parse_num_attr(el, "milliseconds") {
                 Some(v) => PauseSpec::Fixed(v),
@@ -638,7 +645,10 @@ impl Compiler {
                 let id = self.var_reads(v);
                 PauseSpec::Variable(id)
             }
-            (None, None, Some(d)) => self.parse_distribution(d, el.line),
+            (None, None, Some(kind)) => match self.parse_distribution(el, &kind, sanity_check) {
+                Some(d) => PauseSpec::Distribution(d),
+                None => PauseSpec::Default,
+            },
             _ => {
                 self.diags.error(
                     Some(el.line),
@@ -913,39 +923,38 @@ impl Compiler {
         out
     }
 
-    fn parse_distribution(&mut self, raw: &str, line: u32) -> PauseSpec {
-        const KINDS: &[&str] = &[
-            "uniform",
-            "normal",
-            "exponential",
-            "lognormal",
-            "weibull",
-            "pareto",
-            "gamma",
-            "negbin",
-            "poisson",
-            "fixed",
-        ];
-        let (kind, rest) = raw.split_once('(').unwrap_or((raw, ""));
-        let kind = kind.trim();
-        if !KINDS.contains(&kind) {
-            self.diags.error(
-                Some(line),
-                format!("unknown pause distribution '{kind}' (expected one of {KINDS:?})"),
-            );
-            return PauseSpec::Default;
+    /// Build the distribution `kind` from `el`'s attributes (SIPp's names
+    /// and error wording, `crate::distribution`); with `sanity_check`, refuse
+    /// one whose 99th percentile exceeds `INT_MAX` ms, as SIPp does.
+    fn parse_distribution(
+        &mut self,
+        el: &Element,
+        kind: &str,
+        sanity_check: bool,
+    ) -> Option<Distribution> {
+        let dist = match crate::distribution::from_attrs(kind, &|name| el.attr(name)) {
+            Ok(d) => d,
+            Err(msg) => {
+                self.diags.error(Some(el.line), msg);
+                return None;
+            }
+        };
+        if sanity_check {
+            if let Some(p99) = dist.percentile_99() {
+                if p99 > f64::from(i32::MAX) {
+                    self.diags.error(
+                        Some(el.line),
+                        format!(
+                            "The distribution {} has a 99th percentile of {p99:.0} ms, which \
+                             is larger than INT_MAX. You should choose different parameters.",
+                            dist.describe()
+                        ),
+                    );
+                    return None;
+                }
+            }
         }
-        let params: Vec<f64> = rest
-            .trim_end_matches(')')
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .filter_map(|p| p.parse().ok())
-            .collect();
-        PauseSpec::Distribution {
-            kind: kind.to_owned(),
-            params,
-        }
+        Some(dist)
     }
 
     // ---- actions -------------------------------------------------------
@@ -1351,13 +1360,29 @@ impl Compiler {
                     protocol: protocol?,
                 })
             }
-            "sample" | "index" => {
+            "sample" => {
+                let mut allowed = vec!["assign_to"];
+                allowed.extend(crate::distribution::all_param_attrs(false));
+                self.warn_unknown_attrs(el, &allowed);
+                let to = self.require_attr(el, "assign_to")?;
+                let Some(kind) = crate::distribution::kind_of(&|name| el.attr(name), false) else {
+                    self.diags.error(
+                        Some(line),
+                        "statistically distributed actions or pauses requires 'distribution' parameter",
+                    );
+                    return None;
+                };
+                let distribution = self.parse_distribution(el, &kind, false)?;
+                Some(Action::Sample {
+                    assign_to: self.var_writes(&to),
+                    distribution,
+                })
+            }
+            "index" => {
                 self.diags.error(
                     Some(line),
-                    format!(
-                        "action <{}> is not supported yet — planned for v1.x",
-                        el.name
-                    ),
+                    "action <index> is not supported — sipr builds injection indexes from \
+                     -infindex at load (docs/SIPP_COMPAT.md §1)",
                 );
                 None
             }

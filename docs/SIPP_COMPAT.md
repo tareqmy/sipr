@@ -17,7 +17,7 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 | `scenario` | `name` | |
 | `send` | common⁺, `retrans`, `lost`, `crlf`, `start_txn`, `ack_txn` | CDATA body = message template; the `_txn` attrs name a transaction (M36, §6) |
 | `recv` | common⁺, `response`, `request`, `optional`, `timeout`, `ontimeout`, `rrs`, `auth`, `lost`, `regexp_match`, `response_txn` | |
-| `pause` | common⁺, `milliseconds`, `variable`, `distribution`, `sanity_check` | uniform/normal/exp distributions |
+| `pause` | common⁺, `milliseconds`, `variable`, `distribution` + its parameters, `sanity_check` | all ten SIPp distributions, SIPp's attribute names and old-style `min`/`max` (M38, §6) |
 | `nop` | common⁺, `display` | carries actions |
 | `label` | `id` | jump target; validated at compile |
 | `timewait` | `milliseconds` | end-of-call linger |
@@ -36,7 +36,8 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 = `msg|hdr|body|var`, `variable`, `start_line`), `log`, `warning`, `error`, `assign`, `assignstr`, `strcmp`,
 `verifyauth` (with `assign_to`, `username`, `password`), `pauserestore`
 (`value`/`variable`), `closecon`, `test`, `add`, `subtract`, `multiply`, `divide`, `todouble`, `jump`, `trim`,
-`gettimeofday`, `urlencode`, `urldecode`, `jump` (`value`/`variable`; the
+`gettimeofday`, `urlencode`, `urldecode`, `sample` (`assign_to`, `distribution`
++ its parameters; M38, §6), `jump` (`value`/`variable`; the
 `_unexp.main` label, `_unexp.retaddr` and `_unexp.pausedaddr` recipe),
 `exec` with `int_cmd` (`stop_now`, `stop_gracefully`, `stop_call`) or
 `command=` (an external shell command, M37), `setdest` (`host`, `port`,
@@ -44,9 +45,9 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 
 ### v1.x tier (fast follow)
 
-`sample`. Manual transactions (`start_txn`/`ack_txn`/`response_txn`)
-shipped in M36, `exec command=` and `setdest` in M37. `index` as a
-standalone action stays out — sipr builds the index from `-infindex` at load,
+Manual transactions (`start_txn`/`ack_txn`/`response_txn`) shipped in
+M36, `exec command=` and `setdest` in M37, statistical pauses and `sample`
+in M38 — the tier is complete. `index` as a standalone action stays out — sipr builds the index from `-infindex` at load,
 not from a scenario action. Extended 3PCC (`-master`/`-slave`/`-slave_cfg` with
 `dest=`/`src=` peer routing) also stays out; classic `-3pcc` is supported.
 
@@ -299,8 +300,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   single trailing CRLF appended; internal blank line (header/body separator)
   preserved. TO VERIFY against `scenario.cpp` message construction at M3
   interop — especially whether SIPp appends CRLFCRLF or CRLF.
-- `<pause sanity_check>` only tunes a runtime warning in SIPp; sipr accepts
-  and ignores it (comment in `compile_pause`).
+- `<pause sanity_check>` (default true) is SIPp's 99th-percentile guard on a
+  distributed pause; implemented as of M38 (see the M38 note below).
 - The DTD spells the recv SDP attribute `ignosesdp` (sic); SIPp docs use
   `ignoresdp`. sipr recognizes both spellings (and rejects them until media).
 - Regex engine (M6, `sipr-scenario/src/regex.rs`): `ereg` and
@@ -1076,3 +1077,41 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   are redirections and a command separator) — quote it.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)
+- Statistical pauses and `<sample>` (M38; verified in `scenario.cpp`
+  ~l.1112 `parse_distribution`, ~l.965-985 the `<pause>` branch and its
+  `sanity_check`, ~l.1522 `sample`; `stat.cpp` ~l.1530-1880 the `CSample`
+  classes; `call.cpp` ~l.1956 the pause branch of `call::run`, ~l.6125
+  `E_AT_ASSIGN_FROM_SAMPLE`): the distribution is `distribution="<kind>"`
+  and its parameters are **separate attributes** with SIPp's names —
+  `fixed` `value`; `uniform` `min`/`max`; `normal` and `lognormal`
+  `mean`/`stdev` (a lognormal's are the log-space parameters, GSL's
+  `zeta`/`sigma`); `exponential` `mean`; `weibull` `lambda` (scale) /`k`
+  (shape); `pareto` `k` (shape) /`x_m` (minimum); `gpareto`
+  `shape`/`scale`/`location`; `gamma` `k` (shape) /`theta` (scale);
+  `negbin` `p`/`n`. There is no `poisson`. A missing parameter is SIPp's
+  "<Kind> distribution is missing the required '<name>' parameter.", an
+  unknown kind "Unknown distribution: <kind>". Old-style `<pause>` spellings
+  are accepted too: `min`/`max` alone mean `uniform`, and a bare
+  `normal="…"`/`exponential="…"`/`lognormal`/`weibull`/`pareto`/`gamma`
+  flag names that kind. sipr's earlier positional shorthand,
+  `distribution="uniform(200,3000)"`, still parses (values in SIPp's
+  attribute order) but is a sipr extension. `sanity_check` (default true)
+  refuses a distribution whose 99th percentile exceeds `INT_MAX` ms, as
+  SIPp does; a negative binomial has no percentile in SIPp and is not
+  checked. Sampling (engine `sample.rs`, one draw per pause or action
+  from the seeded generator): SIPp uses GSL and is built with these only
+  under `USE_GSL` — a GSL-less sipp errors "The distribution '…' is only
+  available with GSL" for everything but `fixed` and `uniform`; sipr always
+  has them. A pause sample below 1 (the negative tail of a normal) is no
+  pause, as SIPp's `if (actualpause < 1) pause = 0`. `<sample>` stores a
+  double. Two deliberate divergences: (1) SIPp passes negbin's `n` and `p`
+  to GSL swapped (`gsl_ran_negative_binomial(rng, n, p)` against GSL's
+  `(rng, p, n)`), so with its own documented `p="0.1" n="2"` GSL gets a
+  "probability" of 2 and the pauses are garbage — sipr draws the documented
+  meaning, failures before `n` successes at probability `p`; (2) the
+  generalized Pareto's `shape="0"` divides by zero in SIPp — sipr uses the
+  `shape → 0` limit, `location + Exp(scale)`. Poisson draws past a mean of
+  30 (inside negbin) use the normal approximation. The screen/`--check`
+  label is SIPp's `textDescr`: `N(mean,stdev)`, `LN(…)`, `Exp(mean)`,
+  `Wb(lambda,k)`, `P(k,x_m)`, `P(shape,scale,location)`, `G(k,theta)`,
+  `NB(p,n)`, `min/max`, or the fixed value.

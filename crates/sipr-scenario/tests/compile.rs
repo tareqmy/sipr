@@ -4,6 +4,7 @@
 
 use sipr_scenario::compile;
 use sipr_scenario::diag::Severity;
+use sipr_scenario::distribution::Distribution;
 use sipr_scenario::model::{Action, Expect, PauseSpec, Role, Step};
 
 fn wrap(body: &str) -> String {
@@ -351,8 +352,214 @@ fn pause_variants_parse() {
     assert_eq!(specs[0], &PauseSpec::Default);
     assert_eq!(specs[1], &PauseSpec::Fixed(250));
     assert!(matches!(specs[2], PauseSpec::Variable(_)));
+    // sipr's positional shorthand still works next to SIPp's attributes.
+    assert_eq!(
+        specs[3],
+        &PauseSpec::Distribution(Distribution::Uniform {
+            min: 200.0,
+            max: 3000.0
+        })
+    );
+}
+
+/// Every distribution SIPp names, spelled as SIPp's docs spell them
+/// (`ownscenarios.rst`), plus the old-style `<pause min= max=>` and flag
+/// forms `parse_distribution(oldstyle)` accepts.
+#[test]
+fn sipp_pause_distributions_parse_from_attributes() {
+    let xml = wrap(&format!(
+        r#"{invite}
+           <pause distribution="fixed" value="1000"/>
+           <pause distribution="uniform" min="2000" max="5000"/>
+           <pause distribution="normal" mean="60000" stdev="15000"/>
+           <pause distribution="lognormal" mean="12.28" stdev="1" sanity_check="false"/>
+           <pause distribution="exponential" mean="900000"/>
+           <pause distribution="weibull" lambda="3" k ="4"/>
+           <pause distribution="pareto" k="1" x_m="2"/>
+           <pause distribution="gpareto" shape="0.5" scale="100" location="10"/>
+           <pause distribution="gamma" k="3" theta="2"/>
+           <pause distribution="negbin" p="0.1" n="2"/>
+           <pause min="10" max="20"/>
+           <pause exponential="1" mean="7"/>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let specs: Vec<&PauseSpec> = sc
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Pause { spec, .. } => Some(spec),
+            _ => None,
+        })
+        .collect();
+    let want = [
+        Distribution::Fixed { value: 1000.0 },
+        Distribution::Uniform {
+            min: 2000.0,
+            max: 5000.0,
+        },
+        Distribution::Normal {
+            mean: 60000.0,
+            stdev: 15000.0,
+        },
+        Distribution::LogNormal {
+            mean: 12.28,
+            stdev: 1.0,
+        },
+        Distribution::Exponential { mean: 900_000.0 },
+        Distribution::Weibull {
+            lambda: 3.0,
+            k: 4.0,
+        },
+        Distribution::Pareto { k: 1.0, x_m: 2.0 },
+        Distribution::GPareto {
+            shape: 0.5,
+            scale: 100.0,
+            location: 10.0,
+        },
+        Distribution::Gamma { k: 3.0, theta: 2.0 },
+        Distribution::NegBin { p: 0.1, n: 2.0 },
+        Distribution::Uniform {
+            min: 10.0,
+            max: 20.0,
+        },
+        Distribution::Exponential { mean: 7.0 },
+    ];
+    assert_eq!(specs.len(), want.len());
+    for (spec, d) in specs.iter().zip(want) {
+        assert_eq!(*spec, &PauseSpec::Distribution(d));
+    }
+    let dump = sc.dump();
     assert!(
-        matches!(specs[3], PauseSpec::Distribution { kind, params } if kind == "uniform" && params == &[200.0, 3000.0])
+        dump.contains("pause normal N(60000.000,15000.000)"),
+        "{dump}"
+    );
+    assert!(dump.contains("pause lognormal LN(12.280,1.000)"), "{dump}");
+    assert!(dump.contains("pause negbin NB(0.100,2.000)"), "{dump}");
+    assert!(dump.contains("pause uniform 10.000000/20.000000"), "{dump}");
+}
+
+#[test]
+fn sample_action_draws_into_a_double_variable() {
+    let xml = wrap(&format!(
+        r#"{invite}
+           <nop>
+             <action>
+               <sample assign_to="jitter" distribution="normal" mean="0" stdev="1"/>
+               <sample assign_to="wait" distribution="uniform(5,10)"/>
+             </action>
+           </nop>
+           <pause variable="wait"/>
+           <Reference variables="jitter"/>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let actions: Vec<&Action> = sc
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Nop { actions, .. } => Some(actions),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(actions.len(), 2);
+    let Action::Sample {
+        assign_to,
+        distribution,
+    } = actions[0]
+    else {
+        panic!("{:?}", actions[0]);
+    };
+    assert_eq!(sc.vars.name(*assign_to), "jitter");
+    assert_eq!(
+        distribution,
+        &Distribution::Normal {
+            mean: 0.0,
+            stdev: 1.0
+        }
+    );
+    assert!(matches!(
+        actions[1],
+        Action::Sample {
+            distribution: Distribution::Uniform { min, max },
+            ..
+        } if *min == 5.0 && *max == 10.0
+    ));
+}
+
+#[test]
+fn distribution_errors_use_sipp_wording() {
+    let cases: &[(&str, &str)] = &[
+        (
+            r#"<pause distribution="normal" mean="1"/>"#,
+            "Normal distribution is missing the required 'stdev' parameter.",
+        ),
+        (
+            r#"<pause distribution="poisson" lambda="3"/>"#,
+            "Unknown distribution: poisson",
+        ),
+        (
+            r#"<pause distribution="gamma" k="x" theta="2"/>"#,
+            "Gamma distribution 'k' parameter",
+        ),
+        (
+            r#"<nop><action><sample assign_to="v" mean="1" stdev="1"/></action></nop>"#,
+            "requires 'distribution' parameter",
+        ),
+        (
+            r#"<nop><action><sample distribution="fixed" value="1"/></action></nop>"#,
+            "<sample> needs a 'assign_to' attribute",
+        ),
+        // SIPp's sanity check: a 99th percentile past INT_MAX ms is refused…
+        (
+            r#"<pause distribution="exponential" mean="1e9"/>"#,
+            "99th percentile",
+        ),
+        (
+            r#"<pause milliseconds="5" distribution="fixed" value="1"/>"#,
+            "at most one of",
+        ),
+    ];
+    for (step, want) in cases {
+        let xml = wrap(&format!("{}{step}", send_invite()));
+        let out = compile("test", &xml);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains(want)),
+            "{step}: expected an error containing {want:?}, got {:#?}",
+            out.diagnostics
+        );
+    }
+    // …unless the scenario turns the check off.
+    let ok = wrap(&format!(
+        r#"{}<pause distribution="exponential" mean="1e9" sanity_check="false"/>"#,
+        send_invite()
+    ));
+    assert!(compile("test", &ok).diagnostics.is_empty());
+    // A parameter nobody reads is a loud warning, not a silent skip.
+    let noisy = wrap(&format!(
+        r#"{}<pause distribution="fixed" value="1" lambda="3"/>"#,
+        send_invite()
+    ));
+    let out = compile("test", &noisy);
+    assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    let stray = wrap(&format!(
+        r#"{}<pause distribution="fixed" value="1" bogus="3"/>"#,
+        send_invite()
+    ));
+    let out = compile("test", &stray);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.message.contains("unknown attribute 'bogus'")),
+        "{:#?}",
+        out.diagnostics
     );
 }
 

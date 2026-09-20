@@ -239,13 +239,9 @@ pub enum PauseSpec {
     Fixed(u64),
     /// `variable="name"`: duration from a call variable.
     Variable(VarId),
-    /// `distribution="uniform(200,3000)"` etc.
-    Distribution {
-        /// Distribution kind (`uniform`, `normal`, `exponential`, ...).
-        kind: String,
-        /// Numeric parameters.
-        params: Vec<f64>,
-    },
+    /// `distribution="normal" mean="…" stdev="…"` and the other kinds
+    /// (see [`crate::distribution`]).
+    Distribution(crate::distribution::Distribution),
 }
 
 /// One step of the compiled scenario.
@@ -501,6 +497,14 @@ pub enum Action {
     Warn(MsgTemplate),
     /// Fail the call with a keyword-expanded message.
     Fail(MsgTemplate),
+    /// `<sample assign_to="…" distribution="…" …/>`: draw a value from a
+    /// statistical distribution into a double variable.
+    Sample {
+        /// Destination.
+        assign_to: VarId,
+        /// The distribution to draw from.
+        distribution: crate::distribution::Distribution,
+    },
     /// Copy one variable to another.
     Assign {
         /// Destination.
@@ -852,8 +856,8 @@ impl Scenario {
                         PauseSpec::Default => "default (-d)".to_owned(),
                         PauseSpec::Fixed(ms) => format!("{ms}ms"),
                         PauseSpec::Variable(v) => format!("variable ${}", self.vars.name(*v)),
-                        PauseSpec::Distribution { kind, params } => {
-                            format!("{kind}{params:?}")
+                        PauseSpec::Distribution(d) => {
+                            format!("{} {}", d.kind(), d.describe())
                         }
                     };
                     format!("pause {what}{}", common_suffix(common))

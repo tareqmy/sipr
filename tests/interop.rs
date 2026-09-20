@@ -3973,3 +3973,171 @@ fn setdest_redirects_to_a_second_peer_like_real_sipp() {
         }
     }
 }
+
+// ---- M38: statistical pauses and <sample> -----------------------------
+
+/// A UAC sending one OPTIONS per call, then every statistical pause SIPp
+/// names (SIPp's own attribute spellings) plus two `<sample>` draws read
+/// back by `<pause variable=>`. Parameters are in milliseconds and small,
+/// so a call lasts well under a second.
+const STATISTICAL_PAUSES_UAC: &str = r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="statistical pauses">
+  <send retrans="500"><![CDATA[
+OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]:[remote_port]>
+Call-ID: [call_id]
+CSeq: 1 OPTIONS
+Contact: <sip:sipp@[local_ip]:[local_port]>
+Max-Forwards: 70
+Content-Length: 0
+
+]]></send>
+  <recv response="200">
+    <action>
+      <sample assign_to="jitter" distribution="normal" mean="20" stdev="5"/>
+      <sample assign_to="think" distribution="uniform" min="5" max="15"/>
+    </action>
+  </recv>
+  <pause distribution="fixed" value="10"/>
+  <pause distribution="uniform" min="5" max="15"/>
+  <pause distribution="normal" mean="10" stdev="2"/>
+  <pause distribution="lognormal" mean="2" stdev="0.5"/>
+  <pause distribution="exponential" mean="10"/>
+  <pause distribution="weibull" lambda="10" k="4"/>
+  <pause distribution="pareto" k="3" x_m="5"/>
+  <pause distribution="gpareto" shape="0.5" scale="5" location="1"/>
+  <pause distribution="gamma" k="3" theta="2"/>
+  <pause distribution="negbin" p="0.5" n="4"/>
+  <pause min="5" max="10"/>
+  <pause variable="think"/>
+  <pause variable="jitter"/>
+</scenario>
+"#;
+
+/// The matching UAS: answer each OPTIONS with a 200 mirroring the request.
+const STATISTICAL_PAUSES_UAS: &str = r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="options responder">
+  <recv request="OPTIONS" crlf="true"/>
+  <send><![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]></send>
+</scenario>
+"#;
+
+/// Run the statistical-pauses UAC on `uac_bin` against the responder on
+/// `uas_bin`, `calls` calls; return (uac exit, uas exit, uac stderr).
+fn run_statistical_pauses_pair(
+    uas_bin: &std::path::Path,
+    uac_bin: &std::path::Path,
+    calls: u32,
+    tag: &str,
+) -> (Option<i32>, Option<i32>, String) {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let uas_path = dir.join(format!("sipr-interop-statpause-uas-{tag}-{pid}.xml"));
+    let uac_path = dir.join(format!("sipr-interop-statpause-uac-{tag}-{pid}.xml"));
+    std::fs::write(&uas_path, STATISTICAL_PAUSES_UAS).expect("write uas");
+    std::fs::write(&uac_path, STATISTICAL_PAUSES_UAC).expect("write uac");
+    let port = free_port();
+    let mut uas = Reaper(
+        Command::new(uas_bin)
+            .current_dir(&dir)
+            .args([
+                "-sf",
+                uas_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                &calls.to_string(),
+                "-timeout",
+                "30",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut uac = Reaper(
+        Command::new(uac_bin)
+            .current_dir(&dir)
+            .args([
+                "-sf",
+                uac_path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-r",
+                "10",
+                "-m",
+                &calls.to_string(),
+                "-timeout",
+                "20",
+                "-bg",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uac"),
+    );
+    let uac_code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    let stderr = uac
+        .0
+        .stderr
+        .take()
+        .map(|mut s| {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    let uas_code = wait_with_timeout(&mut uas.0, Duration::from_secs(15));
+    let _ = std::fs::remove_file(&uas_path);
+    let _ = std::fs::remove_file(&uac_path);
+    (uac_code, uas_code, stderr)
+}
+
+/// Every statistical pause and `<sample>`, both ways: sipr's UAC runs the
+/// scenario against real sipp's UAS, and real sipp's UAC runs the same file
+/// against sipr's UAS. A sipp built without GSL refuses the scenario ("is
+/// only available with GSL"); that is an environment limit of sipp's, not a
+/// behavior to compare against — skipped visibly.
+#[test]
+fn statistical_pauses_both_ways_against_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::statistical_pauses_both_ways_against_real_sipp — no sipp.");
+        return;
+    };
+    let sipr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let (uac_code, uas_code, stderr) = run_statistical_pauses_pair(&sipp, &sipr, 3, "sipr-uac");
+    assert_eq!(uac_code, Some(0), "sipr uac stderr:\n{stderr}");
+    assert!(stderr.contains("successful 3 failed 0"), "{stderr}");
+    assert_eq!(uas_code, Some(0), "sipp uas exited {uas_code:?}");
+
+    let dir = std::env::temp_dir();
+    let (uac_code, uas_code, _) = run_statistical_pauses_pair(&sipr, &sipp, 3, "sipp-uac");
+    if sipp_error_log_contains(&dir, "only available with GSL") {
+        eprintln!(
+            "SKIPPED interop::statistical_pauses_both_ways_against_real_sipp (sipp side) — \
+             sipp built without GSL refuses statistical pauses."
+        );
+        return;
+    }
+    assert_eq!(uac_code, Some(0), "sipp uac exited {uac_code:?}");
+    assert_eq!(uas_code, Some(0), "sipr uas exited {uas_code:?}");
+}

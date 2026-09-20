@@ -64,13 +64,13 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build real SIPp 3.7 with TLS, PCAP, and SCTP
+      - name: Build real SIPp 3.7 with TLS, PCAP, SCTP, and GSL
         run: |
           sudo modprobe sctp || true
           sudo apt-get update
-          sudo apt-get install -y cmake libsctp-dev libpcap-dev libncurses-dev libssl-dev
+          sudo apt-get install -y cmake libsctp-dev libpcap-dev libncurses-dev libssl-dev libgsl-dev
           git clone --depth 1 --branch v3.7.7 https://github.com/SIPp/sipp.git /tmp/sipp
-          cd /tmp/sipp && cmake . -DUSE_SCTP=1 -DUSE_PCAP=1 -DUSE_SSL=1 && make -j"$(nproc)"
+          cd /tmp/sipp && cmake . -DUSE_SCTP=1 -DUSE_PCAP=1 -DUSE_SSL=1 -DUSE_GSL=1 && make -j"$(nproc)"
           /tmp/sipp/sipp -v | head -1
       - name: Interop against real SIPp
         run: SIPP_BIN=/tmp/sipp/sipp SIPP_SRC=/tmp/sipp cargo test --test interop -- --nocapture

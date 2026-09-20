@@ -154,7 +154,7 @@ scanning. That single decision is worth more to throughput than anything else.
 | Tier | Surface | When |
 |---|---|---|
 | **v1 (M1–M6)** | `send`, `recv`, `pause`, `nop`, `label`, `timewait`; `Reference`, `ResponseTimeRepartition`, `CallLengthRepartition`; step attrs `next/test/chance/condexec/optional/timeout/ontimeout/rrs/auth/lost/retrans/crlf/counter/rtd/start_rtd/repeat_rtd`; actions `ereg, log, warning, assign, assignstr, strcmp, test, add/subtract/multiply/divide, jump, lookup, insert, replace, gettimeofday, exec int_cmd, todouble, trim, urlencode/urldecode, error`; keywords `[service] [remote_ip] [remote_port] [local_ip] [local_ip_type] [local_port] [transport] [call_id] [call_number] [cseq] [branch] [msg_index] [pid] [routes] [next_url] [peer_tag_param] [field0..N] [$var] [last_*] [authentication] [len] [tdmmap?no]` | core |
-| **v1.x** | `-inf` injection files (`[fieldN]`, `lookup`), `-key` keywords, `sendCmd`/`recvCmd` (3PCC), `setdest`, `sample`/statistical pauses, `exec command=` (external), regexp variants | fast follow |
+| **v1.x** | `-inf` injection files (`[fieldN]`, `lookup`), `-key` keywords, `sendCmd`/`recvCmd` (3PCC), `setdest`, `sample`/statistical pauses, `exec command=` (external), regexp variants | done through M38 except `-key` (second backlog, M39) |
 | **later** | `exec play_pcap*`, `rtp_stream`, `rtp_echo`, `verifyauth`, `closecon`, `pauserestore`, TCP/TLS-dependent attrs | with media/transport milestones |
 
 Unknown elements/attributes must produce a **loud warning with file:line**, never a

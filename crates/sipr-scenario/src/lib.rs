@@ -14,6 +14,7 @@
 
 mod compile;
 pub mod diag;
+pub mod distribution;
 pub mod inject;
 pub mod model;
 pub mod regex;

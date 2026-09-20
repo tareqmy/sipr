@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- Every statistical pause SIPp names, spelled as its docs spell them
+     (ownscenarios.rst), the old-style min/max form, and the <sample>
+     action drawing into a variable a later pause reads (M38, SIPP_COMPAT §6). -->
+
+<scenario name="Statistical pauses">
+  <send retrans="500">
+    <![CDATA[
+
+      OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 OPTIONS
+      Contact: <sip:sipr@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200">
+    <action>
+      <sample assign_to="jitter" distribution="normal" mean="20" stdev="5"/>
+      <sample assign_to="think" distribution="uniform" min="5" max="15"/>
+    </action>
+  </recv>
+
+  <pause distribution="fixed" value="10"/>
+  <pause distribution="uniform" min="5" max="15"/>
+  <pause distribution="normal" mean="10" stdev="2"/>
+  <pause distribution="lognormal" mean="2" stdev="0.5"/>
+  <pause distribution="exponential" mean="10"/>
+  <pause distribution="weibull" lambda="10" k="4"/>
+  <pause distribution="pareto" k="3" x_m="5"/>
+  <pause distribution="gpareto" shape="0.5" scale="5" location="1"/>
+  <pause distribution="gamma" k="3" theta="2"/>
+  <pause distribution="negbin" p="0.5" n="4"/>
+  <pause min="5" max="10"/>
+  <pause variable="think"/>
+  <pause variable="jitter"/>
+</scenario>

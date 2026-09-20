@@ -6752,3 +6752,60 @@ fn setdest_is_refused_where_sipp_refuses_it() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The M38 corpus scenario — every statistical pause SIPp names plus two
+/// `<sample>` draws — runs end to end against an OPTIONS responder.
+#[test]
+fn statistical_pauses_scenario_runs_against_scripted_uas() {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut options = 0u32;
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            if msg.method() == Some("OPTIONS") {
+                options += 1;
+                let _ = sock.send_to(&mirror_response(&msg, "200 OK", true), from);
+            }
+        }
+        options
+    });
+    let scenario = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sipr-scenario/tests/corpus/positive/statistical_pauses.xml"
+    );
+    let out = run_sipr(&[
+        "-sf",
+        scenario,
+        "-r",
+        "10",
+        "-m",
+        "3",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 3 failed 0"), "{err}");
+    assert_eq!(uas.join().expect("uas thread"), 3);
+    // `--check` describes each pause the way SIPp's screen does.
+    let out = run_sipr(&["-sf", scenario, "--check"]);
+    let dump = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{dump}");
+    for want in [
+        "pause normal N(10.000,2.000)",
+        "pause lognormal LN(2.000,0.500)",
+        "pause gpareto P(0.500,5.000,1.000)",
+        "pause negbin NB(0.500,4.000)",
+        "pause uniform 5.000000/10.000000",
+    ] {
+        assert!(dump.contains(want), "missing {want:?} in:\n{dump}");
+    }
+}

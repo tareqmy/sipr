@@ -1,0 +1,9 @@
+<!-- expect: Unknown distribution: poisson -->
+<scenario name="a distribution SIPp does not have">
+  <send><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Call-ID: [call_id]
+  ]]></send>
+  <recv response="200"/>
+  <pause distribution="poisson" lambda="3"/>
+</scenario>

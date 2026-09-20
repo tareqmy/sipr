@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Statistical pauses at SIPp parity: `<pause distribution="…">` now takes
+  SIPp's attribute form (`distribution="normal" mean="…" stdev="…"`) and
+  all ten of SIPp's kinds — `fixed`, `uniform`, `normal`, `lognormal`,
+  `exponential`, `weibull`, `pareto`, `gpareto`, `gamma`, `negbin` — plus
+  the old-style `<pause min= max=>` spellings and SIPp's `sanity_check`.
+  The `<sample assign_to= distribution=…>` action draws into a variable.
+  A pause sample below 1 ms is no pause, as in SIPp. The interop CI build
+  of sipp now includes GSL so the comparison runs both ways.
+
+### Changed
+
+- `--check` and the scenario screen label a distributed pause the way
+  SIPp's screen does (`N(60000.000,15000.000)`, `Exp(…)`, `Wb(…)`, …).
+- The scenario-side positional form `distribution="uniform(200,3000)"`
+  still parses but is documented as a sipr extension; SIPp's attributes
+  are canonical. `poisson`, which SIPp never had, is now an error.
+
 ## [0.27.1] — 2026-09-20
 
 ### Changed

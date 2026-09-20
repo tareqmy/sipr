@@ -170,8 +170,8 @@ reference and the interop suite is the check that the result matches.
 
 Parts of SIPp that sipr does not implement, and where that is deliberate:
 
-- The `<sample>` action (statistical pauses) and the standalone `<index>`
-  action (sipr builds injection indexes from `-infindex` at load time).
+- The standalone `<index>` action (sipr builds injection indexes from
+  `-infindex` at load time).
 - Extended 3PCC (`-master`/`-slave`/`-slave_cfg`, `sendCmd dest=`,
   `recvCmd src=`); classic `-3pcc` is supported.
 - `PRINTF=` virtual-line injection files.

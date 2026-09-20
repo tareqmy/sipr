@@ -6,6 +6,7 @@
 //! everything else is arithmetic/string/control over the store.
 
 use sipr_net::Inbound;
+use sipr_net::rng::Rng;
 use sipr_scenario::model::{Action, ArithOp, CompareOp, JumpTarget, Operand, SearchIn};
 use sipr_scenario::template::MsgTemplate;
 
@@ -128,8 +129,9 @@ pub fn run_actions(
     last_msg: Option<&Inbound>,
     base_ctx: &RenderCtx<'_>,
     auth_uri: Option<&str>,
+    rng: &mut Rng,
 ) -> Vec<ActionOutcome> {
-    run_actions_impl(actions, store, last_msg, None, base_ctx, auth_uri)
+    run_actions_impl(actions, store, last_msg, None, base_ctx, auth_uri, rng)
 }
 
 /// Like [`run_actions`], but `ereg` searches the raw 3PCC command `cmd_text`
@@ -139,8 +141,9 @@ pub fn run_cmd_actions(
     store: &mut VarStore,
     cmd_text: &str,
     base_ctx: &RenderCtx<'_>,
+    rng: &mut Rng,
 ) -> Vec<ActionOutcome> {
-    run_actions_impl(actions, store, None, Some(cmd_text), base_ctx, None)
+    run_actions_impl(actions, store, None, Some(cmd_text), base_ctx, None, rng)
 }
 
 fn run_actions_impl(
@@ -150,10 +153,11 @@ fn run_actions_impl(
     cmd_text: Option<&str>,
     base_ctx: &RenderCtx<'_>,
     auth_uri: Option<&str>,
+    rng: &mut Rng,
 ) -> Vec<ActionOutcome> {
     let mut out = Vec::new();
     for action in actions {
-        let outcome = run_one(action, store, last_msg, cmd_text, base_ctx, auth_uri);
+        let outcome = run_one(action, store, last_msg, cmd_text, base_ctx, auth_uri, rng);
         let terminal = !matches!(
             outcome,
             ActionOutcome::Continue
@@ -194,6 +198,7 @@ fn run_one(
     cmd_text: Option<&str>,
     base_ctx: &RenderCtx<'_>,
     auth_uri: Option<&str>,
+    rng: &mut Rng,
 ) -> ActionOutcome {
     match action {
         Action::VerifyAuth {
@@ -282,6 +287,14 @@ fn run_one(
         Action::AssignStr { assign_to, value } => {
             let rendered = render_with_store(value, store, base_ctx);
             store.set(*assign_to, Value::Str(rendered));
+            ActionOutcome::Continue
+        }
+        Action::Sample {
+            assign_to,
+            distribution,
+        } => {
+            let value = crate::sample::sample(distribution, rng);
+            store.set(*assign_to, Value::Num(value));
             ActionOutcome::Continue
         }
         Action::Strcmp {
