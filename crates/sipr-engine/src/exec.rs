@@ -93,27 +93,29 @@ mod tests {
     fn commands_run_through_a_shell_and_are_reaped() {
         let dir = std::env::temp_dir().join(format!("sipr-exec-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let out = dir.join("out.txt");
+        // One file per command: the commands are fire-and-forget and run
+        // concurrently, and two shells appending to one file at once lose a
+        // write on Windows (the file is locked by the first).
+        let out_one = dir.join("one.txt");
+        let out_two = dir.join("two.txt");
         let runner = ExecRunner::start();
         // A shell feature (redirection) and two commands in a row.
-        assert!(runner.run(format!("echo one >> {}", out.display())));
-        assert!(runner.run(format!("echo two >> {}", out.display())));
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut text = String::new();
-        while std::time::Instant::now() < deadline {
-            text = std::fs::read_to_string(&out).unwrap_or_default();
-            if text.lines().count() == 2 {
-                break;
+        assert!(runner.run(format!("echo one >> {}", out_one.display())));
+        assert!(runner.run(format!("echo two >> {}", out_two.display())));
+        let read = |path: &std::path::Path| -> String {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                if !text.is_empty() || std::time::Instant::now() >= deadline {
+                    // Trimmed: cmd's `echo one >> f` keeps the space before
+                    // the redirect.
+                    return text.trim().to_owned();
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // Both commands ran (through a shell, since `>>` is a shell feature).
-        // They are fire-and-forget and run concurrently, so their order in
-        // the file is not guaranteed — only that each appended once. Trimmed:
-        // cmd's `echo one >> f` keeps the space before the redirect.
-        let mut lines: Vec<&str> = text.lines().map(str::trim).collect();
-        lines.sort_unstable();
-        assert_eq!(lines, ["one", "two"]);
+        };
+        assert_eq!(read(&out_one), "one");
+        assert_eq!(read(&out_two), "two");
         drop(runner);
         let _ = std::fs::remove_dir_all(&dir);
     }

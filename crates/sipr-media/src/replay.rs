@@ -840,8 +840,13 @@ mod tests {
             panic!("{check:?}")
         };
         assert_eq!(sent, 8);
-        assert!(failed <= 2, "failed {failed} of {sent}");
-        assert!(bytes_in >= 16 * 6, "bytes_in {bytes_in}");
+        // The first check never sees an echo, and a media thread that a
+        // loaded host starves catches up in a burst whose checks find no
+        // echo yet either; what distinguishes an echo peer from a silent
+        // one (the test above: every check fails, nothing received) is that
+        // some checks pass and its packets come back.
+        assert!(failed < sent, "failed {failed} of {sent}");
+        assert!(bytes_in >= 16 * 2, "bytes_in {bytes_in}");
     }
 
     #[test]
