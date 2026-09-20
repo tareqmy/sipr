@@ -3294,7 +3294,7 @@ fn hidden_steps_and_display_labels_reach_the_stats_api() {
 
   ]]></send>
   <nop hide="true"/>
-  <pause milliseconds="3000"/>
+  <pause milliseconds="8000"/>
   <send retrans="500"><![CDATA[
     BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
     Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
@@ -3339,7 +3339,8 @@ fn hidden_steps_and_display_labels_reach_the_stats_api() {
         panic!("HTTP API never came up; sipr stderr:\n{err}");
     }
     std::thread::sleep(Duration::from_millis(1500));
-    // The call is in its 3 s pause here; a sipr that has already exited
+    // The call is in its 8 s pause here (long enough for the queries below
+    // on a slow host; /quit ends the run); a sipr that has already exited
     // is the bug, and its stderr says why.
     if let Ok(Some(st)) = child.try_wait() {
         let err = stderr.join().expect("stderr");
