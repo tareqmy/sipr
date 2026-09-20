@@ -23,7 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/tareqmy/sipr/master/scripts/install
 
 The script detects the platform, downloads the matching release archive, and
 installs `sipr` into `/usr/local/bin` when that is writable, otherwise into
-`~/.local/bin`. Set `VERSION=v0.26.0` in the environment to pin a release.
+`~/.local/bin`. Set `VERSION=v0.27.0` in the environment to pin a release.
 Read the script before piping it to a shell; its checksum is in
 `scripts/install.sh.sha256`.
 

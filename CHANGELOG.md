@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-09-20
+
 ### Security
 
 - rustls updated to 0.23.45 for RUSTSEC-2026-0285 (TLS 1.3 handshake messages
@@ -34,6 +36,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - README rewritten to describe sipr's relationship to SIPp neutrally, state
   the benchmark numbers `benches/BASELINES.md` actually records, and list
   every deliberate compatibility gap.
+
+### Fixed
+
+- The call pacer now credits new calls from elapsed wall-clock time
+  (`rate × elapsed / rate_period`, as SIPp does) instead of counting timer
+  ticks, so a delayed or coalesced tick no longer lowers the achieved rate.
 
 ## [0.26.0] — 2026-09-19
 
@@ -513,7 +521,8 @@ library — no external crates.
   leftmost-longest — identical on the patterns real scenarios use; see
   `docs/SIPP_COMPAT.md` §6.
 
-[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/tareqmy/sipr/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/tareqmy/sipr/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/tareqmy/sipr/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/tareqmy/sipr/compare/v0.23.0...v0.24.0

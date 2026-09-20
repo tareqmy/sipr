@@ -2,7 +2,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>sipr</id>
-    <version>0.26.0</version>
+    <version>0.27.0</version>
     <title>sipr</title>
     <authors>tareqmy</authors>
     <projectUrl>https://github.com/tareqmy/sipr</projectUrl>
