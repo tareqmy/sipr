@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Statistics files at parity (M40): `-trace_stat` writes SIPp's full
+  column set (`StartTime` … `WatchdogMinor`, `ResponseTime<rtd>` mean and
+  standard deviation per RTD, `CallLength`, a repartition block per RTD
+  and for the call length, SIPp's time formats and trailing delimiter);
+  new `-trace_rtt`/`-rtt_freq`, `-trace_counts`, `-trace_error_codes`,
+  `-trace_screen`/`-screen_file`, `-stat_delimiter`, `-periodic_rtd` and
+  `-f`, all with SIPp's file names and formats.
 - Keyword parity (M39): `[clock_tick]`, `[timestamp]`, `[date]`,
   `[sipp_version]`, `[dynamic_id]`, `[remote_host]`, `[tdmmap]`,
   `[last_message]`, `[last_cseq_number]` (with `+N`/`-N`), `[fill
@@ -26,6 +33,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `-fd` defaults to 60 s as in SIPp (it was 1 s); the final statistics
+  row is still written at exit. The `-trace_stat` header changed from
+  sipr's earlier subset to SIPp's columns, so parsers keyed on column
+  position need SIPp's layout.
 - `--check` and the scenario screen label a distributed pause the way
   SIPp's screen does (`N(60000.000,15000.000)`, `Exp(…)`, `Wb(…)`, …).
 - The scenario-side positional form `distribution="uniform(200,3000)"`

@@ -488,7 +488,10 @@ fn trace_files_are_written() {
     );
     assert!(msg_content.contains("received from"), "inbound traced too");
     let csv_content = std::fs::read_to_string(dir.join(csv.expect("csv"))).expect("read csv");
-    assert!(csv_content.starts_with("CurrentTime;"), "csv header");
+    assert!(
+        csv_content.starts_with("StartTime;LastResetTime;CurrentTime;"),
+        "csv header:\n{csv_content}"
+    );
     assert!(csv_content.lines().count() >= 2, "csv rows:\n{csv_content}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -7046,4 +7049,151 @@ Content-Length: 0
             .all(|c| c.starts_with("0.9.1/") || c.starts_with("1.9.1/")),
         "{circuits:?}"
     );
+}
+
+/// The M40 statistics files: `-trace_stat` with SIPp's full column set,
+/// `-trace_rtt`, `-trace_counts`, `-trace_error_codes` and `-trace_screen`
+/// are all written, with SIPp's headers, names and delimiter handling.
+#[test]
+fn statistics_files_have_sipps_shape() {
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let dir = std::env::temp_dir().join(format!("sipr-statfiles-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .args([
+            "-sn",
+            "uac",
+            "-m",
+            "3",
+            "-r",
+            "10",
+            // Long enough for a -fd 1 dump before the final row.
+            "-d",
+            "2500",
+            "-timeout",
+            "15",
+            "-fd",
+            "1",
+            "-trace_stat",
+            "-trace_rtt",
+            "-rtt_freq",
+            "1",
+            "-trace_counts",
+            "-trace_error_codes",
+            "-trace_screen",
+            "-stat_delimiter",
+            ",",
+            "-bg",
+            &addr.to_string(),
+        ])
+        .output()
+        .expect("run sipr");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let read = |suffix: &str| -> String {
+        let name = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no *{suffix} in {}", dir.display()));
+        assert!(
+            name.starts_with("uac_"),
+            "SIPp names files <scenario>_<pid>_…: {name}"
+        );
+        std::fs::read_to_string(dir.join(name)).expect("read")
+    };
+    // -trace_stat: SIPp's header, the chosen delimiter, one RTD, the
+    // embedded scenario's repartitions, rows with the same column count.
+    let stat = read("_.csv");
+    let mut lines = stat.lines();
+    let header = lines.next().expect("header");
+    assert!(
+        header.starts_with("StartTime,LastResetTime,CurrentTime,ElapsedTime(P),"),
+        "{header}"
+    );
+    assert!(header.contains(",WatchdogMinor(C),ResponseTime1(P),ResponseTime1(C),ResponseTime1StDev(P),ResponseTime1StDev(C),CallLength(P),"), "{header}");
+    assert!(
+        header.contains(",ResponseTimeRepartition1,ResponseTimeRepartition1_<"),
+        "{header}"
+    );
+    assert!(
+        header.contains(",CallLengthRepartition,CallLengthRepartition_<"),
+        "{header}"
+    );
+    assert!(
+        header.ends_with(','),
+        "trailing delimiter like SIPp: {header}"
+    );
+    let rows: Vec<&str> = lines.collect();
+    assert!(rows.len() >= 2, "a -fd 1 row and the final row:\n{stat}");
+    for row in &rows {
+        assert_eq!(
+            row.matches(',').count(),
+            header.matches(',').count(),
+            "{row}"
+        );
+    }
+    let last: Vec<&str> = rows[rows.len() - 1].split(',').collect();
+    assert_eq!(last[12], "3", "TotalCallCreated: {stat}");
+    assert_eq!(last[15], "3", "SuccessfulCall(C): {stat}");
+    assert!(
+        last[3].starts_with("00:00:0"),
+        "ElapsedTime(P) hh:mm:ss: {}",
+        last[3]
+    );
+    assert!(
+        last[69].starts_with("00:00:00:"),
+        "ResponseTime1(C) hh:mm:ss:us: {}",
+        last[69]
+    );
+    // -trace_rtt: one row per rtd="true" response, flushed every -rtt_freq.
+    let rtt = read("_rtt.csv");
+    assert!(
+        rtt.starts_with("Date_ms,response_time_ms,rtd_no\n"),
+        "{rtt}"
+    );
+    let rtt_rows: Vec<&str> = rtt.lines().skip(1).collect();
+    assert_eq!(rtt_rows.len(), 3, "{rtt}");
+    assert!(rtt_rows.iter().all(|r| r.ends_with(",1")), "{rtt}");
+    // -trace_counts: per-step columns named by index and method/code.
+    let counts = read("_counts.csv");
+    let cheader = counts.lines().next().expect("counts header");
+    assert!(
+        cheader.starts_with(
+            "CurrentTime,ElapsedTime,0_INVITE_Sent,0_INVITE_Retrans,0_INVITE_Timeout,1_100_Recv,"
+        ),
+        "{cheader}"
+    );
+    let crow = counts.lines().last().expect("counts row");
+    assert_eq!(
+        crow.matches(',').count(),
+        cheader.matches(',').count(),
+        "{counts}"
+    );
+    assert!(crow.split(',').nth(2) == Some("3"), "INVITE sent 3: {crow}");
+    // -trace_error_codes: a row per dump, no codes on a clean run.
+    let codes = read("_error_codes.csv");
+    assert!(codes.lines().count() >= 1, "{codes}");
+    assert!(codes.lines().all(|l| l.ends_with(',')), "{codes}");
+    // -trace_screen: the three screens as text at exit.
+    let screens = read("_screens.log");
+    for want in [
+        "send INVITE",
+        "3 created",
+        "3 ok",
+        "RTD 1",
+        "Response time repartition",
+    ] {
+        assert!(
+            screens.contains(want),
+            "missing {want:?} in screens:\n{screens}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

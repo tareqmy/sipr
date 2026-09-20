@@ -567,11 +567,13 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
         Keyword::ClockTick => {
             let _ = write!(out, "{}", ctx.run.clock_tick);
         }
-        Keyword::Timestamp => out.push_str(&crate::clock::sipp_timestamp(
+        Keyword::Timestamp => out.push_str(&sipr_stats::clock::sipp_timestamp(
             std::time::SystemTime::now(),
             ctx.run.rfc3339,
         )),
-        Keyword::Date => out.push_str(&crate::clock::rfc1123_date(std::time::SystemTime::now())),
+        Keyword::Date => out.push_str(&sipr_stats::clock::rfc1123_date(
+            std::time::SystemTime::now(),
+        )),
         Keyword::SippVersion => out.push_str(env!("CARGO_PKG_VERSION")),
         Keyword::DynamicId => {
             let id = ctx.run.dynamic.map_or(0, DynamicId::take);

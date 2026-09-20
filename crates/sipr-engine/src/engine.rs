@@ -137,6 +137,20 @@ pub struct EngineConfig {
     pub tdm_map: Option<crate::tdm::TdmMap>,
     /// `-rfc3339`: `[timestamp]` in RFC 3339 form.
     pub rfc3339: bool,
+    /// `-f`: how often the screen snapshot and the `-bg` line refresh.
+    pub report_interval: Duration,
+    /// `-trace_rtt` destination.
+    pub trace_rtt: Option<std::path::PathBuf>,
+    /// `-trace_counts` destination.
+    pub trace_counts: Option<std::path::PathBuf>,
+    /// `-trace_error_codes` destination.
+    pub trace_error_codes: Option<std::path::PathBuf>,
+    /// `-rtt_freq`: buffered response times before a `-trace_rtt` flush.
+    pub rtt_freq: usize,
+    /// `-stat_delimiter`: the statistics files' column separator.
+    pub stat_delimiter: String,
+    /// `-periodic_rtd`: zero the repartition tables at every dump.
+    pub periodic_rtd: bool,
     /// `-tls_*` options; required when `transport` is [`TransportKind::TlsMono`].
     pub tls: Option<sipr_net::TlsConfig>,
     /// `-mi`: media address for `[media_ip]` and the RTP sockets (default:
@@ -265,6 +279,8 @@ pub struct RunReport {
     pub rtp_check_failed: u64,
     /// Wall-clock duration of the run.
     pub elapsed: Duration,
+    /// The screens' data at the end of the run (`-trace_screen`).
+    pub snapshot: Box<sipr_stats::Snapshot>,
 }
 
 impl RunReport {
@@ -824,6 +840,9 @@ struct Engine<'s> {
     trace_msg: Option<sipr_stats::TraceFile>,
     trace_err: Option<sipr_stats::TraceFile>,
     trace_stat: Option<sipr_stats::TraceFile>,
+    trace_rtt: Option<sipr_stats::TraceFile>,
+    trace_counts: Option<sipr_stats::TraceFile>,
+    trace_codes: Option<sipr_stats::TraceFile>,
     inf_files: Vec<std::cell::RefCell<InjectionFile>>,
     inf_seq: Vec<usize>,
     /// 3PCC twin control channel (`-3pcc`), when the scenario uses it.
@@ -1412,11 +1431,27 @@ impl<'s> Engine<'s> {
                 })
                 .transpose()
         };
+        let mut stat_set = new_stat_set(scenario);
+        stat_set.dump = sipr_stats::DumpOptions {
+            delimiter: config.stat_delimiter.clone(),
+            rfc3339: config.rfc3339,
+            periodic_rtd: config.periodic_rtd,
+            rtt_freq: config.rtt_freq,
+            trace_rtt: config.trace_rtt.is_some(),
+        };
         let mut trace_stat = open_trace(&config.trace_stat, "statistics")?;
         if let Some(f) = trace_stat.as_mut() {
-            f.write(&sipr_stats::StatSet::csv_header());
+            f.write(&stat_set.csv_header());
         }
-        let stat_set = new_stat_set(scenario);
+        let mut trace_rtt = open_trace(&config.trace_rtt, "rtt")?;
+        if let Some(f) = trace_rtt.as_mut() {
+            f.write(&stat_set.rtt_header());
+        }
+        let mut trace_counts = open_trace(&config.trace_counts, "counts")?;
+        if let Some(f) = trace_counts.as_mut() {
+            f.write(&stat_set.counts_header());
+        }
+        let trace_codes = open_trace(&config.trace_error_codes, "error codes")?;
         let secondary = secondary.map(|(kind, sc)| SecondaryScenario {
             kind,
             scenario: sc,
@@ -1452,6 +1487,9 @@ impl<'s> Engine<'s> {
             trace_msg: open_trace(&config.trace_msg, "message trace")?,
             trace_err: open_trace(&config.trace_err, "error trace")?,
             trace_stat,
+            trace_rtt,
+            trace_counts,
+            trace_codes,
             inf_files,
             inf_seq: vec![0; inf_len],
             twin,
@@ -1577,7 +1615,8 @@ impl<'s> Engine<'s> {
             // Closed-loop: replace any calls that just ended (no-op otherwise).
             self.refill_users();
             self.run_rate_ramp();
-            if last_line.elapsed() >= Duration::from_secs(1) {
+            self.flush_rtt(false);
+            if last_line.elapsed() >= self.config.report_interval {
                 last_line = Instant::now();
                 self.sample_media_counters();
                 if self.config.periodic_stats {
@@ -1585,29 +1624,24 @@ impl<'s> Engine<'s> {
                 }
                 self.publish_snapshot();
             }
-            if self.trace_stat.is_some() && last_stat_dump.elapsed() >= self.config.stat_interval {
+            if last_stat_dump.elapsed() >= self.config.stat_interval {
                 last_stat_dump = Instant::now();
-                let row = self.stats.csv_row(self.live_main());
-                if let Some(f) = self.trace_stat.as_mut() {
-                    f.write(&row);
-                    f.flush();
-                }
+                self.dump_statistics();
             }
         }
         self.control.stop_pacer.store(true, Ordering::Relaxed);
         self.sample_media_counters();
         self.collect_final_media_events();
-        // Final CSV row + flush all trace files.
-        if self.trace_stat.is_some() {
-            let row = self.stats.csv_row(self.live_main());
-            if let Some(f) = self.trace_stat.as_mut() {
-                f.write(&row);
-            }
-        }
+        // Final rows of every statistics file, then flush all trace files.
+        self.dump_statistics();
+        self.flush_rtt(true);
         for f in [
             &mut self.trace_msg,
             &mut self.trace_err,
             &mut self.trace_stat,
+            &mut self.trace_rtt,
+            &mut self.trace_counts,
+            &mut self.trace_codes,
         ]
         .into_iter()
         .flatten()
@@ -1629,6 +1663,7 @@ impl<'s> Engine<'s> {
             rtp_check_ok: self.stats.rtp_check_ok,
             rtp_check_failed: self.stats.rtp_check_failed,
             elapsed: started.elapsed(),
+            snapshot: Box::new(self.build_snapshot()),
         }
     }
 
@@ -1679,6 +1714,19 @@ impl<'s> Engine<'s> {
         if self.snapshot_tx.is_none() && self.control_snapshot.is_none() {
             return;
         }
+        let snap = self.build_snapshot();
+        if let Some(shared) = self.control_snapshot.as_ref()
+            && let Ok(mut slot) = shared.lock()
+        {
+            *slot = snap.clone();
+        }
+        if let Some(tx) = self.snapshot_tx.as_ref() {
+            let _ = tx.send(snap); // UI gone → ignored; run continues headless
+        }
+    }
+
+    /// The screens' data as of now (the TUI's, and `-trace_screen`'s at exit).
+    fn build_snapshot(&mut self) -> sipr_stats::Snapshot {
         // `set display ooc|rx` (SIPp `display_scenario`): every screen —
         // counters, statistics, repartitions and the scenario page — shows
         // the displayed scenario (`screen.cpp` reads `display_scenario->stats`
@@ -1720,13 +1768,45 @@ impl<'s> Engine<'s> {
                 / now.duration_since(last_at).as_secs_f64().max(1e-9);
         }
         self.last_snapshot = (now, shown.created());
-        if let Some(shared) = self.control_snapshot.as_ref()
-            && let Ok(mut slot) = shared.lock()
-        {
-            *slot = snap.clone();
+        snap
+    }
+
+    /// The `-fd` dump (SIPp `stattask::report`): a `-trace_stat` row, a
+    /// `-trace_counts` row and a `-trace_error_codes` row, then the period
+    /// ends. Nothing happens without one of the three files.
+    fn dump_statistics(&mut self) {
+        if self.trace_stat.is_none() && self.trace_counts.is_none() && self.trace_codes.is_none() {
+            return;
         }
-        if let Some(tx) = self.snapshot_tx.as_ref() {
-            let _ = tx.send(snap); // UI gone → ignored; run continues headless
+        let live = self.live_main();
+        let rate = self.control.rate();
+        let users = self.config.users;
+        if let Some(f) = self.trace_stat.as_mut() {
+            f.write(&self.stats.csv_row(live, rate, users));
+            f.flush();
+        }
+        if let Some(f) = self.trace_counts.as_mut() {
+            f.write(&self.stats.counts_row());
+            f.flush();
+        }
+        if let Some(f) = self.trace_codes.as_mut() {
+            f.write(&self.stats.error_codes_row());
+            f.flush();
+        }
+        self.stats.end_period();
+    }
+
+    /// Write the buffered `-trace_rtt` rows once `-rtt_freq` of them are
+    /// waiting (SIPp `computeRtt` → `dumpDataRtt`), or all of them when
+    /// `force` (the end of the run).
+    fn flush_rtt(&mut self, force: bool) {
+        if self.trace_rtt.is_none() || !(force || self.stats.rtt_due()) {
+            return;
+        }
+        let rows = self.stats.take_rtt_rows();
+        if let Some(f) = self.trace_rtt.as_mut() {
+            f.write(&rows);
+            f.flush();
         }
     }
 
@@ -2687,6 +2767,7 @@ impl<'s> Engine<'s> {
         self.trace_recv(packet);
         let Some(call_id) = msg.call_id().map(ToOwned::to_owned) else {
             self.stats.unexpected += 1;
+            self.stats.out_of_call_msgs += 1;
             return;
         };
         // Inbound retransmission dedupe (branch + CSeq + start line). SIPp
@@ -2763,6 +2844,7 @@ impl<'s> Engine<'s> {
                 // receive call even for a response, which then fails on it;
                 // sipr keeps discarding responses, as its UAS does.)
                 self.stats.unexpected += 1;
+                self.stats.out_of_call_msgs += 1;
                 self.log_err(&format!("out-of-call message ignored (Call-ID {call_id})"));
                 return;
             }
@@ -2795,7 +2877,9 @@ impl<'s> Engine<'s> {
         }
         if completing {
             // Timewait: absorb without failing (deadcall behavior).
-            self.stats_of(secondary).unexpected += 1;
+            let stats = self.stats_of(secondary);
+            stats.unexpected += 1;
+            stats.dead_call_msgs += 1;
             return;
         }
         let msg_hash = hash_bytes(&packet.raw);
@@ -2826,6 +2910,9 @@ impl<'s> Engine<'s> {
                 }
                 let stats = self.stats_of(secondary);
                 stats.unexpected += 1;
+                if let Some(code) = msg.status_code() {
+                    stats.record_error_code(code);
+                }
                 if let Some(s) = stats.step_mut(window_start) {
                     s.unexpected += 1;
                 }
@@ -4555,6 +4642,54 @@ fn test_truthy(v: &crate::actions::Value) -> bool {
 }
 
 /// Short display label for a step (scenario screen rows).
+/// RTD names in order of first appearance (`start_rtd=`, then `rtd=`, per
+/// step): SIPp numbers its RTDs by first mention in the scenario.
+fn rtd_names(scenario: &Scenario) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for step in &scenario.steps {
+        if let Some(c) = step_common(step) {
+            for n in [c.start_rtd.as_ref(), c.rtd.as_ref()].into_iter().flatten() {
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// What a step is for the `-trace_counts` columns (SIPp `print_count_file`:
+/// a send is named by its method or status code, a recv by what it expects).
+fn step_kind(step: &Step) -> sipr_stats::StepKind {
+    match step {
+        Step::Send(s) => {
+            let what = template_first_word(&s.template).unwrap_or_default();
+            let name = if what == "SIP/2.0" {
+                s.template
+                    .spans
+                    .first()
+                    .map_or(String::new(), |sp| match sp {
+                        Span::Lit(l) => l.split_whitespace().nth(1).unwrap_or("").to_owned(),
+                        Span::Kw(_) => String::new(),
+                    })
+            } else {
+                what
+            };
+            sipr_stats::StepKind::Send {
+                name,
+                retrans: s.retrans_ms.is_some(),
+            }
+        }
+        Step::Recv(r) => sipr_stats::StepKind::Recv {
+            name: match &r.expect {
+                Expect::Response(c) => c.clone(),
+                Expect::Request(m) => m.clone(),
+            },
+        },
+        _ => sipr_stats::StepKind::Other,
+    }
+}
+
 fn step_label(step: &Step) -> String {
     // `display="…"` replaces the derived label (SIPp shows it verbatim).
     if let Some(d) = step_common(step).and_then(|c| c.display.as_deref()) {
@@ -4766,6 +4901,8 @@ fn new_stat_set(scenario: &Scenario) -> sipr_stats::StatSet {
         &scenario.call_length_repartition,
     );
     stats.init_steps(scenario.steps.iter().map(step_label).collect());
+    stats.set_rtd_names(rtd_names(scenario));
+    stats.set_step_kinds(scenario.steps.iter().map(step_kind).collect());
     stats.set_step_hidden(
         scenario
             .steps
@@ -4813,6 +4950,15 @@ fn apply_rtds(
                 call.rtd_starts[pos].1 = now;
             } else {
                 call.rtd_starts.swap_remove(pos);
+            }
+        } else {
+            // No `start_rtd=` for this name: SIPp starts every RTD's clock
+            // when the call is created (`call::init`, `start_time_rtd[i] =
+            // getmicroseconds()`), so `rtd=` alone measures from call
+            // start — its own default UAC relies on that.
+            stats.record_rtd(name, now.saturating_duration_since(call.started));
+            if common.repeat_rtd {
+                call.rtd_starts.push((name.clone(), now));
             }
         }
     }

@@ -10,6 +10,7 @@
 //! SIPp-style `(P)`/`(C)` periodic/cumulative naming, semicolon-separated.
 //! Full column parity is a v1-polish item — recorded in SIPP_COMPAT §6.
 
+pub mod clock;
 mod histogram;
 mod snapshot;
 
@@ -17,6 +18,7 @@ pub use histogram::{Histogram, Repartition};
 pub use snapshot::{Display, RtdRow, Snapshot, StepRow, StepStats};
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -88,22 +90,109 @@ pub struct StatSet {
     pub response_repartition: Repartition,
     /// `CallLengthRepartition`.
     pub call_length_repartition: Repartition,
+    /// A response-time repartition per RTD name (SIPp keeps one table per
+    /// RTD; `response_repartition` above is RTD `1`'s, for the screen).
+    pub rtd_repartitions: HashMap<String, Repartition>,
+    /// RTD names in scenario order (SIPp numbers them by first appearance).
+    pub rtd_names: Vec<String>,
+    /// Messages for no live call (SIPp `OutOfCallMsgs`).
+    pub out_of_call_msgs: u64,
+    /// Messages absorbed by a call in timewait (SIPp `DeadCallMsgs`).
+    pub dead_call_msgs: u64,
+    /// Response codes of unexpected messages since the last dump
+    /// (`-trace_error_codes`).
+    pub error_codes: Vec<u16>,
     /// Per-step counters (scenario screen).
     pub steps: Vec<StepStats>,
     /// Short per-step labels, set once by the engine.
     pub step_labels: Vec<String>,
     /// Per-step `hide` flags, parallel to `step_labels`.
     pub step_hidden: Vec<bool>,
-    // Snapshot of cumulative values at the last CSV dump, for (P) columns.
-    last_dump: PeriodSnapshot,
+    /// What each step is, for the `-trace_counts` columns.
+    pub step_kinds: Vec<StepKind>,
+    /// Delimiter, timestamp form and periodic-repartition switch of the
+    /// statistics files.
+    pub dump: DumpOptions,
+    /// When the run started, wall clock (`StartTime`).
+    start_time: SystemTime,
+    /// When the current period started (`LastResetTime`).
+    period_start_time: SystemTime,
+    period_start: Instant,
+    /// Cumulative counters at the last dump: the `(P)` columns are the
+    /// difference (SIPp resets its PL counters at every dump).
+    last_dump: Counters,
+    /// This period's response-time and call-length samples.
+    rtd_period: HashMap<String, Histogram>,
+    call_length_period: Histogram,
+    /// Buffered `-trace_rtt` rows: (seconds since start, rtt in seconds,
+    /// rtd name).
+    rtt_rows: Vec<(f64, f64, String)>,
 }
 
+/// What a scenario step is, for the `-trace_counts` columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepKind {
+    /// A send: the method, or the status code of a response; `retrans` is
+    /// whether the step carries `retrans=` (SIPp adds a `Timeout` column).
+    Send {
+        /// Method or status code.
+        name: String,
+        /// `retrans=` set.
+        retrans: bool,
+    },
+    /// A recv: the method or status code expected.
+    Recv {
+        /// Method or status code.
+        name: String,
+    },
+    /// Anything else (pause, nop, label, …): no columns.
+    Other,
+}
+
+/// How the statistics files are written.
+#[derive(Debug, Clone)]
+pub struct DumpOptions {
+    /// `-stat_delimiter` (SIPp's default `;`).
+    pub delimiter: String,
+    /// `-rfc3339`: the time columns' form.
+    pub rfc3339: bool,
+    /// `-periodic_rtd`: zero the repartition tables at every dump.
+    pub periodic_rtd: bool,
+    /// `-rtt_freq`: buffered `-trace_rtt` rows before a flush.
+    pub rtt_freq: usize,
+    /// `-trace_rtt` is on: keep the per-response rows.
+    pub trace_rtt: bool,
+}
+
+impl Default for DumpOptions {
+    fn default() -> Self {
+        Self {
+            delimiter: ";".to_owned(),
+            rfc3339: false,
+            periodic_rtd: false,
+            rtt_freq: 200,
+            trace_rtt: false,
+        }
+    }
+}
+
+/// The cumulative counters a dump reads, snapshotted per period.
 #[derive(Debug, Default, Clone, Copy)]
-struct PeriodSnapshot {
-    at_elapsed: Duration,
-    created: u64,
+struct Counters {
+    incoming: u64,
+    outgoing: u64,
     successful: u64,
     failed: u64,
+    cannot_send: u64,
+    max_retrans: u64,
+    tcp_connect: u64,
+    tcp_closed: u64,
+    unexpected_msg: u64,
+    timeout: u64,
+    out_of_call: u64,
+    dead_call: u64,
+    retrans: u64,
+    auto_answered: u64,
 }
 
 impl StatSet {
@@ -144,20 +233,39 @@ impl StatSet {
             steps: Vec::new(),
             step_labels: Vec::new(),
             step_hidden: Vec::new(),
-            last_dump: PeriodSnapshot::default(),
+            rtd_repartitions: HashMap::new(),
+            rtd_names: Vec::new(),
+            out_of_call_msgs: 0,
+            dead_call_msgs: 0,
+            error_codes: Vec::new(),
+            step_kinds: Vec::new(),
+            dump: DumpOptions::default(),
+            start_time: SystemTime::now(),
+            period_start_time: SystemTime::now(),
+            period_start: Instant::now(),
+            last_dump: Counters::default(),
+            rtd_period: HashMap::new(),
+            call_length_period: Histogram::new(),
+            rtt_rows: Vec::new(),
         }
     }
 
-    /// Zero every cumulative counter and histogram (SIPp `reset stats`,
-    /// `E_RESET_C_COUNTERS`). The run start and step labels are kept.
+    /// Zero every counter (SIPp's `set reset`), keeping the scenario-shaped
+    /// data: step labels, kinds and hide flags, RTD names, dump options.
     pub fn reset(&mut self) {
         let labels = std::mem::take(&mut self.step_labels);
         let hidden = std::mem::take(&mut self.step_hidden);
+        let kinds = std::mem::take(&mut self.step_kinds);
+        let rtd_names = std::mem::take(&mut self.rtd_names);
+        let dump = self.dump.clone();
         let response_bounds = self.response_repartition.bounds();
         let call_length_bounds = self.call_length_repartition.bounds();
         *self = Self::new(&response_bounds, &call_length_bounds);
         self.init_steps(labels);
         self.step_hidden = hidden;
+        self.step_kinds = kinds;
+        self.rtd_names = rtd_names;
+        self.dump = dump;
     }
 
     /// Size the per-step table and install display labels (engine, once).
@@ -195,18 +303,93 @@ impl StatSet {
             + self.failed_cannot_send
     }
 
-    /// Record an RTD stop for `name`.
+    /// A response time for RTD `name` (`rtd=` closed a `start_rtd=`).
     pub fn record_rtd(&mut self, name: &str, d: Duration) {
         self.rtd.entry(name.to_owned()).or_default().record(d);
+        self.rtd_period
+            .entry(name.to_owned())
+            .or_default()
+            .record(d);
         if name == "1" {
             self.response_repartition.record(d);
         }
+        let bounds = self.response_repartition.bounds();
+        self.rtd_repartitions
+            .entry(name.to_owned())
+            .or_insert_with(|| Repartition::new(&bounds))
+            .record(d);
+        if !self.rtd_names.iter().any(|n| n == name) {
+            self.rtd_names.push(name.to_owned());
+        }
+        if self.dump.trace_rtt {
+            // SIPp `computeRtt`: the stop time and the rtt, both in seconds
+            // (its columns say ms; the values are divided by 1000).
+            self.rtt_rows.push((
+                self.started.elapsed().as_secs_f64(),
+                d.as_secs_f64(),
+                name.to_owned(),
+            ));
+        }
     }
 
-    /// Record a finished call's duration.
+    /// A finished call's duration.
     pub fn record_call_length(&mut self, d: Duration) {
         self.call_length.record(d);
+        self.call_length_period.record(d);
         self.call_length_repartition.record(d);
+    }
+
+    /// An unexpected response's status code, for `-trace_error_codes`.
+    pub fn record_error_code(&mut self, code: u16) {
+        self.error_codes.push(code);
+    }
+
+    /// Name the RTDs in scenario order before any is recorded, so the CSV
+    /// columns follow SIPp's numbering (first appearance).
+    pub fn set_rtd_names(&mut self, names: Vec<String>) {
+        self.rtd_names = names;
+    }
+
+    /// What each step is, in step order (`-trace_counts` columns).
+    pub fn set_step_kinds(&mut self, kinds: Vec<StepKind>) {
+        self.step_kinds = kinds;
+    }
+
+    fn counters(&self) -> Counters {
+        Counters {
+            incoming: self.incoming_created,
+            outgoing: self.outgoing_created,
+            successful: self.successful,
+            failed: self.failed(),
+            cannot_send: self.failed_cannot_send,
+            max_retrans: self.failed_retrans,
+            tcp_connect: self.failed_tcp_connect,
+            tcp_closed: self.failed_tcp_closed,
+            unexpected_msg: self.failed_unexpected,
+            timeout: self.failed_timeout,
+            out_of_call: self.out_of_call_msgs,
+            dead_call: self.dead_call_msgs,
+            retrans: self.retrans_sent,
+            auto_answered: self.auto_answered,
+        }
+    }
+
+    /// Close the statistics period after a dump (SIPp `E_RESET_PL_COUNTERS`):
+    /// the `(P)` baselines move, the period histograms empty, and with
+    /// `-periodic_rtd` the repartition tables zero.
+    pub fn end_period(&mut self) {
+        self.last_dump = self.counters();
+        self.period_start_time = SystemTime::now();
+        self.period_start = Instant::now();
+        self.rtd_period.clear();
+        self.call_length_period = Histogram::new();
+        if self.dump.periodic_rtd {
+            self.response_repartition.reset();
+            self.call_length_repartition.reset();
+            for r in self.rtd_repartitions.values_mut() {
+                r.reset();
+            }
+        }
     }
 
     /// One-line human summary (used by `-bg` and the final report).
@@ -256,63 +439,410 @@ impl StatSet {
         )
     }
 
-    /// The CSV header row (write once when creating the file).
+    /// The `-trace_stat` header: SIPp's `CStat::dumpData` columns in its
+    /// order — the fixed counter set, `ResponseTime<rtd>` mean and standard
+    /// deviation per RTD, `CallLength`, then a repartition block per RTD and
+    /// for the call length (each a name column plus `_<b` … `_>=last`).
     #[must_use]
-    pub fn csv_header() -> String {
-        "CurrentTime;ElapsedTime(C);ElapsedTime(P);CallRate(P);CallRate(C);\
-         IncomingCall(C);OutgoingCall(C);TotalCallCreated;CurrentCall;\
-         SuccessfulCall(P);SuccessfulCall(C);FailedCall(P);FailedCall(C);\
-         Retransmissions(C);AutoAnswered(C);UnexpectedMessage(C);\
-         ResponseTime1(C)ms;ResponseTime1StDev(C)ms;ResponseTime1Max(C)ms;\
-         CallLength(C)ms\n"
-            .to_owned()
+    pub fn csv_header(&self) -> String {
+        let d = self.dump.delimiter.as_str();
+        let mut out = String::new();
+        for name in CSV_FIXED_COLUMNS {
+            out.push_str(name);
+            out.push_str(d);
+        }
+        for rtd in &self.rtd_names {
+            for col in [
+                format!("ResponseTime{rtd}(P)"),
+                format!("ResponseTime{rtd}(C)"),
+                format!("ResponseTime{rtd}StDev(P)"),
+                format!("ResponseTime{rtd}StDev(C)"),
+            ] {
+                out.push_str(&col);
+                out.push_str(d);
+            }
+        }
+        for col in [
+            "CallLength(P)",
+            "CallLength(C)",
+            "CallLengthStDev(P)",
+            "CallLengthStDev(C)",
+        ] {
+            out.push_str(col);
+            out.push_str(d);
+        }
+        let response_bounds = self.response_repartition.bounds();
+        for rtd in &self.rtd_names {
+            out.push_str(&repartition_header(
+                &format!("ResponseTimeRepartition{rtd}"),
+                &response_bounds,
+                d,
+            ));
+        }
+        out.push_str(&repartition_header(
+            "CallLengthRepartition",
+            &self.call_length_repartition.bounds(),
+            d,
+        ));
+        out.push('\n');
+        out
     }
 
-    /// Produce the next CSV row and roll the period snapshot.
-    pub fn csv_row(&mut self, live: usize) -> String {
+    /// One `-trace_stat` row. `target` is the `-r` rate (or the `-users`
+    /// count, which SIPp prints instead when in users mode), `live` the
+    /// current calls. The caller ends the period afterwards.
+    #[must_use]
+    pub fn csv_row(&self, live: usize, target: f64, users: Option<usize>) -> String {
+        let d = self.dump.delimiter.as_str();
+        let now = SystemTime::now();
         let elapsed = self.started.elapsed();
-        let period = elapsed.saturating_sub(self.last_dump.at_elapsed);
-        let period_s = period.as_secs_f64().max(1e-9);
-        let created = self.created();
-        let d_created = created - self.last_dump.created;
-        let d_ok = self.successful - self.last_dump.successful;
-        let d_failed = self.failed() - self.last_dump.failed;
+        let period = self.period_start.elapsed();
+        let cur = self.counters();
+        let last = self.last_dump;
+        let p = |now: u64, then: u64| now.saturating_sub(then);
         #[allow(clippy::cast_precision_loss)]
-        let rate_p = d_created as f64 / period_s;
+        let rate_p = p(cur.incoming + cur.outgoing, last.incoming + last.outgoing) as f64
+            / period.as_secs_f64().max(1e-9);
         #[allow(clippy::cast_precision_loss)]
-        let rate_c = created as f64 / elapsed.as_secs_f64().max(1e-9);
-        let epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or_default();
-        let rtd1 = self.rtd.get("1");
-        let (r_avg, r_dev, r_max) =
-            rtd1.map_or((0.0, 0.0, 0), |h| (h.mean_ms(), h.stddev_ms(), h.max_ms()));
-        self.last_dump = PeriodSnapshot {
-            at_elapsed: elapsed,
-            created,
-            successful: self.successful,
-            failed: self.failed(),
-        };
-        format!(
-            "{epoch:.3};{:.3};{:.3};{rate_p:.3};{rate_c:.3};{};{};{created};{live};\
-             {d_ok};{};{d_failed};{};{};{};{};{r_avg:.3};{r_dev:.3};{r_max};{:.3}\n",
-            elapsed.as_secs_f64(),
-            period.as_secs_f64(),
-            self.incoming_created,
-            self.outgoing_created,
-            self.successful,
-            self.failed(),
-            self.retrans_sent + self.retrans_recv,
-            self.auto_answered,
-            self.unexpected,
-            self.call_length.mean_ms(),
-        )
+        let rate_c = (cur.incoming + cur.outgoing) as f64 / elapsed.as_secs_f64().max(1e-9);
+        let mut cols: Vec<String> = vec![
+            clock::sipp_timestamp(self.start_time, self.dump.rfc3339),
+            clock::sipp_timestamp(self.period_start_time, self.dump.rfc3339),
+            clock::sipp_timestamp(now, self.dump.rfc3339),
+            hhmmss(period),
+            hhmmss(elapsed),
+            match users {
+                Some(u) => u.to_string(),
+                None => format!("{target:.3}"),
+            },
+            format!("{rate_p:.3}"),
+            format!("{rate_c:.3}"),
+        ];
+        // A `(P)`/`(C)` pair: the period delta, then the cumulative value.
+        fn pc(cols: &mut Vec<String>, now: u64, then: u64) {
+            cols.push(now.saturating_sub(then).to_string());
+            cols.push(now.to_string());
+        }
+        pc(&mut cols, cur.incoming, last.incoming);
+        pc(&mut cols, cur.outgoing, last.outgoing);
+        cols.push((cur.incoming + cur.outgoing).to_string());
+        cols.push(live.to_string());
+        pc(&mut cols, cur.successful, last.successful);
+        pc(&mut cols, cur.failed, last.failed);
+        pc(&mut cols, cur.cannot_send, last.cannot_send);
+        pc(&mut cols, cur.max_retrans, last.max_retrans);
+        pc(&mut cols, cur.tcp_connect, last.tcp_connect);
+        pc(&mut cols, cur.tcp_closed, last.tcp_closed);
+        pc(&mut cols, cur.unexpected_msg, last.unexpected_msg);
+        // FailedCallRejected, FailedCmdNotSent, FailedRegexp{DoesntMatch,
+        // ShouldntMatch,HdrNotFound}, FailedOutboundCongestion: no sipr
+        // counter, always 0 (SIPP_COMPAT §6).
+        for _ in 0..6 {
+            pc(&mut cols, 0, 0);
+        }
+        pc(&mut cols, cur.timeout, last.timeout);
+        // FailedTimeoutOnSend, FailedTest*, FailedStrcmp*: 0.
+        for _ in 0..5 {
+            pc(&mut cols, 0, 0);
+        }
+        pc(&mut cols, cur.out_of_call, last.out_of_call);
+        pc(&mut cols, cur.dead_call, last.dead_call);
+        pc(&mut cols, cur.retrans, last.retrans);
+        pc(&mut cols, cur.auto_answered, last.auto_answered);
+        // Warnings, FatalErrors, WatchdogMajor, WatchdogMinor: 0.
+        for _ in 0..4 {
+            pc(&mut cols, 0, 0);
+        }
+        for rtd in &self.rtd_names {
+            let period = self.rtd_period.get(rtd);
+            let total = self.rtd.get(rtd);
+            cols.push(hhmmss_us(period.map_or(0.0, Histogram::mean_ms)));
+            cols.push(hhmmss_us(total.map_or(0.0, Histogram::mean_ms)));
+            cols.push(hhmmss_us(period.map_or(0.0, Histogram::stddev_ms)));
+            cols.push(hhmmss_us(total.map_or(0.0, Histogram::stddev_ms)));
+        }
+        cols.push(hhmmss_us(self.call_length_period.mean_ms()));
+        cols.push(hhmmss_us(self.call_length.mean_ms()));
+        cols.push(hhmmss_us(self.call_length_period.stddev_ms()));
+        cols.push(hhmmss_us(self.call_length.stddev_ms()));
+        let mut out = cols.join(d);
+        out.push_str(d);
+        let response_bounds = self.response_repartition.bounds();
+        for rtd in &self.rtd_names {
+            let rows = self.rtd_repartitions.get(rtd).map_or_else(
+                || Repartition::new(&response_bounds).rows(),
+                Repartition::rows,
+            );
+            out.push_str(&repartition_values(&rows, d));
+        }
+        out.push_str(&repartition_values(&self.call_length_repartition.rows(), d));
+        out.push('\n');
+        out
+    }
+
+    /// The `-trace_counts` header (SIPp `print_count_file(header)`): time,
+    /// elapsed, then per visible step `<index>_<name>_Sent`/`_Retrans`
+    /// (+ `_Timeout` when the send has `retrans=`) for sends and
+    /// `_Recv`/`_Retrans`/`_Timeout`/`_Unexp` for recvs.
+    #[must_use]
+    pub fn counts_header(&self) -> String {
+        let d = self.dump.delimiter.as_str();
+        let mut out = format!("CurrentTime{d}ElapsedTime{d}");
+        for (i, kind) in self.step_kinds.iter().enumerate() {
+            if self.step_hidden.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            match kind {
+                StepKind::Send { name, retrans } => {
+                    let _ = write!(out, "{i}_{name}_Sent{d}{i}_{name}_Retrans{d}");
+                    if *retrans {
+                        let _ = write!(out, "{i}_{name}_Timeout{d}");
+                    }
+                }
+                StepKind::Recv { name } => {
+                    let _ = write!(
+                        out,
+                        "{i}_{name}_Recv{d}{i}_{name}_Retrans{d}{i}_{name}_Timeout{d}{i}_{name}_Unexp{d}"
+                    );
+                }
+                StepKind::Other => {}
+            }
+        }
+        out.push('\n');
+        out
+    }
+
+    /// One `-trace_counts` row: the per-step counters, cumulative.
+    #[must_use]
+    pub fn counts_row(&self) -> String {
+        let d = self.dump.delimiter.as_str();
+        let mut out = format!(
+            "{}{d}{}{d}",
+            clock::sipp_timestamp(SystemTime::now(), self.dump.rfc3339),
+            hhmmss_us(self.started.elapsed().as_secs_f64() * 1000.0)
+        );
+        for (i, kind) in self.step_kinds.iter().enumerate() {
+            if self.step_hidden.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let st = self.steps.get(i).cloned().unwrap_or_default();
+            match kind {
+                StepKind::Send { retrans, .. } => {
+                    let _ = write!(out, "{}{d}{}{d}", st.sent, st.retrans);
+                    if *retrans {
+                        let _ = write!(out, "{}{d}", st.timeouts);
+                    }
+                }
+                StepKind::Recv { .. } => {
+                    let _ = write!(
+                        out,
+                        "{}{d}{}{d}{}{d}{}{d}",
+                        st.recv, st.retrans, st.timeouts, st.unexpected
+                    );
+                }
+                StepKind::Other => {}
+            }
+        }
+        out.push('\n');
+        out
+    }
+
+    /// One `-trace_error_codes` row (SIPp `print_error_codes_file`): time,
+    /// elapsed, then the unexpected response codes since the last row,
+    /// comma-terminated, newest first as SIPp pops them. Takes the codes.
+    pub fn error_codes_row(&mut self) -> String {
+        let d = self.dump.delimiter.as_str();
+        let mut out = format!(
+            "{}{d}{}{d}",
+            clock::sipp_timestamp(SystemTime::now(), self.dump.rfc3339),
+            hhmmss_us(self.started.elapsed().as_secs_f64() * 1000.0)
+        );
+        for code in self.error_codes.drain(..).rev() {
+            let _ = write!(out, "{code},");
+        }
+        out.push('\n');
+        out
+    }
+
+    /// The `-trace_rtt` header (`CStat::dumpDataRtt`).
+    #[must_use]
+    pub fn rtt_header(&self) -> String {
+        let d = self.dump.delimiter.as_str();
+        format!("Date_ms{d}response_time_ms{d}rtd_no\n")
+    }
+
+    /// Whether enough `-trace_rtt` rows are buffered for a flush
+    /// (`-rtt_freq`).
+    #[must_use]
+    pub fn rtt_due(&self) -> bool {
+        self.rtt_rows.len() >= self.dump.rtt_freq.max(1)
+    }
+
+    /// The buffered `-trace_rtt` rows, taken; empty when there are none.
+    pub fn take_rtt_rows(&mut self) -> String {
+        let d = self.dump.delimiter.as_str();
+        let mut out = String::new();
+        for (date, rtt, rtd) in self.rtt_rows.drain(..) {
+            let _ = writeln!(out, "{}{d}{}{d}{rtd}", g6(date), g6(rtt));
+        }
+        out
     }
 }
 
 /// Buffered line writer for trace files; write failures degrade to a
 /// one-time warning rather than killing the run.
+/// SIPp's fixed `-trace_stat` columns, before the per-RTD ones.
+const CSV_FIXED_COLUMNS: &[&str] = &[
+    "StartTime",
+    "LastResetTime",
+    "CurrentTime",
+    "ElapsedTime(P)",
+    "ElapsedTime(C)",
+    "TargetRate",
+    "CallRate(P)",
+    "CallRate(C)",
+    "IncomingCall(P)",
+    "IncomingCall(C)",
+    "OutgoingCall(P)",
+    "OutgoingCall(C)",
+    "TotalCallCreated",
+    "CurrentCall",
+    "SuccessfulCall(P)",
+    "SuccessfulCall(C)",
+    "FailedCall(P)",
+    "FailedCall(C)",
+    "FailedCannotSendMessage(P)",
+    "FailedCannotSendMessage(C)",
+    "FailedMaxUDPRetrans(P)",
+    "FailedMaxUDPRetrans(C)",
+    "FailedTcpConnect(P)",
+    "FailedTcpConnect(C)",
+    "FailedTcpClosed(P)",
+    "FailedTcpClosed(C)",
+    "FailedUnexpectedMessage(P)",
+    "FailedUnexpectedMessage(C)",
+    "FailedCallRejected(P)",
+    "FailedCallRejected(C)",
+    "FailedCmdNotSent(P)",
+    "FailedCmdNotSent(C)",
+    "FailedRegexpDoesntMatch(P)",
+    "FailedRegexpDoesntMatch(C)",
+    "FailedRegexpShouldntMatch(P)",
+    "FailedRegexpShouldntMatch(C)",
+    "FailedRegexpHdrNotFound(P)",
+    "FailedRegexpHdrNotFound(C)",
+    "FailedOutboundCongestion(P)",
+    "FailedOutboundCongestion(C)",
+    "FailedTimeoutOnRecv(P)",
+    "FailedTimeoutOnRecv(C)",
+    "FailedTimeoutOnSend(P)",
+    "FailedTimeoutOnSend(C)",
+    "FailedTestDoesntMatch(P)",
+    "FailedTestDoesntMatch(C)",
+    "FailedTestShouldntMatch(P)",
+    "FailedTestShouldntMatch(C)",
+    "FailedStrcmpDoesntMatch(P)",
+    "FailedStrcmpDoesntMatch(C)",
+    "FailedStrcmpShouldntMatch(P)",
+    "FailedStrcmpShouldntMatch(C)",
+    "OutOfCallMsgs(P)",
+    "OutOfCallMsgs(C)",
+    "DeadCallMsgs(P)",
+    "DeadCallMsgs(C)",
+    "Retransmissions(P)",
+    "Retransmissions(C)",
+    "AutoAnswered(P)",
+    "AutoAnswered(C)",
+    "Warnings(P)",
+    "Warnings(C)",
+    "FatalErrors(P)",
+    "FatalErrors(C)",
+    "WatchdogMajor(P)",
+    "WatchdogMajor(C)",
+    "WatchdogMinor(P)",
+    "WatchdogMinor(C)",
+];
+
+/// SIPp `sRepartitionHeader`: `Name;Name_<b0;…;Name_<bn;Name_>=bn;` — the
+/// name column, one `<bound` column per bound, one `>=last`. Empty
+/// without bounds.
+fn repartition_header(name: &str, bounds: &[u64], d: &str) -> String {
+    let Some(last) = bounds.last() else {
+        return String::new();
+    };
+    let mut out = format!("{name}{d}");
+    for b in bounds {
+        let _ = write!(out, "{name}_<{b}{d}");
+    }
+    let _ = write!(out, "{name}_>={last}{d}");
+    out
+}
+
+/// SIPp `sRepartitionInfo`: an empty name column, then the counts.
+fn repartition_values(rows: &[(String, u64)], d: &str) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = d.to_owned();
+    for (_, n) in rows {
+        let _ = write!(out, "{n}{d}");
+    }
+    out
+}
+
+/// SIPp `msToHHMMSS`: `hh:mm:ss`.
+#[must_use]
+pub fn hhmmss(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+}
+
+/// SIPp `msToHHMMSSus`: `hh:mm:ss:uuuuuu` of a millisecond count (the
+/// microseconds are the leftover milliseconds × 1000).
+#[must_use]
+pub fn hhmmss_us(ms: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ms = if ms.is_nan() || ms < 0.0 {
+        0
+    } else {
+        ms as u64
+    };
+    let s = ms / 1000;
+    format!(
+        "{:02}:{:02}:{:02}:{:06}",
+        s / 3600,
+        s % 3600 / 60,
+        s % 60,
+        (ms % 1000) * 1000
+    )
+}
+
+/// A double as a C++ `ostream` prints it by default (`%g`, six significant
+/// digits, no trailing zeros), for the `-trace_rtt` rows.
+#[must_use]
+pub fn g6(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_owned();
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let magnitude = v.abs().log10().floor() as i32;
+    if !(-5..6).contains(&magnitude) {
+        let s = format!("{v:.5e}");
+        // Rust's `1.5e-1` → C's `1.5e-01`.
+        let (mant, exp) = s.split_once('e').unwrap_or((&s, "0"));
+        let mant = mant.trim_end_matches('0').trim_end_matches('.');
+        let e: i32 = exp.parse().unwrap_or(0);
+        return format!("{mant}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs());
+    }
+    let decimals = usize::try_from(5 - magnitude).unwrap_or(0);
+    let s = format!("{v:.decimals$}");
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        s
+    }
+}
+
 pub struct TraceFile {
     writer: Option<std::io::BufWriter<std::fs::File>>,
     path: PathBuf,
@@ -382,20 +912,164 @@ mod tests {
     }
 
     #[test]
+    fn csv_header_is_sipps_column_set() {
+        let mut s = StatSet::new(&[10, 100], &[500]);
+        s.set_rtd_names(vec!["1".to_owned(), "setup".to_owned()]);
+        let header = s.csv_header();
+        let cols: Vec<&str> = header.trim_end().split(';').collect();
+        // SIPp writes a trailing delimiter, so the last split is empty.
+        assert_eq!(cols.last(), Some(&""));
+        assert_eq!(&cols[..3], &["StartTime", "LastResetTime", "CurrentTime"]);
+        assert_eq!(cols[67], "WatchdogMinor(C)");
+        assert_eq!(cols[68], "ResponseTime1(P)");
+        assert_eq!(cols[71], "ResponseTime1StDev(C)");
+        assert_eq!(cols[72], "ResponseTimesetup(P)");
+        assert_eq!(cols[76], "CallLength(P)");
+        assert_eq!(cols[79], "CallLengthStDev(C)");
+        assert_eq!(
+            &cols[80..84],
+            &[
+                "ResponseTimeRepartition1",
+                "ResponseTimeRepartition1_<10",
+                "ResponseTimeRepartition1_<100",
+                "ResponseTimeRepartition1_>=100"
+            ]
+        );
+        assert_eq!(cols[84], "ResponseTimeRepartitionsetup");
+        assert_eq!(
+            &cols[88..91],
+            &[
+                "CallLengthRepartition",
+                "CallLengthRepartition_<500",
+                "CallLengthRepartition_>=500"
+            ]
+        );
+        assert_eq!(cols.len(), 92);
+        // Every row has exactly the header's columns.
+        s.outgoing_created = 5;
+        s.successful = 4;
+        s.failed_timeout = 1;
+        s.record_rtd("1", Duration::from_millis(25));
+        s.record_rtd("setup", Duration::from_millis(250));
+        s.record_call_length(Duration::from_millis(600));
+        let row = s.csv_row(2, 10.0, None);
+        let vals: Vec<&str> = row.trim_end().split(';').collect();
+        assert_eq!(vals.len(), cols.len(), "{header}{row}");
+        assert_eq!(vals[5], "10.000", "TargetRate");
+        assert_eq!(vals[10], "5", "OutgoingCall(P)");
+        assert_eq!(vals[12], "5", "TotalCallCreated");
+        assert_eq!(vals[13], "2", "CurrentCall");
+        assert_eq!(vals[15], "4", "SuccessfulCall(C)");
+        assert_eq!(vals[41], "1", "FailedTimeoutOnRecv(C)");
+        assert_eq!(vals[68], "00:00:00:025000", "ResponseTime1(P)");
+        assert_eq!(vals[73], "00:00:00:250000", "ResponseTimesetup(C)");
+        assert_eq!(vals[77], "00:00:00:600000", "CallLength(C)");
+        assert_eq!(&vals[80..84], &["", "0", "1", "0"], "rtd 1 repartition");
+        assert_eq!(&vals[88..91], &["", "0", "1"], "call length repartition");
+        // -users prints the user count where the rate goes.
+        let row = s.csv_row(2, 10.0, Some(7));
+        assert_eq!(row.split(';').nth(5), Some("7"));
+    }
+
+    #[test]
     fn csv_periods_roll() {
         let mut s = StatSet::new(&[], &[]);
         s.outgoing_created = 5;
         s.successful = 5;
-        let header = StatSet::csv_header();
-        assert!(header.contains("SuccessfulCall(P);SuccessfulCall(C)"));
-        let row1 = s.csv_row(0);
-        assert_eq!(row1.matches(';').count(), header.matches(';').count());
-        // Second period with no new completions: periodic column reads 0.
-        let row2 = s.csv_row(0);
-        let cols: Vec<&str> = row2.split(';').collect();
-        // SuccessfulCall(P) is column index 9.
-        assert_eq!(cols[9], "0", "row2: {row2}");
-        assert_eq!(cols[10], "5", "cumulative stays: {row2}");
+        s.record_rtd("1", Duration::from_millis(40));
+        let row1 = s.csv_row(0, 1.0, None);
+        s.end_period();
+        // Second period with no new completions: periodic columns read 0,
+        // cumulative ones stay; the period RTD mean is empty, the total not.
+        let row2 = s.csv_row(0, 1.0, None);
+        let c1: Vec<&str> = row1.split(';').collect();
+        let c2: Vec<&str> = row2.split(';').collect();
+        assert_eq!(c1[14], "5", "SuccessfulCall(P) first period: {row1}");
+        assert_eq!(c2[14], "0", "SuccessfulCall(P) second period: {row2}");
+        assert_eq!(c2[15], "5", "SuccessfulCall(C): {row2}");
+        assert_eq!(c1[68], "00:00:00:040000");
+        assert_eq!(c2[68], "00:00:00:000000");
+        assert_eq!(c2[69], "00:00:00:040000");
+    }
+
+    #[test]
+    fn periodic_rtd_zeroes_the_repartitions() {
+        let mut s = StatSet::new(&[50], &[]);
+        s.dump.periodic_rtd = true;
+        s.record_rtd("1", Duration::from_millis(10));
+        assert_eq!(s.response_repartition.rows()[0].1, 1);
+        s.end_period();
+        assert_eq!(s.response_repartition.rows()[0].1, 0);
+        assert_eq!(s.rtd_repartitions["1"].rows()[0].1, 0);
+    }
+
+    #[test]
+    fn counts_file_follows_sipps_columns() {
+        let mut s = StatSet::new(&[], &[]);
+        s.init_steps(vec!["a".into(), "b".into(), "c".into(), "d".into()]);
+        s.set_step_kinds(vec![
+            StepKind::Send {
+                name: "INVITE".into(),
+                retrans: true,
+            },
+            StepKind::Recv { name: "200".into() },
+            StepKind::Other,
+            StepKind::Send {
+                name: "200".into(),
+                retrans: false,
+            },
+        ]);
+        s.set_step_hidden(vec![false, false, false, true]);
+        assert_eq!(
+            s.counts_header(),
+            "CurrentTime;ElapsedTime;0_INVITE_Sent;0_INVITE_Retrans;0_INVITE_Timeout;\
+             1_200_Recv;1_200_Retrans;1_200_Timeout;1_200_Unexp;\n"
+        );
+        s.steps[0].sent = 3;
+        s.steps[0].retrans = 1;
+        s.steps[1].recv = 2;
+        s.steps[1].unexpected = 1;
+        let row = s.counts_row();
+        assert!(row.ends_with(";3;1;0;2;0;0;1;\n"), "{row}");
+        assert_eq!(row.split(';').count(), s.counts_header().split(';').count());
+    }
+
+    #[test]
+    fn error_codes_and_rtt_rows() {
+        let mut s = StatSet::new(&[], &[]);
+        s.dump.trace_rtt = true;
+        s.dump.rtt_freq = 2;
+        s.record_error_code(486);
+        s.record_error_code(503);
+        let row = s.error_codes_row();
+        assert!(row.ends_with(";503,486,\n"), "{row}");
+        assert!(s.error_codes_row().ends_with(";\n"));
+        assert_eq!(s.rtt_header(), "Date_ms;response_time_ms;rtd_no\n");
+        assert!(!s.rtt_due());
+        s.record_rtd("1", Duration::from_millis(25));
+        s.record_rtd("x", Duration::from_millis(1500));
+        assert!(s.rtt_due());
+        let rows = s.take_rtt_rows();
+        let lines: Vec<&str> = rows.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with(";0.025;1"), "{rows}");
+        assert!(lines[1].ends_with(";1.5;x"), "{rows}");
+        assert!(s.take_rtt_rows().is_empty());
+    }
+
+    #[test]
+    fn sipp_number_formats() {
+        assert_eq!(hhmmss(Duration::from_secs(3661)), "01:01:01");
+        assert_eq!(hhmmss_us(25.0), "00:00:00:025000");
+        assert_eq!(hhmmss_us(61_002.7), "00:01:01:002000");
+        assert_eq!(hhmmss_us(f64::NAN), "00:00:00:000000");
+        assert_eq!(g6(0.0), "0");
+        assert_eq!(g6(0.025), "0.025");
+        assert_eq!(g6(12.3456789), "12.3457");
+        assert_eq!(g6(1500.0), "1500");
+        assert_eq!(g6(123_456.0), "123456");
+        assert_eq!(g6(1_234_567.0), "1.23457e+06");
+        assert_eq!(g6(0.0000012), "1.2e-06");
     }
 
     #[test]

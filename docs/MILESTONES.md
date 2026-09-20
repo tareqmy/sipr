@@ -1596,7 +1596,7 @@ the fill character), `TDM_Map` (`-tdmmap` circuit map keyword);
 - [x] Docs: SIPP_COMPAT §2, §3 and a §6 note (incl. SIPp's TDM
       off-by-one, not copied); README "Not yet" loses `-key`; CHANGELOG.
 
-### M40 — Statistics files at parity: `-trace_stat` columns, `-trace_rtt`, `-trace_counts`, `-trace_error_codes`
+### M40 — Statistics files at parity: `-trace_stat` columns, `-trace_rtt`, `-trace_counts`, `-trace_error_codes` ✅
 
 `-trace_stat` writes "a pragmatic subset" of SIPp's columns (SIPP_COMPAT
 §6 M4: "full column parity is a v1-polish item"); wrappers that parse
@@ -1620,19 +1620,33 @@ per-step send/recv counts), `-trace_error_codes`
 refresh period; sipr's TUI tick is fixed at 1 s — keep the flag for the
 file dump period).
 
-- [ ] `-trace_stat`: every SIPp column in SIPp's order, including the
-      repartition ones sized from `<ResponseTimeRepartition>` /
-      `<CallLengthRepartition>`; `-stat_delimiter`; `-periodic_rtd`.
-- [ ] `-trace_rtt` + `-rtt_freq`, `-trace_counts`, `-trace_error_codes`,
-      `-trace_screen` + `-screen_file`, `-f`. File naming
-      `<scenario>_<pid>_<kind>.{csv,log}` exactly as SIPp's (the
-      `-sn uac` name is `uac`). All writes go through the stats
-      thread/snapshot path, never the engine hot path.
-- [ ] Tests: golden headers; an e2e run diffing the CSV header against a
-      checked-in copy of sipp's for the same scenario; interop: run both
-      with `-trace_stat -trace_rtt -trace_counts` on the same scenario
-      and compare headers byte-for-byte and row counts.
-- [ ] Docs: SIPP_COMPAT §3 (tracing), §6 M4 note closed.
+- [x] `-trace_stat`: every SIPp column in SIPp's order (`sipr-stats`
+      `csv_header`/`csv_row`, the fixed set as a checked-in list), the
+      per-RTD mean/stdev and repartition blocks sized from the scenario's
+      `<ResponseTimeRepartition>`/`<CallLengthRepartition>`, SIPp's
+      `hh:mm:ss` / `hh:mm:ss:uuuuuu` / three-decimal formats, `(P)` as a
+      per-dump period; `-stat_delimiter`; `-periodic_rtd`; `-fd` default
+      60 s as SIPp's. Counters sipr cannot source are 0 (listed in §6).
+- [x] `-trace_rtt` + `-rtt_freq` (rows buffered in the stat set, flushed
+      from the engine loop's tick), `-trace_counts` (per-step columns
+      from a `StepKind` per step), `-trace_error_codes` (codes captured
+      where an unexpected response fails a call), `-trace_screen` +
+      `-screen_file` (main renders the TUI's three screens from the run
+      report's final snapshot), `-f` (the snapshot/`-bg` line period).
+      File names `<scenario>_<pid>_{,rtt,counts,error_codes}.csv` and
+      `_screens.log` as SIPp's. Rows are built off the per-message path,
+      in the `-fd` dump and the once-a-second tick.
+- [x] Tests: stats unit tests (header column set and positions, period
+      roll-over, periodic RTD, counts columns, error-code and RTT rows,
+      SIPp's number formats); an e2e run with every file on asserting the
+      headers, names, delimiter and row widths; interop
+      `statistics_file_headers_match_real_sipps` — sipr and real sipp run
+      the same embedded UAC and the `-trace_stat`, `-trace_rtt` and
+      `-trace_counts` headers must be byte-for-byte equal (the M40
+      acceptance criterion), rows the headers' width on both sides.
+- [x] Docs: SIPP_COMPAT §3 (tracing flags), §6 M4 note closed and an M40
+      note (formats, zero columns, the seconds-not-ms RTT quirk, the
+      `-fd` default change); CHANGELOG.
 
 ### M41 — Message and error logs at parity: short messages, `<log>` files, calldebug, rotation
 

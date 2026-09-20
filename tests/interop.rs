@@ -4291,3 +4291,141 @@ fn m39_keywords_both_ways_against_real_sipp() {
     assert_eq!(uac_code, Some(0), "sipp uac exited {uac_code:?}");
     assert_eq!(uas_code, Some(0), "sipr uas exited {uas_code:?}");
 }
+
+// ---- M40: statistics files -------------------------------------------
+
+/// Run the embedded UAC of `uac_bin` against the embedded UAS of `uas_bin`
+/// with every statistics file on, in its own directory; return that
+/// directory (the caller reads the files) and the UAC's exit code.
+fn run_with_stat_files(
+    uas_bin: &std::path::Path,
+    uac_bin: &std::path::Path,
+    tag: &str,
+) -> (std::path::PathBuf, Option<i32>) {
+    let dir = std::env::temp_dir().join(format!("sipr-interop-stats-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let port = free_port();
+    let mut uas = Reaper(
+        Command::new(uas_bin)
+            .current_dir(&dir)
+            .args([
+                "-sn",
+                "uas",
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "3",
+                "-timeout",
+                "30",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let uac_is_sipr = uac_bin == std::path::Path::new(env!("CARGO_BIN_EXE_sipr"));
+    let mut args: Vec<String> = [
+        "-sn",
+        "uac",
+        "-i",
+        "127.0.0.1",
+        "-r",
+        "10",
+        "-m",
+        "3",
+        "-d",
+        "50",
+        "-timeout",
+        "20",
+        "-fd",
+        "1",
+        "-trace_stat",
+        "-trace_rtt",
+        "-rtt_freq",
+        "1",
+        "-trace_counts",
+        "-trace_error_codes",
+    ]
+    .iter()
+    .map(|a| (*a).to_owned())
+    .collect();
+    if uac_is_sipr {
+        args.push("-bg".to_owned());
+    }
+    args.push(format!("127.0.0.1:{port}"));
+    let mut uac = Reaper(
+        Command::new(uac_bin)
+            .current_dir(&dir)
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uac"),
+    );
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    let _ = wait_with_timeout(&mut uas.0, Duration::from_secs(15));
+    (dir, code)
+}
+
+/// The header line of the file in `dir` whose name ends with `suffix`.
+fn stat_file_header(dir: &std::path::Path, suffix: &str) -> String {
+    let name = std::fs::read_dir(dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.ends_with(suffix))
+        .unwrap_or_else(|| panic!("no *{suffix} in {}", dir.display()));
+    let text = std::fs::read_to_string(dir.join(&name)).expect("read");
+    text.lines().next().unwrap_or_default().to_owned()
+}
+
+/// The statistics files at parity: sipr and real sipp run the same embedded
+/// UAC (same RTDs, same repartitions) and their `-trace_stat`,
+/// `-trace_rtt` and `-trace_counts` headers are byte-for-byte equal; the
+/// rows have the headers' column counts on both sides.
+#[test]
+fn statistics_file_headers_match_real_sipps() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::statistics_file_headers_match_real_sipps — no sipp.");
+        return;
+    };
+    let sipr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let (sipr_dir, sipr_code) = run_with_stat_files(&sipp, &sipr, "sipr");
+    assert_eq!(sipr_code, Some(0), "sipr uac");
+    let (sipp_dir, _) = run_with_stat_files(&sipr, &sipp, "sipp");
+    for suffix in ["_.csv", "_rtt.csv", "_counts.csv"] {
+        let ours = stat_file_header(&sipr_dir, suffix);
+        let theirs = stat_file_header(&sipp_dir, suffix);
+        assert_eq!(ours, theirs, "{suffix} header differs");
+        assert!(!ours.is_empty(), "{suffix} header empty");
+    }
+    for dir in [&sipr_dir, &sipp_dir] {
+        for suffix in ["_.csv", "_counts.csv"] {
+            let name = std::fs::read_dir(dir)
+                .expect("readdir")
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .find(|n| n.ends_with(suffix))
+                .expect("file");
+            let text = std::fs::read_to_string(dir.join(name)).expect("read");
+            let mut lines = text.lines();
+            let header = lines.next().expect("header");
+            for row in lines {
+                assert_eq!(
+                    row.matches(';').count(),
+                    header.matches(';').count(),
+                    "{}: {suffix} row width:\n{row}",
+                    dir.display()
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&sipr_dir);
+    let _ = std::fs::remove_dir_all(&sipp_dir);
+}

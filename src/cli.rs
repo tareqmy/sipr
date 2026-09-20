@@ -165,6 +165,24 @@ pub struct Cli {
     pub stat_file: Option<PathBuf>,
     /// `-fd`: statistics dump interval in seconds.
     pub stat_interval_s: Option<u64>,
+    /// `-f`: screen / `-bg` line report frequency in seconds.
+    pub report_interval_s: Option<u64>,
+    /// `-trace_rtt`: every response time to a CSV file.
+    pub trace_rtt: bool,
+    /// `-rtt_freq`: buffered response times before a `-trace_rtt` flush.
+    pub rtt_freq: Option<usize>,
+    /// `-trace_counts`: per-message counters to a CSV file.
+    pub trace_counts: bool,
+    /// `-trace_error_codes`: unexpected response codes to a CSV file.
+    pub trace_error_codes: bool,
+    /// `-trace_screen`: the statistics screens to a file at exit.
+    pub trace_screen: bool,
+    /// `-screen_file`: that file's name.
+    pub screen_file: Option<PathBuf>,
+    /// `-stat_delimiter`: the statistics files' column separator.
+    pub stat_delimiter: Option<String>,
+    /// `-periodic_rtd`: zero the repartition tables each dump.
+    pub periodic_rtd: bool,
     /// `-timeout`: global test timeout in seconds.
     pub timeout_s: Option<u64>,
     /// `-base_cseq`: initial CSeq value for outbound requests.
@@ -265,6 +283,15 @@ impl Default for Cli {
             trace_stat: false,
             stat_file: None,
             stat_interval_s: None,
+            report_interval_s: None,
+            trace_rtt: false,
+            rtt_freq: None,
+            trace_counts: false,
+            trace_error_codes: false,
+            trace_screen: false,
+            screen_file: None,
+            stat_delimiter: None,
+            periodic_rtd: false,
             timeout_s: None,
             base_cseq: None,
             call_id_format: None,
@@ -572,7 +599,66 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "FILE",
         "Statistics CSV file name (with -trace_stat)",
     ),
-    ("fd", true, "SECONDS", "Statistics dump interval in seconds"),
+    (
+        "fd",
+        true,
+        "SECONDS",
+        "Statistics dump log report frequency (default 60 s)",
+    ),
+    (
+        "f",
+        true,
+        "SECONDS",
+        "Statistics report frequency on screen and in -bg lines (default 1 s)",
+    ),
+    (
+        "trace_rtt",
+        false,
+        "",
+        "Trace every response time to <scenario>_<pid>_rtt.csv",
+    ),
+    (
+        "rtt_freq",
+        true,
+        "N",
+        "Dump response times every N calls to the -trace_rtt file (default 200)",
+    ),
+    (
+        "trace_counts",
+        false,
+        "",
+        "Dump the per-message counters to <scenario>_<pid>_counts.csv",
+    ),
+    (
+        "trace_error_codes",
+        false,
+        "",
+        "Dump the response codes of unexpected messages to <scenario>_<pid>_error_codes.csv",
+    ),
+    (
+        "trace_screen",
+        false,
+        "",
+        "Dump the statistics screens to <scenario>_<pid>_screens.log when quitting",
+    ),
+    (
+        "screen_file",
+        true,
+        "FILE",
+        "Set the name of the screen file (with -trace_screen)",
+    ),
+    (
+        "stat_delimiter",
+        true,
+        "STRING",
+        "Set the delimiter for the statistics files (default ;)",
+    ),
+    (
+        "periodic_rtd",
+        false,
+        "",
+        "Reset the response time repartition counters each logging interval",
+    ),
     ("timeout", true, "SECONDS", "Global test timeout in seconds"),
     ("base_cseq", true, "N", "Initial CSeq for outbound requests"),
     (
@@ -929,6 +1015,15 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "trace_stat" => cli.trace_stat = true,
         "stf" => cli.stat_file = Some(PathBuf::from(val(value))),
         "fd" => cli.stat_interval_s = Some(parse_num(flag, &val(value))?),
+        "f" => cli.report_interval_s = Some(parse_num(flag, &val(value))?),
+        "trace_rtt" => cli.trace_rtt = true,
+        "rtt_freq" => cli.rtt_freq = Some(parse_num(flag, &val(value))?),
+        "trace_counts" => cli.trace_counts = true,
+        "trace_error_codes" => cli.trace_error_codes = true,
+        "trace_screen" => cli.trace_screen = true,
+        "screen_file" => cli.screen_file = Some(PathBuf::from(val(value))),
+        "stat_delimiter" => cli.stat_delimiter = Some(val(value)),
+        "periodic_rtd" => cli.periodic_rtd = true,
         "timeout" => cli.timeout_s = Some(parse_num(flag, &val(value))?),
         "base_cseq" => cli.base_cseq = Some(parse_num(flag, &val(value))?),
         "cid_str" => cli.call_id_format = Some(val(value)),

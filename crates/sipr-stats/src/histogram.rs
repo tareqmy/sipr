@@ -160,6 +160,11 @@ impl Repartition {
         self.bounds.clone()
     }
 
+    /// Zero every bucket, keeping the bounds (`-periodic_rtd`).
+    pub fn reset(&mut self) {
+        self.counts.fill(0);
+    }
+
     /// True when the scenario configured no bounds.
     #[must_use]
     pub fn is_inert(&self) -> bool {

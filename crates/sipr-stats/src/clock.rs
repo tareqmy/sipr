@@ -1,5 +1,5 @@
-//! Wall-clock text for `[date]` and `[timestamp]` (docs/SIPP_COMPAT.md §6
-//! M39), in UTC, with no dependency: a proleptic-Gregorian civil-date
+//! Wall-clock text for `[date]`, `[timestamp]` and the statistics files
+//! (docs/SIPP_COMPAT.md §6 M39/M40), in UTC, with no dependency: a proleptic-Gregorian civil-date
 //! conversion (Howard Hinnant's `civil_from_days`) over `SystemTime`.
 //!
 //! SIPp renders `[date]` from `gmtime` and `[timestamp]` from `localtime`;

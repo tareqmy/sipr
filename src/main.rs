@@ -192,7 +192,8 @@ fn run(cli: &Cli) -> ExitCode {
                 .clone()
                 .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_.csv")))
         }),
-        stat_interval: std::time::Duration::from_secs(cli.stat_interval_s.unwrap_or(1)),
+        // SIPp's -fd default is 60 s; the final row is written regardless.
+        stat_interval: std::time::Duration::from_secs(cli.stat_interval_s.unwrap_or(60)),
         inf_files: cli.inf.clone(),
         rx_inf_files: cli.rxinf.clone(),
         inf_index: cli.inf_index.clone(),
@@ -206,6 +207,19 @@ fn run(cli: &Cli) -> ExitCode {
         ),
         tdm_map: cli.tdmmap.clone(),
         rfc3339: cli.rfc3339,
+        report_interval: std::time::Duration::from_secs(cli.report_interval_s.unwrap_or(1)),
+        trace_rtt: cli
+            .trace_rtt
+            .then(|| std::path::PathBuf::from(format!("{base}_{pid}_rtt.csv"))),
+        trace_counts: cli
+            .trace_counts
+            .then(|| std::path::PathBuf::from(format!("{base}_{pid}_counts.csv"))),
+        trace_error_codes: cli
+            .trace_error_codes
+            .then(|| std::path::PathBuf::from(format!("{base}_{pid}_error_codes.csv"))),
+        rtt_freq: cli.rtt_freq.unwrap_or(200),
+        stat_delimiter: cli.stat_delimiter.clone().unwrap_or_else(|| ";".to_owned()),
+        periodic_rtd: cli.periodic_rtd,
         transport: match cli.transport {
             crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
             crate::cli::Transport::UdpPerCall => sipr_engine::TransportKind::UdpPerCall,
@@ -325,6 +339,9 @@ fn run(cli: &Cli) -> ExitCode {
             if let Some(msg) = &report.fatal {
                 eprintln!("sipr: error: {msg}");
             }
+            if cli.trace_screen {
+                write_screens(cli, &base, pid, &report.snapshot);
+            }
             eprintln!("sipr: run complete: {}", report.summary());
             ExitCode::from(report.exit_code())
         }
@@ -357,6 +374,31 @@ fn resolve_http_addr(raw: &str) -> Result<std::net::SocketAddr, String> {
 /// `[remote_host]`: the host part of the target as typed — `host`,
 /// `host:port`, `[v6]` or `[v6]:port` — brackets and port stripped, never
 /// resolved (SIPp's `remote_host`).
+/// `-trace_screen`: the scenario, statistics and repartition screens as
+/// text, in SIPp's `print_screens` order, to `-screen_file` or
+/// `<scenario>_<pid>_screens.log`.
+fn write_screens(cli: &cli::Cli, base: &str, pid: u32, snap: &sipr_stats::Snapshot) {
+    let path = cli
+        .screen_file
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_screens.log")));
+    let mut text = String::new();
+    for screen in [
+        sipr_tui::Screen::Scenario,
+        sipr_tui::Screen::Main,
+        sipr_tui::Screen::Repartition,
+    ] {
+        for line in sipr_tui::render_screen(snap, screen) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text.push('\n');
+    }
+    if let Err(e) = std::fs::write(&path, text) {
+        eprintln!("sipr: warning: cannot write {}: {e}", path.display());
+    }
+}
+
 fn host_part(target: &str) -> String {
     if let Some(rest) = target.strip_prefix('[') {
         if let Some(end) = rest.find(']') {

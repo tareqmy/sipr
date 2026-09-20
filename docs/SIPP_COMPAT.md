@@ -130,7 +130,11 @@ Control (M17): `-cp <port>` `-ci <ip>` (SIPp's UDP control socket; `-cp 0`
 disables — sipr addition) and sipr's `--sipr-http [HOST:]PORT` /
 `--sipr-http-token` (docs/CONTROL_API.md).
 Tracing/output: `-trace_msg` `-trace_err` `-trace_stat` `-stf <file>`
-`-fd <interval s>` `-nd` (no defaults) `-timeout <s>` `-bg` (headless).
+`-fd <interval s>` (default 60, the `(P)` period) `-f <interval s>` (screen
+and `-bg` line refresh, default 1) `-trace_rtt` `-rtt_freq <n>`
+`-trace_counts` `-trace_error_codes` `-trace_screen` `-screen_file <file>`
+`-stat_delimiter <s>` `-periodic_rtd` (M40, §6) `-nd` (no defaults)
+`-timeout <s>` `-bg` (headless).
 Behavior toggles: `-aa` (auto-answer OPTIONS/INFO/UPDATE/NOTIFY in-dialog),
 `-base_cseq`, `-cid_str` (Call-ID format), `-max_retrans`, `-nr` (no retrans).
 Keywords (M39): `-key <keyword> <value>` (repeatable), `-tdmmap <map>`,
@@ -278,12 +282,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   in-dialog OPTIONS/INFO/UPDATE/NOTIFY with a 200 mirroring
   Via/From/To/Call-ID/CSeq. UAS calls reply to the request's source
   address (Via received/rport handling: post-v1).
-- `-trace_stat` CSV (M4): a pragmatic subset of SIPp's columns with the
-  (P)/(C) periodic/cumulative naming and `;` separators — CurrentTime,
-  ElapsedTime, CallRate, Incoming/OutgoingCall, TotalCallCreated,
-  CurrentCall, Successful/FailedCall, Retransmissions, AutoAnswered,
-  UnexpectedMessage, ResponseTime1 (avg/stddev/max ms), CallLength.
-  Full column parity with SIPp is a v1-polish item.
+- `-trace_stat` CSV (M4, at parity since M40 — see the M40 note): SIPp's
+  columns, names, order, `(P)`/`(C)` naming and `;` delimiter.
 - `-l` cap: calls above the concurrent cap are not queued — the pacer simply
   does not start them; effective rate drops.
 - `[branch]` must be unique per transaction and RFC 3261 magic-cookie prefixed
@@ -1164,3 +1164,60 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   random start — sipr hands out the lowest free circuit and frees the
   same one. The screen/`--check` dump names each keyword; `[file]` shows
   as `[file name=…]`.
+- Statistics files at parity (M40; verified in `stat.cpp` `CStat::dumpData`
+  ~l.1230-1400 (the header and row), `sRepartitionHeader`/`sRepartitionInfo`,
+  `msToHHMMSS`/`msToHHMMSSus`, `computeRtt`/`dumpDataRtt`, `findRtd`
+  (RTD numbering by first mention), `initRtt`/`setFileName` (file names);
+  `logger.cpp` `print_count_file`, `print_error_codes_file`,
+  `print_screens`; `reporttask.cpp` (`-fd` `stattask` dumps the CSV, the
+  counts and the error codes then resets the PL counters; `-f`
+  `screentask` refreshes the screen and resets the PD counters);
+  `sipp.hpp` the defaults): `-trace_stat` writes
+  `<scenario>_<pid>_.csv` (or `-stf`) with SIPp's header — `StartTime`,
+  `LastResetTime`, `CurrentTime` (the `formatTime` form, `-rfc3339`
+  aware), `ElapsedTime(P|C)` as `hh:mm:ss`, `TargetRate` (the `-users`
+  count in users mode), `CallRate(P|C)` with three decimals, the fixed
+  counter pairs through `WatchdogMinor`, then `ResponseTime<rtd>(P|C)` and
+  `…StDev(P|C)` per RTD as `hh:mm:ss:uuuuuu`, `CallLength(P|C)` and
+  `…StDev`, then a repartition block per RTD and for the call length: a
+  name column (empty in rows) plus `Name_<b` per bound and `Name_>=last`.
+  Every field ends with the delimiter, so the header ends with one. `(P)`
+  is since the last dump (SIPp resets its PL counters after each dump;
+  sipr diffs against a per-dump baseline), `(C)` since the start. RTDs
+  are numbered by first mention in the scenario and named as written
+  (`rtd="1"` → `ResponseTime1`, `rtd="setup"` → `ResponseTimesetup`).
+  Counters sipr has no source for are always 0: `FailedCallRejected`,
+  `FailedCmdNotSent`, `FailedRegexp*`, `FailedOutboundCongestion`,
+  `FailedTimeoutOnSend`, `FailedTest*`, `FailedStrcmp*`, `Warnings`,
+  `FatalErrors`, `Watchdog*`; `OutOfCallMsgs` counts messages for no
+  call, `DeadCallMsgs` those absorbed in timewait. SIPp's generic
+  `counter=` columns are not written (sipr's counters are per call,
+  M44). `-fd` defaults to 60 s as SIPp's (it was 1 s) and the final row
+  is written at exit regardless; `-f` (default 1 s) paces the screen
+  snapshot and the `-bg` line. `-trace_rtt` writes
+  `<scenario>_<pid>_rtt.csv`: `Date_ms;response_time_ms;rtd_no`, then
+  per `rtd=` close the stop time and the response time — both in
+  **seconds** despite the names, as SIPp divides by 1000 — and the RTD
+  name, in C++ `ostream` default number form (six significant digits),
+  buffered `-rtt_freq` (200) rows between flushes. `-trace_counts` writes
+  `<scenario>_<pid>_counts.csv`: `CurrentTime;ElapsedTime` (the latter
+  `hh:mm:ss:uuuuuu`) then per visible step `<index>_<name>_Sent`,
+  `_Retrans` and, for a send with `retrans=`, `_Timeout`; for a recv
+  `_Recv`, `_Retrans`, `_Timeout`, `_Unexp` — `<name>` the method or
+  status code, `<index>` the step's position counting every step (SIPp's
+  message index counts pauses and nops too). SIPp's `_Lost` columns
+  appear only with `-lost` (M42). `-trace_error_codes` writes
+  `<scenario>_<pid>_error_codes.csv`: per dump the time, the elapsed
+  time and the status codes of the responses that failed a call as
+  unexpected since the last dump, comma-terminated, newest first (SIPp
+  pops them off the back). `-trace_screen` (or `-screen_file`) writes the
+  scenario, statistics and repartition screens as text at exit, SIPp's
+  `print_screens` order; sipr's screens are its own layout, not a copy of
+  SIPp's curses text. `-periodic_rtd` zeroes every repartition table
+  (per RTD and call length) at each dump. `-stat_delimiter` applies to
+  all four CSV files. Found on the way: an `rtd=` with no matching
+  `start_rtd=` measures from the call's creation — SIPp initialises every
+  RTD's start time in `call::init`, and its own default UAC has only
+  `rtd="true"` on the 200 — where sipr used to record nothing (so its
+  `ResponseTime1` stayed 0 for the embedded UAC); `repeat_rtd` then
+  restarts that clock at the recording step.
