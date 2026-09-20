@@ -661,14 +661,30 @@ mod tests {
         player
             .play(spec("c3", Arc::clone(&stream), remote))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(60));
-        player.stop("c3", Some("audio"));
         // The superseded stream may or may not have sent its frame 0 before
         // being replaced, but two live streams would repeat later sequence
         // numbers. Prove exactly one stream ran after the replacement.
+        //
+        // The replacement starts on the media thread; a loaded host can take
+        // more than one packet interval to get it going, so wait generously
+        // for its first frame past 0 before stopping it, then drain.
+        let seq_of = |frame: &[u8]| u16::from_be_bytes([frame[2], frame[3]]);
         let mut seen: Vec<u16> = Vec::new();
+        rx_sock
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         while let Ok((n, _)) = rx_sock.recv_from(&mut buf) {
-            seen.push(u16::from_be_bytes([buf[..n][2], buf[..n][3]]));
+            seen.push(seq_of(&buf[..n]));
+            if seen.last().is_some_and(|s| *s > 0) {
+                break;
+            }
+        }
+        player.stop("c3", Some("audio"));
+        rx_sock
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        while let Ok((n, _)) = rx_sock.recv_from(&mut buf) {
+            seen.push(seq_of(&buf[..n]));
         }
         let zeros = seen.iter().filter(|s| **s == 0).count();
         assert!((1..=2).contains(&zeros), "{seen:?}");
