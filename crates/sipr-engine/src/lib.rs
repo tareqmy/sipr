@@ -7,10 +7,13 @@
 //! variables, and auth execute at M6; UAS mode lands at M4).
 
 mod actions;
+mod clock;
 mod engine;
 mod exec;
 mod render;
 mod sample;
+mod tdm;
+pub use tdm::TdmMap;
 mod vars;
 
 pub use engine::{

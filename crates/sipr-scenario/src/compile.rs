@@ -39,6 +39,20 @@ pub struct CompileOutcome {
 /// Compile scenario XML. `source_name` labels diagnostics (path or `-sn` name).
 #[must_use]
 pub fn compile(source_name: &str, xml_text: &str) -> CompileOutcome {
+    compile_with(source_name, xml_text, &CompileOptions::default())
+}
+
+/// Run-time inputs the compiler needs to know about.
+#[derive(Debug, Clone, Default)]
+pub struct CompileOptions {
+    /// `-key KEYWORD VALUE` names: `[KEYWORD]` compiles to a generic
+    /// keyword instead of drawing the unknown-keyword warning.
+    pub generic_keywords: Vec<String>,
+}
+
+/// [`compile`] with [`CompileOptions`].
+#[must_use]
+pub fn compile_with(source_name: &str, xml_text: &str, options: &CompileOptions) -> CompileOutcome {
     let mut diags = Diagnostics::new(source_name);
     let root = match xml::parse(xml_text) {
         Ok(root) => root,
@@ -52,6 +66,7 @@ pub fn compile(source_name: &str, xml_text: &str) -> CompileOutcome {
     };
     let mut c = Compiler {
         diags,
+        generic_keywords: options.generic_keywords.clone(),
         vars: VarTable::default(),
         var_read: Vec::new(),
         var_written: Vec::new(),
@@ -115,6 +130,8 @@ impl TxnUse {
 
 struct Compiler {
     diags: Diagnostics,
+    /// `-key` names (see [`CompileOptions`]).
+    generic_keywords: Vec<String>,
     vars: VarTable,
     var_read: Vec<bool>,
     var_written: Vec<bool>,
@@ -230,12 +247,14 @@ impl Compiler {
 
     /// Tokenize template text and record `[$var]` reads.
     fn templ(&mut self, text: &str, line: u32) -> MsgTemplate {
-        let t = template::tokenize(text, line, &mut self.diags);
-        // `[$v]` reads, and `[fieldN line=[$v]]` reads its selector variable.
+        let t = template::tokenize_with(text, line, &mut self.diags, &self.generic_keywords);
+        // `[$v]` reads, `[fieldN line=[$v]]` reads its selector variable,
+        // `[fill variable=v]` its length, and a `[file name=…]` sub-template
+        // whatever it references.
         let mut vars: Vec<String> = t
             .keywords()
             .filter_map(|k| match k {
-                Keyword::Var(v) => Some(v.clone()),
+                Keyword::Var(v) | Keyword::Fill { variable: v, .. } => Some(v.clone()),
                 Keyword::Field {
                     line: Some(template::LineExpr::Var(v)),
                     ..
@@ -243,13 +262,26 @@ impl Compiler {
                 _ => None,
             })
             .collect();
+        for k in t.keywords() {
+            if let Keyword::File { name } = k {
+                vars.extend(name.keywords().filter_map(|k| match k {
+                    Keyword::Var(v) => Some(v.clone()),
+                    _ => None,
+                }));
+            }
+        }
         // `[authentication username=[$u] aka_K=[field2]]`: SIPp renders each
         // parameter as a sub-message, so their `[$var]` reads count too.
         for k in t.keywords() {
             if let Keyword::Authentication(params) = k {
                 for (_, value) in params {
                     if value.contains('[') {
-                        let sub = template::tokenize(value, line, &mut self.diags);
+                        let sub = template::tokenize_with(
+                            value,
+                            line,
+                            &mut self.diags,
+                            &self.generic_keywords,
+                        );
                         vars.extend(sub.keywords().filter_map(|k| match k {
                             Keyword::Var(v) => Some(v.clone()),
                             _ => None,

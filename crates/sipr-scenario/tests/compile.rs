@@ -1372,3 +1372,48 @@ fn setdest_needs_all_three_parameters_and_exec_command_stays_exclusive() {
         "{errs:?}"
     );
 }
+
+/// The M39 keywords compile without a diagnostic, `[fill variable=]`
+/// counts as a read of its variable, and the dump names them.
+#[test]
+fn m39_keywords_compile_and_fill_reads_its_variable() {
+    let xml = wrap(&format!(
+        r#"{invite}
+           <recv response="200">
+             <action>
+               <ereg regexp="[0-9]+" search_in="hdr" header="Content-Length:" assign_to="n"/>
+             </action>
+           </recv>
+           <send><![CDATA[
+             OPTIONS sip:[remote_host] SIP/2.0
+             X-Run: [clock_tick] [timestamp] [date] [sipp_version] [dynamic_id] [tdmmap]
+             CSeq: [last_cseq_number+1] OPTIONS
+             X-Fill: [fill variable=n text="ab"]
+             X-File: [file name=/dev/null]
+             Content-Length: 0
+
+             [last_message]
+           ]]></send>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    // The dump names the keywords of each send's start line.
+    let dump = out.scenario.expect("compiles").dump();
+    assert!(
+        dump.contains("send: OPTIONS sip:[remote_host] SIP/2.0"),
+        "{dump}"
+    );
+    // A -key name is a keyword only when the compiler is told about it.
+    let xml = wrap(&format!(
+        "{}<send><![CDATA[\nOPTIONS sip:[pbx] SIP/2.0\n\n]]></send>",
+        send_invite()
+    ));
+    assert_eq!(compile("test", &xml).diagnostics.len(), 1);
+    let opts = sipr_scenario::CompileOptions {
+        generic_keywords: vec!["pbx".to_owned()],
+    };
+    let out = sipr_scenario::compile_with("test", &xml, &opts);
+    assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    assert!(out.scenario.expect("compiles").dump().contains("[pbx]"));
+}

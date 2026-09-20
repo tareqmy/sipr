@@ -6809,3 +6809,241 @@ fn statistical_pauses_scenario_runs_against_scripted_uas() {
         assert!(dump.contains(want), "missing {want:?} in:\n{dump}");
     }
 }
+
+/// The M39 keywords end to end: the OPTIONS a scripted responder receives
+/// carries the `-key` value, `[remote_host]`, `[dynamic_id]`, `[date]`,
+/// `[sipp_version]`, and on the second request `[fill]` sized by a
+/// captured variable and `[last_cseq_number+1]` from the previous 200.
+#[test]
+fn m39_keywords_render_in_sent_messages() {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("timeout");
+    let uas =
+        std::thread::spawn(move || {
+            let mut seen: Vec<String> = Vec::new();
+            let mut buf = [0u8; 65_535];
+            while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                    continue;
+                };
+                if msg.method() == Some("OPTIONS") {
+                    seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    // The 200 carries a header the scenario captures into `n`.
+                    let ok = String::from_utf8_lossy(&mirror_response(&msg, "200 OK", true))
+                        .replacen("\r\n\r\n", "\r\nX-Len: 5\r\n\r\n", 1);
+                    let _ = sock.send_to(ok.as_bytes(), from);
+                }
+            }
+            seen
+        });
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let path = dir.join(format!("sipr-e2e-m39-{pid}.xml"));
+    std::fs::write(
+        &path,
+        r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="m39 keywords">
+  <send retrans="500"><![CDATA[
+OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]:[remote_port]>
+Call-ID: [call_id]
+CSeq: 1 OPTIONS
+Contact: <sip:sipr@[local_ip]:[local_port]>
+Max-Forwards: 70
+X-Pbx: [pbx]
+X-Host: [remote_host]
+X-Dyn: [dynamic_id]
+X-Tick: [clock_tick]
+X-Ver: [sipp_version]
+Date: [date]
+X-Stamp: [timestamp]
+Content-Length: 0
+
+]]></send>
+  <recv response="200">
+    <action>
+      <ereg regexp="([0-9]+)" search_in="hdr" header="X-Len:" check_it="true" assign_to="whole,n"/>
+    </action>
+  </recv>
+  <send retrans="500"><![CDATA[
+OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]:[remote_port]>
+Call-ID: [call_id]
+CSeq: [last_cseq_number+1] OPTIONS
+Max-Forwards: 70
+X-Fill: [fill variable=n text="ab"]
+X-Last: [last_cseq_number]
+Content-Length: 0
+
+]]></send>
+  <recv response="200"/>
+  <Reference variables="whole"/>
+</scenario>
+"#,
+    )
+    .expect("write scenario");
+    let scenario = path.to_str().expect("utf8");
+    // Without `-key` the bracketed name is an unknown keyword; --check says so.
+    let out = run_sipr(&["-sf", scenario, "--check"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("[pbx]"));
+    let out = run_sipr(&["-sf", scenario, "-key", "pbx", "pbx-1.example", "--check"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_sipr(&[
+        "-sf",
+        scenario,
+        "-key",
+        "pbx",
+        "pbx-1.example",
+        "-dynamicStart",
+        "500",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    let _ = std::fs::remove_file(&path);
+    let seen = uas.join().expect("uas thread");
+    assert_eq!(seen.len(), 2, "{seen:#?}");
+    let first = &seen[0];
+    for want in [
+        "X-Pbx: pbx-1.example\r\n",
+        "X-Host: 127.0.0.1\r\n",
+        "X-Dyn: 500\r\n",
+        &format!("X-Ver: {}\r\n", env!("CARGO_PKG_VERSION")),
+        " GMT\r\n",
+    ] {
+        assert!(first.contains(want), "missing {want:?} in:\n{first}");
+    }
+    let tick: u64 = first
+        .lines()
+        .find_map(|l| l.strip_prefix("X-Tick: "))
+        .and_then(|v| v.parse().ok())
+        .expect("clock tick");
+    assert!(tick < 10_000, "{tick}");
+    let stamp = first
+        .lines()
+        .find_map(|l| l.strip_prefix("X-Stamp: "))
+        .expect("timestamp");
+    assert_eq!(stamp.matches('\t').count(), 2, "{stamp}");
+    let second = &seen[1];
+    for want in ["CSeq: 2 OPTIONS\r\n", "X-Fill: ababa\r\n", "X-Last: 1\r\n"] {
+        assert!(second.contains(want), "missing {want:?} in:\n{second}");
+    }
+}
+
+/// `[tdmmap]` needs `-tdmmap` (SIPp's wording, at start-up here) and
+/// renders the call's circuit from the map.
+#[test]
+fn tdmmap_keyword_needs_the_flag_and_renders_a_circuit() {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut seen: Vec<String> = Vec::new();
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            if msg.method() == Some("OPTIONS") {
+                seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = sock.send_to(&mirror_response(&msg, "200 OK", true), from);
+            }
+        }
+        seen
+    });
+    let path = std::env::temp_dir().join(format!("sipr-e2e-tdm-{}.xml", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="tdm">
+  <send retrans="500"><![CDATA[
+OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]:[remote_port]>
+Call-ID: [call_id]
+CSeq: 1 OPTIONS
+Max-Forwards: 70
+X-Tdm: [tdmmap]
+Content-Length: 0
+
+]]></send>
+  <recv response="200"/>
+</scenario>
+"#,
+    )
+    .expect("write scenario");
+    let scenario = path.to_str().expect("utf8");
+    let out = run_sipr(&[
+        "-sf",
+        scenario,
+        "-m",
+        "1",
+        "-timeout",
+        "5",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains("[tdmmap] keyword without -tdmmap parameter on command line"),
+        "{err}"
+    );
+    let out = run_sipr(&[
+        "-sf",
+        scenario,
+        "-tdmmap",
+        "{0-1}{9}{1-1}{1-2}",
+        "-m",
+        "2",
+        "-r",
+        "20",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    let _ = std::fs::remove_file(&path);
+    let seen = uas.join().expect("uas thread");
+    assert_eq!(seen.len(), 2, "{seen:#?}");
+    // Two circuits handed out from the four in the map, each call its own.
+    let circuits: Vec<&str> = seen
+        .iter()
+        .filter_map(|m| m.lines().find_map(|l| l.strip_prefix("X-Tdm: ")))
+        .collect();
+    assert_eq!(circuits.len(), 2, "{seen:#?}");
+    assert!(
+        circuits
+            .iter()
+            .all(|c| c.starts_with("0.9.1/") || c.starts_with("1.9.1/")),
+        "{circuits:?}"
+    );
+}

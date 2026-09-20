@@ -622,3 +622,29 @@ fn check_mode_prints_the_transactions() {
     assert!(out.contains("send ack_txn=invite"), "{out}");
     assert!(stderr(&o).is_empty(), "{}", stderr(&o));
 }
+
+#[test]
+fn key_takes_keyword_and_value_and_needs_both() {
+    let o = sipr(&["-key", "pbx"]);
+    assert_code(&o, 2);
+    assert!(
+        stderr(&o).contains("requires a VALUE after KEYWORD"),
+        "{}",
+        stderr(&o)
+    );
+    let o = sipr(&["-key"]);
+    assert_code(&o, 2);
+}
+
+#[test]
+fn tdmmap_rejects_a_bad_map_with_sipps_wording() {
+    let o = sipr(&["-tdmmap", "0-3,99,5-8,1-31", "-sn", "uac", "127.0.0.1"]);
+    assert_code(&o, 2);
+    assert!(
+        stderr(&o).contains("Parameter -tdmmap must be of form"),
+        "{}",
+        stderr(&o)
+    );
+    let o = sipr(&["-dynamicStart", "ten", "-sn", "uac", "127.0.0.1"]);
+    assert_code(&o, 2);
+}

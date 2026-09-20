@@ -68,8 +68,11 @@ Shipped: `exec play_pcap_audio|video|image=` and `<recv ignoresdp>` (M14),
 `[last_*]` (verbatim copy of header(s) from last received message, e.g.
 `[last_Via:]`, `[last_From:]`) `[$var]` `[authentication]` (+ `username=`/
 `password=` params) `[len]` (Content-Length auto-compute) `[field0..N]` (v1.x,
-with injection files) `[date]` `[timestamp]` `[cseq+n]`-style arithmetic if
-present in corpus scenarios (verify against C++).
+with injection files).
+M39 keywords (§6): `[clock_tick]` `[timestamp]` `[date]` `[sipp_version]`
+`[dynamic_id]` `[remote_host]` `[tdmmap]` `[last_message]`
+`[last_cseq_number]` (with `+N`/`-N`) `[fill variable= text=]`
+`[file name=]` and the `-key KEYWORD VALUE` generic keywords `[KEYWORD]`.
 
 Media keywords (M14): `[media_ip]` (`-mi`, default the local IP),
 `[media_ip_type]`, `[media_port]` (`-mp`, default 6000, the same value for
@@ -130,6 +133,9 @@ Tracing/output: `-trace_msg` `-trace_err` `-trace_stat` `-stf <file>`
 `-fd <interval s>` `-nd` (no defaults) `-timeout <s>` `-bg` (headless).
 Behavior toggles: `-aa` (auto-answer OPTIONS/INFO/UPDATE/NOTIFY in-dialog),
 `-base_cseq`, `-cid_str` (Call-ID format), `-max_retrans`, `-nr` (no retrans).
+Keywords (M39): `-key <keyword> <value>` (repeatable), `-tdmmap <map>`,
+`-dynamicStart`/`-dynamicMax`/`-dynamicStep` (the `[dynamic_id]` counter),
+`-rfc3339` (`[timestamp]` form).
 
 Where sipr needs a flag SIPp lacks, prefix long-form `--sipr-*` to keep the two
 namespaces distinct.
@@ -467,7 +473,7 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   does this, its pcap path does not); (5) 802.11 captures are rejected
   (unsupported link type) — recapture on the wired side. `play_pcap=` (in
   the DTD, never implemented by SIPp) is an error pointing at
-  `play_pcap_audio=`. Bracketed `-key` values are not supported yet.
+  `play_pcap_audio=`. `-key` shipped in M39 (§6).
 - `exec rtp_stream=` / `exec play_dtmf=` (M15; verified in `rtpstream.cpp`
   `rtpstream_playrtptask` (~l.603), `rtpstream_get_localport` (~l.1789),
   `rtpstream_cache_file` / `get_wav_header_size` (~l.1619/2240),
@@ -1115,3 +1121,46 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   label is SIPp's `textDescr`: `N(mean,stdev)`, `LN(…)`, `Exp(mean)`,
   `Wb(lambda,k)`, `P(k,x_m)`, `P(shape,scale,location)`, `G(k,theta)`,
   `NB(p,n)`, `min/max`, or the fixed value.
+- Keyword parity, `-key` and `-tdmmap` (M39; verified in `message.cpp`
+  ~l.50-120 the keyword table and ~l.236-372 `SendingMessage`'s dispatch,
+  `call.cpp` `createSendingMessage` the `E_Message_*` arms, `sipp.cpp`
+  `SIPP_OPTION_KEY`/`SIPP_OPTION_TDMMAP`, `call.cpp` ~l.113 the dynamic-id
+  defaults and ~l.281 `get_tdm_map_number`, `stat.cpp` `CStat::formatTime`,
+  `time.cpp` `getmicroseconds`): SIPp looks a bracketed name up in its
+  keyword table **before** the `last_<Header>` copy, so `[last_message]`
+  (the whole last received message, empty without one) and
+  `[last_cseq_number]` (the CSeq number of the last received message,
+  `sscanf("%d")`, 0 without one, plus a `+N`/`-N` suffix) are keywords,
+  not header copies. `[clock_tick]` is milliseconds since the process
+  started (SIPp's `clock_tick`, a steady clock). `[date]` is `gmtime` in
+  RFC 1123 form, `Mon, 25 Oct 2021 07:20:55 GMT`. `[timestamp]` is the
+  log time: `YYYY-MM-DD<TAB>HH:MM:SS.uuuuuu<TAB>ssssssssss.uuuuuu` or, with
+  `-rfc3339`, `YYYY-MM-DDTHH:MM:SS.uuuuuu<offset>`; SIPp renders it in
+  **local** time — sipr in UTC (offset `Z`), the one deliberate
+  divergence, so it needs no timezone dependency. `[sipp_version]` is the
+  bare version number (SIPp drops its `v`; sipr renders its own, e.g.
+  `0.28.0`). `[dynamic_id]` is one counter for the run, starting at
+  `-dynamicStart` (10000), stepping by `-dynamicStep` (4) at **every
+  render**, wrapping back to the start once past `-dynamicMax` (18000).
+  `[remote_host]` is the target host as typed on the command line,
+  unresolved, port and IPv6 brackets stripped. `[fill variable=N
+  text="…"]` repeats `text` (default `X`) to the variable's numeric value
+  in characters (negative or unset = nothing); `[file name=…]` inserts a
+  file's contents, the name itself a template (`[$var]`, `[fieldN]`) —
+  sipr reads each name once per run and caches it, and a missing file
+  fails the call where SIPp aborts the process. `-key KEYWORD VALUE`
+  defines `[KEYWORD]` as the literal VALUE (SIPp's `generic` map, no
+  keyword expansion inside the value); the compiler is told the names so
+  they do not draw the unknown-keyword warning. `-tdmmap
+  {x-x'}{h}{y-y'}{z-z'}` builds `(x'-x+1)·(y'-y+1)·(z'-z+1)` circuits;
+  each outgoing call takes a free one at creation and `[tdmmap]` renders
+  it as `X.h.Y/Z` (SIPp's formula, `Z` cycling fastest); no free circuit
+  is SIPp's warning "Can't create new outgoing call: all tdm_map circuits
+  busy" and a failed call. `[tdmmap]` without `-tdmmap` is SIPp's
+  "[tdmmap] keyword without -tdmmap parameter on command line", raised at
+  start-up rather than at the first render. Divergences from SIPp's
+  circuit bookkeeping, deliberate: SIPp marks circuit `n-1` busy and frees
+  circuit `n` (an off-by-one that leaks one circuit per call) and picks a
+  random start — sipr hands out the lowest free circuit and frees the
+  same one. The screen/`--check` dump names each keyword; `[file]` shows
+  as `[file name=…]`.

@@ -1545,7 +1545,7 @@ is the interop baseline, not a behavior to copy; `actions.cpp`
       the gpareto shape-0 division, both diverged from deliberately);
       README "Not yet" loses `<sample>`; PLAN.md §3.4 v1.x row; CHANGELOG.
 
-### M39 — Keyword parity: `-key`, `[fill]`, `[last_message]`, `[clock_tick]` and friends
+### M39 — Keyword parity: `-key`, `[fill]`, `[last_message]`, `[clock_tick]` and friends ✅
 
 Ten keywords from SIPp's table render nothing in sipr today and are
 warned as unknown: `[clock_tick]`, `[date]`, `[dynamic_id]`,
@@ -1568,18 +1568,33 @@ starting at a random base — used for `[dynamic_id]` REGISTER contacts),
 the fill character), `TDM_Map` (`-tdmmap` circuit map keyword);
 `sipp.cpp` `-tdmmap` parsing (`{a-b}{c-d}{e-f}{g-h}` form).
 
-- [ ] CLI: `-key <keyword> <value>` (repeatable), `-tdmmap <map>`; the
-      keyword names collide with nothing built-in (error otherwise, as
-      SIPp's "duplicate keyword"? — verify).
-- [ ] Renderer: the ten keywords as `Slot` variants, computed per render
-      (no allocation beyond the slot fill; `[last_message]` copies the
-      stored last-received bytes); `[sipp_version]` renders
-      `sipr v<version>` and is documented as the one deliberate wording
-      divergence.
-- [ ] Tests: golden render for each; interop: a scenario exercising
-      `-key`, `[fill]`, `[dynamic_id]`, `[clock_tick]` against sipp,
-      comparing the message bytes modulo the time-dependent values.
-- [ ] Docs: SIPP_COMPAT §2 and §3; README "Not yet" loses `-key`.
+- [x] CLI: `-key <keyword> <value>` (repeatable; the value is a literal,
+      as SIPp's), `-tdmmap <map>` (SIPp's bad-form wording),
+      `-dynamicStart`/`-dynamicMax`/`-dynamicStep` (found on the way:
+      SIPp has them, the option-table sweep missed their help shape) and
+      `-rfc3339` for `[timestamp]`. A `-key` name that is also a built-in
+      keyword loses: SIPp checks its table first, so does sipr.
+- [x] Renderer: eleven new `Keyword` variants (the ten plus `[file
+      name=]`, SIPp's prefix-handled keyword the table sweep missed) and
+      `Generic` for `-key`; a `RunInfo` on the render context carries the
+      run-wide inputs (clock, `-key` pairs, the `[dynamic_id]` counter,
+      the TDM table, the `[file]` cache). `[sipp_version]` renders the
+      bare version number like SIPp's; `[timestamp]` is UTC (documented).
+      `-tdmmap` circuits are handed to outgoing calls and released with
+      them (`engine::alloc_tdm`/`release_tdm`); `[tdmmap]` without the
+      flag is refused at start-up with SIPp's wording.
+- [x] Tests: tokenizer, renderer, clock and TDM unit tests; compile
+      test (dump names, `[fill]` counts as a variable read, `-key` names
+      via `CompileOptions`); corpus `keywords_m39.xml`; CLI tests for the
+      two-argument `-key` and `-tdmmap`'s wording; e2e runs asserting the
+      rendered headers a responder receives (`-key`, `[remote_host]`,
+      `[dynamic_id]`, `[fill]`, `[last_cseq_number+1]`, `[tdmmap]`);
+      interop `m39_keywords_both_ways_against_real_sipp` (sipr and sipp
+      each run the same `-key` scenario as UAC against the other's
+      responder). Byte comparison modulo the clock values was dropped:
+      `[timestamp]` is UTC here and local time there.
+- [x] Docs: SIPP_COMPAT §2, §3 and a §6 note (incl. SIPp's TDM
+      off-by-one, not copied); README "Not yet" loses `-key`; CHANGELOG.
 
 ### M40 — Statistics files at parity: `-trace_stat` columns, `-trace_rtt`, `-trace_counts`, `-trace_error_codes`
 

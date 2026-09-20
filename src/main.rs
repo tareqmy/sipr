@@ -66,7 +66,16 @@ fn run(cli: &Cli) -> ExitCode {
     };
 
     // Compile to the step IR; every diagnostic is printed, loudly.
-    let outcome = sipr_scenario::compile(&scenario_name, &source);
+    // `-key` names render as literals instead of drawing the unknown-keyword
+    // warning; the compiler needs them to tell the two apart.
+    let compile_options = sipr_scenario::CompileOptions {
+        generic_keywords: cli
+            .generic_keywords
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect(),
+    };
+    let outcome = sipr_scenario::compile_with(&scenario_name, &source, &compile_options);
     for d in &outcome.diagnostics {
         eprintln!("sipr: {d}");
     }
@@ -75,7 +84,7 @@ fn run(cli: &Cli) -> ExitCode {
     // the same lint rules under --check.
     let secondary_outcome = match load_secondary_source(cli) {
         Ok(Some((kind, name, source))) => {
-            let out = sipr_scenario::compile(&name, &source);
+            let out = sipr_scenario::compile_with(&name, &source, &compile_options);
             for d in &out.diagnostics {
                 eprintln!("sipr: {d}");
             }
@@ -188,6 +197,15 @@ fn run(cli: &Cli) -> ExitCode {
         rx_inf_files: cli.rxinf.clone(),
         inf_index: cli.inf_index.clone(),
         global_sets: cli.set_vars.clone(),
+        remote_host: cli.target.as_deref().map(host_part).unwrap_or_default(),
+        generic_keywords: cli.generic_keywords.clone(),
+        dynamic_id: (
+            cli.dynamic_start.unwrap_or(10_000),
+            cli.dynamic_step.unwrap_or(4),
+            cli.dynamic_max.unwrap_or(18_000),
+        ),
+        tdm_map: cli.tdmmap.clone(),
+        rfc3339: cli.rfc3339,
         transport: match cli.transport {
             crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
             crate::cli::Transport::UdpPerCall => sipr_engine::TransportKind::UdpPerCall,
@@ -334,6 +352,22 @@ fn resolve_http_addr(raw: &str) -> Result<std::net::SocketAddr, String> {
         return Err(format!("'{raw}' needs a port (PORT or HOST:PORT)"));
     }
     resolve_target(raw)
+}
+
+/// `[remote_host]`: the host part of the target as typed — `host`,
+/// `host:port`, `[v6]` or `[v6]:port` — brackets and port stripped, never
+/// resolved (SIPp's `remote_host`).
+fn host_part(target: &str) -> String {
+    if let Some(rest) = target.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_owned();
+        }
+    }
+    match target.rsplit_once(':') {
+        // One colon = host:port; more = a bare IPv6 literal.
+        Some((host, _)) if host.matches(':').count() == 0 => host.to_owned(),
+        _ => target.to_owned(),
+    }
 }
 
 fn resolve_target(raw: &str) -> Result<std::net::SocketAddr, String> {

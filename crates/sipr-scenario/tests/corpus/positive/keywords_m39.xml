@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- The keywords added in M39 (SIPP_COMPAT §2, §6): run-wide values,
+     the last received message and its CSeq number, and [fill] sized by a
+     captured variable. -->
+
+<scenario name="M39 keywords">
+  <send retrans="500">
+    <![CDATA[
+
+      OPTIONS sip:[service]@[remote_host]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 OPTIONS
+      Max-Forwards: 70
+      X-Started: [clock_tick] ms into the run at [timestamp]
+      Date: [date]
+      User-Agent: sipr [sipp_version]
+      X-Dynamic: [dynamic_id]
+      X-Circuit: [tdmmap]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200">
+    <action>
+      <ereg regexp="([0-9]+)" search_in="hdr" header="CSeq:" check_it="true" assign_to="whole,n"/>
+      <todouble assign_to="len" variable="n"/>
+    </action>
+  </recv>
+
+  <send retrans="500">
+    <![CDATA[
+
+      OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: [last_cseq_number+1] OPTIONS
+      Max-Forwards: 70
+      X-Padding: [fill variable=len text="ab"]
+      Content-Type: message/sip
+      Content-Length: [len]
+
+      [last_message]
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+  <Reference variables="whole"/>
+</scenario>

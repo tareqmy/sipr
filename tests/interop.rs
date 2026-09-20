@@ -4042,12 +4042,35 @@ fn run_statistical_pauses_pair(
     calls: u32,
     tag: &str,
 ) -> (Option<i32>, Option<i32>, String) {
+    run_sf_pair(
+        uas_bin,
+        uac_bin,
+        STATISTICAL_PAUSES_UAS,
+        STATISTICAL_PAUSES_UAC,
+        &[],
+        calls,
+        tag,
+    )
+}
+
+/// Run `uac_xml` on `uac_bin` (with `uac_extra` flags) against `uas_xml`
+/// on `uas_bin`, `calls` calls; return (uac exit, uas exit, uac stderr).
+/// Either binary may be sipr or real sipp.
+fn run_sf_pair(
+    uas_bin: &std::path::Path,
+    uac_bin: &std::path::Path,
+    uas_xml: &str,
+    uac_xml: &str,
+    uac_extra: &[&str],
+    calls: u32,
+    tag: &str,
+) -> (Option<i32>, Option<i32>, String) {
     let dir = std::env::temp_dir();
     let pid = std::process::id();
-    let uas_path = dir.join(format!("sipr-interop-statpause-uas-{tag}-{pid}.xml"));
-    let uac_path = dir.join(format!("sipr-interop-statpause-uac-{tag}-{pid}.xml"));
-    std::fs::write(&uas_path, STATISTICAL_PAUSES_UAS).expect("write uas");
-    std::fs::write(&uac_path, STATISTICAL_PAUSES_UAC).expect("write uac");
+    let uas_path = dir.join(format!("sipr-interop-pair-uas-{tag}-{pid}.xml"));
+    let uac_path = dir.join(format!("sipr-interop-pair-uac-{tag}-{pid}.xml"));
+    std::fs::write(&uas_path, uas_xml).expect("write uas");
+    std::fs::write(&uac_path, uac_xml).expect("write uac");
     let port = free_port();
     let mut uas = Reaper(
         Command::new(uas_bin)
@@ -4090,6 +4113,7 @@ fn run_statistical_pauses_pair(
     if uac_is_sipr {
         args.push("-bg".to_owned());
     }
+    args.extend(uac_extra.iter().map(|a| (*a).to_owned()));
     args.push(format!("127.0.0.1:{port}"));
     let mut uac = Reaper(
         Command::new(uac_bin)
@@ -4145,6 +4169,93 @@ fn statistical_pauses_both_ways_against_real_sipp() {
         );
         return;
     }
+    assert_eq!(uac_code, Some(0), "sipp uac exited {uac_code:?}");
+    assert_eq!(uas_code, Some(0), "sipr uas exited {uas_code:?}");
+}
+
+// ---- M39: keyword parity -------------------------------------------------
+
+/// A UAC using the M39 keywords SIPp also has: a `-key` generic keyword,
+/// `[remote_host]`, `[dynamic_id]`, `[clock_tick]`, `[sipp_version]`,
+/// `[date]`, `[timestamp]`, then `[last_cseq_number+1]` and `[fill]` sized
+/// by a variable captured from the 200.
+const M39_KEYWORDS_UAC: &str = r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="m39 keywords">
+  <send retrans="500"><![CDATA[
+OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]:[remote_port]>
+Call-ID: [call_id]
+CSeq: 1 OPTIONS
+Contact: <sip:sipp@[local_ip]:[local_port]>
+Max-Forwards: 70
+X-Pbx: [pbx]
+X-Host: [remote_host]
+X-Dyn: [dynamic_id]
+X-Tick: [clock_tick]
+X-Ver: [sipp_version]
+Date: [date]
+X-Stamp: [timestamp]
+Content-Length: 0
+
+]]></send>
+  <recv response="200">
+    <action>
+      <ereg regexp="([0-9]+)" search_in="hdr" header="CSeq:" check_it="true" assign_to="whole,n"/>
+      <todouble assign_to="len" variable="n"/>
+    </action>
+  </recv>
+  <send retrans="500"><![CDATA[
+OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]:[remote_port]>
+Call-ID: [call_id]
+CSeq: [last_cseq_number+1] OPTIONS
+Max-Forwards: 70
+X-Fill: [fill variable=len text="ab"]
+Content-Length: 0
+
+]]></send>
+  <recv response="200"/>
+  <Reference variables="whole"/>
+</scenario>
+"#;
+
+/// The M39 keywords both ways: sipr's UAC against real sipp's OPTIONS
+/// responder, and real sipp's UAC running the same file (same `-key`)
+/// against sipr's responder; every call completes on both sides.
+#[test]
+fn m39_keywords_both_ways_against_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::m39_keywords_both_ways_against_real_sipp — no sipp.");
+        return;
+    };
+    let sipr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let key = ["-key", "pbx", "pbx-1.example"];
+    let (uac_code, uas_code, stderr) = run_sf_pair(
+        &sipp,
+        &sipr,
+        STATISTICAL_PAUSES_UAS,
+        M39_KEYWORDS_UAC,
+        &key,
+        3,
+        "m39-sipr-uac",
+    );
+    assert_eq!(uac_code, Some(0), "sipr uac stderr:\n{stderr}");
+    assert!(stderr.contains("successful 3 failed 0"), "{stderr}");
+    assert_eq!(uas_code, Some(0), "sipp uas exited {uas_code:?}");
+
+    let (uac_code, uas_code, _) = run_sf_pair(
+        &sipr,
+        &sipp,
+        STATISTICAL_PAUSES_UAS,
+        M39_KEYWORDS_UAC,
+        &key,
+        3,
+        "m39-sipp-uac",
+    );
     assert_eq!(uac_code, Some(0), "sipp uac exited {uac_code:?}");
     assert_eq!(uas_code, Some(0), "sipr uas exited {uas_code:?}");
 }

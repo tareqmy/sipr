@@ -179,6 +179,18 @@ pub struct Cli {
     pub inf_index: Vec<(String, usize)>,
     /// `-set VARIABLE VALUE`: initial value of a `<Global>` variable; repeatable.
     pub set_vars: Vec<(String, String)>,
+    /// `-key KEYWORD VALUE`: a generic keyword `[KEYWORD]` rendering VALUE; repeatable.
+    pub generic_keywords: Vec<(String, String)>,
+    /// `-tdmmap MAP`: the TDM circuit table `[tdmmap]` renders from.
+    pub tdmmap: Option<sipr_engine::TdmMap>,
+    /// `-dynamicStart`: first `[dynamic_id]` value (default 10000).
+    pub dynamic_start: Option<u32>,
+    /// `-dynamicMax`: `[dynamic_id]` wraps back to the start past this (default 18000).
+    pub dynamic_max: Option<u32>,
+    /// `-dynamicStep`: `[dynamic_id]` increment per render (default 4).
+    pub dynamic_step: Option<u32>,
+    /// `-rfc3339`: `[timestamp]` in RFC 3339 form.
+    pub rfc3339: bool,
     /// `-3pcc HOST:PORT`: classic 3PCC twin control socket.
     pub three_pcc: Option<String>,
     /// `-users N`: closed-loop mode with N constant concurrent users.
@@ -260,6 +272,12 @@ impl Default for Cli {
             inf: Vec::new(),
             inf_index: Vec::new(),
             set_vars: Vec::new(),
+            generic_keywords: Vec::new(),
+            tdmmap: None,
+            dynamic_start: None,
+            dynamic_max: None,
+            dynamic_step: None,
+            rfc3339: false,
             three_pcc: None,
             users: None,
             tls_cert: PathBuf::from("cacert.pem"),
@@ -494,6 +512,42 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
     ("nd", false, "", "Disable scenario default behaviors"),
     ("nr", false, "", "Disable UDP retransmissions"),
     (
+        "key",
+        true,
+        "KEYWORD VALUE",
+        "Set the generic parameter named KEYWORD to VALUE ([KEYWORD] in the scenario); repeatable",
+    ),
+    (
+        "tdmmap",
+        true,
+        "MAP",
+        "Generate and handle a table of TDM circuits for [tdmmap]; format {0-3}{99}{5-8}{1-31}",
+    ),
+    (
+        "dynamicStart",
+        true,
+        "N",
+        "Set the start offset of the [dynamic_id] variable (default 10000)",
+    ),
+    (
+        "dynamicMax",
+        true,
+        "N",
+        "Set the maximum of the [dynamic_id] variable (default 18000)",
+    ),
+    (
+        "dynamicStep",
+        true,
+        "N",
+        "Set the increment of the [dynamic_id] variable (default 4)",
+    ),
+    (
+        "rfc3339",
+        false,
+        "",
+        "Use timestamps in RFC 3339 format ([timestamp])",
+    ),
+    (
         "bg",
         false,
         "",
@@ -719,6 +773,17 @@ where
             cli.set_vars.push((variable, value));
             continue;
         }
+        // -key takes two arguments too: KEYWORD then VALUE (a literal).
+        if name == "key" {
+            let keyword = inline_value
+                .or_else(|| args.next())
+                .ok_or_else(|| "option '-key' requires KEYWORD and VALUE".to_owned())?;
+            let value = args
+                .next()
+                .ok_or_else(|| "option '-key' requires a VALUE after KEYWORD".to_owned())?;
+            cli.generic_keywords.push((keyword, value));
+            continue;
+        }
         // -infindex is the other two-argument flag: FILE then FIELD.
         if name == "infindex" {
             let file = inline_value
@@ -853,6 +918,11 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "aa" => cli.auto_answer = true,
         "nd" => cli.no_defaults = true,
         "nr" => cli.no_retrans = true,
+        "rfc3339" => cli.rfc3339 = true,
+        "tdmmap" => cli.tdmmap = Some(sipr_engine::TdmMap::parse(&val(value))?),
+        "dynamicStart" => cli.dynamic_start = Some(parse_num(flag, &val(value))?),
+        "dynamicMax" => cli.dynamic_max = Some(parse_num(flag, &val(value))?),
+        "dynamicStep" => cli.dynamic_step = Some(parse_num(flag, &val(value))?),
         "bg" => cli.background = true,
         "trace_msg" => cli.trace_msg = true,
         "trace_err" => cli.trace_err = true,

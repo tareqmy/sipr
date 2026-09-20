@@ -126,6 +126,17 @@ pub struct EngineConfig {
     pub users: Option<usize>,
     /// `-set VARIABLE VALUE`: initial values of `<Global>` variables.
     pub global_sets: Vec<(String, String)>,
+    /// `[remote_host]`: the target host as typed on the command line.
+    pub remote_host: String,
+    /// `-key KEYWORD VALUE` generic keywords: `[KEYWORD]` renders VALUE.
+    pub generic_keywords: Vec<(String, String)>,
+    /// `[dynamic_id]` start, step and maximum (`-dynamicStart`,
+    /// `-dynamicStep`, `-dynamicMax`; SIPp's defaults 10000, 4, 18000).
+    pub dynamic_id: (u32, u32, u32),
+    /// `-tdmmap`: the circuit table `[tdmmap]` renders from.
+    pub tdm_map: Option<crate::tdm::TdmMap>,
+    /// `-rfc3339`: `[timestamp]` in RFC 3339 form.
+    pub rfc3339: bool,
     /// `-tls_*` options; required when `transport` is [`TransportKind::TlsMono`].
     pub tls: Option<sipr_net::TlsConfig>,
     /// `-mi`: media address for `[media_ip]` and the RTP sockets (default:
@@ -415,6 +426,8 @@ struct CallState {
     peer_tag: Option<String>,
     routes: Vec<String>,
     last_recv: Option<Inbound>,
+    /// This call's `-tdmmap` circuit, held until the call ends.
+    tdm_number: Option<u32>,
     /// Remote media endpoints learned from received SDP, by [`MediaKind`]
     /// index. Stale values persist when a later SDP omits a stream (SIPp).
     remote_media: [Option<SocketAddr>; 3],
@@ -538,6 +551,12 @@ pub fn run_scenarios(
     config: &EngineConfig,
     ui: Option<UiChannels>,
 ) -> Result<(RunReport, EngineControl), EngineError> {
+    if config.tdm_map.is_none() && uses_tdmmap(scenario) {
+        // SIPp's wording, at start-up rather than at the first render.
+        return Err(EngineError(
+            "[tdmmap] keyword without -tdmmap parameter on command line".to_owned(),
+        ));
+    }
     if let Some((kind, second)) = secondary {
         validate_secondary(kind, scenario, second)?;
     }
@@ -835,6 +854,14 @@ struct Engine<'s> {
     /// retired id that returns still has its values.
     user_vars: HashMap<usize, crate::vars::SharedTable>,
     rng: sipr_net::rng::Rng,
+    /// When the run started (`[clock_tick]`).
+    run_start: Instant,
+    /// The `[dynamic_id]` counter (`-dynamicStart`/`-dynamicStep`/`-dynamicMax`).
+    dynamic_id: crate::render::DynamicId,
+    /// `-tdmmap` circuits in use, indexed by circuit number.
+    tdm_in_use: Vec<bool>,
+    /// `[file name=…]` contents by rendered name, read once per run.
+    file_cache: std::cell::RefCell<HashMap<String, String>>,
     /// Per-step: CSeq method a response recv must carry (SIPp guard).
     expected_cseq_method: Vec<Option<String>>,
     control: EngineControl,
@@ -898,6 +925,30 @@ struct Engine<'s> {
 }
 
 impl<'s> Engine<'s> {
+    /// Hand a free `-tdmmap` circuit to a new outgoing call (`None` without
+    /// a map); SIPp's warning text when every circuit is taken.
+    fn alloc_tdm(&mut self) -> Result<Option<u32>, &'static str> {
+        if self.tdm_in_use.is_empty() {
+            return Ok(None);
+        }
+        let Some(free) = self.tdm_in_use.iter().position(|used| !used) else {
+            return Err("Can't create new outgoing call: all tdm_map circuits busy");
+        };
+        self.tdm_in_use[free] = true;
+        Ok(Some(u32::try_from(free).unwrap_or(u32::MAX)))
+    }
+
+    /// Return a finished call's `-tdmmap` circuit to the table.
+    fn release_tdm(&mut self, call: &CallState) {
+        if let Some(slot) = call
+            .tdm_number
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(|n| self.tdm_in_use.get_mut(n))
+        {
+            *slot = false;
+        }
+    }
+
     fn new(
         scenario: &'s Scenario,
         secondary: Option<(SecondaryKind, &'s Scenario)>,
@@ -1416,6 +1467,20 @@ impl<'s> Engine<'s> {
             global_vars,
             user_vars: HashMap::new(),
             rng: sipr_net::rng::Rng::new(config.seed ^ 0x51B8_0003),
+            run_start: Instant::now(),
+            dynamic_id: crate::render::DynamicId::new(
+                config.dynamic_id.0,
+                config.dynamic_id.1,
+                config.dynamic_id.2,
+            ),
+            tdm_in_use: vec![
+                false;
+                config
+                    .tdm_map
+                    .as_ref()
+                    .map_or(0, |m| usize::try_from(m.circuits()).unwrap_or(0))
+            ],
+            file_cache: std::cell::RefCell::new(HashMap::new()),
             expected_cseq_method: precompute_cseq_methods(scenario),
             control,
             pacer_carry: 0.0,
@@ -2076,6 +2141,13 @@ impl<'s> Engine<'s> {
             routes: &call.routes,
             last: call.last_recv.as_ref(),
             var_ctx: Some(var_ctx),
+            run: run_info(
+                &self.config,
+                &self.dynamic_id,
+                &self.file_cache,
+                self.run_start,
+                call,
+            ),
             fields: crate::render::FieldSource {
                 files: &self.inf_files,
                 lines: &call.field_lines,
@@ -2173,6 +2245,16 @@ impl<'s> Engine<'s> {
         let Some(target) = self.config.target else {
             return; // unreachable: validated in run_with_control
         };
+        // SIPp takes the TDM circuit in the call constructor and books a
+        // failed call (E_FAILED_OUTBOUND_CONGESTION) when none is free.
+        let tdm_number = match self.alloc_tdm() {
+            Ok(n) => n,
+            Err(msg) => {
+                self.log_err(msg);
+                self.stats.failed_other += 1;
+                return;
+            }
+        };
         self.stats.outgoing_created += 1;
         let number = self.stats.created();
         let call_id = self.make_call_id(number);
@@ -2194,6 +2276,9 @@ impl<'s> Engine<'s> {
                 user_id,
             ),
         );
+        if let Some(call) = self.calls.get_mut(&call_id) {
+            call.tdm_number = tdm_number;
+        }
         self.advance(&call_id);
     }
 
@@ -2969,6 +3054,13 @@ impl<'s> Engine<'s> {
                 routes: &call.routes,
                 last: last.as_ref(),
                 var_ctx: Some(var_ctx),
+                run: run_info(
+                    &self.config,
+                    &self.dynamic_id,
+                    &self.file_cache,
+                    self.run_start,
+                    call,
+                ),
                 fields: crate::render::FieldSource {
                     files: &self.inf_files,
                     lines: &call.field_lines,
@@ -3666,6 +3758,13 @@ impl<'s> Engine<'s> {
             routes: &call.routes,
             last: call.last_recv.as_ref(),
             var_ctx: Some(var_ctx),
+            run: run_info(
+                &self.config,
+                &self.dynamic_id,
+                &self.file_cache,
+                self.run_start,
+                call,
+            ),
             fields: crate::render::FieldSource {
                 files: &self.inf_files,
                 lines: &call.field_lines,
@@ -4334,6 +4433,7 @@ impl<'s> Engine<'s> {
             let stats = self.stats_of(call.secondary);
             stats.successful += 1;
             stats.record_call_length(call.started.elapsed());
+            self.release_tdm(&call);
             self.return_user(&call);
         }
     }
@@ -4355,6 +4455,7 @@ impl<'s> Engine<'s> {
             self.forget_secondary(&call);
             self.stats_of(call.secondary)
                 .record_call_length(call.started.elapsed());
+            self.release_tdm(&call);
             self.return_user(&call);
         }
     }
@@ -4575,6 +4676,37 @@ fn seed_globals(
     Ok(())
 }
 
+/// The run-wide render inputs for one call (a free function over the
+/// engine's fields so a caller can hold `&mut self.rng` alongside it).
+fn run_info<'a>(
+    config: &'a EngineConfig,
+    dynamic: &'a crate::render::DynamicId,
+    files: &'a std::cell::RefCell<HashMap<String, String>>,
+    run_start: Instant,
+    call: &CallState,
+) -> crate::render::RunInfo<'a> {
+    crate::render::RunInfo {
+        clock_tick: u64::try_from(run_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        remote_host: &config.remote_host,
+        generic: &config.generic_keywords,
+        dynamic: Some(dynamic),
+        rfc3339: config.rfc3339,
+        tdm: config.tdm_map.as_ref().zip(call.tdm_number),
+        files: Some(files),
+    }
+}
+
+/// Whether any send in `scenario` renders `[tdmmap]`.
+fn uses_tdmmap(scenario: &Scenario) -> bool {
+    scenario.steps.iter().any(|s| match s {
+        Step::Send(send) => send
+            .template
+            .keywords()
+            .any(|k| matches!(k, Keyword::TdmMap)),
+        _ => false,
+    })
+}
+
 /// Fresh call state.
 #[allow(clippy::too_many_arguments)]
 fn new_call(
@@ -4609,6 +4741,7 @@ fn new_call(
         peer_tag: None,
         routes: Vec::new(),
         last_recv: None,
+        tdm_number: None,
         remote_media: [None; 3],
         rtpstream_ports: [None; 2],
         crypto: crate::render::CallCrypto::default(),

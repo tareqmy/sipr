@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Keyword parity (M39): `[clock_tick]`, `[timestamp]`, `[date]`,
+  `[sipp_version]`, `[dynamic_id]`, `[remote_host]`, `[tdmmap]`,
+  `[last_message]`, `[last_cseq_number]` (with `+N`/`-N`), `[fill
+  variable= text=]` and `[file name=]` render as in SIPp, and `-key
+  KEYWORD VALUE` defines generic keywords. New flags `-tdmmap`,
+  `-dynamicStart`/`-dynamicMax`/`-dynamicStep` and `-rfc3339`.
+  `[timestamp]` is UTC where SIPp uses local time (SIPP_COMPAT §6).
 - Statistical pauses at SIPp parity: `<pause distribution="…">` now takes
   SIPp's attribute form (`distribution="normal" mean="…" stdev="…"`) and
   all ten of SIPp's kinds — `fixed`, `uniform`, `normal`, `lognormal`,

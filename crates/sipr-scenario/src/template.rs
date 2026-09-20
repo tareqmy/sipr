@@ -122,6 +122,44 @@ pub enum Keyword {
         /// `line=` override (`line=M` or `line=[$var]`), else the call's line.
         line: Option<LineExpr>,
     },
+    /// `[clock_tick]` — milliseconds since the run started.
+    ClockTick,
+    /// `[timestamp]` — the current time in SIPp's log format (UTC here).
+    Timestamp,
+    /// `[date]` — the current date, `Mon, 25 Oct 2021 07:20:55 GMT`.
+    Date,
+    /// `[sipp_version]` — the version number.
+    SippVersion,
+    /// `[dynamic_id]` — a run-wide counter stepped at every render.
+    DynamicId,
+    /// `[remote_host]` — the target host as typed on the command line.
+    RemoteHost,
+    /// `[tdmmap]` — this call's TDM circuit (`-tdmmap`).
+    TdmMap,
+    /// `[last_message]` — the whole last received message.
+    LastMessage,
+    /// `[last_cseq_number]`, with an optional `+N`/`-N` — the CSeq number
+    /// of the last received message.
+    LastCseqNumber {
+        /// The `+N`/`-N` suffix (0 without one).
+        offset: i64,
+    },
+    /// `[fill variable=N text="…"]` — `text` repeated to the variable's
+    /// value in characters (`X` by default).
+    Fill {
+        /// The fill pattern.
+        text: String,
+        /// The variable holding the length.
+        variable: String,
+    },
+    /// `[file name=…]` — the contents of a file whose name is itself a
+    /// template (`[$var]`, `[fieldN]` …).
+    File {
+        /// The file name template.
+        name: Box<MsgTemplate>,
+    },
+    /// A `-key KEYWORD VALUE` generic keyword: renders its literal value.
+    Generic(String),
     /// Unrecognized keyword: emitted verbatim (including brackets).
     Unknown(String),
 }
@@ -197,6 +235,18 @@ pub fn normalize_cdata(raw: &str) -> String {
 /// `line` is the CDATA's source line, used for diagnostics.
 #[must_use]
 pub fn tokenize(text: &str, line: u32, diags: &mut Diagnostics) -> MsgTemplate {
+    tokenize_with(text, line, diags, &[])
+}
+
+/// [`tokenize`] with the `-key` generic keyword names: a bracketed use of
+/// one becomes [`Keyword::Generic`] instead of an unknown-keyword warning.
+#[must_use]
+pub fn tokenize_with(
+    text: &str,
+    line: u32,
+    diags: &mut Diagnostics,
+    generic: &[String],
+) -> MsgTemplate {
     let mut spans: Vec<Span> = Vec::new();
     let mut lit = String::new();
     let mut rest = text;
@@ -214,12 +264,22 @@ pub fn tokenize(text: &str, line: u32, diags: &mut Diagnostics) -> MsgTemplate {
         lit.push_str(&rest[..open]);
         let body = &after[..close];
         rest = &after[close + 1..];
-        match classify(body) {
+        match classify(body, generic) {
             Classified::Keyword(kw) => {
                 if !lit.is_empty() {
                     spans.push(Span::Lit(std::mem::take(&mut lit)));
                 }
                 spans.push(Span::Kw(kw));
+            }
+            Classified::File(name) => {
+                // SIPp compiles the file name as a sub-message.
+                let sub = tokenize_with(&name, line, diags, generic);
+                if !lit.is_empty() {
+                    spans.push(Span::Lit(std::mem::take(&mut lit)));
+                }
+                spans.push(Span::Kw(Keyword::File {
+                    name: Box::new(sub),
+                }));
             }
             Classified::Unknown => {
                 diags.warn(
@@ -262,16 +322,29 @@ fn matching_close(after: &str) -> Option<usize> {
 
 enum Classified {
     Keyword(Keyword),
+    /// `[file name=…]`: the name text, tokenized by the caller.
+    File(String),
     Unknown,
 }
 
-fn classify(body: &str) -> Classified {
+fn classify(body: &str, generic: &[String]) -> Classified {
     // `[$var]`
     if let Some(name) = body.strip_prefix('$') {
         if !name.is_empty() && name.chars().all(is_var_char) {
             return Classified::Keyword(Keyword::Var(name.to_owned()));
         }
         return Classified::Unknown;
+    }
+    // `[last_message]` and `[last_cseq_number+N]` sit in SIPp's keyword
+    // table, checked before the generic `last_<Header>` copy.
+    if body == "last_message" {
+        return Classified::Keyword(Keyword::LastMessage);
+    }
+    if let Some(rest) = body.strip_prefix("last_cseq_number") {
+        return match parse_offset(rest) {
+            Some(offset) => Classified::Keyword(Keyword::LastCseqNumber { offset }),
+            None => Classified::Unknown,
+        };
     }
     // `[last_Header:]`
     if let Some(rest) = body.strip_prefix("last_") {
@@ -316,11 +389,80 @@ fn classify(body: &str) -> Classified {
         "media_ip" => simple(Keyword::MediaIp),
         "media_ip_type" => simple(Keyword::MediaIpType),
         "authentication" => Classified::Keyword(Keyword::Authentication(parse_params(params))),
+        "clock_tick" => simple(Keyword::ClockTick),
+        "timestamp" => simple(Keyword::Timestamp),
+        "date" => simple(Keyword::Date),
+        "sipp_version" => simple(Keyword::SippVersion),
+        "dynamic_id" => simple(Keyword::DynamicId),
+        "remote_host" => simple(Keyword::RemoteHost),
+        "tdmmap" => simple(Keyword::TdmMap),
+        "fill" => {
+            let variable = param_value(params, "variable=");
+            if variable.is_empty() {
+                return Classified::Unknown;
+            }
+            let text = param_value(params, "text=");
+            Classified::Keyword(Keyword::Fill {
+                text: if text.is_empty() {
+                    "X".to_owned()
+                } else {
+                    text
+                },
+                variable,
+            })
+        }
+        "file" => {
+            let name = param_value(params, "name=");
+            if name.is_empty() {
+                Classified::Unknown
+            } else {
+                Classified::File(name)
+            }
+        }
         _ => match classify_media_port(name).or_else(|| classify_crypto(name)) {
             Some(kw) => simple(kw),
-            None => classify_field(name, params),
+            None => match classify_field(name, params) {
+                Classified::Unknown if params.is_empty() && generic.iter().any(|g| g == name) => {
+                    Classified::Keyword(Keyword::Generic(name.to_owned()))
+                }
+                other => other,
+            },
         },
     }
+}
+
+/// A keyword's `+N`/`-N` numeric suffix: `""` is 0, anything else that is
+/// not a signed integer is `None`.
+fn parse_offset(rest: &str) -> Option<i64> {
+    if rest.is_empty() {
+        return Some(0);
+    }
+    let (sign, digits) = match rest.as_bytes()[0] {
+        b'+' => (1, &rest[1..]),
+        b'-' => (-1, &rest[1..]),
+        _ => return None,
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i64>().ok().map(|n| n * sign)
+}
+
+/// The value of `key=` (`key` includes the `=`) among keyword parameters,
+/// SIPp's `getKeywordParam`: a `"quoted"` value runs to the closing quote,
+/// a bare one to the next whitespace. Empty when absent.
+fn param_value(params: &str, key: &str) -> String {
+    let Some(at) = params.find(key) else {
+        return String::new();
+    };
+    let rest = &params[at + key.len()..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        return quoted.split('"').next().unwrap_or_default().to_owned();
+    }
+    rest.split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// SIPp's SRTP keyword names: `crypto(tag|suite<s>|keyparams)(1|2)(audio|video)`
@@ -695,5 +837,100 @@ mod tests {
             let warns: Vec<_> = d.into_items();
             assert!(warns.is_empty(), "{name}: {warns:?}");
         }
+    }
+
+    #[test]
+    fn m39_keywords_classify() {
+        let (t, msgs) = tok(
+            "[clock_tick] [timestamp] [date] [sipp_version] [dynamic_id] [remote_host] \
+             [tdmmap] [last_message] [last_cseq_number] [last_cseq_number+1] \
+             [last_cseq_number-2]",
+        );
+        assert!(msgs.is_empty(), "{msgs:?}");
+        let kws: Vec<&Keyword> = t.keywords().collect();
+        assert_eq!(
+            kws,
+            vec![
+                &Keyword::ClockTick,
+                &Keyword::Timestamp,
+                &Keyword::Date,
+                &Keyword::SippVersion,
+                &Keyword::DynamicId,
+                &Keyword::RemoteHost,
+                &Keyword::TdmMap,
+                &Keyword::LastMessage,
+                &Keyword::LastCseqNumber { offset: 0 },
+                &Keyword::LastCseqNumber { offset: 1 },
+                &Keyword::LastCseqNumber { offset: -2 },
+            ]
+        );
+        // A malformed offset is not a keyword.
+        let (_, msgs) = tok("[last_cseq_number+x]");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+    }
+
+    #[test]
+    fn fill_and_file_take_sipp_params() {
+        let (t, msgs) =
+            tok(r#"[fill variable=n] [fill text="ab c" variable=m] [fill variable=k text=-]"#);
+        assert!(msgs.is_empty(), "{msgs:?}");
+        let kws: Vec<&Keyword> = t.keywords().collect();
+        assert_eq!(
+            kws,
+            vec![
+                &Keyword::Fill {
+                    text: "X".to_owned(),
+                    variable: "n".to_owned()
+                },
+                &Keyword::Fill {
+                    text: "ab c".to_owned(),
+                    variable: "m".to_owned()
+                },
+                &Keyword::Fill {
+                    text: "-".to_owned(),
+                    variable: "k".to_owned()
+                },
+            ]
+        );
+        // `variable=` is required (SIPp: "Fill Variable" get_var error).
+        let (_, msgs) = tok("[fill text=X]");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        // The file name is a sub-template.
+        let (t, msgs) = tok("[file name=body-[$n].txt]");
+        assert!(msgs.is_empty(), "{msgs:?}");
+        let Some(Keyword::File { name }) = t.keywords().next() else {
+            panic!("{t:?}");
+        };
+        assert_eq!(
+            name.spans,
+            vec![
+                Span::Lit("body-".to_owned()),
+                Span::Kw(Keyword::Var("n".to_owned())),
+                Span::Lit(".txt".to_owned()),
+            ]
+        );
+        let (_, msgs) = tok("[file]");
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+    }
+
+    #[test]
+    fn generic_keywords_come_from_the_key_list() {
+        let mut d = Diagnostics::new("test");
+        let keys = vec!["pbx".to_owned(), "trunk".to_owned()];
+        let t = tokenize_with("[pbx]/[trunk] [other]", 1, &mut d, &keys);
+        let msgs: Vec<String> = d.into_items().into_iter().map(|i| i.message).collect();
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("[other]"), "{msgs:?}");
+        let kws: Vec<&Keyword> = t.keywords().collect();
+        assert_eq!(
+            kws,
+            vec![
+                &Keyword::Generic("pbx".to_owned()),
+                &Keyword::Generic("trunk".to_owned())
+            ]
+        );
+        // Without the list the same text is unknown, as before.
+        let (_, msgs) = tok("[pbx]");
+        assert_eq!(msgs.len(), 1);
     }
 }

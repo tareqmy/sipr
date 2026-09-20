@@ -175,7 +175,7 @@ Parts of SIPp that sipr does not implement, and where that is deliberate:
 - Extended 3PCC (`-master`/`-slave`/`-slave_cfg`, `sendCmd dest=`,
   `recvCmd src=`); classic `-3pcc` is supported.
 - `PRINTF=` virtual-line injection files.
-- `<rtp_echo variable=…>` (only `value="0|1"`), and bracketed `-key` values.
+- `<rtp_echo variable=…>` (only `value="0|1"`).
 - WebSocket transport (`-t ws`).
 - SIPp's SCTP socket options (`-multihome`, `-heartbeat`, `-pathmaxret`,
   `-pmtu`, `-assocmaxret`, `-gracefulclose`) — out of reach without libsctp.

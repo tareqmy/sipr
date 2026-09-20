@@ -174,6 +174,76 @@ pub struct RenderCtx<'a> {
     pub var_ctx: Option<VarCtx<'a>>,
     /// Injection files + this call's assigned line per file (`[fieldN]`).
     pub fields: FieldSource<'a>,
+    /// Run-wide inputs of the M39 keywords.
+    pub run: RunInfo<'a>,
+}
+
+/// `[dynamic_id]`: SIPp's run-wide counter (`call::dynamicId`), stepped at
+/// every render and wrapped back to `start` once past `max`.
+#[derive(Debug)]
+pub struct DynamicId {
+    start: u32,
+    step: u32,
+    max: u32,
+    next: std::cell::Cell<u32>,
+}
+
+impl DynamicId {
+    /// A counter starting at `start`, stepping by `step`, wrapping past `max`.
+    #[must_use]
+    pub fn new(start: u32, step: u32, max: u32) -> Self {
+        Self {
+            start,
+            step,
+            max,
+            next: std::cell::Cell::new(start),
+        }
+    }
+
+    /// The current value; the counter moves on.
+    pub fn take(&self) -> u32 {
+        let value = self.next.get();
+        let mut following = value.saturating_add(self.step);
+        if following > self.max {
+            following = self.start;
+        }
+        self.next.set(following);
+        value
+    }
+}
+
+/// Run-wide inputs for the keywords added in M39 (`[clock_tick]`,
+/// `[remote_host]`, `-key`, `[dynamic_id]`, `[timestamp]`, `[tdmmap]`,
+/// `[file]`).
+#[derive(Clone, Copy)]
+pub struct RunInfo<'a> {
+    /// Milliseconds since the run started.
+    pub clock_tick: u64,
+    /// The target host as typed on the command line.
+    pub remote_host: &'a str,
+    /// `-key KEYWORD VALUE` pairs.
+    pub generic: &'a [(String, String)],
+    /// The `[dynamic_id]` counter (0 when absent).
+    pub dynamic: Option<&'a DynamicId>,
+    /// `-rfc3339`: `[timestamp]` in RFC 3339 form.
+    pub rfc3339: bool,
+    /// The `-tdmmap` table and this call's circuit number.
+    pub tdm: Option<(&'a crate::tdm::TdmMap, u32)>,
+    /// `[file name=…]` contents by rendered name, read once per run.
+    pub files: Option<&'a RefCell<std::collections::HashMap<String, String>>>,
+}
+
+impl RunInfo<'static> {
+    /// No run-wide inputs (tests, and renders outside a run).
+    pub const EMPTY: Self = Self {
+        clock_tick: 0,
+        remote_host: "",
+        generic: &[],
+        dynamic: None,
+        rfc3339: false,
+        tdm: None,
+        files: None,
+    };
 }
 
 /// `-inf` files plus the current call's assigned line in each (parallel to
@@ -494,6 +564,77 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
             }
         }
         Keyword::Authentication(raw_params) => render_authentication(raw_params, ctx, out)?,
+        Keyword::ClockTick => {
+            let _ = write!(out, "{}", ctx.run.clock_tick);
+        }
+        Keyword::Timestamp => out.push_str(&crate::clock::sipp_timestamp(
+            std::time::SystemTime::now(),
+            ctx.run.rfc3339,
+        )),
+        Keyword::Date => out.push_str(&crate::clock::rfc1123_date(std::time::SystemTime::now())),
+        Keyword::SippVersion => out.push_str(env!("CARGO_PKG_VERSION")),
+        Keyword::DynamicId => {
+            let id = ctx.run.dynamic.map_or(0, DynamicId::take);
+            let _ = write!(out, "{id}");
+        }
+        Keyword::RemoteHost => out.push_str(ctx.run.remote_host),
+        Keyword::TdmMap => {
+            if let Some((map, number)) = ctx.run.tdm {
+                out.push_str(&map.circuit(number));
+            }
+        }
+        Keyword::LastMessage => {
+            if let Some(m) = ctx.last {
+                out.push_str(&m.reconstruct());
+            }
+        }
+        Keyword::LastCseqNumber { offset } => {
+            // SIPp: `sscanf("%d")` on the CSeq value, 0 without a CSeq.
+            let number = ctx
+                .last
+                .and_then(|m| m.header("CSeq"))
+                .and_then(|v| v.split_whitespace().next()?.parse::<i64>().ok())
+                .unwrap_or(0);
+            let _ = write!(out, "{}", number + offset);
+        }
+        Keyword::Fill { text, variable } => {
+            let length = ctx
+                .var_ctx
+                .as_ref()
+                .and_then(|vc| table_lookup(vc.vars, variable).map(|id| vc.store.get(id).as_num()))
+                .unwrap_or(0.0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let length = if length.is_nan() || length < 0.0 {
+                0
+            } else {
+                length as usize
+            };
+            if !text.is_empty() {
+                out.extend(text.chars().cycle().take(length));
+            }
+        }
+        Keyword::File { name } => {
+            let path = render_to_string(name, ctx, None);
+            let Some(cache) = ctx.run.files else {
+                return Err(RenderError(format!(
+                    "[file name={path}] cannot be read outside a run"
+                )));
+            };
+            let mut cache = cache.borrow_mut();
+            if !cache.contains_key(&path) {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| RenderError(format!("Could not open '{path}': {e}")))?;
+                cache.insert(path.clone(), String::from_utf8_lossy(&bytes).into_owned());
+            }
+            if let Some(content) = cache.get(&path) {
+                out.push_str(content);
+            }
+        }
+        Keyword::Generic(name) => {
+            if let Some((_, value)) = ctx.run.generic.iter().find(|(k, _)| k == name) {
+                out.push_str(value);
+            }
+        }
         Keyword::Unknown(u) => {
             // Tokenizer emits unknown keywords as literals; reaching here is
             // a bug upstream, but render verbatim rather than dying.
@@ -789,6 +930,7 @@ mod tests {
             last,
             var_ctx: None,
             fields: crate::render::FieldSource::EMPTY,
+            run: RunInfo::EMPTY,
         }
     }
 
@@ -953,5 +1095,91 @@ mod tests {
         let rb = String::from_utf8(render(&t, &b).unwrap()).unwrap();
         assert!(ra.contains("branch=z9hG4bK-99-1-0"));
         assert!(rb.contains("branch=z9hG4bK-99-1-7"));
+    }
+
+    fn render_kw(text: &str, ctx: &RenderCtx<'_>) -> String {
+        let mut d = sipr_scenario::diag::Diagnostics::new("t");
+        let t = sipr_scenario::template::tokenize_with(text, 1, &mut d, &["pbx".to_owned()]);
+        render_to_string(&t, ctx, None)
+    }
+
+    #[test]
+    fn m39_run_keywords_render_from_run_info() {
+        let dynamic = DynamicId::new(10, 4, 20);
+        let generic = vec![("pbx".to_owned(), "pbx-1.example".to_owned())];
+        let files = RefCell::new(std::collections::HashMap::new());
+        let map = crate::tdm::TdmMap::parse("{0-3}{99}{5-8}{1-31}").unwrap();
+        let mut c = ctx(None);
+        c.run = RunInfo {
+            clock_tick: 1234,
+            remote_host: "sip.example.org",
+            generic: &generic,
+            dynamic: Some(&dynamic),
+            rfc3339: true,
+            tdm: Some((&map, 31)),
+            files: Some(&files),
+        };
+        assert_eq!(render_kw("[clock_tick]", &c), "1234");
+        assert_eq!(render_kw("[remote_host]", &c), "sip.example.org");
+        assert_eq!(render_kw("[pbx]", &c), "pbx-1.example");
+        assert_eq!(render_kw("[sipp_version]", &c), env!("CARGO_PKG_VERSION"));
+        assert_eq!(render_kw("[tdmmap]", &c), "0.99.6/1");
+        // [dynamic_id] steps at every render and wraps past the maximum.
+        let ids: Vec<String> = (0..4).map(|_| render_kw("[dynamic_id]", &c)).collect();
+        assert_eq!(ids, ["10", "14", "18", "10"]);
+        // [date] and [timestamp] carry SIPp's shapes.
+        let date = render_kw("[date]", &c);
+        assert!(date.ends_with(" GMT") && date.len() == 29, "{date}");
+        let ts = render_kw("[timestamp]", &c);
+        assert!(
+            ts.len() == 27 && ts.ends_with('Z') && ts.as_bytes()[10] == b'T',
+            "{ts}"
+        );
+        c.run.rfc3339 = false;
+        let ts = render_kw("[timestamp]", &c);
+        assert_eq!(ts.matches('\t').count(), 2, "{ts}");
+        // Outside a run: empty, never a panic.
+        let bare = ctx(None);
+        assert_eq!(
+            render_kw("[dynamic_id]|[tdmmap]|[pbx]|[remote_host]", &bare),
+            "0|||"
+        );
+    }
+
+    #[test]
+    fn last_message_and_last_cseq_number_read_the_last_received() {
+        let msg = Inbound::parse(b"INVITE sip:x SIP/2.0\r\nCSeq: 41 INVITE\r\nCall-ID: c\r\n\r\n")
+            .unwrap();
+        let c = ctx(Some(&msg));
+        assert_eq!(render_kw("[last_cseq_number]", &c), "41");
+        assert_eq!(render_kw("[last_cseq_number+1]", &c), "42");
+        assert_eq!(render_kw("[last_cseq_number-40]", &c), "1");
+        assert!(
+            render_kw("[last_message]", &c)
+                .starts_with("INVITE sip:x SIP/2.0\r\nCSeq: 41 INVITE\r\n")
+        );
+        let none = ctx(None);
+        assert_eq!(render_kw("[last_cseq_number]", &none), "0");
+        assert_eq!(render_kw("x[last_message]y", &none), "xy");
+    }
+
+    #[test]
+    fn file_keyword_reads_once_through_the_cache() {
+        let path =
+            std::env::temp_dir().join(format!("sipr-render-file-{}.txt", std::process::id()));
+        std::fs::write(&path, "v=0\r\n").unwrap();
+        let files = RefCell::new(std::collections::HashMap::new());
+        let mut c = ctx(None);
+        c.run.files = Some(&files);
+        let text = format!("[file name={}]", path.display());
+        assert_eq!(render_kw(&text, &c), "v=0\r\n");
+        std::fs::remove_file(&path).unwrap();
+        // Cached: the second render never touches the disk.
+        assert_eq!(render_kw(&text, &c), "v=0\r\n");
+        // A missing file is a render error (the call fails) rather than a
+        // silently truncated message.
+        let mut d = sipr_scenario::diag::Diagnostics::new("t");
+        let t = sipr_scenario::template::tokenize("[file name=/definitely/not/here]", 1, &mut d);
+        assert!(render(&t, &c).is_err());
     }
 }

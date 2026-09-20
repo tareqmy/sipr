@@ -975,7 +975,28 @@ fn keyword_name(k: &Keyword) -> String {
                 format!("[{base}]")
             };
         }
+        Keyword::LastCseqNumber { offset } => {
+            let off = match *offset {
+                0 => String::new(),
+                n if n > 0 => format!("+{n}"),
+                n => n.to_string(),
+            };
+            return format!("[last_cseq_number{off}]");
+        }
+        Keyword::Fill { text, variable } => {
+            return format!("[fill variable={variable} text=\"{text}\"]");
+        }
+        Keyword::File { .. } => return "[file name=…]".to_owned(),
+        Keyword::Generic(g) => return format!("[{g}]"),
         Keyword::Authentication(_) => "authentication",
+        Keyword::ClockTick => "clock_tick",
+        Keyword::Timestamp => "timestamp",
+        Keyword::Date => "date",
+        Keyword::SippVersion => "sipp_version",
+        Keyword::DynamicId => "dynamic_id",
+        Keyword::RemoteHost => "remote_host",
+        Keyword::TdmMap => "tdmmap",
+        Keyword::LastMessage => "last_message",
         Keyword::Service => "service",
         Keyword::RemoteIp => "remote_ip",
         Keyword::RemotePort => "remote_port",
