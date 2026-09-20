@@ -45,9 +45,9 @@ reverses it.
 
 ## Chocolatey (Windows)
 
-```cmd
-choco install sipr
-```
+Not published yet. The package definition is in `dist/chocolatey/` and the
+release workflow pushes it once a `CHOCO_API_KEY` secret is set; until then,
+use the PowerShell installer above.
 
 ## Cargo
 
