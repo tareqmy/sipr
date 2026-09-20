@@ -4071,23 +4071,30 @@ fn run_statistical_pauses_pair(
             .expect("spawn uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
+    // `-bg` is sipr's headless switch (periodic stat lines on stderr);
+    // sipp's `-bg` forks and the parent exits 99 at once (docs/TESTING.md),
+    // so real sipp runs in the foreground with its screen on a null stdout.
+    let mut args = vec![
+        "-sf".to_owned(),
+        uac_path.to_str().expect("utf8").to_owned(),
+        "-i".to_owned(),
+        "127.0.0.1".to_owned(),
+        "-r".to_owned(),
+        "10".to_owned(),
+        "-m".to_owned(),
+        calls.to_string(),
+        "-timeout".to_owned(),
+        "20".to_owned(),
+    ];
+    let uac_is_sipr = uac_bin == std::path::Path::new(env!("CARGO_BIN_EXE_sipr"));
+    if uac_is_sipr {
+        args.push("-bg".to_owned());
+    }
+    args.push(format!("127.0.0.1:{port}"));
     let mut uac = Reaper(
         Command::new(uac_bin)
             .current_dir(&dir)
-            .args([
-                "-sf",
-                uac_path.to_str().expect("utf8"),
-                "-i",
-                "127.0.0.1",
-                "-r",
-                "10",
-                "-m",
-                &calls.to_string(),
-                "-timeout",
-                "20",
-                "-bg",
-                &format!("127.0.0.1:{port}"),
-            ])
+            .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
