@@ -109,8 +109,9 @@ mod tests {
         }
         // Both commands ran (through a shell, since `>>` is a shell feature).
         // They are fire-and-forget and run concurrently, so their order in
-        // the file is not guaranteed — only that each appended once.
-        let mut lines: Vec<&str> = text.lines().collect();
+        // the file is not guaranteed — only that each appended once. Trimmed:
+        // cmd's `echo one >> f` keeps the space before the redirect.
+        let mut lines: Vec<&str> = text.lines().map(str::trim).collect();
         lines.sort_unstable();
         assert_eq!(lines, ["one", "two"]);
         drop(runner);
