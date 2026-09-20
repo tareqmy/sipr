@@ -787,7 +787,14 @@ mod tests {
             rx_sock.recv_from(&mut buf).is_err(),
             "paused stream kept sending"
         );
+        // Resume goes through the media thread; a loaded host can take
+        // more than one packet interval to act on it, so wait generously
+        // for the first packet (a paused stream is checked above with the
+        // short window, where slowness only makes the check easier).
         player.set_paused("r2", Some("rtp-audio"), false);
+        rx_sock
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         assert!(rx_sock.recv_from(&mut buf).is_ok(), "resume sent nothing");
         player.stop("r2", None);
     }
