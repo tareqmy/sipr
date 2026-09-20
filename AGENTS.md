@@ -10,7 +10,7 @@ pcap replay, RTP streaming + DTMF, RTP echo + rtpcheck, SRTP + SRTP echo server,
 control socket + HTTP API). `PLAN.md` is the
 master plan (its dependency choices were superseded by in-tree implementations —
 `docs/MILESTONES.md` notes record each swap); the post-v1 backlog at the bottom of
-`docs/MILESTONES.md` is exhausted — new work needs a new backlog entry there first.
+`docs/MILESTONES.md` (the second backlog, M38+) is what comes next.
 
 ## Read this first
 

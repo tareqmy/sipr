@@ -1477,3 +1477,295 @@ the IPv6-without-brackets warning: brackets would be read as a keyword).
       setdest); ARCHITECTURE (the exec runner thread next to the media
       threads); README feature bullet; CONVENTIONS if the runner needs a
       dependency (it should not — `std::process` suffices).
+
+## Second backlog (ordered, after M37)
+
+Drawn up 2026-09-20 from a sweep of what still fails loudly: SIPp's CLI
+option table (`sipp.cpp`) against `sipr -h`, its keyword table
+(`message.cpp`) against the renderer, `sipp.dtd` against the compiler, the
+"not supported yet" errors in the source, and the "post-v1" / "left as is"
+notes in `docs/SIPP_COMPAT.md` §6. Every DTD element is handled; the gaps
+are inside attributes, keywords and flags. Ordered by how often real
+SIPp scenarios and CI wrappers hit them. Each entry states its behavioral
+oracle; read the C++ before implementing, as before. Parity first (M38–M44),
+sipr's own additions after (M45+).
+
+### M38 — Statistical pauses: the seven missing `distribution=` kinds and `<sample>`
+
+The last v1.x-tier item in PLAN.md §3.4. `<pause distribution="…">`
+accepts `fixed`, `uniform`, `normal` and `exponential`; the engine
+rejects `lognormal`, `weibull`, `pareto`, `gpareto`, `gamma`, `negbin` and
+`poisson` ("pause distribution '…' is not implemented yet", `engine.rs`
+`validate_for_engine`), and the `<sample assign_to="…" distribution="…"/>`
+action is a compile error ("action <sample> is not supported yet").
+
+Behavioral oracle: `scenario.cpp` ~l.1112 `parse_distribution` (the
+attribute names per kind, read from the source: `fixed` `value`;
+`uniform` `min`/`max`; `normal` and `lognormal` `mean`/`stdev`;
+`exponential` `mean`; `weibull` `lambda`/`k`; `pareto` `k`/`x_m`;
+`gpareto` `shape`/`scale`/`location`; `gamma` `k`/`theta`; `negbin`
+`n`/`p`; `poisson` — verify, `lambda` expected; plus the old-style
+`<pause>` attributes `milliseconds`/`variable`/`distribution` and how
+they combine), the `CSample` subclasses (`CFixed`, `CUniform`,
+`CNormal`, `CLogNormal`, `CExponential`, `CWeibull`, `CPareto`,
+`CGPareto`, `CGamma`, `CNegBin`, `CPoisson`) and their `sample()` /
+`textDescr()`
+(the TUI shows the description), `HAVE_GSL` — SIPp builds these seven
+only with GSL, so a GSL-less sipp errors "…requires GSL" at parse; that
+is the interop baseline, not a behavior to copy; `actions.cpp`
+`E_AT_ASSIGN_FROM_SAMPLE` (the sample lands in a double variable).
+
+- [ ] Scenario: parse the seven kinds with SIPp's attribute names and
+      validation messages; `<sample>` compiles to `Action::Sample {
+      assign_to, sampler }`, `--check` dumps the description text.
+- [ ] Engine: samplers in-tree over the sanctioned `rand` (no
+      `rand_distr` unless a stated reason lands in the commit): Box–Muller
+      already exists for normal; lognormal = exp(normal); Weibull, Pareto
+      and generalized Pareto by inverse CDF; gamma by Marsaglia–Tsang;
+      Poisson by Knuth
+      (small λ) / transformed rejection; negbin as the gamma–Poisson
+      mixture. Non-positive samples clamp as SIPp's do (verify). Off the
+      hot path: one sample per pause step or action.
+- [ ] Tests: statistical unit tests (sample mean/variance within
+      tolerance over 100k draws, seeded); golden `--check` output for
+      every kind; interop: a scenario with each distribution loads in
+      sipp built with GSL — if the local sipp lacks GSL, the harness
+      asserts sipp's "requires GSL" refusal and skips the timing
+      comparison, recorded as such.
+- [ ] Docs: SIPP_COMPAT §1 (pause attributes, `sample` action) and §6
+      note; README "Not yet" loses `<sample>`; PLAN.md §3.4 v1.x row done.
+
+### M39 — Keyword parity: `-key`, `[fill]`, `[last_message]`, `[clock_tick]` and friends
+
+Ten keywords from SIPp's table render nothing in sipr today and are
+warned as unknown: `[clock_tick]`, `[date]`, `[dynamic_id]`,
+`[last_cseq_number]`, `[last_message]`, `[remote_host]`,
+`[sipp_version]`, `[tdmmap]`, `[timestamp]`, `[fill variable=…]`; and
+the generic `-key keyword value` flag (`[keyword]` expands to `value`)
+is an unknown option. `-key` is the most common one in real wrappers.
+
+Behavioral oracle: `message.cpp` the keyword table (~l.60-120) and
+`SendingMessage::SendingMessage` (bracketed-value parsing; the `-key`
+values are themselves message templates — "Bracketed `-key` values"
+in SIPP_COMPAT §6 M14 note); `call.cpp` `createSendingMessage` for each
+`E_Message_*`: `Clock_Tick` (ms since start), `Timestamp` (SIPp's
+`%Y-%m-%d %H:%M:%S.%f`-style — verify), `Date` (RFC 1123, for the
+`Date:` header), `Sipp_Version`, `Dynamic_ID` (a per-run counter
+starting at a random base — used for `[dynamic_id]` REGISTER contacts),
+`Last_CSeq_Number`, `Last_Message` (the whole last received message),
+`Remote_Host` (the `-rsa`/target host as given, not resolved), `Fill`
+(`variable=` names a numeric variable, emits that many `X`s — verify
+the fill character), `TDM_Map` (`-tdmmap` circuit map keyword);
+`sipp.cpp` `-tdmmap` parsing (`{a-b}{c-d}{e-f}{g-h}` form).
+
+- [ ] CLI: `-key <keyword> <value>` (repeatable), `-tdmmap <map>`; the
+      keyword names collide with nothing built-in (error otherwise, as
+      SIPp's "duplicate keyword"? — verify).
+- [ ] Renderer: the ten keywords as `Slot` variants, computed per render
+      (no allocation beyond the slot fill; `[last_message]` copies the
+      stored last-received bytes); `[sipp_version]` renders
+      `sipr v<version>` and is documented as the one deliberate wording
+      divergence.
+- [ ] Tests: golden render for each; interop: a scenario exercising
+      `-key`, `[fill]`, `[dynamic_id]`, `[clock_tick]` against sipp,
+      comparing the message bytes modulo the time-dependent values.
+- [ ] Docs: SIPP_COMPAT §2 and §3; README "Not yet" loses `-key`.
+
+### M40 — Statistics files at parity: `-trace_stat` columns, `-trace_rtt`, `-trace_counts`, `-trace_error_codes`
+
+`-trace_stat` writes "a pragmatic subset" of SIPp's columns (SIPP_COMPAT
+§6 M4: "full column parity is a v1-polish item"); wrappers that parse
+the CSV by column name break on the missing ones. `-trace_rtt`/
+`-rtt_freq`, `-trace_counts`, `-trace_error_codes`, `-periodic_rtd`,
+`-stat_delimiter`, `-f` and `-trace_screen`/`-screen_file` are unknown
+options.
+
+Behavioral oracle: `stat.cpp` `CStat::dumpData` (the exact header —
+every counter with `(P)`/`(C)`, the repartition columns
+`ResponseTimeRepartition1_<n>` / `CallLengthRepartition_<n>`, per-code
+columns from `-trace_error_codes`? — verify — and the `;` delimiter
+default), `dumpDataRtt` (`-trace_rtt`: `Date_ms;response_time_ms;rtd_no`
+per call every `-rtt_freq` calls), `CStat::displayData` +
+`dumpScreens` (`-trace_screen` writes the final screens as text, the
+`-bg` idiom), `-trace_counts` (`<scenario>_<pid>_counts.csv`: one row per
+`-f` interval with every message-command counter — the `counter=` and
+per-step send/recv counts), `-trace_error_codes`
+(`<scenario>_<pid>_error_codes.log`: unexpected response codes),
+`-periodic_rtd` (reset repartition counters each interval), `-f` (screen
+refresh period; sipr's TUI tick is fixed at 1 s — keep the flag for the
+file dump period).
+
+- [ ] `-trace_stat`: every SIPp column in SIPp's order, including the
+      repartition ones sized from `<ResponseTimeRepartition>` /
+      `<CallLengthRepartition>`; `-stat_delimiter`; `-periodic_rtd`.
+- [ ] `-trace_rtt` + `-rtt_freq`, `-trace_counts`, `-trace_error_codes`,
+      `-trace_screen` + `-screen_file`, `-f`. File naming
+      `<scenario>_<pid>_<kind>.{csv,log}` exactly as SIPp's (the
+      `-sn uac` name is `uac`). All writes go through the stats
+      thread/snapshot path, never the engine hot path.
+- [ ] Tests: golden headers; an e2e run diffing the CSV header against a
+      checked-in copy of sipp's for the same scenario; interop: run both
+      with `-trace_stat -trace_rtt -trace_counts` on the same scenario
+      and compare headers byte-for-byte and row counts.
+- [ ] Docs: SIPP_COMPAT §3 (tracing), §6 M4 note closed.
+
+### M41 — Message and error logs at parity: short messages, `<log>` files, calldebug, rotation
+
+`<log>` actions print to stderr with a `[log]` prefix; SIPp writes them
+to `<scenario>_<pid>_logs.log` under `-trace_logs`. `-trace_shortmsg`
+(one CSV line per message, the format most SIPp CI wrappers grep),
+`-trace_calldebug`, `-trace_timeout`, `-error_file`, `-message_file`,
+`-log_file`, `-shortmessage_file`, `-calldebug_file`, the `*_overwrite`
+flags, `-ringbuffer_files`/`-ringbuffer_size`/`-max_log_size` rotation,
+`-rfc3339` timestamps and `-deadcall_wait` (how long a finished call's
+Call-ID stays known so late messages log against it) are unknown
+options.
+
+Behavioral oracle: `logger.cpp` (`print_message`/`print_short_message`
+formats — the shortmessage CSV fields: date, call id, direction, message
+type, method/code, ...; the `*_overwrite` semantics — default overwrite
+true; `rotate_*` and the ringbuffer scheme `<name>_<n>.log`), `sipp.cpp`
+the option table defaults, `call.cpp` `~call` / deadcall handling and
+`-deadcall_wait` (keeps `Call-ID → final status` for the error log:
+"Received message for a dead call"), `-trace_calldebug` (`call.cpp`
+`dumpCall`: the message history of aborted calls).
+
+- [ ] `-trace_logs`/`-log_file`: `<log>` goes to the file (stderr stays
+      the fallback without the flag, documented); `-trace_shortmsg`/
+      `-shortmessage_file` with SIPp's CSV format; `-trace_calldebug`/
+      `-calldebug_file`; `-trace_timeout`; `-error_file`, `-message_file`
+      (rename the existing `-trace_err`/`-trace_msg` outputs);
+      `-rfc3339`.
+- [ ] Rotation: `-ringbuffer_files`/`-ringbuffer_size`/`-max_log_size`
+      and the `*_overwrite` flags for every file above, on the writer
+      thread (the engine only hands lines to a channel — check the
+      existing trace path already does; if not, this is where it moves).
+- [ ] `-deadcall_wait`: a bounded map of finished calls (Call-ID →
+      final status, expiry) consulted before "unexpected message" so the
+      error log names the dead call as SIPp does.
+- [ ] Tests: golden files for each format; e2e rotation test with a
+      tiny `-ringbuffer_size`; interop: `-trace_shortmsg` on both sides,
+      compare field counts per line and the direction/method columns.
+- [ ] Docs: SIPP_COMPAT §3 (tracing) and a new §6 note on file naming.
+
+### M42 — Timer and behavior knobs: retransmission counts, timeouts, `-lost`, `-default_behaviors`
+
+The retransmission policy is SIPp's default with only `-max_retrans`
+and `-nr`; `-max_invite_retrans`, `-max_non_invite_retrans`,
+`-timer_resol`, `-recv_timeout`, `-send_timeout`, `-timeout_error`,
+`-lost` (default `lost=` for every send), `-pause_msg_ign`,
+`-default_behaviors`, `-callid_slash_ign`, `-sleep`, `-nostdin` are
+unknown options. Also two SIPP_COMPAT "post-v1" notes: UAS replies go to
+the request's source address, not Via `received`/`rport` (§6 M4), and
+the digest `uri=` shape (§6 M6, partly closed by `-auth_uri`).
+
+Behavioral oracle: `call.cpp` `call::run` / `sendmsg` retransmission
+schedule (`DEFAULT_T1_TIMER`, the INVITE vs non-INVITE caps, when
+`-max_retrans` applies to both), `-recv_timeout` (`recv_timeout` on
+every recv without its own `timeout=`), `-send_timeout`, `-lost` (the
+per-send default `lost` percentage — scenario `lost=` overrides),
+`-pause_msg_ign` (messages arriving during a `<pause>` are dropped
+without "unexpected"), `-default_behaviors` (`all|none|bye|abortunexp|
+pingreply|cseq` and the `-` prefixed removals; `-nd` = `none`;
+`cseq` = check CSeq on responses), `-callid_slash_ign` (the `///`
+3PCC Call-ID prefix rule), `-timeout_error` (exit non-zero when
+`-timeout` fires), `-timer_resol` (the scheduler tick — sipr's pacer is
+elapsed-time based, so this becomes the wake-up granularity, verify it
+has any observable effect worth matching), `-sleep`, `-nostdin`;
+`socket.cpp` `process_message` for where SIPp sends responses
+(it does **not** honour `received`/`rport` either — verify before
+implementing, and if SIPp replies to the source address as sipr does,
+close the §6 note as no divergence).
+
+- [ ] CLI + engine: each flag with SIPp's default and unit parsing
+      (`ms`/`s`/`m`/`h` suffixes as SIPp's `get_time` — check the
+      existing `-rate_interval` parser is shared).
+- [ ] `-default_behaviors` as a bitset replacing the `-nd` boolean
+      (`-nd` stays as the alias); `-lost` as the send default; the
+      retransmission caps split INVITE/non-INVITE.
+- [ ] Tests: unit tests per flag; interop: `-max_invite_retrans 2` with
+      a UAS that never answers, compare retransmission counts and the
+      timeout timing on both sides; `-pause_msg_ign` with an early BYE.
+- [ ] Docs: SIPP_COMPAT §3 and §6 (retransmission schedule note
+      extended; the Via received/rport question answered either way).
+
+### M43 — Extended 3PCC: `-master`/`-slave`/`-slave_cfg`, `sendCmd dest=`, `recvCmd src=`
+
+The last "Not yet" README item with a real user base (IMS and
+conference testing). `sendCmd dest=` and `recvCmd src=` are compile
+errors ("extended 3PCC is not supported yet — classic -3pcc only");
+`-master`, `-slave`, `-slave_cfg` are unknown options; optional
+`recvCmd` fall-through and twin reconnection are listed as unsupported
+in SIPP_COMPAT §6 M10.
+
+Behavioral oracle: `sipp.cpp` the twin-socket setup for extended mode
+(`-slave_cfg` file format: `master` / `slave` sections of `name;host:port`
+lines — verify), `socket.cpp` `open_connections` / `connect_to_peer` /
+`process_twin_command` / `free_peer_socket` (the master listens, slaves
+connect, peers are named; a command carries the destination peer name;
+reconnection on a dropped twin), `call.cpp` `E_AT_SEND_CMD` with `dest`
+(routing by name) and `recvCmd src` (accept only from that peer;
+`optional`? — the fall-through rule), `docs/3pcc.rst` "Extended 3PCC".
+
+- [ ] Scenario: `dest=`/`src=` attributes compile to peer names; the
+      classic form stays the default.
+- [ ] Net/engine: named peer connections from `-slave_cfg`, master
+      accept loop, slave dial with reconnection, commands routed by
+      name; `recvCmd src=` matched by origin; fall-through for optional
+      `recvCmd`.
+- [ ] Tests: unit tests for the cfg parser and routing; e2e with three
+      sipr processes (master + two slaves); interop: sipr master with
+      sipp slaves and the reverse, on SIPp's documented extended 3PCC
+      example scenarios.
+- [ ] Docs: SIPP_COMPAT §1 and §6 M10 note; README "Not yet" loses
+      extended 3PCC.
+
+### M44 — Leftovers that still reject loudly
+
+Small, independent items; ship in any order, each its own commit:
+
+- [ ] `PRINTF=` virtual-line injection files (`infile.cpp`: a header
+      line `PRINTF=<n>` and a `printf`-style template expanded to n
+      lines — verify the exact substitution) — the last injection-file
+      mode missing.
+- [ ] `<rtp_echo variable="…">` (toggle from a variable, `call.cpp`
+      `E_AT_RTP_ECHO`).
+- [ ] `-bind_local` (UAS listens on `-i` only, not all interfaces),
+      `-buff_size`, `-sendbuffer_warn`; `-bind_to_device` on Linux
+      (`SO_BINDTODEVICE`, needs root; reject clearly elsewhere).
+- [ ] pcapng input for `play_pcap_*` (sipr addition: `tcpdump`/Wireshark
+      write pcapng by default now; SIPp rejects it — keep the `-s0`
+      advice for the classic format). Sanctioned-dependency check: an
+      in-tree block reader, no crate.
+- [ ] Decide and document the three "left as is" divergences in
+      SIPP_COMPAT §6 M37 (`[next_url]` without `rrs`, `[last_*]` inside
+      the matching recv's own actions, and the M35 action-step
+      interleaving): either match SIPp behind a `--sipr-strict-sipp`
+      flag or state them as permanent in §6 with the reason. No silent
+      status quo.
+- [ ] `-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`,
+      `-rtp_threadtasks`, `-skip_rlimit`, `-plugin` and the SCTP socket
+      options (`-multihome` etc.): accept with one loud
+      "no effect in sipr" warning each (they tune SIPp's scheduler and
+      process, which sipr does not have) so wrapper scripts written for
+      sipp keep running. This is the one sanctioned exception to "unknown
+      flag is an error": each is named in the table with the reason.
+
+### M45+ — sipr's own additions (after parity)
+
+Candidates, to be promoted into numbered milestones once M38–M44 are
+done and in the order the users of the HTTP API ask for them:
+
+- Structured stats: `--sipr-stats-json <file>` (the 1 s snapshot as
+  JSON lines) and a Prometheus `/metrics` on the existing HTTP API.
+- A load-comparison bench: criterion + a documented `make bench-vs-sipp`
+  that runs both tools at 500/2000/5000 cps on loopback and records
+  CPU, memory, retransmissions and max concurrent calls in
+  `docs/PERFORMANCE.md`; the hot-path rules were designed but never
+  measured against SIPp.
+- Library API: `sipr-engine` embedded in another Rust test harness
+  (scenario in, stats out, no CLI, no TUI) — needs a stable
+  `EngineConfig` and a documented public surface.
+- Scenario linting beyond `--check`: unreachable labels, `optional`
+  recv ordering traps, `[len]` without a body — the folklore in
+  SIPP_COMPAT §6 turned into diagnostics.

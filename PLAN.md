@@ -231,6 +231,8 @@ snapshots, never on the hot path.
 
 ## 7. Next steps
 
-M0–M13 are done. The ordered post-v1 backlog lives at the bottom of
-`docs/MILESTONES.md`: pcap/RTP media (study gossipper first) → AKA auth → HTTP
-control API.
+M0–M37 are done (v0.27.1). The ordered backlog lives at the bottom of
+`docs/MILESTONES.md`: the second backlog (M38+) closes the remaining SIPp
+parity gaps — statistical pauses, keyword parity incl. `-key`, the statistics
+and log file families, timer/behavior knobs, extended 3PCC, leftovers — and
+then sipr's own additions.
