@@ -151,6 +151,19 @@ pub struct EngineConfig {
     pub stat_delimiter: String,
     /// `-periodic_rtd`: zero the repartition tables at every dump.
     pub periodic_rtd: bool,
+    /// `-trace_logs` destination (`<log>` actions).
+    pub trace_logs: Option<std::path::PathBuf>,
+    /// `-trace_shortmsg` destination.
+    pub trace_shortmsg: Option<std::path::PathBuf>,
+    /// `-trace_calldebug` destination.
+    pub trace_calldebug: Option<std::path::PathBuf>,
+    /// `-<kind>_overwrite`: truncate or append each log file.
+    pub log_overwrite: LogOverwrite,
+    /// `-ringbuffer_files`/`-ringbuffer_size`/`-max_log_size`.
+    pub log_rotation: sipr_stats::LogRotation,
+    /// `-deadcall_wait`: how long a finished call's Call-ID stays known so
+    /// late messages are logged against it (0 disables).
+    pub deadcall_wait: Duration,
     /// `-tls_*` options; required when `transport` is [`TransportKind::TlsMono`].
     pub tls: Option<sipr_net::TlsConfig>,
     /// `-mi`: media address for `[media_ip]` and the RTP sockets (default:
@@ -246,6 +259,41 @@ impl TransportKind {
             Self::UdpPerCall | Self::TcpPerCall | Self::TlsPerCall | Self::SctpPerCall
         )
     }
+}
+
+/// SIPp's `-<kind>_overwrite` flags: truncate (true, the default) or append
+/// to each log file.
+#[derive(Debug, Clone, Copy)]
+pub struct LogOverwrite {
+    /// `-message_overwrite`.
+    pub messages: bool,
+    /// `-error_overwrite`.
+    pub errors: bool,
+    /// `-log_overwrite`.
+    pub logs: bool,
+    /// `-shortmessage_overwrite`.
+    pub shortmessages: bool,
+    /// `-calldebug_overwrite`.
+    pub calldebug: bool,
+}
+
+impl Default for LogOverwrite {
+    fn default() -> Self {
+        Self {
+            messages: true,
+            errors: true,
+            logs: true,
+            shortmessages: true,
+            calldebug: true,
+        }
+    }
+}
+
+/// A finished call kept for `-deadcall_wait` (SIPp `deadcall`): a late
+/// message is logged against it instead of being an out-of-call message.
+struct DeadCall {
+    expires: Instant,
+    reason: String,
 }
 
 /// Final counters of a run.
@@ -444,6 +492,8 @@ struct CallState {
     last_recv: Option<Inbound>,
     /// This call's `-tdmmap` circuit, held until the call ends.
     tdm_number: Option<u32>,
+    /// The `-trace_calldebug` buffer (SIPp `debugBuffer`), when tracing.
+    debug: Option<String>,
     /// Remote media endpoints learned from received SDP, by [`MediaKind`]
     /// index. Stale values persist when a later SDP omits a stream (SIPp).
     remote_media: [Option<SocketAddr>; 3],
@@ -843,6 +893,11 @@ struct Engine<'s> {
     trace_rtt: Option<sipr_stats::TraceFile>,
     trace_counts: Option<sipr_stats::TraceFile>,
     trace_codes: Option<sipr_stats::TraceFile>,
+    trace_logs: Option<sipr_stats::TraceFile>,
+    trace_shortmsg: Option<sipr_stats::TraceFile>,
+    trace_calldebug: Option<sipr_stats::TraceFile>,
+    /// Finished calls still answering to their Call-ID (`-deadcall_wait`).
+    dead_calls: HashMap<String, DeadCall>,
     inf_files: Vec<std::cell::RefCell<InjectionFile>>,
     inf_seq: Vec<usize>,
     /// 3PCC twin control channel (`-3pcc`), when the scenario uses it.
@@ -1420,6 +1475,8 @@ impl<'s> Engine<'s> {
                 }
             );
         }
+        // The statistics CSVs are plain files; the logs rotate and honour
+        // `-<kind>_overwrite`, named for SIPp's `<scenario>_<pid>_<kind>.log`.
         let open_trace = |path: &Option<std::path::PathBuf>,
                           what: &str|
          -> Result<Option<sipr_stats::TraceFile>, EngineError> {
@@ -1431,6 +1488,46 @@ impl<'s> Engine<'s> {
                 })
                 .transpose()
         };
+        let log_base = config
+            .trace_name_base
+            .clone()
+            .unwrap_or_else(|| "sipr".to_owned());
+        let open_log = |path: &Option<std::path::PathBuf>,
+                        kind: &str,
+                        overwrite: bool,
+                        what: &str|
+         -> Result<Option<sipr_stats::TraceFile>, EngineError> {
+            path.as_ref()
+                .map(|p| {
+                    sipr_stats::TraceFile::open(p, &log_base, kind, overwrite, config.log_rotation)
+                        .map_err(|e| {
+                            EngineError(format!("cannot create {what} file {}: {e}", p.display()))
+                        })
+                })
+                .transpose()
+        };
+        let trace_logs = open_log(&config.trace_logs, "logs", config.log_overwrite.logs, "log")?;
+        let trace_shortmsg = open_log(
+            &config.trace_shortmsg,
+            "shortmessages",
+            config.log_overwrite.shortmessages,
+            "short message",
+        )?;
+        let trace_calldebug = open_log(
+            &config.trace_calldebug,
+            "calldebug",
+            config.log_overwrite.calldebug,
+            "call debug",
+        )?;
+        let mut trace_err = open_log(
+            &config.trace_err,
+            "errors",
+            config.log_overwrite.errors,
+            "error trace",
+        )?;
+        if let Some(f) = trace_err.as_mut() {
+            f.write(sipr_stats::ERROR_LOG_HEADER);
+        }
         let mut stat_set = new_stat_set(scenario);
         stat_set.dump = sipr_stats::DumpOptions {
             delimiter: config.stat_delimiter.clone(),
@@ -1484,12 +1581,21 @@ impl<'s> Engine<'s> {
             rx,
             calls: HashMap::new(),
             stats: stat_set,
-            trace_msg: open_trace(&config.trace_msg, "message trace")?,
-            trace_err: open_trace(&config.trace_err, "error trace")?,
+            trace_msg: open_log(
+                &config.trace_msg,
+                "messages",
+                config.log_overwrite.messages,
+                "message trace",
+            )?,
+            trace_err,
             trace_stat,
             trace_rtt,
             trace_counts,
             trace_codes,
+            trace_logs,
+            trace_shortmsg,
+            trace_calldebug,
+            dead_calls: HashMap::new(),
             inf_files,
             inf_seq: vec![0; inf_len],
             twin,
@@ -1618,6 +1724,8 @@ impl<'s> Engine<'s> {
             self.flush_rtt(false);
             if last_line.elapsed() >= self.config.report_interval {
                 last_line = Instant::now();
+                let now = Instant::now();
+                self.dead_calls.retain(|_, d| d.expires > now);
                 self.sample_media_counters();
                 if self.config.periodic_stats {
                     eprintln!("sipr: {}", self.stats.line(self.live_main()));
@@ -1642,6 +1750,9 @@ impl<'s> Engine<'s> {
             &mut self.trace_rtt,
             &mut self.trace_counts,
             &mut self.trace_codes,
+            &mut self.trace_logs,
+            &mut self.trace_shortmsg,
+            &mut self.trace_calldebug,
         ]
         .into_iter()
         .flatten()
@@ -2060,6 +2171,18 @@ impl<'s> Engine<'s> {
                 "errors",
                 "error trace",
             ),
+            "logs" => (
+                &mut self.trace_logs,
+                self.config.trace_logs.clone(),
+                "logs",
+                "log trace",
+            ),
+            "shortmessages" => (
+                &mut self.trace_shortmsg,
+                self.config.trace_shortmsg.clone(),
+                "shortmessages",
+                "short message trace",
+            ),
             other => return Err(format!("trace {other} is not supported by sipr")),
         };
         if !on {
@@ -2083,8 +2206,13 @@ impl<'s> Engine<'s> {
                 "trace {log} on: no file name known for the {label}"
             ));
         };
+        let base = self
+            .config
+            .trace_name_base
+            .clone()
+            .unwrap_or_else(|| "sipr".to_owned());
         *slot = Some(
-            sipr_stats::TraceFile::create(&path)
+            sipr_stats::TraceFile::open(&path, &base, suffix, true, self.config.log_rotation)
                 .map_err(|e| format!("cannot open {label} {}: {e}", path.display()))?,
         );
         Ok(())
@@ -2359,6 +2487,7 @@ impl<'s> Engine<'s> {
         if let Some(call) = self.calls.get_mut(&call_id) {
             call.tdm_number = tdm_number;
         }
+        self.call_debug(&call_id, format!("Starting call {call_id}\n"));
         self.advance(&call_id);
     }
 
@@ -2789,6 +2918,29 @@ impl<'s> Engine<'s> {
             ),
         );
         if !self.calls.contains_key(&call_id) {
+            // A finished call still remembered (`-deadcall_wait`): SIPp's
+            // deadcall answers with a warning and a trace entry, refreshes
+            // its expiry and counts DeadCallMsgs — no new call, no
+            // out-of-call handling.
+            if let Some(reason) = self.dead_calls.get(&call_id).map(|d| d.reason.clone()) {
+                if let Some(d) = self.dead_calls.get_mut(&call_id) {
+                    d.expires = Instant::now() + self.config.deadcall_wait;
+                }
+                self.stats.dead_call_msgs += 1;
+                let transport = self.transport_token;
+                if let Some(f) = self.trace_msg.as_mut() {
+                    f.write(&sipr_stats::dead_call_frame(
+                        &call_id,
+                        transport,
+                        &packet.raw,
+                    ));
+                }
+                self.log_err(&format!(
+                    "Dead call {call_id} ({reason}), received '{}'",
+                    String::from_utf8_lossy(&packet.raw)
+                ));
+                return;
+            }
             // UAS: an unknown Call-ID carrying the scenario's initial request
             // creates a new call.
             if self.scenario.role == Role::Uas
@@ -2826,6 +2978,7 @@ impl<'s> Engine<'s> {
                     call.server_ip = packet.local.ip().to_string();
                     call.socket = received_on.map(CallSocket::Udp);
                 }
+                self.call_debug(&call_id, format!("Starting call {call_id}\n"));
                 // Fall through to normal matching below (window at 0).
             } else if let Some(method) = msg.method()
                 && let Some(kind) = self.secondary.as_ref().map(|o| o.kind)
@@ -2916,6 +3069,15 @@ impl<'s> Engine<'s> {
                 if self.try_auto_answer(&call_id, msg) {
                     return;
                 }
+                let transport = self.transport_token;
+                self.call_debug(
+                    &call_id,
+                    format!(
+                        "Unexpected {transport} message received (index {window_start}, hash {}):\n\n{}\n",
+                        msg_hash,
+                        String::from_utf8_lossy(&packet.raw)
+                    ),
+                );
                 let stats = self.stats_of(secondary);
                 stats.unexpected += 1;
                 if let Some(code) = msg.status_code() {
@@ -3182,7 +3344,8 @@ impl<'s> Engine<'s> {
         for outcome in outcomes {
             match outcome {
                 crate::actions::ActionOutcome::Continue => {}
-                crate::actions::ActionOutcome::Log(line) => self.log_err(&line),
+                crate::actions::ActionOutcome::Log(line) => self.log_action(&line),
+                crate::actions::ActionOutcome::Warn(line) => self.log_err(&line),
                 crate::actions::ActionOutcome::Jump(dest) => {
                     // SIPp: "Jump statement out of range" is fatal; sipr
                     // fails the call instead of the run.
@@ -4363,29 +4526,97 @@ impl<'s> Engine<'s> {
         )
     }
 
-    fn trace_send(&mut self, buf: &[u8], remote: SocketAddr) {
+    /// A message went out: the `-trace_msg` frame, the `-trace_shortmsg`
+    /// line and the call's `-trace_calldebug` entry (SIPp `send_raw` /
+    /// `SIPpSocket::write_primitive`).
+    fn trace_send(&mut self, buf: &[u8], _remote: SocketAddr) {
+        let transport = self.transport_token;
+        let rfc3339 = self.config.rfc3339;
         if let Some(f) = self.trace_msg.as_mut() {
-            f.write(&sipr_stats::frame_message(
-                "UDP message sent to",
-                &remote.to_string(),
-                self.stats.started.elapsed(),
-                buf,
-            ));
+            f.write(&sipr_stats::sipp_message_frame(transport, "sent", buf));
+        }
+        if let Some(f) = self.trace_shortmsg.as_mut() {
+            f.write(&sipr_stats::short_message_line('S', buf, rfc3339));
+        }
+        if self.trace_calldebug.is_some()
+            && let Some(call_id) = sipr_stats::message_call_id(buf)
+        {
+            let index = self.calls.get(&call_id).map_or(0, |c| c.index);
+            self.call_debug(
+                &call_id,
+                format!(
+                    "Sending {transport} message for call {call_id} (index {index}, hash {}):\n{}\n\n",
+                    hash_bytes(buf),
+                    String::from_utf8_lossy(buf)
+                ),
+            );
         }
     }
 
+    /// A message came in: the `-trace_msg` frame, the `-trace_shortmsg`
+    /// line and the call's `-trace_calldebug` entry (SIPp `process_message`
+    /// / `call::process_incoming`).
     fn trace_recv(&mut self, packet: &sipr_net::InboundPacket) {
-        if self.trace_msg.is_some() {
-            let framed = sipr_stats::frame_message(
-                "UDP message received from",
-                &packet.from.to_string(),
-                self.stats.started.elapsed(),
+        let transport = self.transport_token;
+        let rfc3339 = self.config.rfc3339;
+        if let Some(f) = self.trace_msg.as_mut() {
+            f.write(&sipr_stats::sipp_message_frame(
+                transport,
+                "received",
                 &packet.raw,
-            );
-            if let Some(f) = self.trace_msg.as_mut() {
-                f.write(&framed);
-            }
+            ));
         }
+        if let Some(f) = self.trace_shortmsg.as_mut() {
+            f.write(&sipr_stats::short_message_line('R', &packet.raw, rfc3339));
+        }
+        if self.trace_calldebug.is_some()
+            && let Some(call_id) = packet.message.call_id().map(ToOwned::to_owned)
+        {
+            self.call_debug(
+                &call_id,
+                format!(
+                    "Processing {} byte incoming message for call-ID {call_id} (hash {}):\n{}\n\n",
+                    packet.raw.len(),
+                    hash_bytes(&packet.raw),
+                    String::from_utf8_lossy(&packet.raw)
+                ),
+            );
+        }
+    }
+
+    /// Append a `-trace_calldebug` entry to the call's buffer (SIPp
+    /// `callDebug`: timestamped, dumped when the call aborts).
+    fn call_debug(&mut self, call_id: &str, text: String) {
+        if self.trace_calldebug.is_none() {
+            return;
+        }
+        let rfc3339 = self.config.rfc3339;
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.debug
+                .get_or_insert_with(String::new)
+                .push_str(&sipr_stats::calldebug_line(&text, rfc3339));
+        }
+    }
+
+    /// A `<log>` action's line, to the `-trace_logs` file (SIPp `LOG_MSG`).
+    fn log_action(&mut self, line: &str) {
+        if let Some(f) = self.trace_logs.as_mut() {
+            f.write(&format!("{line}\n"));
+        }
+    }
+
+    /// Remember a finished call for `-deadcall_wait` (SIPp `new deadcall`).
+    fn remember_dead(&mut self, call_id: &str, reason: String) {
+        if self.config.deadcall_wait.is_zero() {
+            return;
+        }
+        self.dead_calls.insert(
+            call_id.to_owned(),
+            DeadCall {
+                expires: Instant::now() + self.config.deadcall_wait,
+                reason,
+            },
+        );
     }
 
     /// `dump variables` (SIPp `AllocVariableTable::dump` on the displayed
@@ -4414,9 +4645,11 @@ impl<'s> Engine<'s> {
         }
     }
 
+    /// A line for the `-trace_err` file, timestamped as SIPp's `WARNING`s.
     fn log_err(&mut self, line: &str) {
+        let rfc3339 = self.config.rfc3339;
         if let Some(f) = self.trace_err.as_mut() {
-            f.write(&format!("{line}\n"));
+            f.write(&sipr_stats::error_line(line, rfc3339));
         }
     }
 
@@ -4534,6 +4767,7 @@ impl<'s> Engine<'s> {
             stats.record_call_length(call.started.elapsed());
             self.release_tdm(&call);
             self.return_user(&call);
+            self.remember_dead(call_id, "successful".to_owned());
         }
     }
 
@@ -4556,6 +4790,19 @@ impl<'s> Engine<'s> {
                 .record_call_length(call.started.elapsed());
             self.release_tdm(&call);
             self.return_user(&call);
+            // SIPp `call::abort`: the call's debug buffer goes to
+            // -trace_calldebug, then the Call-ID lives on as a dead call.
+            if let Some(f) = self.trace_calldebug.as_mut() {
+                let mut debug = call.debug.take().unwrap_or_default();
+                debug.push_str(&sipr_stats::calldebug_line(
+                    &format!("Aborting call {call_id} (index {}).\n", call.index),
+                    self.config.rfc3339,
+                ));
+                f.write(&format!(
+                    "-------------------------------------------------------------------------------\nCall debugging information for call {call_id}:\n{debug}"
+                ));
+            }
+            self.remember_dead(call_id, format!("aborted at index {}", call.index));
         }
     }
 
@@ -4894,6 +5141,7 @@ fn new_call(
         routes: Vec::new(),
         last_recv: None,
         tdm_number: None,
+        debug: None,
         remote_media: [None; 3],
         rtpstream_ports: [None; 2],
         crypto: crate::render::CallCrypto::default(),

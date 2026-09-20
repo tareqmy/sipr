@@ -75,8 +75,10 @@ pub use crate::vars::VarStore;
 pub enum ActionOutcome {
     /// Continue normally.
     Continue,
-    /// A `<log>`/`<warning>` produced a line for the error trace.
+    /// A `<log>` line for the `-trace_logs` file (SIPp `LOG_MSG`).
     Log(String),
+    /// A `<warning>` line for the error trace (SIPp `WARNING`).
+    Warn(String),
     /// Fail this call (`<error>`, `ereg check_it` miss, `exec stop_call`).
     FailCall(String),
     /// Jump to a message index (`<jump>`).
@@ -162,6 +164,7 @@ fn run_actions_impl(
             outcome,
             ActionOutcome::Continue
                 | ActionOutcome::Log(_)
+                | ActionOutcome::Warn(_)
                 | ActionOutcome::PlayPcap { .. }
                 | ActionOutcome::RtpStream(_)
                 | ActionOutcome::PlayDtmf(_)
@@ -268,13 +271,8 @@ fn run_one(
                 }
             }
         }
-        Action::Log(t) => {
-            ActionOutcome::Log(format!("[log] {}", render_with_store(t, store, base_ctx)))
-        }
-        Action::Warn(t) => ActionOutcome::Log(format!(
-            "[warning] {}",
-            render_with_store(t, store, base_ctx)
-        )),
+        Action::Log(t) => ActionOutcome::Log(render_with_store(t, store, base_ctx)),
+        Action::Warn(t) => ActionOutcome::Warn(render_with_store(t, store, base_ctx)),
         Action::Fail(t) => ActionOutcome::FailCall(render_with_store(t, store, base_ctx)),
         Action::Assign {
             assign_to,

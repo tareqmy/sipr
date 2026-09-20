@@ -867,38 +867,167 @@ pub fn g6(v: f64) -> String {
     }
 }
 
+/// Rotation policy shared by every log file: SIPp's `-ringbuffer_files`,
+/// `-ringbuffer_size` and `-max_log_size` (`logger.cpp` `_trace`/`rotatef`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogRotation {
+    /// How many rotated files to keep (0: rotation truncates in place).
+    pub ringbuffer_files: usize,
+    /// Rotate once this many bytes were written to the current file (0: never).
+    pub ringbuffer_size: u64,
+    /// Stop writing once this many bytes were written in total (0: never).
+    pub max_log_size: u64,
+}
+
+/// A log file the engine writes to: `-trace_msg`, `-trace_err`,
+/// `-trace_logs`, `-trace_shortmsg`, `-trace_calldebug` and the statistics
+/// CSVs. Writes count bytes for SIPp's size-based rotation; a write error
+/// disables the file with one warning instead of failing the run.
 pub struct TraceFile {
     writer: Option<std::io::BufWriter<std::fs::File>>,
     path: PathBuf,
+    /// `<scenario>_<pid>` and the kind (`messages`, `errors`, …), the
+    /// rotated files' name parts. `None`: never rotates.
+    rotated_base: Option<(String, String)>,
+    rotation: LogRotation,
+    /// Bytes written to the current file (SIPp `lfi->count`).
+    count: u64,
+    /// Unix seconds when the current file was opened (SIPp `starttime`).
+    started: u64,
+    /// The rotated files kept, oldest first: (start seconds, disambiguator).
+    kept: Vec<(u64, u32)>,
 }
 
 impl TraceFile {
-    /// Create/truncate `path`.
+    /// Create (truncate) `path`; no rotation.
     ///
     /// # Errors
     ///
-    /// I/O errors opening the file.
+    /// The file cannot be created.
     pub fn create(path: &Path) -> std::io::Result<Self> {
         Ok(Self {
             writer: Some(std::io::BufWriter::new(std::fs::File::create(path)?)),
             path: path.to_owned(),
+            rotated_base: None,
+            rotation: LogRotation::default(),
+            count: 0,
+            started: unix_now(),
+            kept: Vec::new(),
         })
     }
 
-    /// Append a chunk (caller controls framing).
+    /// Open `path` for a `kind` log of the run `base` (`<scenario>_<pid>`):
+    /// truncated when `overwrite` (SIPp's default), appended to otherwise
+    /// (`-<kind>_overwrite false`), rotating per `rotation`.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be opened.
+    pub fn open(
+        path: &Path,
+        base: &str,
+        kind: &str,
+        overwrite: bool,
+        rotation: LogRotation,
+    ) -> std::io::Result<Self> {
+        let file = if overwrite {
+            std::fs::File::create(path)?
+        } else {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)?
+        };
+        Ok(Self {
+            writer: Some(std::io::BufWriter::new(file)),
+            path: path.to_owned(),
+            rotated_base: Some((base.to_owned(), kind.to_owned())),
+            rotation,
+            count: 0,
+            started: unix_now(),
+            kept: Vec::new(),
+        })
+    }
+
+    /// Where the file is.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether writes still reach the file (a `-max_log_size` overrun or a
+    /// write error closes it).
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.writer.is_some()
+    }
+
     pub fn write(&mut self, chunk: &str) {
-        if let Some(w) = self.writer.as_mut() {
-            if w.write_all(chunk.as_bytes()).is_err() {
-                eprintln!(
-                    "sipr: warning: cannot write {}; tracing disabled",
-                    self.path.display()
-                );
-                self.writer = None;
-            }
+        let Some(w) = self.writer.as_mut() else {
+            return;
+        };
+        if w.write_all(chunk.as_bytes()).is_err() {
+            eprintln!(
+                "sipr: warning: cannot write {}; tracing disabled",
+                self.path.display()
+            );
+            self.writer = None;
+            return;
+        }
+        self.count += chunk.len() as u64;
+        let r = self.rotation;
+        if r.max_log_size > 0 && self.count > r.max_log_size {
+            // SIPp closes the file for good once the cap is passed.
+            self.flush();
+            self.writer = None;
+            return;
+        }
+        if r.ringbuffer_size > 0 && self.count > r.ringbuffer_size {
+            self.rotate();
+            self.count = 0;
         }
     }
 
-    /// Flush buffered output (called periodically and at shutdown).
+    /// SIPp `rotatef`: with `-ringbuffer_files` the current file is renamed
+    /// to `<base>_<kind>_<start>.log` (`<start>.<n>.log` when a file of the
+    /// same second exists) and the oldest kept file beyond the count is
+    /// deleted; then the file is reopened, truncated. Without
+    /// `-ringbuffer_files` the file is simply truncated in place.
+    fn rotate(&mut self) {
+        self.flush();
+        self.writer = None;
+        if let Some((base, kind)) = self.rotated_base.clone()
+            && self.rotation.ringbuffer_files > 0
+        {
+            let name = |start: u64, n: u32| {
+                let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+                if n > 0 {
+                    dir.join(format!("{base}_{kind}_{start}.{n}.log"))
+                } else {
+                    dir.join(format!("{base}_{kind}_{start}.log"))
+                }
+            };
+            if self.kept.len() >= self.rotation.ringbuffer_files {
+                let (start, n) = self.kept.remove(0);
+                let _ = std::fs::remove_file(name(start, n));
+            }
+            let n = match self.kept.last() {
+                Some(&(last_start, last_n)) if last_start == self.started => last_n + 1,
+                _ => 0,
+            };
+            let _ = std::fs::rename(&self.path, name(self.started, n));
+            self.kept.push((self.started, n));
+        }
+        self.started = unix_now();
+        match std::fs::File::create(&self.path) {
+            Ok(f) => self.writer = Some(std::io::BufWriter::new(f)),
+            Err(e) => eprintln!(
+                "sipr: warning: cannot reopen {} after rotation: {e}",
+                self.path.display()
+            ),
+        }
+    }
+
     pub fn flush(&mut self) {
         if let Some(w) = self.writer.as_mut() {
             let _ = w.flush();
@@ -906,14 +1035,92 @@ impl TraceFile {
     }
 }
 
-/// Frame one SIP message for `-trace_msg`, SIPp-style separators.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The first line of the `-trace_err` file (SIPp writes it when the file
+/// is created).
+pub const ERROR_LOG_HEADER: &str = "The following events occurred:\n";
+
+/// One `-trace_msg` entry as SIPp's `TRACE_MSG` writes it on send and
+/// receive: a rule, the time (always the RFC 3339 form there), then
+/// `<TRANSPORT> message sent|received [<len>] bytes:` and the message.
 #[must_use]
-pub fn frame_message(direction: &str, peer: &str, elapsed: Duration, payload: &[u8]) -> String {
+pub fn sipp_message_frame(transport: &str, direction: &str, payload: &[u8]) -> String {
     format!(
-        "----------------------------------------------- {:.6}\n{direction} {peer}\n\n{}\n",
-        elapsed.as_secs_f64(),
+        "----------------------------------------------- {}\n{transport} message {direction} [{}] bytes:\n\n{}\n",
+        clock::sipp_timestamp(SystemTime::now(), true),
+        payload.len(),
         String::from_utf8_lossy(payload)
     )
+}
+
+/// One `-trace_msg` entry for a message that reached no live call (SIPp
+/// `deadcall::process_incoming`).
+#[must_use]
+pub fn dead_call_frame(call_id: &str, transport: &str, payload: &[u8]) -> String {
+    format!(
+        "-----------------------------------------------\nDead call {call_id} received a {transport} message:\n\n{}\n",
+        String::from_utf8_lossy(payload)
+    )
+}
+
+/// One `-trace_shortmsg` line (SIPp `TRACE_SHORTMSG`): the time, `S` or
+/// `R`, the Call-ID, `CSeq:<value>` and the start line, tab-separated.
+/// SIPp's receive side always uses the default time form, its send side
+/// honours `-rfc3339`; so does this.
+#[must_use]
+pub fn short_message_line(direction: char, message: &[u8], rfc3339: bool) -> String {
+    let text = String::from_utf8_lossy(message);
+    let call_id = header_value(&text, "Call-ID").unwrap_or_default();
+    let cseq = header_value(&text, "CSeq").unwrap_or_default();
+    let first = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('\r');
+    let ts = clock::sipp_timestamp(SystemTime::now(), rfc3339 && direction == 'S');
+    format!("{ts}\t{direction}\t{call_id}\tCSeq:{cseq}\t{first}\n")
+}
+
+/// One `-trace_err` line (SIPp `_screen_error`): the time, `: `, the text.
+#[must_use]
+pub fn error_line(text: &str, rfc3339: bool) -> String {
+    format!(
+        "{}: {text}\n",
+        clock::sipp_timestamp(SystemTime::now(), rfc3339)
+    )
+}
+
+/// One `-trace_calldebug` line (SIPp `callDebug`): the time, a space, the
+/// text (which carries its own newline).
+#[must_use]
+pub fn calldebug_line(text: &str, rfc3339: bool) -> String {
+    format!(
+        "{} {text}",
+        clock::sipp_timestamp(SystemTime::now(), rfc3339)
+    )
+}
+
+/// The Call-ID of a message on the wire (for the per-call logs of an
+/// outbound message, which the engine has only as bytes).
+#[must_use]
+pub fn message_call_id(message: &[u8]) -> Option<String> {
+    header_value(&String::from_utf8_lossy(message), "Call-ID")
+}
+
+/// A header's value in a SIP message text (case-insensitive name, the first
+/// occurrence), trimmed.
+fn header_value(text: &str, name: &str) -> Option<String> {
+    text.lines().skip(1).find_map(|line| {
+        let (n, v) = line.split_once(':')?;
+        n.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| v.trim().to_owned())
+    })
 }
 
 #[cfg(test)]
@@ -1119,17 +1326,123 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("trace.log");
         let mut t = TraceFile::create(&path).expect("create");
-        t.write(&frame_message(
-            "UDP message sent to",
-            "127.0.0.1:5060",
-            Duration::from_millis(1500),
+        t.write(&sipp_message_frame(
+            "UDP",
+            "sent",
             b"INVITE sip:x SIP/2.0\r\n",
         ));
         t.flush();
         let content = std::fs::read_to_string(&path).expect("read");
-        assert!(content.contains("1.500000"), "{content}");
-        assert!(content.contains("INVITE sip:x"), "{content}");
+        let first = content.lines().next().unwrap();
+        assert!(
+            first.starts_with("----------------------------------------------- 20")
+                && first.ends_with('Z'),
+            "{content}"
+        );
+        assert!(
+            content.contains("UDP message sent [22] bytes:\n\nINVITE sip:x SIP/2.0\r\n\n"),
+            "{content}"
+        );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn log_lines_have_sipps_shapes() {
+        let msg = b"INVITE sip:x SIP/2.0\r\nVia: SIP/2.0/UDP h\r\ncall-id: abc@h\r\nCSeq: 7 INVITE\r\n\r\n";
+        let s = short_message_line('S', msg, true);
+        let cols: Vec<&str> = s.trim_end().split('\t').collect();
+        assert_eq!(cols.len(), 5, "{s}");
+        assert!(cols[0].ends_with('Z'), "send side honours -rfc3339: {s}");
+        assert_eq!(
+            &cols[1..],
+            &["S", "abc@h", "CSeq:7 INVITE", "INVITE sip:x SIP/2.0"]
+        );
+        let r = short_message_line('R', msg, true);
+        assert!(
+            !r.starts_with(|c: char| c.is_ascii_digit()) || r.split('\t').count() == 7,
+            "receive side keeps the tabbed time form: {r}"
+        );
+        assert_eq!(
+            r.trim_end().split('\t').next_back(),
+            Some("INVITE sip:x SIP/2.0")
+        );
+        let e = error_line("call c failed", false);
+        assert!(e.contains(": call c failed\n"), "{e}");
+        let d = calldebug_line("Starting call c\n", true);
+        assert!(d.ends_with(" Starting call c\n") && d.contains('Z'), "{d}");
+        let f = dead_call_frame("c", "UDP", b"BYE sip:x SIP/2.0\r\n");
+        assert!(
+            f.contains("Dead call c received a UDP message:\n\nBYE"),
+            "{f}"
+        );
+    }
+
+    #[test]
+    fn log_rotation_follows_sipps_ring_buffer() {
+        let dir = std::env::temp_dir().join(format!("sipr-rot-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("uac_1_messages.log");
+        let rotation = LogRotation {
+            ringbuffer_files: 2,
+            ringbuffer_size: 10,
+            max_log_size: 0,
+        };
+        let mut t = TraceFile::open(&path, "uac_1", "messages", true, rotation).unwrap();
+        for i in 0..4 {
+            // 12 bytes each: every write passes the 10-byte ring size.
+            t.write(&format!("chunk-{i:05}\n"));
+        }
+        t.flush();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        // Four rotations of a file opened within the same second: the
+        // rotated names take .1/.2/.3 disambiguators and only the last two
+        // rotated files survive, plus the live one.
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(
+            names.contains(&"uac_1_messages.log".to_owned()),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("uac_1_messages_"))
+                .count()
+                == 2,
+            "{names:?}"
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().is_empty());
+        // -max_log_size closes the file for good.
+        let path2 = dir.join("uac_1_errors.log");
+        let mut t2 = TraceFile::open(
+            &path2,
+            "uac_1",
+            "errors",
+            true,
+            LogRotation {
+                ringbuffer_files: 0,
+                ringbuffer_size: 0,
+                max_log_size: 5,
+            },
+        )
+        .unwrap();
+        t2.write("123456");
+        assert!(!t2.is_open());
+        t2.write("more");
+        t2.flush();
+        assert_eq!(std::fs::read_to_string(&path2).unwrap(), "123456");
+        // -<kind>_overwrite false appends.
+        let mut t3 =
+            TraceFile::open(&path2, "uac_1", "errors", false, LogRotation::default()).unwrap();
+        t3.write("+");
+        t3.flush();
+        assert_eq!(std::fs::read_to_string(&path2).unwrap(), "123456+");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

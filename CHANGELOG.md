@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Message and error logs at parity (M41): `-trace_msg` frames and
+  `-trace_err` lines take SIPp's exact shapes (timestamps, the
+  `The following events occurred:` header), `<log>` actions go to the new
+  `-trace_logs`/`-log_file`, and `-trace_shortmsg`/`-shortmessage_file`,
+  `-trace_calldebug`/`-calldebug_file`, `-error_file`, `-message_file`,
+  the `-<kind>_overwrite` flags, `-ringbuffer_files`/`-ringbuffer_size`/
+  `-max_log_size` rotation and `-deadcall_wait` are implemented as SIPp's;
+  `-trace_timeout` is accepted (a no-op in SIPp too). `trace
+  logs|shortmessages on|off` work on the control socket.
 - Statistics files at parity (M40): `-trace_stat` writes SIPp's full
   column set (`StartTime` … `WatchdogMinor`, `ResponseTime<rtd>` mean and
   standard deviation per RTD, `CallLength`, a repartition block per RTD
@@ -33,6 +42,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The `-trace_msg` frame no longer carries the peer address, and
+  `-trace_err` lines are timestamped: both are now SIPp's formats. `<log>`
+  lines no longer go to the error trace with a `[log]` prefix; they need
+  `-trace_logs`.
 - `-fd` defaults to 60 s as in SIPp (it was 1 s); the final statistics
   row is still written at exit. The `-trace_stat` header changed from
   sipr's earlier subset to SIPp's columns, so parsers keyed on column

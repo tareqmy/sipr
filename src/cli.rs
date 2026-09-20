@@ -183,6 +183,38 @@ pub struct Cli {
     pub stat_delimiter: Option<String>,
     /// `-periodic_rtd`: zero the repartition tables each dump.
     pub periodic_rtd: bool,
+    /// `-trace_logs`: `<log>` actions to a file.
+    pub trace_logs: bool,
+    /// `-log_file`: that file's name.
+    pub log_file: Option<PathBuf>,
+    /// `-trace_shortmsg`: one CSV line per message to a file.
+    pub trace_shortmsg: bool,
+    /// `-shortmessage_file`: that file's name.
+    pub shortmessage_file: Option<PathBuf>,
+    /// `-trace_calldebug`: aborted calls' debug history to a file.
+    pub trace_calldebug: bool,
+    /// `-calldebug_file`: that file's name.
+    pub calldebug_file: Option<PathBuf>,
+    /// `-trace_timeout`: accepted, no effect (SIPp never implemented it).
+    pub trace_timeout: bool,
+    /// `-error_file`: the error log's name.
+    pub error_file: Option<PathBuf>,
+    /// `-message_file`: the message log's name.
+    pub message_file: Option<PathBuf>,
+    /// `-message_overwrite`, `-error_overwrite`, `-log_overwrite`,
+    /// `-shortmessage_overwrite`, `-calldebug_overwrite`, `-screen_overwrite`.
+    pub message_overwrite: bool,
+    pub error_overwrite: bool,
+    pub log_overwrite: bool,
+    pub shortmessage_overwrite: bool,
+    pub calldebug_overwrite: bool,
+    pub screen_overwrite: bool,
+    /// `-ringbuffer_files`, `-ringbuffer_size`, `-max_log_size`.
+    pub ringbuffer_files: Option<usize>,
+    pub ringbuffer_size: Option<u64>,
+    pub max_log_size: Option<u64>,
+    /// `-deadcall_wait` in milliseconds.
+    pub deadcall_wait_ms: Option<u64>,
     /// `-timeout`: global test timeout in seconds.
     pub timeout_s: Option<u64>,
     /// `-base_cseq`: initial CSeq value for outbound requests.
@@ -292,6 +324,25 @@ impl Default for Cli {
             screen_file: None,
             stat_delimiter: None,
             periodic_rtd: false,
+            trace_logs: false,
+            log_file: None,
+            trace_shortmsg: false,
+            shortmessage_file: None,
+            trace_calldebug: false,
+            calldebug_file: None,
+            trace_timeout: false,
+            error_file: None,
+            message_file: None,
+            message_overwrite: true,
+            error_overwrite: true,
+            log_overwrite: true,
+            shortmessage_overwrite: true,
+            calldebug_overwrite: true,
+            screen_overwrite: true,
+            ringbuffer_files: None,
+            ringbuffer_size: None,
+            max_log_size: None,
+            deadcall_wait_ms: None,
             timeout_s: None,
             base_cseq: None,
             call_id_format: None,
@@ -587,6 +638,120 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "Trace sent/received SIP messages to a file",
     ),
     ("trace_err", false, "", "Trace errors to a file"),
+    (
+        "trace_logs",
+        false,
+        "",
+        "Trace <log> actions to <scenario>_<pid>_logs.log",
+    ),
+    (
+        "log_file",
+        true,
+        "FILE",
+        "Set the name of the log actions log file",
+    ),
+    (
+        "trace_shortmsg",
+        false,
+        "",
+        "Trace sent and received messages as CSV lines to <scenario>_<pid>_shortmessages.log",
+    ),
+    (
+        "shortmessage_file",
+        true,
+        "FILE",
+        "Set the name of the short message log file",
+    ),
+    (
+        "trace_calldebug",
+        false,
+        "",
+        "Dump debugging information about aborted calls to <scenario>_<pid>_calldebug.log",
+    ),
+    (
+        "calldebug_file",
+        true,
+        "FILE",
+        "Set the name of the call debug log file",
+    ),
+    (
+        "trace_timeout",
+        false,
+        "",
+        "Accepted for SIPp compatibility; SIPp 3.7 never implemented it either",
+    ),
+    (
+        "error_file",
+        true,
+        "FILE",
+        "Set the name of the error log file",
+    ),
+    (
+        "message_file",
+        true,
+        "FILE",
+        "Set the name of the message log file",
+    ),
+    (
+        "message_overwrite",
+        true,
+        "BOOL",
+        "Overwrite (true, default) or append to the message log file",
+    ),
+    (
+        "error_overwrite",
+        true,
+        "BOOL",
+        "Overwrite (true, default) or append to the error log file",
+    ),
+    (
+        "log_overwrite",
+        true,
+        "BOOL",
+        "Overwrite (true, default) or append to the log actions log file",
+    ),
+    (
+        "shortmessage_overwrite",
+        true,
+        "BOOL",
+        "Overwrite (true, default) or append to the short message log file",
+    ),
+    (
+        "calldebug_overwrite",
+        true,
+        "BOOL",
+        "Overwrite (true, default) or append to the call debug log file",
+    ),
+    (
+        "screen_overwrite",
+        true,
+        "BOOL",
+        "Overwrite (true, default) or append to the screen file",
+    ),
+    (
+        "ringbuffer_files",
+        true,
+        "N",
+        "How many rotated error, message, shortmessage and calldebug files to keep",
+    ),
+    (
+        "ringbuffer_size",
+        true,
+        "BYTES",
+        "Rotate the error, message, shortmessage and calldebug files at this size",
+    ),
+    (
+        "max_log_size",
+        true,
+        "BYTES",
+        "Stop writing the error, message, shortmessage and calldebug files at this size",
+    ),
+    (
+        "deadcall_wait",
+        true,
+        "MS",
+        "How long a finished call's Call-ID stays known for late messages (default 33000)",
+    ),
     (
         "trace_stat",
         false,
@@ -1024,6 +1189,27 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "screen_file" => cli.screen_file = Some(PathBuf::from(val(value))),
         "stat_delimiter" => cli.stat_delimiter = Some(val(value)),
         "periodic_rtd" => cli.periodic_rtd = true,
+        "trace_logs" => cli.trace_logs = true,
+        "log_file" => cli.log_file = Some(PathBuf::from(val(value))),
+        "trace_shortmsg" => cli.trace_shortmsg = true,
+        "shortmessage_file" => cli.shortmessage_file = Some(PathBuf::from(val(value))),
+        "trace_calldebug" => cli.trace_calldebug = true,
+        "calldebug_file" => cli.calldebug_file = Some(PathBuf::from(val(value))),
+        "trace_timeout" => cli.trace_timeout = true,
+        "error_file" => cli.error_file = Some(PathBuf::from(val(value))),
+        "message_file" => cli.message_file = Some(PathBuf::from(val(value))),
+        "message_overwrite" => cli.message_overwrite = parse_bool_value(flag, &val(value))?,
+        "error_overwrite" => cli.error_overwrite = parse_bool_value(flag, &val(value))?,
+        "log_overwrite" => cli.log_overwrite = parse_bool_value(flag, &val(value))?,
+        "shortmessage_overwrite" => {
+            cli.shortmessage_overwrite = parse_bool_value(flag, &val(value))?;
+        }
+        "calldebug_overwrite" => cli.calldebug_overwrite = parse_bool_value(flag, &val(value))?,
+        "screen_overwrite" => cli.screen_overwrite = parse_bool_value(flag, &val(value))?,
+        "ringbuffer_files" => cli.ringbuffer_files = Some(parse_num(flag, &val(value))?),
+        "ringbuffer_size" => cli.ringbuffer_size = Some(parse_num(flag, &val(value))?),
+        "max_log_size" => cli.max_log_size = Some(parse_num(flag, &val(value))?),
+        "deadcall_wait" => cli.deadcall_wait_ms = Some(parse_num(flag, &val(value))?),
         "timeout" => cli.timeout_s = Some(parse_num(flag, &val(value))?),
         "base_cseq" => cli.base_cseq = Some(parse_num(flag, &val(value))?),
         "cid_str" => cli.call_id_format = Some(val(value)),
@@ -1146,16 +1332,25 @@ fn closest_flag(name: &str) -> Option<&'static str> {
 
 /// Plain Levenshtein distance; inputs are short flag names.
 fn edit_distance(a: &str, b: &str) -> usize {
+    // Optimal string alignment: a transposition of two adjacent characters
+    // (`-trace_mgs` for `-trace_msg`) is one edit, so it beats a flag that
+    // is a plain two-edit neighbour (`-trace_logs`).
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
+    let mut before: Vec<usize> = vec![0; b.len() + 1];
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     let mut cur = vec![0usize; b.len() + 1];
     for (i, ca) in a.iter().enumerate() {
         cur[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
             let sub = prev[j] + usize::from(ca != cb);
-            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+            let mut d = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+            if i > 0 && j > 0 && *ca == b[j - 1] && a[i - 1] == *cb {
+                d = d.min(before[j - 1] + 1);
+            }
+            cur[j + 1] = d;
         }
+        std::mem::swap(&mut before, &mut prev);
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
@@ -1526,7 +1721,8 @@ mod tests {
 
     #[test]
     fn edit_distance_sanity() {
-        assert_eq!(edit_distance("trace_mgs", "trace_msg"), 2);
+        assert_eq!(edit_distance("trace_mgs", "trace_msg"), 1);
+        assert_eq!(edit_distance("trace_mgs", "trace_logs"), 2);
         assert_eq!(edit_distance("sn", "sn"), 0);
         assert!(closest_flag("zzzzzzzzzz").is_none());
     }

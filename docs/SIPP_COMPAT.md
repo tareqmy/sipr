@@ -133,8 +133,13 @@ Tracing/output: `-trace_msg` `-trace_err` `-trace_stat` `-stf <file>`
 `-fd <interval s>` (default 60, the `(P)` period) `-f <interval s>` (screen
 and `-bg` line refresh, default 1) `-trace_rtt` `-rtt_freq <n>`
 `-trace_counts` `-trace_error_codes` `-trace_screen` `-screen_file <file>`
-`-stat_delimiter <s>` `-periodic_rtd` (M40, §6) `-nd` (no defaults)
-`-timeout <s>` `-bg` (headless).
+`-stat_delimiter <s>` `-periodic_rtd` (M40, §6) `-trace_logs` `-log_file`
+`-trace_shortmsg` `-shortmessage_file` `-trace_calldebug` `-calldebug_file`
+`-error_file` `-message_file` `-<kind>_overwrite <bool>` (message, error,
+log, shortmessage, calldebug, screen) `-ringbuffer_files` `-ringbuffer_size`
+`-max_log_size` `-deadcall_wait <ms>` `-trace_timeout` (accepted; a no-op
+in SIPp 3.7 too) (M41, §6) `-nd` (no defaults) `-timeout <s>` `-bg`
+(headless).
 Behavior toggles: `-aa` (auto-answer OPTIONS/INFO/UPDATE/NOTIFY in-dialog),
 `-base_cseq`, `-cid_str` (Call-ID format), `-max_retrans`, `-nr` (no retrans).
 Keywords (M39): `-key <keyword> <value>` (repeatable), `-tdmmap <map>`,
@@ -566,9 +571,9 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   these divergences: (1) default bind is loopback, `-ci` opts into more;
   (2) `-cp 0` disables the socket; (3) the bound address is printed;
   (4) screen digits are ignored (sipr's TUI cycles with `s`); (5) `set
-  display rx`, `trace logs|shortmessages`, and `dump variables` warn
-  that they are unsupported instead of silently succeeding (`set display
-  ooc|main` works as SIPp's since M33); (6) `set
+  display rx` and `dump variables` warn that they are unsupported instead
+  of silently succeeding (`set display ooc|main` works as SIPp's since
+  M33; `trace logs|shortmessages on|off` work since M41); (6) `set
   limit` in sipr simply sets `-l` (sipr never auto-sizes the cap from the
   rate). The HTTP API is a sipr addition with no SIPp counterpart.
 - RTP echo and the RTP check (M18; verified in `sipp.cpp` `rtp_echo_thread`
@@ -1224,3 +1229,50 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `rtd="true"` on the 200 — where sipr used to record nothing (so its
   `ResponseTime1` stayed 0 for the embedded UAC); `repeat_rtd` then
   restarts that clock at the recording step.
+- Message and error logs at parity (M41; verified in `logger.cpp`
+  `_trace`/`rotatef`/`_screen_error`/`LOG_MSG`, `socket.cpp` the
+  `TRACE_MSG`/`TRACE_SHORTMSG` calls in `process_message` (receive) and
+  `write_primitive` (send), `call.cpp` `callDebug`/`_callDebug`, `abort`
+  (the dump) and `terminate` (`new deadcall`), `deadcall.cpp`, `sipp.cpp`
+  the `SIPP_OPTION_LFNAME`/`LFOVERWRITE` cases and the startup
+  `rotate_*f` calls, `sipp.hpp` `DEFAULT_DEADCALL_WAIT`): every log is
+  `<scenario>_<pid>_<kind>.log` — `messages`, `errors`, `logs`,
+  `shortmessages`, `calldebug`, `screens` — or the `-<kind>_file` name;
+  `-<kind>_overwrite false` appends instead of truncating (SIPp also sets
+  `fixedname` there, which empties the name when no `-<kind>_file` was
+  given — a SIPp bug sipr does not copy). `-trace_msg` frames are SIPp's:
+  a 47-dash rule and the time (always the RFC 3339 form there), then
+  `<TRANSPORT> message sent|received [<bytes>] bytes:`, a blank line and
+  the message — no peer address (sipr used to print one). `-trace_err`
+  starts with `The following events occurred:` and each line is `<time>:
+  <text>` (`-rfc3339` aware); `<warning>` actions land there. `<log>`
+  actions go to `-trace_logs` (`LOG_MSG`, one line each, keyword-expanded)
+  and nowhere without it. `-trace_shortmsg` writes per message
+  `<time>\tS|R\t<Call-ID>\tCSeq:<value>\t<start line>`; SIPp's receive
+  side always uses the default (tab-separated) time form while its send
+  side honours `-rfc3339`, so a line has seven tab-separated columns
+  except an RFC 3339 send line's five — matched, quirk included.
+  `-trace_calldebug` buffers per call SIPp's `callDebug` entries (`<time>
+  <text>`): `Starting call`, `Sending <TRANSPORT> message for call <id>
+  (index <n>, hash <h>)` with the message, `Processing <n> byte incoming
+  message for call-ID <id> (hash <h>)` with the message, `Unexpected …
+  message received`, and on abort `Aborting call <id> (index <n>).`; an
+  aborted call's buffer is written under `Call debugging information for
+  call <id>:` and its rule — a successful call writes nothing, as SIPp's
+  `abort` is the only dumper. The hash is sipr's, not SIPp's. Rotation
+  (`_trace`): `-ringbuffer_size` bytes written rotates the file — with
+  `-ringbuffer_files` N the current file is renamed
+  `<scenario>_<pid>_<kind>_<start seconds>.log` (`.<n>.log` when the same
+  second repeats) and the oldest beyond N is deleted; without it the file
+  is truncated in place — and `-max_log_size` closes the file for good.
+  Rotation applies to the messages, errors, logs, shortmessages and
+  calldebug files, not the statistics CSVs, as in SIPp. `-deadcall_wait`
+  (default 33 s; 0 disables): a finished call's Call-ID is remembered
+  with its reason — `successful`, or `aborted at index <n>` — and a late
+  message for it is not out-of-call: SIPp's `deadcall` counts
+  `DeadCallMsgs`, warns `Dead call <id> (<reason>), received '<msg>'`,
+  writes `Dead call <id> received a <TRANSPORT> message:` to the message
+  trace and refreshes the expiry; sipr does the same and sweeps expired
+  entries once a second (a message absorbed by a call in `<timewait>`
+  also counts as `DeadCallMsgs`, M40). `-trace_timeout` is accepted and
+  does nothing: SIPp 3.7's implementation is commented out.

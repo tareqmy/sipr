@@ -1648,7 +1648,7 @@ file dump period).
       note (formats, zero columns, the seconds-not-ms RTT quirk, the
       `-fd` default change); CHANGELOG.
 
-### M41 — Message and error logs at parity: short messages, `<log>` files, calldebug, rotation
+### M41 — Message and error logs at parity: short messages, `<log>` files, calldebug, rotation ✅
 
 `<log>` actions print to stderr with a `[log]` prefix; SIPp writes them
 to `<scenario>_<pid>_logs.log` under `-trace_logs`. `-trace_shortmsg`
@@ -1669,23 +1669,36 @@ the option table defaults, `call.cpp` `~call` / deadcall handling and
 "Received message for a dead call"), `-trace_calldebug` (`call.cpp`
 `dumpCall`: the message history of aborted calls).
 
-- [ ] `-trace_logs`/`-log_file`: `<log>` goes to the file (stderr stays
-      the fallback without the flag, documented); `-trace_shortmsg`/
-      `-shortmessage_file` with SIPp's CSV format; `-trace_calldebug`/
-      `-calldebug_file`; `-trace_timeout`; `-error_file`, `-message_file`
-      (rename the existing `-trace_err`/`-trace_msg` outputs);
-      `-rfc3339`.
-- [ ] Rotation: `-ringbuffer_files`/`-ringbuffer_size`/`-max_log_size`
-      and the `*_overwrite` flags for every file above, on the writer
-      thread (the engine only hands lines to a channel — check the
-      existing trace path already does; if not, this is where it moves).
-- [ ] `-deadcall_wait`: a bounded map of finished calls (Call-ID →
-      final status, expiry) consulted before "unexpected message" so the
-      error log names the dead call as SIPp does.
-- [ ] Tests: golden files for each format; e2e rotation test with a
-      tiny `-ringbuffer_size`; interop: `-trace_shortmsg` on both sides,
-      compare field counts per line and the direction/method columns.
-- [ ] Docs: SIPP_COMPAT §3 (tracing) and a new §6 note on file naming.
+- [x] `-trace_logs`/`-log_file` (`<log>` lines go there and nowhere
+      else, as SIPp's `LOG_MSG`; `<warning>` stays in the error trace);
+      `-trace_shortmsg`/`-shortmessage_file` with SIPp's tab layout and
+      its receive-side time quirk; `-trace_calldebug`/`-calldebug_file`
+      with SIPp's entries, dumped on abort only; `-trace_timeout`
+      accepted as the no-op it is in SIPp; `-error_file`, `-message_file`;
+      the message frame and error line rewritten to SIPp's exact shapes
+      (`-rfc3339` aware). Found on the way: the frame used to carry the
+      peer address and the error lines no timestamp.
+- [x] Rotation: `-ringbuffer_files`/`-ringbuffer_size`/`-max_log_size`
+      with SIPp's rotated names and the `-<kind>_overwrite` flags, in the
+      stats crate's `TraceFile` (the writes stay on the engine thread as
+      before — a buffered `write_all` per event, the same cost as the
+      existing message trace; moving them to a thread is not needed at
+      the rates measured so far).
+- [x] `-deadcall_wait`: finished calls stay in a map (Call-ID → reason,
+      expiry) consulted before the unknown-call handling: a late message
+      counts as `DeadCallMsgs`, warns and traces as SIPp's `deadcall`
+      does, and spawns nothing; expired entries are swept once a second.
+- [x] Tests: stats unit tests for every line format and the ring-buffer
+      rotation and size cap; e2e `log_files_have_sipps_shapes` (logs,
+      timestamped errors under the header, short messages' seven
+      columns, rotated message files, a dead-call message) and
+      `calldebug_dumps_aborted_calls`; interop
+      `short_message_log_matches_real_sipps` — the (S|R, start line)
+      sets of sipr's and sipp's short-message logs for the same run are
+      equal.
+- [x] Docs: SIPP_COMPAT §3 (the flags) and a §6 note (naming, formats,
+      the receive-side time quirk, rotation, dead calls, SIPp's
+      `fixedname` bug not copied); the M17 note on `trace logs`; CHANGELOG.
 
 ### M42 — Timer and behavior knobs: retransmission counts, timeouts, `-lost`, `-default_behaviors`
 

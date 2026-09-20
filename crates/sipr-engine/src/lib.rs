@@ -16,8 +16,8 @@ pub use tdm::TdmMap;
 mod vars;
 
 pub use engine::{
-    EngineConfig, EngineControl, EngineError, RunReport, SecondaryKind, TransportKind, UiChannels,
-    run, run_scenarios, run_with_control, run_with_ui,
+    EngineConfig, EngineControl, EngineError, LogOverwrite, RunReport, SecondaryKind,
+    TransportKind, UiChannels, run, run_scenarios, run_with_control, run_with_ui,
 };
 // Re-exported so the binary can build a TLS config without depending on
 // sipr-net directly.

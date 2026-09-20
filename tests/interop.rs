@@ -4429,3 +4429,126 @@ fn statistics_file_headers_match_real_sipps() {
     let _ = std::fs::remove_dir_all(&sipr_dir);
     let _ = std::fs::remove_dir_all(&sipp_dir);
 }
+
+// ---- M41: message and error logs ---------------------------------------
+
+/// The `-trace_shortmsg` lines of every `*_shortmessages.log` in `dir`,
+/// reduced to (direction, start line) pairs, distinct, sorted.
+fn short_message_shapes(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with("_shortmessages.log")
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        for line in text.lines() {
+            let cols: Vec<&str> = line.split('\t').collect();
+            // A time in the default form holds two tabs of its own.
+            let (dir, start) = match cols.len() {
+                7 => (cols[3], cols[6]),
+                5 => (cols[1], cols[4]),
+                _ => panic!("unexpected short message line: {line}"),
+            };
+            let pair = (dir.to_owned(), start.to_owned());
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `-trace_shortmsg` at parity: sipr and real sipp run the same embedded
+/// UAC against the other's UAS and log the same set of (S|R, start line)
+/// pairs, one tab-separated line per message in SIPp's field layout.
+#[test]
+fn short_message_log_matches_real_sipps() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::short_message_log_matches_real_sipps — no sipp.");
+        return;
+    };
+    let sipr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let run = |uas_bin: &std::path::Path, uac_bin: &std::path::Path, tag: &str| {
+        let dir = std::env::temp_dir().join(format!(
+            "sipr-interop-shortmsg-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let port = free_port();
+        let mut uas = Reaper(
+            Command::new(uas_bin)
+                .current_dir(&dir)
+                .args([
+                    "-sn",
+                    "uas",
+                    "-i",
+                    "127.0.0.1",
+                    "-p",
+                    &port.to_string(),
+                    "-m",
+                    "2",
+                    "-timeout",
+                    "30",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn uas"),
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        let mut args: Vec<String> = [
+            "-sn",
+            "uac",
+            "-i",
+            "127.0.0.1",
+            "-r",
+            "10",
+            "-m",
+            "2",
+            "-d",
+            "50",
+            "-timeout",
+            "20",
+            "-trace_shortmsg",
+        ]
+        .iter()
+        .map(|a| (*a).to_owned())
+        .collect();
+        if uac_bin == std::path::Path::new(env!("CARGO_BIN_EXE_sipr")) {
+            args.push("-bg".to_owned());
+        }
+        args.push(format!("127.0.0.1:{port}"));
+        let mut uac = Reaper(
+            Command::new(uac_bin)
+                .current_dir(&dir)
+                .args(&args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn uac"),
+        );
+        let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+        let _ = wait_with_timeout(&mut uas.0, Duration::from_secs(15));
+        (dir, code)
+    };
+    let (sipr_dir, sipr_code) = run(&sipp, &sipr, "sipr");
+    assert_eq!(sipr_code, Some(0), "sipr uac");
+    let (sipp_dir, _) = run(&sipr, &sipp, "sipp");
+    let ours = short_message_shapes(&sipr_dir);
+    let theirs = short_message_shapes(&sipp_dir);
+    assert!(!ours.is_empty(), "sipr wrote no short messages");
+    assert_eq!(
+        ours, theirs,
+        "short message (direction, start line) sets differ"
+    );
+    let _ = std::fs::remove_dir_all(&sipr_dir);
+    let _ = std::fs::remove_dir_all(&sipp_dir);
+}

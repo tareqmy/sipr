@@ -486,7 +486,14 @@ fn trace_files_are_written() {
         msg_content.contains("INVITE sip:service@"),
         "message log content"
     );
-    assert!(msg_content.contains("received from"), "inbound traced too");
+    assert!(
+        msg_content.contains("UDP message received ["),
+        "inbound traced too, SIPp's frame: {msg_content}"
+    );
+    assert!(
+        msg_content.contains("UDP message sent ["),
+        "outbound traced, SIPp's frame: {msg_content}"
+    );
     let csv_content = std::fs::read_to_string(dir.join(csv.expect("csv"))).expect("read csv");
     assert!(
         csv_content.starts_with("StartTime;LastResetTime;CurrentTime;"),
@@ -6003,8 +6010,14 @@ fn set_users_retires_and_reuses_ids_like_sipp() {
         .find(|e| e.file_name().to_string_lossy().ends_with("_errors.log"))
         .map(|e| std::fs::read_to_string(e.path()).expect("read log"))
         .expect("an errors log");
+    // Every error-trace line is timestamped (M41): compare the texts.
+    let texts: String = errors_log
+        .lines()
+        .map(|l| l.split_once(": ").map_or(l, |(_, t)| t))
+        .map(|t| format!("{t}\n"))
+        .collect();
     assert!(
-        errors_log.contains("2 level 0 variables:\nper_run\nregion\n1 level 1 variables:\nper_user\n0 level 2 variables:\n"),
+        texts.contains("2 level 0 variables:\nper_run\nregion\n1 level 1 variables:\nper_user\n0 level 2 variables:\n"),
         "dump variables output:\n{errors_log}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -7194,6 +7207,229 @@ fn statistics_files_have_sipps_shape() {
             screens.contains(want),
             "missing {want:?} in screens:\n{screens}"
         );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The M41 log files: `<log>` lines to `-trace_logs`, `<warning>` lines
+/// timestamped in `-trace_err` under SIPp's header, one tab-separated
+/// `-trace_shortmsg` line per message, SIPp's message frames rotated by
+/// `-ringbuffer_size`/`-ringbuffer_files`, and a late message for a
+/// finished call logged as a dead call rather than an out-of-call one.
+#[test]
+fn log_files_have_sipps_shapes() {
+    // An OPTIONS responder that also re-sends the 200 of the first call
+    // 200 ms later, after that call has ended: a dead-call message.
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut buf = [0u8; 65_535];
+        let mut first: Option<(Vec<u8>, SocketAddr)> = None;
+        let mut answered = 0u32;
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            if msg.method() == Some("OPTIONS") {
+                let ok = mirror_response(&msg, "200 OK", true);
+                let _ = sock.send_to(&ok, from);
+                answered += 1;
+                if first.is_none() {
+                    first = Some((ok, from));
+                } else if let Some((late, to)) = first.take() {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let _ = sock.send_to(&late, to);
+                }
+            }
+        }
+        answered
+    });
+    let dir = std::env::temp_dir().join(format!("sipr-logs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("logs.xml");
+    std::fs::write(
+        &path,
+        r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="logs">
+  <send retrans="500"><![CDATA[
+OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipr <sip:sipr@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]:[remote_port]>
+Call-ID: [call_id]
+CSeq: 1 OPTIONS
+Max-Forwards: 70
+Content-Length: 0
+
+]]></send>
+  <recv response="200"/>
+  <nop>
+    <action>
+      <log message="hello from [call_id]"/>
+      <warning message="careful [call_id]"/>
+    </action>
+  </nop>
+</scenario>
+"#,
+    )
+    .expect("write scenario");
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .args([
+            "-sf",
+            path.to_str().expect("utf8"),
+            "-m",
+            "3",
+            "-r",
+            "1",
+            "-timeout",
+            "15",
+            "-trace_msg",
+            "-trace_err",
+            "-trace_logs",
+            "-trace_shortmsg",
+            // Big enough that the error log never rotates (its header is
+            // written once, at creation), small enough that the message
+            // log rotates more than twice.
+            "-ringbuffer_size",
+            "1000",
+            "-ringbuffer_files",
+            "2",
+            "-deadcall_wait",
+            "5000",
+            "-bg",
+            &addr.to_string(),
+        ])
+        .output()
+        .expect("run sipr");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 3 failed 0"), "{err}");
+    drop(uas);
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let read = |suffix: &str| -> String {
+        let name = names
+            .iter()
+            .find(|n| n.starts_with("logs_") && n.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no logs_*{suffix} in {names:?}"));
+        std::fs::read_to_string(dir.join(name)).expect("read")
+    };
+    // -trace_logs: <log> lines, one per call, keyword-expanded, no prefix.
+    let logs = read("_logs.log");
+    assert_eq!(logs.lines().count(), 3, "{logs}");
+    assert!(logs.lines().all(|l| l.starts_with("hello from ")), "{logs}");
+    // -trace_err: SIPp's header, then timestamped lines; the <warning>s and
+    // the dead-call message.
+    let errors = read("_errors.log");
+    assert!(
+        errors.starts_with("The following events occurred:\n"),
+        "{errors}"
+    );
+    let warnings: Vec<&str> = errors
+        .lines()
+        .filter(|l| l.contains(": careful "))
+        .collect();
+    assert_eq!(warnings.len(), 3, "{errors}");
+    assert!(
+        warnings[0].starts_with("20"),
+        "timestamped: {}",
+        warnings[0]
+    );
+    assert!(
+        errors.contains("Dead call ") && errors.contains("(successful), received 'SIP/2.0 200"),
+        "{errors}"
+    );
+    assert!(!errors.contains("out-of-call message ignored"), "{errors}");
+    // -trace_shortmsg: 3 sent + 3 received + the dead-call 200, tab-separated.
+    let short = read("_shortmessages.log");
+    let s_lines = short.lines().filter(|l| l.contains("\tS\t")).count();
+    let r_lines = short.lines().filter(|l| l.contains("\tR\t")).count();
+    assert_eq!((s_lines, r_lines), (3, 4), "{short}");
+    for line in short.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        // The default time form itself holds two tabs: 7 columns.
+        assert_eq!(cols.len(), 7, "{line}");
+        assert!(
+            cols[4].contains('@') || !cols[4].is_empty(),
+            "call id: {line}"
+        );
+        assert!(cols[5].starts_with("CSeq:"), "{line}");
+        assert!(
+            cols[6].starts_with("OPTIONS ") || cols[6].starts_with("SIP/2.0 200"),
+            "{line}"
+        );
+    }
+    // -trace_msg rotated by size into a two-file ring: the live file plus
+    // at most two rotated ones, all with SIPp's frame.
+    let rotated: Vec<&String> = names
+        .iter()
+        .filter(|n| n.starts_with("logs_") && n.contains("_messages_") && n.ends_with(".log"))
+        .collect();
+    assert!(!rotated.is_empty() && rotated.len() <= 2, "{names:?}");
+    let live = read("_messages.log");
+    let any = if live.is_empty() {
+        std::fs::read_to_string(dir.join(rotated[0])).expect("read rotated")
+    } else {
+        live
+    };
+    assert!(
+        any.contains("UDP message sent [") || any.contains("UDP message received ["),
+        "{any}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `-trace_calldebug`: an aborted call's history — start, sends, the
+/// abort — under SIPp's header; a successful call writes nothing.
+#[test]
+fn calldebug_dumps_aborted_calls() {
+    let dir = std::env::temp_dir().join(format!("sipr-calldebug-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // Nobody listens here: the INVITE times out after one retransmission.
+    let dead = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = dead.local_addr().expect("addr");
+    drop(dead);
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .args([
+            "-sn",
+            "uac",
+            "-m",
+            "1",
+            "-max_retrans",
+            "1",
+            "-timeout",
+            "10",
+            "-trace_calldebug",
+            "-bg",
+            &addr.to_string(),
+        ])
+        .output()
+        .expect("run sipr");
+    assert_ne!(out.status.code(), Some(0));
+    let name = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("uac_") && n.ends_with("_calldebug.log"))
+        .expect("calldebug file");
+    let text = std::fs::read_to_string(dir.join(name)).expect("read");
+    for want in [
+        "Call debugging information for call ",
+        " Starting call ",
+        " Sending UDP message for call ",
+        "INVITE sip:",
+        " Aborting call ",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

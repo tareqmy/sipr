@@ -152,6 +152,9 @@ fn run(cli: &Cli) -> ExitCode {
             |s| s.to_string_lossy().into_owned(),
         );
     let pid = std::process::id();
+    if cli.trace_timeout {
+        eprintln!("sipr: warning: -trace_timeout has no effect (SIPp 3.7 never implemented it)");
+    }
     // A v6 target needs a v6 local socket; default the bind family to `::` when
     // the target is IPv6 and no explicit -i was given.
     let local_ip = cli.local_ip.or_else(|| {
@@ -181,12 +184,16 @@ fn run(cli: &Cli) -> ExitCode {
         auth_user: cli.auth_user.clone(),
         auth_password: cli.auth_password.clone(),
         auth_uri: cli.auth_uri.clone(),
-        trace_msg: cli
-            .trace_msg
-            .then(|| std::path::PathBuf::from(format!("{base}_{pid}_messages.log"))),
-        trace_err: cli
-            .trace_err
-            .then(|| std::path::PathBuf::from(format!("{base}_{pid}_errors.log"))),
+        trace_msg: cli.trace_msg.then(|| {
+            cli.message_file
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_messages.log")))
+        }),
+        trace_err: cli.trace_err.then(|| {
+            cli.error_file
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_errors.log")))
+        }),
         trace_stat: cli.trace_stat.then(|| {
             cli.stat_file
                 .clone()
@@ -220,6 +227,34 @@ fn run(cli: &Cli) -> ExitCode {
         rtt_freq: cli.rtt_freq.unwrap_or(200),
         stat_delimiter: cli.stat_delimiter.clone().unwrap_or_else(|| ";".to_owned()),
         periodic_rtd: cli.periodic_rtd,
+        trace_logs: cli.trace_logs.then(|| {
+            cli.log_file
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_logs.log")))
+        }),
+        trace_shortmsg: cli.trace_shortmsg.then(|| {
+            cli.shortmessage_file.clone().unwrap_or_else(|| {
+                std::path::PathBuf::from(format!("{base}_{pid}_shortmessages.log"))
+            })
+        }),
+        trace_calldebug: cli.trace_calldebug.then(|| {
+            cli.calldebug_file
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_calldebug.log")))
+        }),
+        log_overwrite: sipr_engine::LogOverwrite {
+            messages: cli.message_overwrite,
+            errors: cli.error_overwrite,
+            logs: cli.log_overwrite,
+            shortmessages: cli.shortmessage_overwrite,
+            calldebug: cli.calldebug_overwrite,
+        },
+        log_rotation: sipr_stats::LogRotation {
+            ringbuffer_files: cli.ringbuffer_files.unwrap_or(0),
+            ringbuffer_size: cli.ringbuffer_size.unwrap_or(0),
+            max_log_size: cli.max_log_size.unwrap_or(0),
+        },
+        deadcall_wait: std::time::Duration::from_millis(cli.deadcall_wait_ms.unwrap_or(33_000)),
         transport: match cli.transport {
             crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
             crate::cli::Transport::UdpPerCall => sipr_engine::TransportKind::UdpPerCall,
@@ -394,7 +429,17 @@ fn write_screens(cli: &cli::Cli, base: &str, pid: u32, snap: &sipr_stats::Snapsh
         }
         text.push('\n');
     }
-    if let Err(e) = std::fs::write(&path, text) {
+    let result = if cli.screen_overwrite {
+        std::fs::write(&path, text)
+    } else {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(text.as_bytes()))
+    };
+    if let Err(e) = result {
         eprintln!("sipr: warning: cannot write {}: {e}", path.display());
     }
 }
