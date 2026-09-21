@@ -109,6 +109,21 @@ fn sipp_stream_client_cannot_bind(dir: &std::path::Path) -> bool {
     sipp_error_log_contains(dir, "Unable to bind TCP socket")
 }
 
+/// Whether sipp tripped over its own use-after-free on a reset TCP
+/// connection (`socket.cpp` ~l.2151: the `SIPpSocket` it sends on has been
+/// freed, so `ss_transport` reads back as garbage). It shows up two ways,
+/// both diagnostic and both seen on macOS with sipp 3.7.7: the fatal
+/// `default:` arm of `write_primitive` ("Internal error, unknown transport
+/// type 1024"), or "Unable to send UDP message" on a run that is `-t t1`
+/// throughout and has no UDP socket at all — after which sipp can spin past
+/// its own `-timeout`. Nothing sipr does can prevent it: closing the
+/// connection is the point of the test. So the test skips visibly rather
+/// than failing on sipp's bug (docs/SIPP_COMPAT.md §6).
+fn sipp_freed_socket_on_reset(dir: &std::path::Path) -> bool {
+    sipp_error_log_contains(dir, "unknown transport type")
+        || sipp_error_log_contains(dir, "Unable to send UDP message")
+}
+
 /// Whether any sipp `*_errors.log` in `dir` mentions `needle`.
 fn sipp_error_log_contains(dir: &std::path::Path, needle: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -2207,6 +2222,14 @@ fn real_sipp_tcp_uac_reconnects_to_sipr() {
     let (code, _) = tcp_reconnect_pair(&sipr, &["-bg"], &sipp, &["-trace_err"], None, dir.path());
     if code != Some(0) && sipp_stream_client_cannot_bind(dir.path()) {
         eprintln!("SKIPPED interop::real_sipp_tcp_uac_reconnects_to_sipr — sipp bind limitation.");
+        return;
+    }
+    if code != Some(1) && sipp_freed_socket_on_reset(dir.path()) {
+        eprintln!(
+            "SKIPPED interop::real_sipp_tcp_uac_reconnects_to_sipr — sipp tripped over its \
+             own use-after-free on the reset connection (socket.cpp ~l.2151): it either \
+             died on the fatal 'unknown transport type' or spun past its -timeout."
+        );
         return;
     }
     assert_eq!(

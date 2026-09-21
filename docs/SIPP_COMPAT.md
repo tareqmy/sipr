@@ -1263,6 +1263,19 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   it means SIPp's one-step-per-turn scheduler, the opposite of the runtime
   model in ARCHITECTURE §3, for a difference observable only through a
   `<Global>` variable two such calls both write.
+- sipp frees the socket it is still sending on when a TCP peer resets
+  (found M44 while closing the interop gate; `socket.cpp` ~l.2151, the
+  `default:` arm of `write_primitive`). After the far end closes a `-t t1`
+  connection, sipp 3.7.7 reaches a `SIPpSocket` whose `ss_transport` reads
+  back as garbage — the same run logs "Unable to send UDP message" for a
+  TCP run, and then dies on the fatal "Internal error, unknown transport
+  type 1024" instead of reconnecting. Reproducible on macOS; the mirror
+  direction (sipr's UAC reconnecting to a sipp UAS) is unaffected, so this
+  is sipp's bookkeeping, not a protocol difference. Nothing sipr can do
+  about it — closing the connection is what the test is *for* — so
+  `real_sipp_tcp_uac_reconnects_to_sipr` skips **visibly** when sipp's
+  error log shows it, alongside the pre-existing "Unable to bind TCP
+  socket" guard.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)
 - Statistical pauses and `<sample>` (M38; verified in `scenario.cpp`
