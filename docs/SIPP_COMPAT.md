@@ -1123,8 +1123,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   returns after a `<nop>`'s `next()`), sipr runs a call until its first
   blocking step — so two calls started in the same tick interleave their
   action steps differently (both `<nop>`s before either `<send>` in
-  SIPp), which only shows through shared (global) variables. Left as is;
-  the M35 interop test normalises it.
+  SIPp), which only shows through shared (global) variables. Settled as a
+  permanent divergence in M44 below; the M35 interop test normalises it.
 - Variable value semantics (v0.24.0; verified in `variables.cpp` ~l.33-46
   `CCallVariable::isSet`, `call.cpp` ~l.3968-3978 `E_Message_Variable`,
   ~l.1933 `call::next`, ~l.2241 `condexec`): a variable "is set" when it
@@ -1225,16 +1225,44 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   otherwise the keyword falls back to the last *received* request's URI,
   which a UAC never has — so the documented setdest example silently
   depends on `rrs="true"` on the `recv response="200"`. sipr renders the
-  last received Contact regardless of `rrs` (pre-existing, left as is:
-  it is what the example intends). (c) `[last_*]` inside the actions of
+  last received Contact regardless of `rrs` (settled as permanent in
+  M44 below: it is what the example intends). (c) `[last_*]` inside the actions of
   the recv that just matched (`call.cpp` ~l.5517 `executeAction` before
   ~l.5641 `last_recv_msg = …`): SIPp still names the *previous* received
   message — empty on a call's first recv — so SIPp's own
   `<exec command="echo [last_From] >> from_list.log"/>` example writes
-  blank lines; sipr's `[last_*]` name the message just received
-  (pre-existing, left as is; the interop test accepts both). (d) The
+  blank lines; sipr's `[last_*]` name the message just received (settled
+  as permanent in M44 below; the interop test accepts both). (d) The
   example's unquoted From also breaks under any shell (`<`, `>` and `;`
   are redirections and a command separator) — quote it.
+- The three divergences M37 and M35 left open, settled (M44). Each was
+  "left as is" with no decision recorded; each is now **permanent**, with
+  no `--sipr-strict-sipp` flag, and the first two are pinned by
+  `next_url_and_last_headers_follow_siprs_reading_not_sipps` in
+  `tests/e2e.rs`.
+  (1) **`[next_url]` without `rrs`** (`call.cpp` ~l.5570-5580): SIPp fills
+  `next_req_url` only on a recv carrying `rrs="true"` and otherwise falls
+  back to the last received *request's* URI, which a UAC never has — so its
+  own documented `setdest` example depends on an `rrs` nobody writes, and
+  the keyword renders **empty** without it. sipr renders the last received
+  Contact either way. A scenario written SIPp's way behaves identically in
+  both; matching SIPp could only turn a working scenario into one that
+  sends to an empty URI, which is no one's test.
+  (2) **`[last_*]` inside the matching recv's own actions** (`call.cpp`
+  ~l.5517 `executeAction` runs before ~l.5641 `last_recv_msg = …`): SIPp's
+  keywords still name the *previous* received message, empty on a call's
+  first recv — which is why SIPp's own `echo [last_From]` example logs
+  blank lines. Matching it would mean rendering `[last_*]` from the
+  previous message while `ereg` in the same action list still searches the
+  new one: two different "current messages" in one `<action>` block, for a
+  behavior no scenario depends on deliberately.
+  (3) **Action-step interleaving** (`call.cpp` `call::run` returns after a
+  `<nop>`'s `next()`): SIPp's scheduler runs one message step per call per
+  turn, sipr runs a call until its first blocking step, so two calls
+  started in the same tick interleave their `<nop>`s differently. Matching
+  it means SIPp's one-step-per-turn scheduler, the opposite of the runtime
+  model in ARCHITECTURE §3, for a difference observable only through a
+  `<Global>` variable two such calls both write.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)
 - Statistical pauses and `<sample>` (M38; verified in `scenario.cpp`

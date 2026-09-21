@@ -1828,12 +1828,17 @@ Small, independent items; ship in any order, each its own commit:
       in-tree block reader, no crate. Done: `sipr-media::pcapng`, std
       only; `pcap::parse` dispatches on the section-header magic so no
       caller changed.
-- [ ] Decide and document the three "left as is" divergences in
+- [x] Decide and document the three "left as is" divergences in
       SIPP_COMPAT §6 M37 (`[next_url]` without `rrs`, `[last_*]` inside
       the matching recv's own actions, and the M35 action-step
       interleaving): either match SIPp behind a `--sipr-strict-sipp`
       flag or state them as permanent in §6 with the reason. No silent
-      status quo.
+      status quo. Decided: all three permanent, no flag — SIPP_COMPAT §6
+      M44 gives the reason for each, and an e2e test pins the first two.
+      In short: (1) matching SIPp makes `[next_url]` render empty for a
+      UAC, (2) matching SIPp would put two different "current messages"
+      in one `<action>` block, and (3) matching SIPp means its
+      one-step-per-turn scheduler, which contradicts ARCHITECTURE §3.
 - [x] `-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`,
       `-rtp_threadtasks`, `-skip_rlimit`, `-plugin` and the SCTP socket
       options (`-multihome` etc.): accept with one loud

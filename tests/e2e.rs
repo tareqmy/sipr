@@ -8285,3 +8285,124 @@ fn bind_local_and_buff_size_drive_a_call_without_an_explicit_i() {
     let uerr = uas_err.join().expect("uas stderr");
     assert_eq!(code, Some(0), "uas stderr:\n{uerr}");
 }
+
+// ---- the M44 settled divergences ---------------------------------------
+
+/// Two keyword divergences from SIPp, settled as permanent in M44 and
+/// pinned here (SIPP_COMPAT §6 M44):
+///
+/// 1. `[next_url]` renders the last received Contact whether or not the
+///    recv carried `rrs="true"`. SIPp fills `next_req_url` only under
+///    `rrs`, and otherwise falls back to the last received *request's* URI
+///    — which a UAC never has, so the keyword renders empty there.
+/// 2. `[last_*]` inside the actions of the recv that just matched names
+///    *that* message. SIPp runs the actions before it stores the message,
+///    so its `[last_*]` name the previous one — empty on a call's first
+///    recv, which is why SIPp's own `echo [last_From]` example logs blanks.
+#[test]
+fn next_url_and_last_headers_follow_siprs_reading_not_sipps() {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                // A Contact that is distinguishable from the request URI.
+                Some("INVITE") => {
+                    let _ = sock.send_to(&ok_with_contact(&msg, 9), from);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+    });
+    // The 200 has no rrs="true", and its actions are the call's first recv.
+    let scenario = r#"<scenario name="settled">
+  <send retrans="500"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:sipr@[local_ip]:[local_port]>
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200">
+    <action>
+      <log message="next_url=[next_url] last=[last_CSeq:]"/>
+    </action>
+  </recv>
+  <send><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Content-Length: 0
+
+  ]]></send>
+  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#;
+    let dir = std::env::temp_dir().join(format!("sipr-settled-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("settled.xml");
+    std::fs::write(&path, scenario).expect("write scenario");
+    let (out, _) = run_sipr_in(
+        &dir,
+        &[
+            "-sf",
+            path.to_str().expect("utf8"),
+            "-i",
+            "127.0.0.1",
+            "-trace_logs",
+            "-cp",
+            "0",
+            "-m",
+            "1",
+            "-timeout",
+            "15",
+            "-bg",
+            &addr.to_string(),
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    let logs = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_logs.log"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    drop(uas);
+    assert!(
+        logs.contains("next_url=sip:svc@127.0.0.1:9 "),
+        "[next_url] must be the received Contact without rrs:\n{logs}"
+    );
+    assert!(
+        logs.contains("last=CSeq: 1 INVITE"),
+        "[last_*] must name the message this recv just matched:\n{logs}"
+    );
+}
