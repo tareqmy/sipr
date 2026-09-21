@@ -131,6 +131,9 @@ Core refactoring strategies:
 
 - Work in small, compilable increments; keep `main` green.
 - Update `docs/MILESTONES.md` checkboxes in the same change that completes them.
+- A new file under `docs/` must be added to `docs/SUMMARY.md`: that is the
+  table of contents of the documentation site (https://tareqmy.github.io/sipr/,
+  built by mdBook from `book.toml`). `make book-build` checks it renders.
 - If you learn a non-obvious SIPp behavior from the C++ source, record it in
   `docs/SIPP_COMPAT.md` §Behavior notes so the next agent doesn't re-derive it.
 - Commit messages follow Conventional Commits (`feat(scenario): ...`,

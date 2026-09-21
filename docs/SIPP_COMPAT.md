@@ -1018,11 +1018,11 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   "… is a non-INVITE transaction with an ACK!". A response for a named
   transaction that arrives once the call has moved past its recv (an
   "old transaction" reply, found by branch anywhere behind the window):
-  a 1xx is ignored ("Ignoring provisional <transport> message for
+  a 1xx is ignored ("Ignoring provisional `<transport>` message for
   transaction n", a trace line), a final one for an INVITE transaction
   gets the recorded `ack_txn` ACK re-rendered and sent again, and a
   repeat of the final response already taken (same message hash) is
-  ignored with a WARNING ("Ignoring final <transport> message for
+  ignored with a WARNING ("Ignoring final `<transport>` message for
   transaction n (hash …)"); anything else is unexpected as usual. The
   accepted response's hash is stored per transaction. `[branch]` itself
   knows nothing of transactions (`z9hG4bK-pid-number-index`): an
@@ -1105,8 +1105,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   (shape); `pareto` `k` (shape) /`x_m` (minimum); `gpareto`
   `shape`/`scale`/`location`; `gamma` `k` (shape) /`theta` (scale);
   `negbin` `p`/`n`. There is no `poisson`. A missing parameter is SIPp's
-  "<Kind> distribution is missing the required '<name>' parameter.", an
-  unknown kind "Unknown distribution: <kind>". Old-style `<pause>` spellings
+  "`<Kind>` distribution is missing the required '`<name>`' parameter.", an
+  unknown kind "Unknown distribution: `<kind>`". Old-style `<pause>` spellings
   are accepted too: `min`/`max` alone mean `uniform`, and a bare
   `normal="…"`/`exponential="…"`/`lognormal`/`weibull`/`pareto`/`gamma`
   flag names that kind. sipr's earlier positional shorthand,

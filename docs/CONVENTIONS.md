@@ -17,7 +17,7 @@
   (`ScenarioError`, `NetError`, ...). Include position context in scenario
   errors (file, line, element) — scenario authors debug with these.
 - Binary: `anyhow` at the top level; user-facing messages must be actionable
-  ("unknown attribute 'retrnas' on <send> at uac.xml:41 — did you mean
+  ("unknown attribute 'retrnas' on `<send>` at uac.xml:41 — did you mean
   'retrans'?"), not debug dumps.
 - No `unwrap()`/`expect()`/`panic!` in library code outside tests and truly
   unreachable states (`unreachable!` with a comment). In tests, unwrap freely.

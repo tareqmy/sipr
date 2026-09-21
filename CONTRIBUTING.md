@@ -13,6 +13,14 @@ so compatibility with SIPp's documented behavior is the bar for every change.
 - Check `docs/MILESTONES.md` and `docs/SIPP_COMPAT.md` before proposing a
   feature. Some gaps are deliberate and listed in the README.
 
+## Documentation
+
+The site at https://tareqmy.github.io/sipr/ is built with
+[mdBook](https://rust-lang.github.io/mdBook/) from `docs/` (`book.toml` at
+the root) and deployed by `.github/workflows/docs.yml` on every push to
+`master`. A new page must be listed in `docs/SUMMARY.md` or it will not be
+rendered. `make book` serves it locally (`cargo install mdbook`).
+
 ## Pull requests
 
 All of these must pass from the repo root; CI runs the same commands:

@@ -157,6 +157,9 @@ root for media.
 
 ## Documentation
 
+Everything below is rendered as a site at
+[tareqmy.github.io/sipr](https://tareqmy.github.io/sipr/).
+
 - `PLAN.md` — architecture and roadmap
 - `docs/` — installation, architecture, SIPp compatibility surface,
   conventions, testing, releasing, glossary, milestones

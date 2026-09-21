@@ -1,0 +1,31 @@
+# mdBook configuration for the documentation site at
+# https://tareqmy.github.io/sipr/ — built from docs/ by
+# .github/workflows/docs.yml on every push to master. `make book` serves
+# it locally. New pages must be listed in docs/SUMMARY.md.
+
+[book]
+title = "sipr"
+description = "A SIP testing tool and traffic generator in Rust, compatible with SIPp scenarios"
+authors = ["Tareq Mohammad Yousuf"]
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "target/book"
+
+[output.html]
+site-url = "/sipr/"
+git-repository-url = "https://github.com/tareqmy/sipr"
+edit-url-template = "https://github.com/tareqmy/sipr/edit/master/docs/{path}"
+theme = "docs/theme"
+additional-css = ["docs/theme/sipr.css"]
+default-theme = "light"
+preferred-dark-theme = "coal"
+no-section-label = true
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+limit-results = 20

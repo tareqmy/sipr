@@ -1,0 +1,25 @@
+/* sipr docs — Ferrous accents on top of mdBook's stock themes.
+   Colors come from brand/tokens.css. */
+
+:root {
+  --sipr-rust: #B7410E;
+  --sipr-rust-bright: #E05A1E;
+  --sipr-sage: #5E7A52;
+}
+
+/* Links and the active sidebar entry take the brand accent. */
+.light, .rust {
+  --links: var(--sipr-rust);
+  --sidebar-active: var(--sipr-rust);
+}
+.coal, .navy, .ayu {
+  --links: var(--sipr-rust-bright);
+  --sidebar-active: var(--sipr-rust-bright);
+}
+
+/* The landing-page lockup: one image for light grounds, one for dark. */
+.sipr-lockup { display: block; margin: 0 auto 1.5rem; max-width: 360px; width: 100%; }
+.coal .sipr-lockup-light, .navy .sipr-lockup-light, .ayu .sipr-lockup-light { display: none; }
+.light .sipr-lockup-dark, .rust .sipr-lockup-dark { display: none; }
+
+.sipr-tagline { text-align: center; font-size: 1.15em; margin-bottom: 2rem; }

@@ -1362,7 +1362,7 @@ an `ack_txn` ACK carries its own branch, as in SIPp.
 
 The two remaining v1.x-tier actions. Both are hard errors in sipr's
 compiler today ("exec command= (external process) is not supported yet",
-"action <setdest> is not supported yet"), so SIPp's documented hook and
+"action `<setdest>` is not supported yet"), so SIPp's documented hook and
 redirect idioms — `<exec command="echo [last_From] >> from_list.log"/>`,
 `<setdest host="[$host]" port="[$port]" protocol="[$transport]"/>` after
 an `ereg` over `[next_url]` — fail to load.
@@ -1411,7 +1411,7 @@ the IPv6-without-brackets warning: brackets would be read as a keyword).
       closed, and reaps each child when it exits, so the engine thread
       never forks, waits or blocks and no zombies accumulate under load.
       Fire-and-forget like SIPp: no exit status, no effect on the call; a
-      spawn failure is one stderr warning ("system call error for <cmd>",
+      spawn failure is one stderr warning ("system call error for `<cmd>`",
       SIPp's text — the runner thread has no error trace) and nothing
       more. Dropping the runner at the end of the run drains the queue
       (every command still starts) without waiting for running commands,

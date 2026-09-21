@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A documentation site at https://tareqmy.github.io/sipr/, built with
+  mdBook from `docs/` and deployed from `master` by the new Docs workflow.
 - Timer and behavior knobs at parity (M42): `-max_invite_retrans`,
   `-max_non_invite_retrans` (SIPp's 5 and 9, with `-max_retrans` as a
   ceiling; an INVITE's timer keeps doubling past T2 as SIPp's does),

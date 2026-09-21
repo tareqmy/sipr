@@ -101,6 +101,14 @@ publish-dry-run: ## Check that every crate packages cleanly, without publishing
 doc: ## Build and open the API docs
 	$(CARGO) doc --workspace --no-deps --open
 
+.PHONY: book
+book: ## Serve the documentation site locally (mdBook; cargo install mdbook)
+	mdbook serve --open
+
+.PHONY: book-build
+book-build: ## Build the documentation site into target/book, as CI does
+	mdbook build
+
 .PHONY: clean
 clean: ## Remove build artifacts
 	$(CARGO) clean
