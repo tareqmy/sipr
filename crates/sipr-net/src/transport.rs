@@ -164,6 +164,7 @@ fn recv_loop(
                     return; // engine gone
                 }
             }
+            Err(e) if is_transient_recv_error(&e) => continue,
             Err(e) => {
                 if stop.is_none() {
                     let _ = sink.send(NetEvent::SocketError(e.kind()));
@@ -172,6 +173,21 @@ fn recv_loop(
             }
         }
     }
+}
+
+/// Errors a UDP receive loop must ride out rather than die on. Windows
+/// reports an ICMP port-unreachable for an earlier `send_to` as a
+/// `ConnectionReset` on the *unconnected* socket (the `WSAECONNRESET`
+/// quirk); Linux never surfaces it, and a peer being down is exactly what a
+/// test tool is expected to keep running through. `Interrupted` is a
+/// signal, not a dead socket.
+fn is_transient_recv_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::Interrupted
+    )
 }
 
 impl UdpTransport {

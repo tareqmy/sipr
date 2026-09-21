@@ -70,6 +70,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still parses but is documented as a sipr extension; SIPp's attributes
   are canonical. `poisson`, which SIPp never had, is now an error.
 
+### Fixed
+
+- On Windows an ICMP port-unreachable for a peer that is down no longer
+  kills the UDP socket: the receive loop rides out `ConnectionReset`
+  (the `WSAECONNRESET` quirk on unconnected sockets) instead of ending
+  the run with "socket error".
+
 ## [0.27.1] — 2026-09-20
 
 ### Changed
