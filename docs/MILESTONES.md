@@ -1786,8 +1786,8 @@ reconnection on a dropped twin), `call.cpp` `E_AT_SEND_CMD` with `dest`
 Findings (from the C++; the full note is SIPP_COMPAT §6 M43): SIPp has
 no twin reconnection at all — a closed control connection ends the run
 with a warning, in classic mode too — so "slave dial with reconnection"
-became "slave dials back on first contact, and a closed twin drains the
-run". `src=` is matched against the command's own `From:` line, not the
+became "slave dials back on first contact, and a closed twin ends the
+run at once, aborting the calls still open". `src=` is matched against the command's own `From:` line, not the
 socket; commands are routed by their Call-ID like SIP messages, and the
 3PCC server sides (controller B, slaves) open calls on the commands that
 name them. Both of those replaced sipr's earlier "hand it to whichever

@@ -16,8 +16,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Twin commands are now routed by their Call-ID like SIP messages, and
   the 3PCC server sides (classic controller B, every slave) open their
   calls on the commands that name them; an optional `recvCmd` lets a SIP
-  message for the recv behind it pass; a closed twin connection drains
-  the run with SIPp's warning; `internal-cmd: abort_call` is honored, and
+  message for the recv behind it pass; a closed twin connection ends the
+  run at once with SIPp's warning, aborting the calls still open;
+  `internal-cmd: abort_call` is honored, and
   a classic controller sends it when it aborts a call on an unexpected
   message.
 - A documentation site at https://tareqmy.github.io/sipr/, built with

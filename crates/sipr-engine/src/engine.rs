@@ -4623,26 +4623,33 @@ impl<'s> Engine<'s> {
     }
 
     /// A twin connection ended. SIPp treats this as the run being over:
-    /// "One of the twin instances has ended -> exiting" (extended), "3PCC
-    /// controller A has ended -> exiting" (controller B); controller A just
-    /// stops creating calls. sipr drains the calls in flight.
+    /// "One of the twin instances has ended -> exiting" (extended) and
+    /// "3PCC controller A has ended -> exiting" (controller B) set
+    /// `quitting += 20`, past the main loop's `>= 11` bar, so the calls in
+    /// flight are aborted at once (`abort_all_tasks`) and the process exits;
+    /// controller A only sets `quitting = 1` and drains.
     fn on_twin_closed(&mut self) {
         if self.twin_ended {
             return;
         }
         self.twin_ended = true;
-        let line = match (&self.twin, twin_role(self.scenario)) {
+        let (line, hard) = match (&self.twin, twin_role(self.scenario)) {
             (Some(TwinLink::Extended { .. }), _) => {
-                "One of the twin instances has ended -> exiting"
+                ("One of the twin instances has ended -> exiting", true)
             }
             (Some(TwinLink::Classic(_)), Some(TwinRole::Listen)) => {
-                "3PCC controller A has ended -> exiting"
+                ("3PCC controller A has ended -> exiting", true)
             }
-            _ => "3PCC twin has ended -> no more calls",
+            _ => ("3PCC twin has ended -> no more calls", false),
         };
         eprintln!("sipr: warning: {line}");
         self.log_err(line);
-        self.soft_stopping = true;
+        if hard {
+            self.fail_all("twin instance ended");
+            self.hard_stop = true;
+        } else {
+            self.soft_stopping = true;
+        }
     }
 
     /// A twin command arrived. SIPp routes it like a SIP message: by the

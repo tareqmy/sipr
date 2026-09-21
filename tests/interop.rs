@@ -4765,8 +4765,10 @@ fn ext3pcc_slave_xml() -> String {
 }
 
 /// One extended-3PCC run: two sipr UASes (one per leg), the slave started
-/// first, the master last (SIPp's rule: the master dials the slaves).
-/// Returns (master exit, slave exit, master stderr, slave stderr).
+/// first and without `-m` (a closed twin aborts whatever is still open, so
+/// the master's end is what stops it), the master last with `-m 1` (SIPp's
+/// rule: the master dials the slaves). Returns (master exit, slave exit,
+/// master stderr, slave stderr).
 fn run_ext3pcc_pair(
     master_bin: &std::path::Path,
     slave_bin: &std::path::Path,
@@ -4823,11 +4825,12 @@ fn run_ext3pcc_pair(
                 name.to_owned(),
                 "-slave_cfg".to_owned(),
                 cfg.clone(),
-                "-m".to_owned(),
-                "1".to_owned(),
                 "-timeout".to_owned(),
                 "30".to_owned(),
             ];
+            if role == "-master" {
+                args.extend(["-m".to_owned(), "1".to_owned()]);
+            }
             if bin == sipr {
                 args.push("-bg".to_owned());
             }

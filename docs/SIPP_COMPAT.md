@@ -432,10 +432,14 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
     `sendCmd`s dials nobody. A pair is joined by two one-way TCP
     connections and a command leaves on the sender's dialed link to that
     peer. There is no reconnection: any control connection closing ends
-    the run — WARNING "One of the twin instances has ended -> exiting", the
-    calls in flight drain (`quitting += 20`). Classic controller B does the
-    same ("3PCC controller A has ended -> exiting"); controller A only stops
-    creating calls.
+    the run at once — WARNING "One of the twin instances has ended ->
+    exiting", then `quitting += 20`, which is past the main loop's `>= 11`
+    hard-exit bar, so the calls still open are aborted (`abort_all_tasks`,
+    they count as failed) and the process exits. Classic controller B does
+    the same ("3PCC controller A has ended -> exiting"); controller A only
+    sets `quitting = 1` and drains. Hence the docs' rule that slaves run
+    without `-m` and the master is launched last: the master's normal end
+    is what stops the slaves, and it comes after their calls are done.
   - Routing: a twin command is keyed by its own `Call-ID:` line exactly like
     a SIP message (`get_trimmed_call_id`, `///` marker included; a command
     without one is discarded). An unknown Call-ID opens a new outgoing call

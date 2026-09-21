@@ -7818,15 +7818,15 @@ fn extended_3pcc_master_drives_two_slaves() {
             name.to_owned(),
             "-slave_cfg".to_owned(),
             cfg.to_owned(),
-            "-m".to_owned(),
-            "1".to_owned(),
             "-timeout".to_owned(),
             "20".to_owned(),
             "-bg".to_owned(),
             target.clone(),
         ]
     };
-    // Slaves first; the master is launched last (SIPp's rule: it dials them).
+    // Slaves first, without -m: they end when the master does (SIPp aborts
+    // whatever is open when a twin closes, so the master, launched last
+    // and finishing after both answers, is what stops them).
     let a1 = slave_args(&s1_path, "s1");
     let (mut s1, s1_err) = spawn_sipr_bg(&a1.iter().map(String::as_str).collect::<Vec<_>>());
     let a2 = slave_args(&s2_path, "s2");
@@ -7868,6 +7868,10 @@ fn extended_3pcc_master_drives_two_slaves() {
     assert!(s1_err.contains("successful 1 failed 0"), "s1:\n{s1_err}");
     assert_eq!(s2_code, Some(0), "s2:\n{s2_err}");
     assert!(s2_err.contains("successful 1 failed 0"), "s2:\n{s2_err}");
+    assert!(
+        s1_err.contains("One of the twin instances has ended -> exiting"),
+        "the master's end stops the slave:\n{s1_err}"
+    );
     assert_eq!(byes, 3, "every leg hung up");
     assert_eq!(
         answers,
