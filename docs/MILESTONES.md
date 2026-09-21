@@ -1796,7 +1796,7 @@ Extended mode never sends `3pcc_abort`; classic mode does on an
 unexpected-message abort, and both sides now honor `internal-cmd:
 abort_call`. `-trace_msg` still does not log twin commands.
 
-### M44 — Leftovers that still reject loudly
+### M44 — Leftovers that still reject loudly ✅
 
 Small, independent items; ship in any order, each its own commit:
 
