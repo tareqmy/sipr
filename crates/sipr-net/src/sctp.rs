@@ -11,8 +11,8 @@
 //! What `socket2` cannot reach — `SCTP_EVENTS` notifications, `SCTP_NODELAY`,
 //! per-path parameters (`-heartbeat`, `-pathmaxret`, `-pmtu`,
 //! `-assocmaxret`), `sctp_bindx` multi-homing (`-multihome`) and the
-//! SHUTDOWN/ABORT choice (`-gracefulclose`) — is out of scope and those
-//! flags are rejected up front (docs/SIPP_COMPAT.md §6).
+//! SHUTDOWN/ABORT choice (`-gracefulclose`) — is out of scope; those flags
+//! are accepted with a "no effect" warning (docs/SIPP_COMPAT.md §6 M44).
 //!
 //! The module compiles on every OS; whether the kernel has an SCTP stack is
 //! discovered at run time ([`available`]) — macOS and Windows have none.

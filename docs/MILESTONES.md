@@ -1825,13 +1825,16 @@ Small, independent items; ship in any order, each its own commit:
       interleaving): either match SIPp behind a `--sipr-strict-sipp`
       flag or state them as permanent in §6 with the reason. No silent
       status quo.
-- [ ] `-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`,
+- [x] `-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`,
       `-rtp_threadtasks`, `-skip_rlimit`, `-plugin` and the SCTP socket
       options (`-multihome` etc.): accept with one loud
       "no effect in sipr" warning each (they tune SIPp's scheduler and
       process, which sipr does not have) so wrapper scripts written for
       sipp keep running. This is the one sanctioned exception to "unknown
       flag is an error": each is named in the table with the reason.
+      Done: `cli::no_effect_reason` is the single list, a unit test keeps
+      it in step with the flag table, and the six SCTP options moved from
+      a hard error to a warning; SIPP_COMPAT §3.1.
 
 ### M45+ — sipr's own additions (after parity)
 

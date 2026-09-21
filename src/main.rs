@@ -35,6 +35,11 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> ExitCode {
+    // SIPp flags sipr accepts but cannot act on (cli::no_effect_reason).
+    for warning in &cli.warnings {
+        eprintln!("sipr: warning: {warning}");
+    }
+
     // -sd: dump an embedded scenario and exit.
     if let Some(name) = cli.sd.as_deref() {
         return match sipr_scenario::embedded(name) {

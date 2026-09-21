@@ -178,12 +178,16 @@ Parts of SIPp that sipr does not implement, and where that is deliberate:
 - The standalone `<index>` action (sipr builds injection indexes from
   `-infindex` at load time).
 - WebSocket transport (`-t ws`).
-- SIPp's SCTP socket options (`-multihome`, `-heartbeat`, `-pathmaxret`,
-  `-pmtu`, `-assocmaxret`, `-gracefulclose`) — out of reach without libsctp.
+- SIPp's plugins (`-plugin`), its scheduler and watchdog knobs
+  (`-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`,
+  `-rtp_threadtasks`, `-skip_rlimit`) and its SCTP socket options
+  (`-multihome`, `-heartbeat`, `-pathmaxret`, `-pmtu`, `-assocmaxret`,
+  `-gracefulclose`) — none of that machinery exists in sipr.
 
-None of these is ignored: a scenario element or flag from this list is
-rejected up front with a message naming it. `docs/SIPP_COMPAT.md` lists the
-exact supported surface.
+None of these is ignored: a scenario element from this list is rejected up
+front with a message naming it, and the flags are accepted with one loud
+"no effect in sipr" warning each so that sipp wrapper scripts keep running.
+`docs/SIPP_COMPAT.md` lists the exact supported surface.
 
 ## Brand
 

@@ -149,6 +149,12 @@ Behavior toggles: `-aa` (auto-answer OPTIONS/INFO/UPDATE/NOTIFY in-dialog),
 Keywords (M39): `-key <keyword> <value>` (repeatable), `-tdmmap <map>`,
 `-dynamicStart`/`-dynamicMax`/`-dynamicStep` (the `[dynamic_id]` counter),
 `-rfc3339` (`[timestamp]` form).
+Accepted with a "no effect in sipr" warning (M44, §6): `-watchdog_interval`
+`-watchdog_reset` `-watchdog_minor_threshold` `-watchdog_major_threshold`
+`-watchdog_minor_maxtriggers` `-watchdog_major_maxtriggers`
+`-max_recv_loops` `-max_sched_loops` `-rtp_threadtasks` `-skip_rlimit`
+`-plugin` and the SCTP socket options `-multihome` `-heartbeat`
+`-assocmaxret` `-pathmaxret` `-pmtu` `-gracefulclose`.
 
 Where sipr needs a flag SIPp lacks, prefix long-form `--sipr-*` to keep the two
 namespaces distinct.
@@ -156,6 +162,21 @@ namespaces distinct.
 `hide="true"` and `display="…"` on any message command (M22): the scenario
 screen skips hidden rows while `set hide true` (default) holds, and shows
 `display` text instead of the derived label.
+
+### 3.1 Flags accepted but without effect
+
+These steer machinery sipr does not have: SIPp's event-loop scheduler and
+watchdog task (`-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`), its
+RTP playback thread pool (`-rtp_threadtasks`), its file-descriptor rlimit
+tuning (`-skip_rlimit`), its `dlopen` plugins (`-plugin`), and the SCTP
+socket options only libsctp can set (`-multihome`, `-heartbeat`,
+`-assocmaxret`, `-pathmaxret`, `-pmtu`, `-gracefulclose`). sipr parses each,
+prints one `sipr: warning: -<flag> has no effect in sipr: <why>` line, and
+carries on, so a CI wrapper written for sipp keeps working instead of dying
+at argument parsing. This is the **only** sanctioned exception to "an
+unknown flag is an error": a flag not in this list and not implemented is
+still a usage error. `-send_timeout` and `-timer_resol` (M42) warn the same
+way for the same reason.
 
 ## 4. Runtime key bindings (TUI)
 
