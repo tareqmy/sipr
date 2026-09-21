@@ -2968,6 +2968,137 @@ fn rtpcheck_against_a_silent_peer_exits_253_when_a_tolerance_is_set() {
     assert!(err.contains("rtpcheck 1/1 failed"), "{err}");
 }
 
+/// `<rtp_echo variable="v"/>` reads the variable at run time, where
+/// `<rtp_echo value="…"/>` reads a literal: the same `-rtp_echo` UAS echoes
+/// or stays silent purely on `v`, and the UAC's rtpcheck sees the difference.
+#[test]
+fn rtp_echo_variable_switches_the_echo_at_run_time() {
+    for (echo_on, expect_failed) in [("1", 0), ("0", 1)] {
+        let sip_port = free_port();
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let uas_path = dir.join(format!("sipr-e2e-echovar-uas-{echo_on}-{pid}.xml"));
+        // `add` on an unset variable leaves it at the literal, which is the
+        // shortest way to hand <rtp_echo> a variable the compiler sees written.
+        std::fs::write(
+            &uas_path,
+            format!(
+                r#"<scenario name="uas-echo-from-variable">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]v[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=sipr 0 0 IN IP[local_ip_type] [local_ip]
+    s=-
+    c=IN IP[media_ip_type] [media_ip]
+    t=0 0
+    m=audio [media_port] RTP/AVP 8
+    a=rtpmap:8 PCMA/8000
+
+  ]]></send>
+  <nop>
+    <action>
+      <add assign_to="echo_on" value="{echo_on}"/>
+      <rtp_echo variable="echo_on"/>
+    </action>
+  </nop>
+  <recv request="ACK" optional="true"/>
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>
+"#
+            ),
+        )
+        .expect("write uas scenario");
+        let (mut uas, uas_err) = spawn_sipr_bg(&[
+            "-sf",
+            uas_path.to_str().expect("utf8"),
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &sip_port.to_string(),
+            "-mi",
+            "127.0.0.1",
+            "-mp",
+            &free_port_block(4).to_string(),
+            "-rtp_echo",
+            "-cp",
+            "0",
+            "-m",
+            "1",
+            "-timeout",
+            "20",
+            "-bg",
+        ]);
+        std::thread::sleep(Duration::from_millis(400));
+        let uac_path = dir.join(format!("sipr-e2e-echovar-uac-{echo_on}-{pid}.xml"));
+        std::fs::write(
+            &uac_path,
+            rtp_stream_uac_scenario("unused")
+                .replace(
+                    r#"rtp_stream="unused,2,8,PCMA/8000""#,
+                    r#"rtp_stream="apattern,1,8""#,
+                )
+                .replace(
+                    r#"<nop><action><exec play_dtmf="1,50"/></action></nop>"#,
+                    "",
+                ),
+        )
+        .expect("write uac scenario");
+        let out = run_sipr(&[
+            "-sf",
+            uac_path.to_str().expect("utf8"),
+            "-i",
+            "127.0.0.1",
+            "-mp",
+            &free_port_block(4).to_string(),
+            // 0.9: only a dead echo path (every check missed) fails; a loaded
+            // CI host can miss half the 20 ms echo windows and must still pass.
+            "-audiotolerance",
+            "0.9",
+            "-cp",
+            "0",
+            "-m",
+            "1",
+            "-timeout",
+            "20",
+            "-bg",
+            &format!("127.0.0.1:{sip_port}"),
+        ]);
+        let _ = std::fs::remove_file(&uac_path);
+        let _ = std::fs::remove_file(&uas_path);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("successful 1 failed 0"),
+            "echo_on={echo_on}\n{err}"
+        );
+        assert!(
+            err.contains(&format!("rtpcheck {expect_failed}/1 failed")),
+            "echo_on={echo_on}\n{err}"
+        );
+        let _ = wait_exit(&mut uas, Duration::from_secs(15));
+        let _ = uas_err.join();
+    }
+}
+
 #[test]
 fn rtp_echo_action_toggles_the_global_echo() {
     // Compiles (positive corpus covers the action); here: the engine warns

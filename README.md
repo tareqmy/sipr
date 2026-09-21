@@ -177,7 +177,6 @@ Parts of SIPp that sipr does not implement, and where that is deliberate:
 
 - The standalone `<index>` action (sipr builds injection indexes from
   `-infindex` at load time).
-- `<rtp_echo variable=…>` (only `value="0|1"`).
 - WebSocket transport (`-t ws`).
 - SIPp's SCTP socket options (`-multihome`, `-heartbeat`, `-pathmaxret`,
   `-pmtu`, `-assocmaxret`, `-gracefulclose`) — out of reach without libsctp.

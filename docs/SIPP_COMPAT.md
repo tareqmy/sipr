@@ -670,8 +670,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   (probing in steps of two only when `-rtp_echo` is on — otherwise
   `media_port` never moves), each thread `recvfrom`s with a 100 ms timeout
   and `sendto`s the bytes back unless the process-wide `rtp_echo_state`
-  (default true, toggled by the `<rtp_echo value=>` action from *any*
-  call) is false; counters `rtp_pckts`/`rtp_bytes` (1st stream) and
+  (default true, toggled by the `<rtp_echo>` action from *any* call) is
+  false; counters `rtp_pckts`/`rtp_bytes` (1st stream) and
   `rtp2_*` (2nd). The RTP check lives inside the `rtp_stream` sender:
   after every successful send it `select`s + `recv`s on the same socket
   and `memcmp`s the payload of what arrived with the payload just sent; a
@@ -686,7 +686,12 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   matches the echo sockets, probing, counters, toggle action, compare
   semantics, and exit code, with these divergences: (1) a stream is
   judged **only when `-audiotolerance`/`-videotolerance` was given**;
-  (2) `<rtp_echo variable=>` is rejected (value only). `exec rtp_echo=`
+  (2) `<rtp_echo variable="v"/>` (M44) reads `v`, where SIPp parses the
+  attribute through `handle_rhs` and then calls `getDoubleValue()` rather
+  than `get_rhs()` — its literal slot, which `variable=` never fills — so
+  in SIPp that form always switches echoing **off**. Every other rhs
+  action (`jump`, `pauserestore`, `add`, …) reads the variable; sipr makes
+  this one consistent instead of copying the slip. `exec rtp_echo=`
   (the per-call SRTP echo) is M25 below.
 - AKA resynchronisation (M19): SIPp's `auth.cpp` has an AUTS branch guarded
   by `if (1/*sqn[5] > sqn_he[5]*/)` (~l.676) whose real condition is

@@ -1807,8 +1807,11 @@ Small, independent items; ship in any order, each its own commit:
       `%[0-9.-]*d` and `%%`, virtual lines over cycling rows, indexing
       and `-users` over the virtual count, `insert`/`replace` refused;
       the two divergences are in SIPP_COMPAT §1.
-- [ ] `<rtp_echo variable="…">` (toggle from a variable, `call.cpp`
-      `E_AT_RTP_ECHO`).
+- [x] `<rtp_echo variable="…">` (toggle from a variable, `call.cpp`
+      `E_AT_RTP_ECHO`). Done: the action takes SIPp's `handle_rhs` pair
+      (`value=` xor `variable=`) and the engine reads the variable —
+      where SIPp reads its literal slot and so always switches echoing
+      off; SIPP_COMPAT §6 M18 records the slip.
 - [ ] `-bind_local` (UAS listens on `-i` only, not all interfaces),
       `-buff_size`, `-sendbuffer_warn`; `-bind_to_device` on Linux
       (`SO_BINDTODEVICE`, needs root; reject clearly elsewhere).

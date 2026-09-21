@@ -640,9 +640,10 @@ pub enum Action {
     /// `exec play_dtmf="digits[,tone_ms]"` (keywords allowed, as SIPp
     /// renders the value): RFC 4733 events on the audio stream.
     PlayDtmf(MsgTemplate),
-    /// `<rtp_echo value="0|1"/>`: switch the process-wide `-rtp_echo`
-    /// echoing off or on (SIPp's global `rtp_echo_state`).
-    RtpEchoState(bool),
+    /// `<rtp_echo value="0|1"/>` or `<rtp_echo variable="v"/>`: switch the
+    /// process-wide `-rtp_echo` echoing off (0) or on (SIPp's global
+    /// `rtp_echo_state`).
+    RtpEchoState(Operand),
     /// `exec rtp_echo="start…"`: this call echoes (S)RTP on its media port.
     RtpEcho(RtpEchoCmd),
     /// Look up a key in an indexed injection file; store the matched line

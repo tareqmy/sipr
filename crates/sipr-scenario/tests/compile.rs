@@ -837,6 +837,47 @@ fn hide_and_display_attributes_land_in_step_common() {
     assert_eq!(common.display, None, "blank display is no display");
 }
 
+/// `<rtp_echo>` takes SIPp's `handle_rhs` pair: `value=` or `variable=`,
+/// never both and never neither.
+#[test]
+fn rtp_echo_toggle_takes_a_value_or_a_variable() {
+    use sipr_scenario::model::Operand;
+    let xml = wrap(&format!(
+        r#"{invite}
+           <nop><action>
+             <add assign_to="v" value="1"/>
+             <rtp_echo value="0"/>
+             <rtp_echo variable="v"/>
+           </action></nop>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let Step::Nop { actions, .. } = &sc.steps[1] else {
+        panic!("nop")
+    };
+    assert!(matches!(
+        &actions[1],
+        Action::RtpEchoState(Operand::Value(v)) if *v == 0.0
+    ));
+    assert!(matches!(&actions[2], Action::RtpEchoState(Operand::Var(_))));
+    assert!(sc.toggles_rtp_echo());
+
+    for bad in [
+        r#"<rtp_echo/>"#,
+        r#"<rtp_echo value="0" variable="v"/>"#,
+        r#"<rtp_echo value="off"/>"#,
+    ] {
+        let xml = wrap(&format!(
+            r#"{invite}
+               <nop><action>{bad}</action></nop>"#,
+            invite = send_invite()
+        ));
+        assert!(!errors(&xml).is_empty(), "{bad}");
+    }
+}
+
 #[test]
 fn rtp_echo_exec_parses_sipp_verbs() {
     use sipr_scenario::model::{RtpEchoCmd, RtpEchoVerb};
