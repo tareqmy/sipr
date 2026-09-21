@@ -141,7 +141,11 @@ log, shortmessage, calldebug, screen) `-ringbuffer_files` `-ringbuffer_size`
 in SIPp 3.7 too) (M41, §6) `-nd` (no defaults) `-timeout <s>` `-bg`
 (headless).
 Behavior toggles: `-aa` (auto-answer OPTIONS/INFO/UPDATE/NOTIFY in-dialog),
-`-base_cseq`, `-cid_str` (Call-ID format), `-max_retrans`, `-nr` (no retrans).
+`-base_cseq`, `-cid_str` (Call-ID format), `-max_retrans`, `-nr` (no retrans),
+`-max_invite_retrans`, `-max_non_invite_retrans`, `-recv_timeout`,
+`-timeout_error`, `-lost`, `-pause_msg_ign`, `-default_behaviors`,
+`-callid_slash_ign`, `-sleep`, `-nostdin` (M42, §6); `-send_timeout` and
+`-timer_resol` are accepted with a warning (no send queue, exact timers).
 Keywords (M39): `-key <keyword> <value>` (repeatable), `-tdmmap <map>`,
 `-dynamicStart`/`-dynamicMax`/`-dynamicStep` (the `[dynamic_id]` counter),
 `-rfc3339` (`[timestamp]` form).
@@ -286,7 +290,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   call absorbs traffic without failing (SIPp deadcall). `-aa` answers
   in-dialog OPTIONS/INFO/UPDATE/NOTIFY with a 200 mirroring
   Via/From/To/Call-ID/CSeq. UAS calls reply to the request's source
-  address (Via received/rport handling: post-v1).
+  address — as SIPp does: it keeps the source as `call_peer` and never
+  reads Via `received`/`rport` (checked in M42; no divergence).
 - `-trace_stat` CSV (M4, at parity since M40 — see the M40 note): SIPp's
   columns, names, order, `(P)`/`(C)` naming and `;` delimiter.
 - `-l` cap: calls above the concurrent cap are not queued — the pacer simply
@@ -299,8 +304,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `[authentication]` keyword consumes it. Stale nonce handling: re-auth once.
 - Default headers: SIPp does NOT auto-add headers to templates (what you write
   is what is sent), except Content-Length when `[len]` present or body exists
-  (verify), and CRLF normalization of line endings. `-nd` disables scenario
-  defaults behaviors. Record exact findings here.
+  (verify), and CRLF normalization of line endings. `-nd` is
+  `-default_behaviors none` (M42 note).
 - Diagnostics policy as implemented (M1): unknown *elements* and *actions*
   are hard errors (skipping a step silently would change call flow); unknown
   *attributes* warn and are ignored; unknown *keywords* warn and pass through
@@ -1276,3 +1281,48 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   entries once a second (a message absorbed by a call in `<timewait>`
   also counts as `DeadCallMsgs`, M40). `-trace_timeout` is accepted and
   does nothing: SIPp 3.7's implementation is commented out.
+- Timer and behavior knobs (M42; verified in `call.cpp` ~l.2252-2320 the
+  retransmission block, ~l.2160-2205 the receive timeout, ~l.2445-2520
+  `process_unexpected`, ~l.2534-2600 `abortCall`, ~l.6665-6830
+  `checkAutomaticResponseMode`/`automaticResponseMode`, ~l.1242
+  `matches_cseq`, ~l.1527 `lost`, ~l.4628 the `-pause_msg_ign` check,
+  `default_message_strings` ~l.2335; `sipp.cpp` `SIPP_OPTION_DEFAULTS`,
+  `timeout_alarm`, the `sleeptime`/`nostdin` setup; `socket.cpp`
+  `get_trimmed_call_id`; `call.hpp`/`sipp.hpp` the defaults): SIPp
+  retransmits an INVITE up to `-max_invite_retrans` (5) times and any
+  other message up to `-max_non_invite_retrans` (9), `-max_retrans` being
+  a ceiling on both; the interval doubles from the send's `retrans=` and
+  is capped at T2 (4 s) only for non-INVITE transactions — an INVITE keeps
+  doubling (500, 1000, 2000, 4000, 8000 ms). sipr used one cap of 5 and
+  capped everything at T2; both now match. `-recv_timeout` (default unit
+  ms) is the timeout of every recv without its own `timeout=`; the
+  timeout fires the same way (`ontimeout` label or a failed call).
+  `-timeout_error` makes reaching `-timeout` an error — SIPp's
+  `<scenario> timed out after '<s>' seconds`, exit 255. `-lost <percent>`
+  is the loss of every send and every recv whose own `lost=` is absent;
+  a received message that "loses" is dropped after matching, with a
+  `message lost (recv)` call-debug entry. `-pause_msg_ign` drops whatever
+  arrives while the call is in a pause before anything is counted.
+  `-default_behaviors` is SIPp's list (`all`, `none`, `bye`,
+  `abortunexp`, `pingreply`, `cseq`; `-x` removes, `+x`/`x` adds, left to
+  right from none; `-nd` = `none`): `abortunexp` off counts an unexpected
+  message and continues the call (SIPp's "Continuing call on unexpected
+  message"); `bye` on ends an aborted client-side call the way SIPp's
+  `abortCall` does — an unestablished INVITE answered 4xx or worse gets an
+  ACK, one answered 200 gets ACK then BYE, one answered provisionally gets
+  a CANCEL, one never answered gets nothing, any other call that received
+  something gets a BYE — using SIPp's own built-in templates (compiled
+  with sipr's template engine, hence the new `[last_Request_URI]`
+  keyword: the URI in `<…>` of the last received To); `bye` also answers
+  an unexpected BYE or CANCEL with a 200 before aborting; `pingreply`
+  answers an unexpected `PING` request with a 200 and drops the call,
+  neither successful nor failed, as SIPp does; `cseq` makes an ACK match
+  only when its CSeq number is the last received INVITE's (SIPp
+  `matches_cseq`). A server-side or secondary call never sends abort
+  messages (SIPp `creationMode != MODE_SERVER`). Call-IDs: SIPp keys a
+  call by the text after the first `///` (its 3PCC twin marker) unless
+  `-callid_slash_ign`; sipr used to keep the whole value and now trims
+  it the same way. `-sleep <s>` waits before the run, `-nostdin` disables
+  the keyboard watcher. `-send_timeout` and `-timer_resol` are accepted
+  with a warning: sipr has no send queue that could time out and its
+  timers are exact, not polled.

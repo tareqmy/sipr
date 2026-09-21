@@ -4561,3 +4561,85 @@ fn short_message_log_matches_real_sipps() {
     let _ = std::fs::remove_dir_all(&sipr_dir);
     let _ = std::fs::remove_dir_all(&sipp_dir);
 }
+
+// ---- M42: timer knobs -------------------------------------------------
+
+/// The INVITE frames in a `-trace_msg` log (first send + retransmissions).
+fn invites_sent_in_message_log(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_messages.log"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .map(|log| log.matches("\nINVITE sip:").count())
+        .sum()
+}
+
+/// `-max_invite_retrans 2` against a peer that never answers: sipr and
+/// real sipp both send the INVITE three times (once plus two
+/// retransmissions) and give the call up within the same few seconds.
+#[test]
+fn max_invite_retrans_counts_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::max_invite_retrans_counts_like_real_sipp — no sipp.");
+        return;
+    };
+    let sipr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let dead = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let target = dead.local_addr().expect("addr").to_string();
+    drop(dead);
+    let run = |bin: &std::path::Path, tag: &str| -> (usize, Duration) {
+        let dir =
+            std::env::temp_dir().join(format!("sipr-interop-retrans-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut args: Vec<String> = [
+            "-sn",
+            "uac",
+            "-i",
+            "127.0.0.1",
+            "-m",
+            "1",
+            "-max_invite_retrans",
+            "2",
+            "-timeout",
+            "20",
+            "-trace_msg",
+        ]
+        .iter()
+        .map(|a| (*a).to_owned())
+        .collect();
+        if bin == std::path::Path::new(env!("CARGO_BIN_EXE_sipr")) {
+            args.push("-bg".to_owned());
+        }
+        args.push(target.clone());
+        let started = std::time::Instant::now();
+        let mut child = Reaper(
+            Command::new(bin)
+                .current_dir(&dir)
+                .args(&args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn"),
+        );
+        let _ = wait_with_timeout(&mut child.0, Duration::from_secs(25));
+        let elapsed = started.elapsed();
+        let invites = invites_sent_in_message_log(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        (invites, elapsed)
+    };
+    let (ours, our_time) = run(&sipr, "sipr");
+    let (theirs, their_time) = run(&sipp, "sipp");
+    assert_eq!(ours, 3, "sipr: one INVITE plus two retransmissions");
+    assert_eq!(theirs, 3, "sipp: one INVITE plus two retransmissions");
+    // 500 ms + 1 s before the third send, then one more interval to give
+    // up: both finish in a few seconds, not SIPp's default ~12.
+    assert!(our_time < Duration::from_secs(8), "sipr took {our_time:?}");
+    assert!(
+        their_time < Duration::from_secs(8),
+        "sipp took {their_time:?}"
+    );
+}

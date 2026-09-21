@@ -215,6 +215,29 @@ pub struct Cli {
     pub max_log_size: Option<u64>,
     /// `-deadcall_wait` in milliseconds.
     pub deadcall_wait_ms: Option<u64>,
+    /// `-max_invite_retrans`, `-max_non_invite_retrans`.
+    pub max_invite_retrans: Option<u32>,
+    pub max_non_invite_retrans: Option<u32>,
+    /// `-recv_timeout` (SIPp's default unit is ms).
+    pub recv_timeout: Option<std::time::Duration>,
+    /// `-send_timeout`: accepted, no effect.
+    pub send_timeout: Option<std::time::Duration>,
+    /// `-timeout_error`.
+    pub timeout_error: bool,
+    /// `-lost`: default loss percentage.
+    pub lost: Option<f64>,
+    /// `-pause_msg_ign`.
+    pub pause_msg_ign: bool,
+    /// `-default_behaviors`, parsed.
+    pub default_behaviors: Option<sipr_engine::Behaviors>,
+    /// `-callid_slash_ign`.
+    pub callid_slash_ign: bool,
+    /// `-sleep`: startup delay.
+    pub sleep: Option<std::time::Duration>,
+    /// `-nostdin`.
+    pub nostdin: bool,
+    /// `-timer_resol`: accepted, no effect.
+    pub timer_resol: Option<std::time::Duration>,
     /// `-timeout`: global test timeout in seconds.
     pub timeout_s: Option<u64>,
     /// `-base_cseq`: initial CSeq value for outbound requests.
@@ -343,6 +366,18 @@ impl Default for Cli {
             ringbuffer_size: None,
             max_log_size: None,
             deadcall_wait_ms: None,
+            max_invite_retrans: None,
+            max_non_invite_retrans: None,
+            recv_timeout: None,
+            send_timeout: None,
+            timeout_error: false,
+            lost: None,
+            pause_msg_ign: false,
+            default_behaviors: None,
+            callid_slash_ign: false,
+            sleep: None,
+            nostdin: false,
+            timer_resol: None,
             timeout_s: None,
             base_cseq: None,
             call_id_format: None,
@@ -589,6 +624,73 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
     ),
     ("nd", false, "", "Disable scenario default behaviors"),
     ("nr", false, "", "Disable UDP retransmissions"),
+    (
+        "max_invite_retrans",
+        true,
+        "N",
+        "Maximum UDP retransmissions of an INVITE before the call ends on timeout (default 5)",
+    ),
+    (
+        "max_non_invite_retrans",
+        true,
+        "N",
+        "Maximum UDP retransmissions of any other message before the call ends on timeout (default 9)",
+    ),
+    (
+        "recv_timeout",
+        true,
+        "MS",
+        "Global receive timeout (default unit ms): a recv without timeout= times out after it",
+    ),
+    (
+        "send_timeout",
+        true,
+        "MS",
+        "Accepted for SIPp compatibility: sipr has no send queue, so it never fires",
+    ),
+    (
+        "timeout_error",
+        false,
+        "",
+        "Fail the run (exit 255) when -timeout is reached",
+    ),
+    (
+        "lost",
+        true,
+        "PERCENT",
+        "Default percentage of messages to lose (a message's lost= overrides it)",
+    ),
+    (
+        "pause_msg_ign",
+        false,
+        "",
+        "Ignore the messages received during a pause",
+    ),
+    (
+        "default_behaviors",
+        true,
+        "LIST",
+        "SIPp's default behaviors: all, none, bye, abortunexp, pingreply, cseq; prefix - to turn one off (e.g. all,-bye)",
+    ),
+    (
+        "callid_slash_ign",
+        false,
+        "",
+        "Don't treat a triple-slash in Call-IDs as a SIPp 3PCC prefix",
+    ),
+    (
+        "sleep",
+        true,
+        "SECONDS",
+        "How long to sleep at startup (default unit s)",
+    ),
+    ("nostdin", false, "", "Disable stdin"),
+    (
+        "timer_resol",
+        true,
+        "MS",
+        "Accepted for SIPp compatibility: sipr's timers are exact, so it has no effect",
+    ),
     (
         "key",
         true,
@@ -1210,6 +1312,22 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "ringbuffer_size" => cli.ringbuffer_size = Some(parse_num(flag, &val(value))?),
         "max_log_size" => cli.max_log_size = Some(parse_num(flag, &val(value))?),
         "deadcall_wait" => cli.deadcall_wait_ms = Some(parse_num(flag, &val(value))?),
+        "max_invite_retrans" => cli.max_invite_retrans = Some(parse_num(flag, &val(value))?),
+        "max_non_invite_retrans" => {
+            cli.max_non_invite_retrans = Some(parse_num(flag, &val(value))?);
+        }
+        "recv_timeout" => cli.recv_timeout = Some(parse_time_ms(flag, &val(value))?),
+        "send_timeout" => cli.send_timeout = Some(parse_time_ms(flag, &val(value))?),
+        "timeout_error" => cli.timeout_error = true,
+        "lost" => cli.lost = Some(parse_num(flag, &val(value))?),
+        "pause_msg_ign" => cli.pause_msg_ign = true,
+        "default_behaviors" => {
+            cli.default_behaviors = Some(sipr_engine::Behaviors::parse(&val(value))?);
+        }
+        "callid_slash_ign" => cli.callid_slash_ign = true,
+        "sleep" => cli.sleep = Some(parse_time(flag, &val(value))?),
+        "nostdin" => cli.nostdin = true,
+        "timer_resol" => cli.timer_resol = Some(parse_time_ms(flag, &val(value))?),
         "timeout" => cli.timeout_s = Some(parse_num(flag, &val(value))?),
         "base_cseq" => cli.base_cseq = Some(parse_num(flag, &val(value))?),
         "cid_str" => cli.call_id_format = Some(val(value)),
@@ -1271,6 +1389,23 @@ fn parse_time(flag: &str, raw: &str) -> Result<std::time::Duration, String> {
         return Err(format!("invalid time value '{raw}' for option '-{flag}'"));
     }
     Ok(std::time::Duration::from_secs_f64(secs))
+}
+
+/// [`parse_time`] for SIPp's `TIME_MS` options: a bare number is
+/// milliseconds, a unit suffix is honoured.
+fn parse_time_ms(flag: &str, raw: &str) -> Result<std::time::Duration, String> {
+    let bare = raw.trim().chars().all(|c| c.is_ascii_digit() || c == '.');
+    if bare {
+        let ms: f64 = raw
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid time value '{raw}' for option '-{flag}'"))?;
+        if !(ms.is_finite() && ms >= 0.0) {
+            return Err(format!("invalid time value '{raw}' for option '-{flag}'"));
+        }
+        return Ok(std::time::Duration::from_secs_f64(ms / 1000.0));
+    }
+    parse_time(flag, raw)
 }
 
 fn parse_num<T: std::str::FromStr>(flag: &str, raw: &str) -> Result<T, String> {

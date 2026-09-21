@@ -5343,7 +5343,7 @@ fn uac_answers_out_of_call_options_with_ooc_scenario() {
         "{errors}"
     );
     assert!(
-        errors.contains("unexpected OPTIONS for call ooc-probe-1@"),
+        errors.contains("Aborting call on unexpected message for Call-Id 'ooc-probe-1@"),
         "{errors}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -7432,4 +7432,182 @@ fn calldebug_dumps_aborted_calls() {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A UAS for the M42 behavior tests: 180 + 200 to INVITE, 200 to BYE, and
+/// an in-dialog NOTIFY sent right after the 200, which the UAC does not
+/// expect. Returns how many BYEs it saw.
+fn spawn_uas_with_notify() -> (SocketAddr, std::thread::JoinHandle<u32>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("timeout");
+    let handle = std::thread::spawn(move || {
+        let mut byes = 0u32;
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                Some("INVITE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "180 Ringing", true), from);
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", true), from);
+                    // An in-dialog request the scenario never expects.
+                    let call_id = msg.call_id().unwrap_or_default();
+                    let from_h = msg.header_lines("From").join("\r\n");
+                    let to_h = msg.header_lines("To").join("\r\n");
+                    let notify = format!(
+                        "NOTIFY sip:sipr@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK-n\r\n{to_h};tag=uas\r\n{from_h}\r\nCall-ID: {call_id}\r\nCSeq: 7 NOTIFY\r\nContent-Length: 0\r\n\r\n",
+                        sock.local_addr().map_or(0, |a| a.port())
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = sock.send_to(notify.as_bytes(), from);
+                }
+                Some("BYE") => {
+                    byes += 1;
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+        byes
+    });
+    (addr, handle)
+}
+
+/// `-default_behaviors`: by default an unexpected in-dialog request aborts
+/// the call and, with `bye` on, sipr ends the dialog with a BYE; `-nd`
+/// continues the call instead; `-pause_msg_ign` never even sees it.
+#[test]
+fn default_behaviors_abort_or_continue_on_an_unexpected_message() {
+    let run = |extra: &[&str]| -> (String, u32) {
+        let (addr, uas) = spawn_uas_with_notify();
+        let mut args = vec![
+            "-sn", "uac", "-m", "1", "-d", "500", "-timeout", "15", "-bg",
+        ];
+        args.extend_from_slice(extra);
+        let target = addr.to_string();
+        args.push(&target);
+        let out = run_sipr(&args);
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        (err, uas.join().expect("uas"))
+    };
+    // Default: aborted on the NOTIFY (during the pause), one BYE — the
+    // abort's, since the scenario's own BYE never comes.
+    let (err, byes) = run(&[]);
+    assert!(err.contains("successful 0 failed 1"), "{err}");
+    assert_eq!(byes, 1, "the abort BYE: {err}");
+    // -nd: the NOTIFY is counted and the call runs to its own BYE.
+    let (err, byes) = run(&["-nd"]);
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(err.contains("unexpected 1"), "{err}");
+    assert_eq!(byes, 1, "{err}");
+    // all,-bye: aborted, but nothing sent to end the dialog.
+    let (err, byes) = run(&["-default_behaviors", "all,-bye"]);
+    assert!(err.contains("successful 0 failed 1"), "{err}");
+    assert_eq!(byes, 0, "{err}");
+    // -pause_msg_ign: the NOTIFY arrives during the pause and is dropped
+    // before being counted.
+    let (err, byes) = run(&["-pause_msg_ign"]);
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(err.contains("unexpected 0"), "{err}");
+    assert_eq!(byes, 1, "{err}");
+}
+
+/// `-recv_timeout` times out a recv that has no `timeout=` of its own;
+/// `-max_invite_retrans` caps the INVITE retransmissions before the call
+/// fails; `-timeout_error` makes reaching `-timeout` fatal; `-lost 100`
+/// sends nothing at all.
+#[test]
+fn timeout_retrans_and_loss_knobs() {
+    // A port nobody answers on.
+    let dead = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = dead.local_addr().expect("addr");
+    drop(dead);
+    let target = addr.to_string();
+    // -recv_timeout with retransmissions off: the 100/180/200 window times
+    // out fast and the call fails as "recv timeout".
+    let started = std::time::Instant::now();
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-m",
+        "1",
+        "-nr",
+        "-recv_timeout",
+        "300",
+        "-timeout",
+        "20",
+        "-trace_err",
+        "-bg",
+        &target,
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("successful 0 failed 1"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+    // -max_invite_retrans 1: one retransmission (500 ms) then failure at
+    // 1.5 s, not SIPp's default five (11.5 s).
+    let started = std::time::Instant::now();
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-m",
+        "1",
+        "-max_invite_retrans",
+        "1",
+        "-timeout",
+        "20",
+        "-bg",
+        &target,
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("successful 0 failed 1"), "{err}");
+    assert!(err.contains("retrans-sent 1 "), "one retransmission: {err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+    // -timeout_error: exit 255 with SIPp's wording.
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-m",
+        "1",
+        "-nr",
+        "-timeout",
+        "1",
+        "-timeout_error",
+        "-bg",
+        &target,
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(255), "{err}");
+    assert!(err.contains("timed out after '"), "{err}");
+    // -lost 100: the INVITE is never put on the wire.
+    let (addr, uas) = spawn_uas(Duration::from_secs(2));
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-m",
+        "1",
+        "-lost",
+        "100",
+        "-nr",
+        "-recv_timeout",
+        "300",
+        "-timeout",
+        "10",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("successful 0 failed 1"), "{err}");
+    let stats = uas.join().expect("uas");
+    assert_eq!(stats.invites, 0, "nothing reached the UAS");
 }

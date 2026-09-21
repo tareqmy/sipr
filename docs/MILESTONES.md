@@ -1700,7 +1700,7 @@ the option table defaults, `call.cpp` `~call` / deadcall handling and
       the receive-side time quirk, rotation, dead calls, SIPp's
       `fixedname` bug not copied); the M17 note on `trace logs`; CHANGELOG.
 
-### M42 — Timer and behavior knobs: retransmission counts, timeouts, `-lost`, `-default_behaviors`
+### M42 — Timer and behavior knobs: retransmission counts, timeouts, `-lost`, `-default_behaviors` ✅
 
 The retransmission policy is SIPp's default with only `-max_retrans`
 and `-nr`; `-max_invite_retrans`, `-max_non_invite_retrans`,
@@ -1729,17 +1729,28 @@ has any observable effect worth matching), `-sleep`, `-nostdin`;
 implementing, and if SIPp replies to the source address as sipr does,
 close the §6 note as no divergence).
 
-- [ ] CLI + engine: each flag with SIPp's default and unit parsing
-      (`ms`/`s`/`m`/`h` suffixes as SIPp's `get_time` — check the
-      existing `-rate_interval` parser is shared).
-- [ ] `-default_behaviors` as a bitset replacing the `-nd` boolean
-      (`-nd` stays as the alias); `-lost` as the send default; the
-      retransmission caps split INVITE/non-INVITE.
-- [ ] Tests: unit tests per flag; interop: `-max_invite_retrans 2` with
-      a UAS that never answers, compare retransmission counts and the
-      timeout timing on both sides; `-pause_msg_ign` with an early BYE.
-- [ ] Docs: SIPP_COMPAT §3 and §6 (retransmission schedule note
-      extended; the Via received/rport question answered either way).
+- [x] CLI + engine: each flag with SIPp's default and unit parsing
+      (`parse_time` shared; a `parse_time_ms` variant for SIPp's
+      `TIME_MS` options whose bare number is milliseconds).
+- [x] `-default_behaviors` as a `Behaviors` bitset (`-nd` = `none`)
+      driving SIPp's `abortCall` messages from its own built-in templates,
+      the unexpected BYE/CANCEL/PING answers, the continue-on-unexpected
+      mode and the ACK CSeq guard; `-lost` as the send and recv default;
+      `RetransCaps` split INVITE/non-INVITE with `-max_retrans` as the
+      ceiling and the T2 cap only for non-INVITE. Found on the way: sipr
+      parsed `-nd` but never used it, never sent abort messages, capped
+      INVITE retransmissions at T2 and defaulted every message to 5.
+- [x] Tests: schedule unit tests (both caps, the INVITE doubling, the
+      ceiling), `Behaviors::parse`, Call-ID trimming, the default
+      templates; e2e `default_behaviors_abort_or_continue_on_an_unexpected_message`
+      (default abort + abort BYE, `-nd` continue, `all,-bye`,
+      `-pause_msg_ign`) and `timeout_retrans_and_loss_knobs`
+      (`-recv_timeout`, `-max_invite_retrans 1`, `-timeout_error`,
+      `-lost 100`); interop `max_invite_retrans_counts_like_real_sipp`
+      (both send the INVITE three times and give up within seconds).
+- [x] Docs: SIPP_COMPAT §3 and a §6 note; the Via received/rport
+      question closed (SIPp replies to the source address too); the `-nd`
+      sentence; CHANGELOG.
 
 ### M43 — Extended 3PCC: `-master`/`-slave`/`-slave_cfg`, `sendCmd dest=`, `recvCmd src=`
 

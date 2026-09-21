@@ -997,6 +997,7 @@ fn keyword_name(k: &Keyword) -> String {
         Keyword::RemoteHost => "remote_host",
         Keyword::TdmMap => "tdmmap",
         Keyword::LastMessage => "last_message",
+        Keyword::LastRequestUri => "last_Request_URI",
         Keyword::Service => "service",
         Keyword::RemoteIp => "remote_ip",
         Keyword::RemotePort => "remote_port",

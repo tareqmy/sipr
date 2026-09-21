@@ -155,6 +155,17 @@ fn run(cli: &Cli) -> ExitCode {
     if cli.trace_timeout {
         eprintln!("sipr: warning: -trace_timeout has no effect (SIPp 3.7 never implemented it)");
     }
+    if cli.send_timeout.is_some() {
+        eprintln!(
+            "sipr: warning: -send_timeout has no effect (sipr has no send queue to time out)"
+        );
+    }
+    if cli.timer_resol.is_some() {
+        eprintln!("sipr: warning: -timer_resol has no effect (sipr's timers are exact)");
+    }
+    if let Some(d) = cli.sleep {
+        std::thread::sleep(d);
+    }
     // A v6 target needs a v6 local socket; default the bind family to `::` when
     // the target is IPv6 and no explicit -i was given.
     let local_ip = cli.local_ip.or_else(|| {
@@ -255,6 +266,19 @@ fn run(cli: &Cli) -> ExitCode {
             max_log_size: cli.max_log_size.unwrap_or(0),
         },
         deadcall_wait: std::time::Duration::from_millis(cli.deadcall_wait_ms.unwrap_or(33_000)),
+        max_invite_retrans: cli.max_invite_retrans.unwrap_or(5),
+        max_non_invite_retrans: cli.max_non_invite_retrans.unwrap_or(9),
+        recv_timeout: cli.recv_timeout,
+        timeout_error: cli.timeout_error,
+        lost: cli.lost,
+        pause_msg_ign: cli.pause_msg_ign,
+        behaviors: if cli.no_defaults {
+            sipr_engine::Behaviors::none()
+        } else {
+            cli.default_behaviors.unwrap_or_default()
+        },
+        callid_slash_ign: cli.callid_slash_ign,
+        nostdin: cli.nostdin,
         transport: match cli.transport {
             crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
             crate::cli::Transport::UdpPerCall => sipr_engine::TransportKind::UdpPerCall,

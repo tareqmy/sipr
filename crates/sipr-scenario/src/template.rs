@@ -138,6 +138,9 @@ pub enum Keyword {
     TdmMap,
     /// `[last_message]` — the whole last received message.
     LastMessage,
+    /// `[last_Request_URI]` — the URI inside `<…>` of the last received
+    /// message's To header (SIPp's default ACK/CANCEL templates).
+    LastRequestUri,
     /// `[last_cseq_number]`, with an optional `+N`/`-N` — the CSeq number
     /// of the last received message.
     LastCseqNumber {
@@ -339,6 +342,9 @@ fn classify(body: &str, generic: &[String]) -> Classified {
     // table, checked before the generic `last_<Header>` copy.
     if body == "last_message" {
         return Classified::Keyword(Keyword::LastMessage);
+    }
+    if body == "last_Request_URI" {
+        return Classified::Keyword(Keyword::LastRequestUri);
     }
     if let Some(rest) = body.strip_prefix("last_cseq_number") {
         return match parse_offset(rest) {

@@ -27,7 +27,7 @@ pub mod transport;
 pub mod twin;
 
 pub use message::{Inbound, MsgKind, ParseError};
-pub use retrans::RetransSchedule;
+pub use retrans::{RetransCaps, RetransSchedule};
 #[cfg(feature = "sctp")]
 pub use sctp::{SctpCallConn, SctpTransport};
 pub use table::CallTable;

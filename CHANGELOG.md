@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Timer and behavior knobs at parity (M42): `-max_invite_retrans`,
+  `-max_non_invite_retrans` (SIPp's 5 and 9, with `-max_retrans` as a
+  ceiling; an INVITE's timer keeps doubling past T2 as SIPp's does),
+  `-recv_timeout`, `-timeout_error`, global `-lost`, `-pause_msg_ign`,
+  `-default_behaviors` (with `-nd` as `none`) including SIPp's abort
+  messages (ACK/BYE/CANCEL from its own built-in templates) and its
+  handling of unexpected BYE, CANCEL and PING, `-callid_slash_ign`,
+  `-sleep`, `-nostdin`; `-send_timeout` and `-timer_resol` are accepted
+  with a warning. The `[last_Request_URI]` keyword.
 - Message and error logs at parity (M41): `-trace_msg` frames and
   `-trace_err` lines take SIPp's exact shapes (timestamps, the
   `The following events occurred:` header), `<log>` actions go to the new
@@ -42,6 +51,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Non-INVITE messages retransmit up to 9 times by default (SIPp's
+  `-max_non_invite_retrans`), not 5; an aborted client call now sends
+  SIPp's BYE/CANCEL/ACK unless `-nd` or `-default_behaviors …,-bye`; a
+  `///` prefix in an inbound Call-ID is stripped as SIPp's 3PCC marker
+  unless `-callid_slash_ign`.
 - The `-trace_msg` frame no longer carries the peer address, and
   `-trace_err` lines are timestamped: both are now SIPp's formats. `<log>`
   lines no longer go to the error trace with a `[log]` prefix; they need

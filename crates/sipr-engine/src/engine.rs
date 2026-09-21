@@ -23,8 +23,8 @@ use sipr_media::sdp::CryptoAttr;
 use sipr_media::{MediaEvent, MediaPlayer, PcapStream, Source, StreamSpec};
 use sipr_net::timer::TimerId;
 use sipr_net::{
-    Inbound, NetEvent, RetransSchedule, TcpCallConn, TcpTransport, TimerService, TlsCallConn,
-    TlsTransport, TransportConfig, TwinChannel, UdpCallSocket, UdpTransport,
+    Inbound, NetEvent, RetransCaps, RetransSchedule, TcpCallConn, TcpTransport, TimerService,
+    TlsCallConn, TlsTransport, TransportConfig, TwinChannel, UdpCallSocket, UdpTransport,
 };
 #[cfg(feature = "sctp")]
 use sipr_net::{SctpCallConn, SctpTransport};
@@ -164,6 +164,25 @@ pub struct EngineConfig {
     /// `-deadcall_wait`: how long a finished call's Call-ID stays known so
     /// late messages are logged against it (0 disables).
     pub deadcall_wait: Duration,
+    /// `-max_invite_retrans` (SIPp's default 5).
+    pub max_invite_retrans: u32,
+    /// `-max_non_invite_retrans` (SIPp's default 9).
+    pub max_non_invite_retrans: u32,
+    /// `-recv_timeout`: the timeout of every recv without its own.
+    pub recv_timeout: Option<Duration>,
+    /// `-timeout_error`: reaching `-timeout` is a fatal error.
+    pub timeout_error: bool,
+    /// `-lost`: the default loss percentage of every send and recv.
+    pub lost: Option<f64>,
+    /// `-pause_msg_ign`: drop what arrives while a call is in a pause.
+    pub pause_msg_ign: bool,
+    /// `-default_behaviors` / `-nd`.
+    pub behaviors: Behaviors,
+    /// `-callid_slash_ign`: keep a `///` prefix in Call-IDs (SIPp strips
+    /// it as its 3PCC marker otherwise).
+    pub callid_slash_ign: bool,
+    /// `-nostdin`: no keyboard control on stdin.
+    pub nostdin: bool,
     /// `-tls_*` options; required when `transport` is [`TransportKind::TlsMono`].
     pub tls: Option<sipr_net::TlsConfig>,
     /// `-mi`: media address for `[media_ip]` and the RTP sockets (default:
@@ -285,6 +304,151 @@ impl Default for LogOverwrite {
             logs: true,
             shortmessages: true,
             calldebug: true,
+        }
+    }
+}
+
+/// SIPp's default behaviors (`-default_behaviors`, all on; `-nd` = none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Behaviors {
+    /// `bye`: abort a call with BYE/CANCEL/ACK, answer an unexpected
+    /// BYE/CANCEL with 200 before aborting.
+    pub bye: bool,
+    /// `abortunexp`: an unexpected message aborts the call (else it is
+    /// counted and the call continues).
+    pub abortunexp: bool,
+    /// `pingreply`: an unexpected `PING` gets a 200 and ends the call.
+    pub pingreply: bool,
+    /// `cseq`: an ACK must carry the CSeq of the last INVITE received.
+    pub cseq: bool,
+}
+
+impl Default for Behaviors {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl Behaviors {
+    /// SIPp's `all`.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            bye: true,
+            abortunexp: true,
+            pingreply: true,
+            cseq: true,
+        }
+    }
+
+    /// SIPp's `none` (`-nd`).
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            bye: false,
+            abortunexp: false,
+            pingreply: false,
+            cseq: false,
+        }
+    }
+
+    /// Parse SIPp's `-default_behaviors` list: comma-separated `all`,
+    /// `none`, `bye`, `abortunexp`, `pingreply`, `cseq`, each optionally
+    /// prefixed `+` (add) or `-` (remove), applied left to right from none
+    /// (`sipp.cpp` `SIPP_OPTION_DEFAULTS`).
+    ///
+    /// # Errors
+    ///
+    /// SIPp's "Unknown default behavior" for anything else.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut b = Self::none();
+        for token in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            if token == "none" {
+                b = Self::none();
+                continue;
+            }
+            let (remove, name) = match token.strip_prefix('-') {
+                Some(n) => (true, n),
+                None => (false, token.strip_prefix('+').unwrap_or(token)),
+            };
+            let mask = match name {
+                "all" => Self::all(),
+                "bye" => Self {
+                    bye: true,
+                    ..Self::none()
+                },
+                "abortunexp" => Self {
+                    abortunexp: true,
+                    ..Self::none()
+                },
+                "pingreply" => Self {
+                    pingreply: true,
+                    ..Self::none()
+                },
+                "cseq" => Self {
+                    cseq: true,
+                    ..Self::none()
+                },
+                _ => return Err(format!("Unknown default behavior: '{token}'")),
+            };
+            let apply = |current: bool, bit: bool| {
+                if bit { !remove } else { current }
+            };
+            b = Self {
+                bye: apply(b.bye, mask.bye),
+                abortunexp: apply(b.abortunexp, mask.abortunexp),
+                pingreply: apply(b.pingreply, mask.pingreply),
+                cseq: apply(b.cseq, mask.cseq),
+            };
+        }
+        Ok(b)
+    }
+}
+
+/// SIPp's built-in messages for aborting a call and answering an
+/// unexpected BYE, CANCEL or PING (`call.cpp` `default_message_strings`),
+/// compiled with the scenario's template engine.
+struct DefaultMessages {
+    ack: MsgTemplate,
+    bye: MsgTemplate,
+    cancel: MsgTemplate,
+    ok: MsgTemplate,
+}
+
+impl DefaultMessages {
+    fn compile() -> Self {
+        let one = |text: &str| {
+            let mut diags = sipr_scenario::diag::Diagnostics::new("default message");
+            sipr_scenario::template::tokenize(
+                &sipr_scenario::template::normalize_cdata(text),
+                0,
+                &mut diags,
+            )
+        };
+        Self {
+            ack: one(
+                "ACK [last_Request_URI] SIP/2.0\n[last_Via]\n[last_From]\n[last_To]\n\
+                 Call-ID: [call_id]\nCSeq: [last_cseq_number] ACK\n\
+                 Contact: <sip:sipp@[local_ip]:[local_port];transport=[transport]>\n\
+                 Max-Forwards: 70\nSubject: Performance Test\nContent-Length: 0\n\n",
+            ),
+            bye: one("BYE [next_url] SIP/2.0\n\
+                 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n\
+                 [routes]\n[last_From]\n[last_To]\nCall-ID: [call_id]\n\
+                 CSeq: [last_cseq_number+1] BYE\nMax-Forwards: 70\n\
+                 Contact: <sip:sipp@[local_ip]:[local_port];transport=[transport]>\n\
+                 Content-Length: 0\n\n"),
+            cancel: one(
+                "CANCEL [last_Request_URI] SIP/2.0\n[last_Via]\n[last_From]\n[last_To]\n\
+                 Call-ID: [call_id]\nCSeq: [last_cseq_number] CANCEL\nMax-Forwards: 70\n\
+                 Contact: <sip:sipp@[local_ip]:[local_port];transport=[transport]>\n\
+                 Content-Length: 0\n\n",
+            ),
+            ok: one(
+                "SIP/2.0 200 OK\n[last_Via:]\n[last_From:]\n[last_To:]\n[last_Call-ID:]\n\
+                 [last_CSeq:]\nContact: <sip:[local_ip]:[local_port];transport=[transport]>\n\
+                 Content-Length: 0\n\n",
+            ),
         }
     }
 }
@@ -494,6 +658,13 @@ struct CallState {
     tdm_number: Option<u32>,
     /// The `-trace_calldebug` buffer (SIPp `debugBuffer`), when tracing.
     debug: Option<String>,
+    /// SIPp `call_established`: an ACK was sent or received.
+    established: bool,
+    /// SIPp `ack_is_pending`: a 200 was received and no ACK sent since.
+    ack_pending: bool,
+    /// The CSeq number of the last INVITE received (the `cseq` behavior's
+    /// guard on ACKs).
+    last_recv_invite_cseq: Option<u32>,
     /// Remote media endpoints learned from received SDP, by [`MediaKind`]
     /// index. Stale values persist when a later SDP omits a stream (SIPp).
     remote_media: [Option<SocketAddr>; 3],
@@ -898,6 +1069,8 @@ struct Engine<'s> {
     trace_calldebug: Option<sipr_stats::TraceFile>,
     /// Finished calls still answering to their Call-ID (`-deadcall_wait`).
     dead_calls: HashMap<String, DeadCall>,
+    /// SIPp's built-in abort/answer messages.
+    default_msgs: DefaultMessages,
     inf_files: Vec<std::cell::RefCell<InjectionFile>>,
     inf_seq: Vec<usize>,
     /// 3PCC twin control channel (`-3pcc`), when the scenario uses it.
@@ -1401,26 +1574,28 @@ impl<'s> Engine<'s> {
                     }
                 }
             });
-        // Stdin watcher: 'q' = soft quit, 'Q' = hard quit.
+        // Stdin watcher: 'q' = soft quit, 'Q' = hard quit (`-nostdin` off).
         let stdin_tx = tx.clone();
-        let _stdin = std::thread::Builder::new()
-            .name("sipr-stdin".into())
-            .spawn(move || {
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match std::io::stdin().read_line(&mut line) {
-                        Ok(0) | Err(_) => return, // EOF: no interactive control
-                        Ok(_) => {
-                            if let Some(c) = line.trim().chars().next() {
-                                if stdin_tx.send(Event::Stdin(c)).is_err() {
-                                    return;
+        let _stdin = (!config.nostdin).then(|| {
+            std::thread::Builder::new()
+                .name("sipr-stdin".into())
+                .spawn(move || {
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match std::io::stdin().read_line(&mut line) {
+                            Ok(0) | Err(_) => return, // EOF: no interactive control
+                            Ok(_) => {
+                                if let Some(c) = line.trim().chars().next() {
+                                    if stdin_tx.send(Event::Stdin(c)).is_err() {
+                                        return;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            });
+                })
+        });
         if let Some(t) = config.timeout {
             timers.arm(t, Event::GlobalTimeout);
         }
@@ -1596,6 +1771,7 @@ impl<'s> Engine<'s> {
             trace_shortmsg,
             trace_calldebug,
             dead_calls: HashMap::new(),
+            default_msgs: DefaultMessages::compile(),
             inf_files,
             inf_seq: vec![0; inf_len],
             twin,
@@ -1707,6 +1883,14 @@ impl<'s> Engine<'s> {
                 Ok(Event::PacerTick) => self.on_pacer_tick(),
                 Ok(Event::GlobalTimeout) => {
                     eprintln!("sipr: global timeout reached; failing active calls");
+                    if self.config.timeout_error {
+                        // SIPp `timeout_alarm`: an ERROR, so the run exits fatal.
+                        self.fatal = Some(format!(
+                            "{} timed out after '{:.3}' seconds",
+                            self.scenario.name,
+                            self.run_start.elapsed().as_secs_f64()
+                        ));
+                    }
                     self.fail_all("global timeout");
                     self.soft_stopping = true;
                     self.control.stop_pacer.store(true, Ordering::Relaxed);
@@ -2425,26 +2609,33 @@ impl<'s> Engine<'s> {
     }
 
     fn scan_call(&self, call_id: &str, window_start: usize, waiting: bool, msg: &Inbound) -> Scan {
-        let (secondary, txns) = self
-            .calls
-            .get(call_id)
-            .map_or((false, &[][..]), |c| (c.secondary, c.txns.as_slice()));
+        let (secondary, txns, invite_cseq) =
+            self.calls.get(call_id).map_or((false, &[][..], None), |c| {
+                (c.secondary, c.txns.as_slice(), c.last_recv_invite_cseq)
+            });
+        let ack_guard = if self.config.behaviors.cseq {
+            invite_cseq
+        } else {
+            None
+        };
         match self.secondary.as_ref() {
-            Some(o) if secondary => scan_for_match(
+            Some(o) if secondary => scan_for_match_guarded(
                 o.scenario,
                 &o.expected_cseq_method,
                 txns,
                 window_start,
                 waiting,
                 msg,
+                ack_guard,
             ),
-            _ => scan_for_match(
+            _ => scan_for_match_guarded(
                 self.scenario,
                 &self.expected_cseq_method,
                 txns,
                 window_start,
                 waiting,
                 msg,
+                ack_guard,
             ),
         }
     }
@@ -2635,7 +2826,12 @@ impl<'s> Engine<'s> {
                     // (E_FAILED_CANNOT_SEND_MSG); a dead connection is then
                     // reset for the calls that follow (-max_reconnect).
                     // Simulated drops still count as "sent".
-                    if let Err(e) = self.send_for_call(call_id, &buf, remote, send.lost_pct) {
+                    if let Err(e) = self.send_for_call(
+                        call_id,
+                        &buf,
+                        remote,
+                        send.lost_pct.or(self.config.lost),
+                    ) {
                         self.after_send_failure(call_id, &e);
                         return;
                     }
@@ -2646,7 +2842,7 @@ impl<'s> Engine<'s> {
                     }
                     self.trace_send(&buf, remote);
                     let retrans_ms = send.retrans_ms;
-                    let lost_pct = send.lost_pct;
+                    let lost_pct = send.lost_pct.or(self.config.lost);
                     let jump = self.jump_target(&send.common, index, call_id);
                     let now = Instant::now();
                     let common = send.common.clone();
@@ -2654,6 +2850,11 @@ impl<'s> Engine<'s> {
                         return;
                     };
                     let on_secondary = call.secondary;
+                    if first == "ACK" {
+                        // SIPp `call_established = true` on sending an ACK.
+                        call.established = true;
+                        call.ack_pending = false;
+                    }
                     apply_rtds(
                         call,
                         stats_for(&mut self.stats, self.secondary.as_mut(), on_secondary),
@@ -2686,7 +2887,12 @@ impl<'s> Engine<'s> {
                     if let Some(base) = retrans_ms.filter(|_| !self.reliable) {
                         let schedule = RetransSchedule::new(
                             Some(base),
-                            self.config.max_retrans,
+                            first == "INVITE",
+                            RetransCaps {
+                                invite: self.config.max_invite_retrans,
+                                non_invite: self.config.max_non_invite_retrans,
+                                global: self.config.max_retrans,
+                            },
                             self.config.no_retrans,
                         );
                         if let Some(interval) = schedule.interval(1) {
@@ -2870,7 +3076,14 @@ impl<'s> Engine<'s> {
         while let Some(step) = scenario.steps.get(i) {
             match step {
                 Step::Recv(r) if r.optional => i += 1,
-                Step::Recv(r) => return Some((i, r.timeout_ms)),
+                Step::Recv(r) => {
+                    // `-recv_timeout`: the default for a recv without its own.
+                    let default_ms = self
+                        .config
+                        .recv_timeout
+                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                    return Some((i, r.timeout_ms.or(default_ms)));
+                }
                 Step::Label { .. } => i += 1,
                 _ => return None,
             }
@@ -2902,7 +3115,7 @@ impl<'s> Engine<'s> {
     fn on_packet(&mut self, packet: &sipr_net::InboundPacket) {
         let msg = &packet.message;
         self.trace_recv(packet);
-        let Some(call_id) = msg.call_id().map(ToOwned::to_owned) else {
+        let Some(call_id) = self.trimmed_call_id(msg) else {
             self.stats.unexpected += 1;
             self.stats.out_of_call_msgs += 1;
             return;
@@ -3010,6 +3223,16 @@ impl<'s> Engine<'s> {
                 return;
             }
         }
+        // `-pause_msg_ign`: whatever arrives while the call sits in a pause
+        // is dropped before anything is counted or answered.
+        if self.config.pause_msg_ign
+            && self
+                .calls
+                .get(&call_id)
+                .is_some_and(|c| c.pause_deadline.is_some())
+        {
+            return;
+        }
         let (window_start, waiting, completing, is_dup, secondary) = match self.calls.get(&call_id)
         {
             Some(c) => (
@@ -3054,7 +3277,25 @@ impl<'s> Engine<'s> {
             other => other,
         };
         match scan {
-            Scan::Forward(si) => self.on_matched(&call_id, si, msg, msg_hash, key),
+            Scan::Forward(si) => {
+                // A recv's `lost=` (or the global `-lost`) drops the
+                // message it just matched (SIPp `call::lost` on receive).
+                let lost = match &self.scenario_of(&call_id).steps[si] {
+                    Step::Recv(r) => r.lost_pct.or(self.config.lost),
+                    _ => None,
+                };
+                if let Some(p) = lost
+                    && self.rng.chance_pct(p)
+                {
+                    let transport = self.transport_token;
+                    self.call_debug(
+                        &call_id,
+                        format!("{transport} message lost (recv) (hash {msg_hash}).\n"),
+                    );
+                    return;
+                }
+                self.on_matched(&call_id, si, msg, msg_hash, key);
+            }
             Scan::Old => {
                 // Late/repeated optional (e.g. another 180): absorbed.
                 self.stats_of(secondary).messages_matched += 1;
@@ -3086,14 +3327,33 @@ impl<'s> Engine<'s> {
                 if let Some(s) = stats.step_mut(window_start) {
                     s.unexpected += 1;
                 }
-                stats.failed_unexpected += 1;
-                let what = msg
-                    .method()
-                    .map_or_else(|| format!("{:?}", msg.status_code()), ToOwned::to_owned);
-                self.log_err(&format!(
-                    "unexpected {what} for call {call_id}; call failed"
-                ));
-                self.remove_call(&call_id);
+                // SIPp `checkAutomaticResponseMode`: BYE, CANCEL and PING
+                // have their own automatic handling; everything else is
+                // the plain unexpected-message case.
+                match msg.method() {
+                    Some(m @ ("BYE" | "CANCEL")) => {
+                        self.on_unexpected_bye_or_cancel(&call_id, m, secondary);
+                    }
+                    Some("PING") => self.on_unexpected_ping(&call_id),
+                    _ => {
+                        let what = msg
+                            .method()
+                            .map_or_else(|| format!("{:?}", msg.status_code()), ToOwned::to_owned);
+                        if !self.config.behaviors.abortunexp {
+                            // SIPp: "Continuing call on unexpected message …".
+                            self.log_err(&format!(
+                                "Continuing call on unexpected message for Call-Id '{call_id}': {what}"
+                            ));
+                            return;
+                        }
+                        self.stats_of(secondary).failed_unexpected += 1;
+                        self.log_err(&format!(
+                            "Aborting call on unexpected message for Call-Id '{call_id}': {what}"
+                        ));
+                        self.send_abort_messages(&call_id);
+                        self.remove_call(&call_id);
+                    }
+                }
             }
         }
     }
@@ -3180,6 +3440,18 @@ impl<'s> Engine<'s> {
         let Some(call) = self.calls.get_mut(call_id) else {
             return;
         };
+        // SIPp: an ACK received establishes the call, a 200 received leaves
+        // an ACK pending (abort sends ACK+BYE rather than CANCEL), and the
+        // last INVITE's CSeq guards later ACKs (`cseq` behavior).
+        if msg.method() == Some("ACK") {
+            call.established = true;
+        }
+        if msg.status_code() == Some(200) {
+            call.ack_pending = true;
+        }
+        if msg.method() == Some("INVITE") {
+            call.last_recv_invite_cseq = msg.cseq().map(|(n, _)| n);
+        }
         // A matched recv cancels the pending retransmission
         // (call.cpp: next_retrans = 0) and the window timeout.
         if let Some(r) = call.retrans.take() {
@@ -4570,7 +4842,7 @@ impl<'s> Engine<'s> {
             f.write(&sipr_stats::short_message_line('R', &packet.raw, rfc3339));
         }
         if self.trace_calldebug.is_some()
-            && let Some(call_id) = packet.message.call_id().map(ToOwned::to_owned)
+            && let Some(call_id) = self.trimmed_call_id(&packet.message)
         {
             self.call_debug(
                 &call_id,
@@ -4866,8 +5138,124 @@ impl<'s> Engine<'s> {
                 _ => stats.failed_other += 1,
             }
             self.log_err(&format!("call {call_id} failed: {reason}"));
+            // SIPp `abortCall`: the `bye` behavior ends the dialog properly
+            // (not after a send failure: the socket is the problem).
+            if !reason.contains("cannot send") {
+                self.send_abort_messages(call_id);
+            }
             self.remove_call(call_id);
         }
+    }
+
+    /// SIPp's `abortCall` messages, when the `bye` behavior is on: for a
+    /// client-side call past its first step — an unestablished INVITE
+    /// answered with a 4xx or worse gets an ACK; one answered with a 200
+    /// gets ACK then BYE; one answered provisionally gets a CANCEL; one
+    /// never answered gets nothing; any other call that received something
+    /// gets a BYE. Server-side and secondary calls send nothing.
+    fn send_abort_messages(&mut self, call_id: &str) {
+        if !self.config.behaviors.bye || self.scenario.role != Role::Uac {
+            return;
+        }
+        let Some(call) = self.calls.get(call_id) else {
+            return;
+        };
+        if call.secondary || call.index == 0 {
+            return;
+        }
+        let last_was_invite = call
+            .last_sent
+            .as_deref()
+            .is_some_and(|b| b.starts_with(b"INVITE"));
+        let last_code = call.last_recv.as_ref().and_then(Inbound::status_code);
+        let received_any = call.last_recv.is_some();
+        let (established, ack_pending, index) = (call.established, call.ack_pending, call.index);
+        let mut plan: Vec<MsgTemplate> = Vec::new();
+        if !established && last_was_invite {
+            if last_code.is_some_and(|c| c >= 400) {
+                plan.push(self.default_msgs.ack.clone());
+            } else if received_any {
+                if ack_pending {
+                    plan.push(self.default_msgs.ack.clone());
+                    plan.push(self.default_msgs.bye.clone());
+                } else {
+                    plan.push(self.default_msgs.cancel.clone());
+                }
+            }
+        } else if received_any {
+            plan.push(self.default_msgs.bye.clone());
+        }
+        for template in plan {
+            self.send_default_message(call_id, index, &template);
+        }
+    }
+
+    /// Render one of SIPp's built-in messages for the call and send it.
+    fn send_default_message(&mut self, call_id: &str, index: usize, template: &MsgTemplate) {
+        let Some(text) = self.render_call_template(call_id, index, template) else {
+            return;
+        };
+        let Some(remote) = self.calls.get(call_id).map(|c| c.remote) else {
+            return;
+        };
+        let buf = text.into_bytes();
+        if self.send_for_call(call_id, &buf, remote, None).is_ok() {
+            self.call_stats(call_id).messages_sent += 1;
+            self.trace_send(&buf, remote);
+        }
+    }
+
+    /// SIPp `E_AM_UNEXP_BYE`/`E_AM_UNEXP_CANCEL`: with `abortunexp` the
+    /// call is aborted — after a 200 when `bye` is on — else it continues.
+    fn on_unexpected_bye_or_cancel(&mut self, call_id: &str, method: &str, secondary: bool) {
+        if !self.config.behaviors.abortunexp {
+            self.log_err(&format!(
+                "Continuing call on an unexpected {method} for call: {call_id}"
+            ));
+            return;
+        }
+        self.log_err(&format!(
+            "Aborting call on an unexpected {method} for call: {call_id}"
+        ));
+        if self.config.behaviors.bye {
+            let index = self.calls.get(call_id).map_or(0, |c| c.index);
+            let ok = self.default_msgs.ok.clone();
+            self.send_default_message(call_id, index, &ok);
+        }
+        self.stats_of(secondary).failed_unexpected += 1;
+        self.remove_call(call_id);
+    }
+
+    /// SIPp `E_AM_PING`: with `pingreply` a 200 answers the PING and the
+    /// call ends, neither successful nor failed; else it is left alone.
+    fn on_unexpected_ping(&mut self, call_id: &str) {
+        if !self.config.behaviors.pingreply {
+            self.log_err(&format!(
+                "Do not answer on an unexpected PING for call: {call_id}"
+            ));
+            return;
+        }
+        self.log_err(&format!(
+            "Automatic response mode for an unexpected PING for call: {call_id}"
+        ));
+        let index = self.calls.get(call_id).map_or(0, |c| c.index);
+        let ok = self.default_msgs.ok.clone();
+        self.send_default_message(call_id, index, &ok);
+        self.stats.auto_answered += 1;
+        if let Some(mut call) = self.calls.remove(call_id) {
+            self.cancel_call_timers(&mut call);
+            self.stop_media(call_id);
+            self.forget_secondary(&call);
+            self.release_tdm(&call);
+            self.return_user(&call);
+        }
+    }
+
+    /// A message's Call-ID as SIPp keys calls by it: the part after a
+    /// `///` (its 3PCC twin marker) unless `-callid_slash_ign`.
+    fn trimmed_call_id(&self, msg: &Inbound) -> Option<String> {
+        let raw = msg.call_id()?;
+        Some(trim_call_id(raw, self.config.callid_slash_ign).to_owned())
     }
 
     fn fail_all(&mut self, reason: &str) {
@@ -5142,6 +5530,9 @@ fn new_call(
         last_recv: None,
         tdm_number: None,
         debug: None,
+        established: false,
+        ack_pending: false,
+        last_recv_invite_cseq: None,
         remote_media: [None; 3],
         rtpstream_ports: [None; 2],
         crypto: crate::render::CallCrypto::default(),
@@ -5249,6 +5640,34 @@ fn scan_for_match(
     waiting: bool,
     msg: &Inbound,
 ) -> Scan {
+    scan_for_match_guarded(
+        scenario,
+        expected_cseq_method,
+        txns,
+        window_start,
+        waiting,
+        msg,
+        None,
+    )
+}
+
+/// [`scan_for_match`] with the `cseq` behavior's guard: an ACK matches only
+/// when its CSeq number is `ack_guard`'s (SIPp `call::matches_cseq`,
+/// `DEFAULT_BEHAVIOR_BADCSEQ`).
+#[allow(clippy::too_many_arguments)]
+fn scan_for_match_guarded(
+    scenario: &Scenario,
+    expected_cseq_method: &[Option<String>],
+    txns: &[TxnInstance],
+    window_start: usize,
+    waiting: bool,
+    msg: &Inbound,
+    ack_guard: Option<u32>,
+) -> Scan {
+    if ack_guard.is_some() && msg.method() == Some("ACK") && msg.cseq().map(|(n, _)| n) != ack_guard
+    {
+        return Scan::NoMatch;
+    }
     // Forward: optionals may be skipped; stop at first mandatory recv
     // (inclusive) or any non-recv step.
     if waiting {
@@ -5332,6 +5751,15 @@ fn sent_via_branch(buf: &[u8]) -> Option<String> {
 
 /// SIPp's `hash(msg)` stand-in: a hash of the datagram, to recognise a
 /// repeated final response of a named transaction.
+/// SIPp `get_trimmed_call_id`: the text after the first `///`, unless
+/// `-callid_slash_ign` keeps the whole value.
+fn trim_call_id(raw: &str, keep_slashes: bool) -> &str {
+    if keep_slashes {
+        return raw;
+    }
+    raw.split_once("///").map_or(raw, |(_, rest)| rest)
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
     use std::hash::{DefaultHasher, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -6173,5 +6601,59 @@ mod tests {
             pacer_credit(10.0, Duration::from_millis(10), Duration::ZERO),
             0.0
         );
+    }
+
+    #[test]
+    fn default_behaviors_parse_like_sipp() {
+        assert_eq!(Behaviors::parse("all").unwrap(), Behaviors::all());
+        assert_eq!(Behaviors::parse("none").unwrap(), Behaviors::none());
+        assert_eq!(
+            Behaviors::parse("all,-bye").unwrap(),
+            Behaviors {
+                bye: false,
+                ..Behaviors::all()
+            }
+        );
+        assert_eq!(
+            Behaviors::parse("bye,+cseq").unwrap(),
+            Behaviors {
+                bye: true,
+                cseq: true,
+                ..Behaviors::none()
+            }
+        );
+        assert!(Behaviors::parse("all,none,pingreply").unwrap().pingreply);
+        assert!(!Behaviors::parse("all,none,pingreply").unwrap().bye);
+        assert_eq!(
+            Behaviors::parse("all,-fooo").unwrap_err(),
+            "Unknown default behavior: '-fooo'"
+        );
+        assert_eq!(Behaviors::default(), Behaviors::all());
+    }
+
+    #[test]
+    fn call_id_slashes_trim_unless_ignored() {
+        assert_eq!(trim_call_id("twin///real@h", false), "real@h");
+        assert_eq!(trim_call_id("twin///real@h", true), "twin///real@h");
+        assert_eq!(trim_call_id("plain@h", false), "plain@h");
+        assert_eq!(trim_call_id("a///b///c", false), "b///c");
+    }
+
+    #[test]
+    fn default_messages_compile_with_sipps_keywords() {
+        let d = DefaultMessages::compile();
+        for t in [&d.ack, &d.bye, &d.cancel, &d.ok] {
+            assert!(!t.spans.is_empty());
+            assert!(
+                !t.keywords().any(|k| matches!(k, Keyword::Unknown(_))),
+                "{t:?}"
+            );
+        }
+        assert!(
+            d.ack
+                .keywords()
+                .any(|k| matches!(k, Keyword::LastRequestUri))
+        );
+        assert!(d.bye.keywords().any(|k| matches!(k, Keyword::NextUrl)));
     }
 }

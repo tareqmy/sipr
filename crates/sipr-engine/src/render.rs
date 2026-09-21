@@ -590,6 +590,16 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
                 out.push_str(&m.reconstruct());
             }
         }
+        Keyword::LastRequestUri => {
+            // SIPp `get_last_request_uri`: what the last message's To
+            // header carries between `<` and `>`, else nothing.
+            if let Some(to) = ctx.last.and_then(|m| m.header("To"))
+                && let Some(start) = to.find('<')
+                && let Some(end) = to[start + 1..].find('>')
+            {
+                out.push_str(&to[start + 1..start + 1 + end]);
+            }
+        }
         Keyword::LastCseqNumber { offset } => {
             // SIPp: `sscanf("%d")` on the CSeq value, 0 without a CSeq.
             let number = ctx
