@@ -4643,3 +4643,243 @@ fn max_invite_retrans_counts_like_real_sipp() {
         "sipp took {their_time:?}"
     );
 }
+
+fn ext3pcc_master_xml() -> String {
+    format!(
+        r#"{SIPP_XML_HEADER}<scenario name="3pcc extended master">
+  <send retrans="500"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: m <sip:m@[local_ip]:[local_port]>;tag=[pid]m[call_number]
+    To: svc <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:m@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200">
+    <action><ereg regexp="Content-Type:.*" search_in="msg" assign_to="1"/></action>
+  </recv>
+  <sendCmd dest="s1"><![CDATA[
+    Call-ID: [call_id]
+    From: m
+    [$1]
+  ]]></sendCmd>
+  <recvCmd src="s1">
+    <action><ereg regexp="Content-Type:.*" search_in="msg" assign_to="2"/></action>
+  </recvCmd>
+  <send><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: m <sip:m@[local_ip]:[local_port]>;tag=[pid]m[call_number]
+    To: svc <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:m@[local_ip]:[local_port]
+    Max-Forwards: 70
+    X-Answer: [$2]
+    Content-Length: 0
+
+  ]]></send>
+  <pause milliseconds="700"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: m <sip:m@[local_ip]:[local_port]>;tag=[pid]m[call_number]
+    To: svc <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Contact: sip:m@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#
+    )
+}
+
+fn ext3pcc_slave_xml() -> String {
+    format!(
+        r#"{SIPP_XML_HEADER}<scenario name="3pcc extended slave">
+  <recvCmd src="m">
+    <action><ereg regexp="Content-Type:.*" search_in="msg" assign_to="1"/></action>
+  </recvCmd>
+  <send retrans="500"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: s1 <sip:s1@[local_ip]:[local_port]>;tag=[pid]s1[call_number]
+    To: svc <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:s1@[local_ip]:[local_port]
+    Max-Forwards: 70
+    X-Offer: [$1]
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200">
+    <action><ereg regexp="Content-Type:.*" search_in="msg" assign_to="2"/></action>
+  </recv>
+  <send><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: s1 <sip:s1@[local_ip]:[local_port]>;tag=[pid]s1[call_number]
+    To: svc <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:s1@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <sendCmd dest="m"><![CDATA[
+    Call-ID: [call_id]
+    From: s1
+    [$2]
+  ]]></sendCmd>
+  <pause milliseconds="100"/>
+  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: s1 <sip:s1@[local_ip]:[local_port]>;tag=[pid]s1[call_number]
+    To: svc <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Contact: sip:s1@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#
+    )
+}
+
+/// One extended-3PCC run: two sipr UASes (one per leg), the slave started
+/// first, the master last (SIPp's rule: the master dials the slaves).
+/// Returns (master exit, slave exit, master stderr, slave stderr).
+fn run_ext3pcc_pair(
+    master_bin: &std::path::Path,
+    slave_bin: &std::path::Path,
+    tag: &str,
+) -> (Option<i32>, Option<i32>, String, String) {
+    let sipr = std::path::Path::new(env!("CARGO_BIN_EXE_sipr"));
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let cfg_path = dir.join(format!("sipr-interop-ext3pcc-{tag}-{pid}.cfg"));
+    let master_path = dir.join(format!("sipr-interop-ext3pcc-master-{tag}-{pid}.xml"));
+    let slave_path = dir.join(format!("sipr-interop-ext3pcc-slave-{tag}-{pid}.xml"));
+    let (pm, p1) = (free_port(), free_port());
+    std::fs::write(&cfg_path, format!("m;127.0.0.1:{pm}\ns1;127.0.0.1:{p1}\n")).expect("write cfg");
+    std::fs::write(&master_path, ext3pcc_master_xml()).expect("write master");
+    std::fs::write(&slave_path, ext3pcc_slave_xml()).expect("write slave");
+    let cfg = cfg_path.to_str().expect("utf8").to_owned();
+    // One UAS per leg: the two legs share the master's Call-ID.
+    let spawn_uas = |port: u16| {
+        Reaper(
+            Command::new(sipr)
+                .current_dir(&dir)
+                .args([
+                    "-sn",
+                    "uas",
+                    "-i",
+                    "127.0.0.1",
+                    "-p",
+                    &port.to_string(),
+                    "-m",
+                    "1",
+                    "-timeout",
+                    "40",
+                    "-bg",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("spawn uas"),
+        )
+    };
+    let (uas_a, uas_b) = (free_port(), free_port());
+    let _uas_a = spawn_uas(uas_a);
+    let _uas_b = spawn_uas(uas_b);
+    std::thread::sleep(Duration::from_millis(300));
+    let spawn_peer =
+        |bin: &std::path::Path, scenario: &std::path::Path, role: &str, name: &str, uas: u16| {
+            let mut args = vec![
+                "-sf".to_owned(),
+                scenario.to_str().expect("utf8").to_owned(),
+                "-i".to_owned(),
+                "127.0.0.1".to_owned(),
+                role.to_owned(),
+                name.to_owned(),
+                "-slave_cfg".to_owned(),
+                cfg.clone(),
+                "-m".to_owned(),
+                "1".to_owned(),
+                "-timeout".to_owned(),
+                "30".to_owned(),
+            ];
+            if bin == sipr {
+                args.push("-bg".to_owned());
+            }
+            args.push(format!("127.0.0.1:{uas}"));
+            Reaper(
+                Command::new(bin)
+                    .current_dir(&dir)
+                    .args(&args)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .stdin(Stdio::null())
+                    .spawn()
+                    .expect("spawn peer"),
+            )
+        };
+    let mut slave = spawn_peer(slave_bin, &slave_path, "-slave", "s1", uas_b);
+    std::thread::sleep(Duration::from_millis(600));
+    let mut master = spawn_peer(master_bin, &master_path, "-master", "m", uas_a);
+    let master_code = wait_with_timeout(&mut master.0, Duration::from_secs(25));
+    let master_err = child_stderr(&mut master.0);
+    let slave_code = wait_with_timeout(&mut slave.0, Duration::from_secs(15));
+    let slave_err = child_stderr(&mut slave.0);
+    for p in [&cfg_path, &master_path, &slave_path] {
+        let _ = std::fs::remove_file(p);
+    }
+    (master_code, slave_code, master_err, slave_err)
+}
+
+/// Extended 3PCC both ways: a sipr master drives a real sipp slave, then a
+/// real sipp master drives a sipr slave, on SIPp's documented
+/// `-master`/`-slave`/`-slave_cfg` + `dest=`/`src=` form (the master's
+/// Content-Type travels to the slave's INVITE and the slave's back into
+/// the master's ACK, as in `docs/3PCC_extended.rst`).
+#[test]
+fn extended_3pcc_both_ways_against_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("skipping: no sipp binary");
+        return;
+    };
+    let sipr = std::path::Path::new(env!("CARGO_BIN_EXE_sipr"));
+    let (m, s, m_err, s_err) = run_ext3pcc_pair(sipr, &sipp, "siprmaster");
+    assert_eq!(m, Some(0), "sipr master:\n{m_err}\nsipp slave:\n{s_err}");
+    assert!(
+        m_err.contains("successful 1 failed 0"),
+        "sipr master:\n{m_err}"
+    );
+    assert_eq!(s, Some(0), "sipp slave:\n{s_err}\nsipr master:\n{m_err}");
+    let (m, s, m_err, s_err) = run_ext3pcc_pair(&sipp, sipr, "sippmaster");
+    assert_eq!(s, Some(0), "sipr slave:\n{s_err}\nsipp master:\n{m_err}");
+    assert!(
+        s_err.contains("successful 1 failed 0"),
+        "sipr slave:\n{s_err}"
+    );
+    assert_eq!(m, Some(0), "sipp master:\n{m_err}\nsipr slave:\n{s_err}");
+}

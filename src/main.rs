@@ -309,6 +309,10 @@ fn run(cli: &Cli) -> ExitCode {
             },
             None => None,
         },
+        extended_3pcc: match extended_3pcc(cli) {
+            Ok(ext) => ext,
+            Err(e) => return fatal(&e),
+        },
         users: cli.users,
         media_ip: cli.media_ip,
         media_port: cli.media_port,
@@ -562,6 +566,55 @@ fn latin1_tolerant(bytes: Vec<u8>) -> String {
         Ok(s) => s,
         Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
     }
+}
+
+/// `-master`/`-slave` + `-slave_cfg`: SIPp's option checks (`sipp.cpp`
+/// `SIPP_OPTION_3PCC_EXTENDED`/`SIPP_OPTION_SLAVE_CFG`), then the peer table
+/// read and resolved. `Ok(None)` when none of the three is given.
+fn extended_3pcc(cli: &Cli) -> Result<Option<sipr_engine::Extended3pcc>, String> {
+    if cli.master.is_some() && cli.slave.is_some() {
+        return Err("-slave and -master options are not compatible".into());
+    }
+    if cli.three_pcc.is_some() {
+        if cli.master.is_some() || cli.slave.is_some() {
+            return Err("-master and -slave options are not compatible with -3PCC option".into());
+        }
+        if cli.slave_cfg.is_some() {
+            return Err("-3pcc and -slave_cfg options are not compatible".into());
+        }
+    }
+    let name = cli.master.as_ref().or(cli.slave.as_ref());
+    let (Some(name), Some(path)) = (name, cli.slave_cfg.as_ref()) else {
+        if name.is_some() || cli.slave_cfg.is_some() {
+            return Err("-slave_cfg option must be used with -slave or -master option".into());
+        }
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Can not open slave_cfg file {}: {e}", path.display()))?;
+    let table = sipr_engine::PeerTable::parse(&text);
+    for line in table.skipped() {
+        eprintln!(
+            "sipr: warning: {}: line without a ';' skipped: {line}",
+            path.display()
+        );
+    }
+    let mut peers = Vec::new();
+    for (peer, host) in table.entries() {
+        let addr = resolve_target(host).map_err(|e| format!("-slave_cfg peer '{peer}': {e}"))?;
+        peers.push((peer.to_owned(), addr));
+    }
+    if table.get(name).is_none() {
+        return Err(format!(
+            "get_peer_addr: Peer {name} not found in {}",
+            path.display()
+        ));
+    }
+    Ok(Some(sipr_engine::Extended3pcc {
+        master: cli.master.is_some(),
+        name: name.clone(),
+        peers,
+    }))
 }
 
 fn fatal(msg: &str) -> ExitCode {

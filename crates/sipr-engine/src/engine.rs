@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,8 +23,9 @@ use sipr_media::sdp::CryptoAttr;
 use sipr_media::{MediaEvent, MediaPlayer, PcapStream, Source, StreamSpec};
 use sipr_net::timer::TimerId;
 use sipr_net::{
-    Inbound, NetEvent, RetransCaps, RetransSchedule, TcpCallConn, TcpTransport, TimerService,
-    TlsCallConn, TlsTransport, TransportConfig, TwinChannel, UdpCallSocket, UdpTransport,
+    Inbound, NetEvent, PeerLinks, RetransCaps, RetransSchedule, TcpCallConn, TcpTransport,
+    TimerService, TlsCallConn, TlsTransport, TransportConfig, TwinChannel, TwinEvent,
+    UdpCallSocket, UdpTransport,
 };
 #[cfg(feature = "sctp")]
 use sipr_net::{SctpCallConn, SctpTransport};
@@ -121,6 +122,9 @@ pub struct EngineConfig {
     /// `-3pcc HOST:PORT`: the twin control socket for classic 3PCC. The role
     /// (dial vs listen) is derived from the scenario's first twin command.
     pub twin_addr: Option<SocketAddr>,
+    /// Extended 3PCC (`-slave_cfg` with `-master NAME` or `-slave NAME`):
+    /// this instance's name and role, and every named peer's address.
+    pub extended_3pcc: Option<Extended3pcc>,
     /// `-users N`: closed-loop mode — keep N concurrent calls, each holding a
     /// 1-based user id (drives `[userid]`/`[users]` and USER injection files).
     pub users: Option<usize>,
@@ -591,8 +595,8 @@ enum Event {
     PacerTick,
     GlobalTimeout,
     Stdin(char),
-    /// A 3PCC command arrived on the twin control channel.
-    TwinCmd(String),
+    /// Something happened on the 3PCC control link.
+    Twin(TwinEvent),
     /// The media thread finished or abandoned a replay.
     Media(MediaEvent),
     /// A runtime control command (UDP control socket or HTTP API).
@@ -868,6 +872,76 @@ impl SecondaryKind {
     }
 }
 
+/// Extended 3PCC configuration (SIPp `-master`/`-slave` + `-slave_cfg`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extended3pcc {
+    /// `-master NAME`: this instance initiates and dials its peers at
+    /// start-up (SIPp: the master is launched last). A slave only listens
+    /// and dials back once a peer has reached it.
+    pub master: bool,
+    /// This instance's name in the peer table.
+    pub name: String,
+    /// The resolved `-slave_cfg` table, in file order.
+    pub peers: Vec<(String, SocketAddr)>,
+}
+
+/// The 3PCC control link the engine talks to.
+enum TwinLink {
+    /// Classic `-3pcc`: one connection to the other controller.
+    Classic(TwinChannel),
+    /// Extended mode: our listening socket plus one dialed connection per
+    /// `dest=` peer, which a slave only opens once a peer has reached it.
+    Extended {
+        links: PeerLinks,
+        /// Every `dest=` of the scenario, resolved, in first-use order.
+        dests: Vec<(String, SocketAddr)>,
+    },
+}
+
+/// SIPp's 3PCC "server" creation (`computeSippMode`: the first of
+/// send/recv/sendCmd/recvCmd is a `recvCmd`, so controller B and every
+/// slave): calls are opened by the commands that name them, not paced.
+fn twin_creates_calls(scenario: &Scenario) -> bool {
+    scenario.steps.iter().find_map(|s| match s {
+        Step::Send(_) | Step::Recv(_) | Step::SendCmd { .. } => Some(false),
+        Step::RecvCmd { .. } => Some(true),
+        _ => None,
+    }) == Some(true)
+}
+
+/// The Call-ID a twin command names (`Call-ID:` or its compact `i:`, case
+/// folded), trimmed the way SIPp keys calls (`///` marker).
+fn command_call_id(cmd: &str, slash_ign: bool) -> Option<String> {
+    let raw = command_header(cmd, &["call-id", "i"])?;
+    let trimmed = trim_call_id(raw, slash_ign);
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// The first token of a command's `From:` line — the sender's peer name in
+/// extended mode (SIPp `check_peer_src`).
+fn command_from(cmd: &str) -> Option<&str> {
+    command_header(cmd, &["from"]).and_then(|v| v.split_whitespace().next())
+}
+
+/// SIPp `checkInternalCmd`: `internal-cmd: abort_call` ends the call.
+fn is_abort_command(cmd: &str) -> bool {
+    command_header(cmd, &["internal-cmd"]).and_then(|v| v.split_whitespace().next())
+        == Some("abort_call")
+}
+
+/// The trimmed value of the first line whose name (before `:`) matches one
+/// of `names`, case folded.
+fn command_header<'a>(cmd: &'a str, names: &[&str]) -> Option<&'a str> {
+    cmd.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        let name = name.trim();
+        names
+            .iter()
+            .any(|n| name.eq_ignore_ascii_case(n))
+            .then(|| value.trim())
+    })
+}
+
 /// Which end of the 3PCC twin socket this instance is.
 #[derive(Clone, Copy)]
 enum TwinRole {
@@ -885,6 +959,163 @@ fn twin_role(scenario: &Scenario) -> Option<TwinRole> {
         Step::RecvCmd { .. } => Some(TwinRole::Listen),
         _ => None,
     })
+}
+
+/// Open the 3PCC control link the scenario and command line call for:
+/// nothing without twin commands, the classic pair for `-3pcc`, the peer
+/// mesh for `-slave_cfg`. The role comes from the first twin command in
+/// the scenario: `sendCmd`-first dials (controller A / master),
+/// `recvCmd`-first listens (controller B / slave).
+fn open_twin(
+    scenario: &Scenario,
+    config: &EngineConfig,
+    tx: &Sender<Event>,
+) -> Result<Option<TwinLink>, EngineError> {
+    let role = twin_role(scenario);
+    match (role, config.extended_3pcc.as_ref(), config.twin_addr) {
+        (None, Some(_), _) => Err(EngineError(
+            "-slave_cfg: extended 3PCC mode enabled but the scenario has no \
+             <sendCmd>/<recvCmd> (SIPp: thirdPartyMode is different from MASTER and SLAVE)"
+                .into(),
+        )),
+        (None, None, _) => Ok(None),
+        (Some(role), Some(ext), _) => {
+            let dests = check_extended_scenario(scenario, ext, role)?;
+            let own = ext
+                .peers
+                .iter()
+                .find(|(n, _)| *n == ext.name)
+                .map(|(_, a)| *a)
+                .ok_or_else(|| {
+                    EngineError(format!("get_peer_addr: Peer {} not found", ext.name))
+                })?;
+            let mut links = PeerLinks::listen(own, twin_bridge(tx)).map_err(|e| {
+                EngineError(format!(
+                    "Unable to bind twin sipp socket {own} for '{}': {e}",
+                    ext.name
+                ))
+            })?;
+            if ext.master {
+                links
+                    .connect_all(&dests)
+                    .map_err(|e| EngineError(e.to_string()))?;
+            }
+            Ok(Some(TwinLink::Extended { links, dests }))
+        }
+        (Some(role), None, Some(addr)) => {
+            if let Some(dest) = scenario.steps.iter().find_map(|s| match s {
+                Step::SendCmd {
+                    dest: Some(dest), ..
+                } => Some(dest),
+                _ => None,
+            }) {
+                return Err(EngineError(format!(
+                    "get_peer_addr: Peer {dest} not found — sendCmd dest= needs extended \
+                     3PCC mode (-slave_cfg with -master or -slave), not -3pcc"
+                )));
+            }
+            if scenario
+                .steps
+                .iter()
+                .any(|s| matches!(s, Step::RecvCmd { src: Some(_), .. }))
+            {
+                eprintln!(
+                    "sipr: warning: recvCmd src= is only checked in extended 3PCC mode \
+                     (-slave_cfg); classic -3pcc has a single twin"
+                );
+            }
+            let ch = match role {
+                TwinRole::Connect => TwinChannel::connect(addr, twin_bridge(tx)).map_err(|e| {
+                    EngineError(format!("cannot connect 3PCC twin socket {addr}: {e}"))
+                })?,
+                TwinRole::Listen => TwinChannel::listen(addr, twin_bridge(tx)).map_err(|e| {
+                    EngineError(format!("cannot bind 3PCC twin socket {addr}: {e}"))
+                })?,
+            };
+            Ok(Some(TwinLink::Classic(ch)))
+        }
+        (Some(_), None, None) => Err(EngineError(
+            "scenario uses <sendCmd>/<recvCmd> (3PCC) but no twin address \
+             was given — pass -3pcc HOST:PORT, or -slave_cfg with -master/-slave"
+                .into(),
+        )),
+    }
+}
+
+/// A channel whose far end forwards twin events into the engine loop.
+fn twin_bridge(tx: &Sender<Event>) -> Sender<TwinEvent> {
+    let (twin_tx, twin_rx) = channel::<TwinEvent>();
+    let bridge_tx = tx.clone();
+    std::thread::Builder::new()
+        .name("sipr-twin-bridge".into())
+        .spawn(move || {
+            while let Ok(ev) = twin_rx.recv() {
+                if bridge_tx.send(Event::Twin(ev)).is_err() {
+                    return;
+                }
+            }
+        })
+        .ok();
+    twin_tx
+}
+
+/// SIPp's extended-mode consistency checks (`scenario.cpp`): the role the
+/// scenario implies must match `-master`/`-slave`, every `sendCmd` needs a
+/// `dest=` and every `recvCmd` a `src=`, and each `dest=` must be in the
+/// peer table. Returns the resolved `dest=` peers in first-use order.
+fn check_extended_scenario(
+    scenario: &Scenario,
+    ext: &Extended3pcc,
+    role: TwinRole,
+) -> Result<Vec<(String, SocketAddr)>, EngineError> {
+    match role {
+        TwinRole::Connect if !ext.master => {
+            return Err(EngineError(
+                "Inconsistency between command line and scenario: master scenario but \
+                 -master option not set"
+                    .into(),
+            ));
+        }
+        TwinRole::Listen if ext.master => {
+            return Err(EngineError(
+                "Inconsistency between command line and scenario: slave scenario but \
+                 -slave option not set"
+                    .into(),
+            ));
+        }
+        _ => {}
+    }
+    let mut dests: Vec<(String, SocketAddr)> = Vec::new();
+    for step in &scenario.steps {
+        match step {
+            Step::SendCmd { dest: None, .. } => {
+                return Err(EngineError(
+                    "You must specify a 'dest' for sendCmd with extended 3pcc mode!".into(),
+                ));
+            }
+            Step::RecvCmd { src: None, .. } => {
+                return Err(EngineError(
+                    "You must specify a 'src' for recvCmd when using extended 3pcc mode!".into(),
+                ));
+            }
+            Step::SendCmd {
+                dest: Some(dest), ..
+            } => {
+                if dests.iter().any(|(n, _)| n == dest) {
+                    continue;
+                }
+                let addr = ext
+                    .peers
+                    .iter()
+                    .find(|(n, _)| n == dest)
+                    .map(|(_, a)| *a)
+                    .ok_or_else(|| EngineError(format!("get_peer_addr: Peer {dest} not found")))?;
+                dests.push((dest.clone(), addr));
+            }
+            _ => {}
+        }
+    }
+    Ok(dests)
 }
 
 /// The bound transport, dispatched by kind. Both variants expose the same
@@ -1073,10 +1304,13 @@ struct Engine<'s> {
     default_msgs: DefaultMessages,
     inf_files: Vec<std::cell::RefCell<InjectionFile>>,
     inf_seq: Vec<usize>,
-    /// 3PCC twin control channel (`-3pcc`), when the scenario uses it.
-    twin: Option<TwinChannel>,
-    /// Twin commands that arrived before a call was ready to consume them.
-    pending_cmds: std::collections::VecDeque<String>,
+    /// 3PCC control link, when the scenario uses twin commands.
+    twin: Option<TwinLink>,
+    /// Calls are opened by the twin commands that name them (SIPp's 3PCC
+    /// server modes: controller B and every slave), not by the pacer.
+    twin_creates_calls: bool,
+    /// A twin ending has been reported; SIPp drains and exits on it.
+    twin_ended: bool,
     /// `-users` closed loop: the pool of free user ids. SIPp's `freeUsers`
     /// order — filled 1..=N at start-up, taken from the back, returned to
     /// the front — so the first call is user N's and a returning id waits
@@ -1369,41 +1603,7 @@ impl<'s> Engine<'s> {
                 (Transport::Tls(t), "TLS", true)
             }
         };
-        // 3PCC twin control channel. The role comes from the first twin command
-        // in the scenario: sendCmd-first dials the peer, recvCmd-first listens.
-        let twin = match (twin_role(scenario), config.twin_addr) {
-            (Some(role), Some(addr)) => {
-                let (twin_tx, twin_rx) = channel::<String>();
-                let bridge_tx = tx.clone();
-                std::thread::Builder::new()
-                    .name("sipr-twin-bridge".into())
-                    .spawn(move || {
-                        while let Ok(cmd) = twin_rx.recv() {
-                            if bridge_tx.send(Event::TwinCmd(cmd)).is_err() {
-                                return;
-                            }
-                        }
-                    })
-                    .ok();
-                let ch = match role {
-                    TwinRole::Connect => TwinChannel::connect(addr, twin_tx).map_err(|e| {
-                        EngineError(format!("cannot connect 3PCC twin socket {addr}: {e}"))
-                    })?,
-                    TwinRole::Listen => TwinChannel::listen(addr, twin_tx).map_err(|e| {
-                        EngineError(format!("cannot bind 3PCC twin socket {addr}: {e}"))
-                    })?,
-                };
-                Some(ch)
-            }
-            (Some(_), None) => {
-                return Err(EngineError(
-                    "scenario uses <sendCmd>/<recvCmd> (3PCC) but no twin address \
-                     was given — pass -3pcc HOST:PORT"
-                        .into(),
-                ));
-            }
-            (None, _) => None,
-        };
+        let twin = open_twin(scenario, config, &tx)?;
         // Media: captures are parsed once here (SIPp: at scenario parse) and
         // the media thread exists only when something will be played.
         let second: Option<&'s Scenario> = secondary.map(|(_, sc)| sc);
@@ -1774,8 +1974,9 @@ impl<'s> Engine<'s> {
             default_msgs: DefaultMessages::compile(),
             inf_files,
             inf_seq: vec![0; inf_len],
+            twin_creates_calls: twin.is_some() && twin_creates_calls(scenario),
             twin,
-            pending_cmds: std::collections::VecDeque::new(),
+            twin_ended: false,
             free_users: config
                 .users
                 .map_or_else(Default::default, |n| (1..=n).collect()),
@@ -1897,7 +2098,7 @@ impl<'s> Engine<'s> {
                 }
                 Ok(Event::Stdin(c)) => self.apply_key(c),
                 Ok(Event::Control(req)) => self.on_control(req),
-                Ok(Event::TwinCmd(cmd)) => self.on_twin_cmd(cmd),
+                Ok(Event::Twin(ev)) => self.on_twin_event(ev),
                 Ok(Event::Media(ev)) => self.on_media_event(ev),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2420,6 +2621,7 @@ impl<'s> Engine<'s> {
         // A paused run credits nothing for the time it was paused.
         if self.config.users.is_some()
             || self.scenario.role == Role::Uas
+            || self.twin_creates_calls
             || self.paused
             || self.done_creating()
         {
@@ -2657,6 +2859,37 @@ impl<'s> Engine<'s> {
         self.stats.outgoing_created += 1;
         let number = self.stats.created();
         let call_id = self.make_call_id(number);
+        self.insert_outgoing_call(call_id, number, target, tdm_number, user_id);
+    }
+
+    /// A call opened by a twin command that names it (SIPp's 3PCC server
+    /// modes, `process_message`: "Adding a new OUTGOING call" keyed by the
+    /// command's Call-ID, so `[call_id]` on this side is the master's).
+    fn start_commanded_call(&mut self, call_id: &str) {
+        let Some(target) = self.config.target else {
+            return;
+        };
+        let tdm_number = match self.alloc_tdm() {
+            Ok(n) => n,
+            Err(msg) => {
+                self.log_err(msg);
+                self.stats.failed_other += 1;
+                return;
+            }
+        };
+        self.stats.outgoing_created += 1;
+        let number = self.stats.created();
+        self.insert_outgoing_call(call_id.to_owned(), number, target, tdm_number, None);
+    }
+
+    fn insert_outgoing_call(
+        &mut self,
+        call_id: String,
+        number: u64,
+        target: SocketAddr,
+        tdm_number: Option<u32>,
+        user_id: Option<usize>,
+    ) {
         let cnonce = self.make_cnonce(number);
         let field_lines = self.assign_field_lines(user_id);
         let store = self.new_store(false, user_id);
@@ -2977,16 +3210,31 @@ impl<'s> Engine<'s> {
                         }
                     }
                 }
-                Step::SendCmd { template, common } => {
-                    if self.twin.is_none() {
-                        self.fail_call(call_id, "3PCC <sendCmd> reached but no -3pcc twin socket");
-                        return;
-                    }
+                Step::SendCmd {
+                    template,
+                    common,
+                    dest,
+                } => {
                     let Some(rendered) = self.render_call_template(call_id, index, template) else {
                         return;
                     };
-                    let result = self.twin.as_ref().map(|t| t.send(&rendered));
-                    if let Some(Err(e)) = result {
+                    // Classic: the one twin. Extended: the named peer's link
+                    // (SIPp `sendCmdMessage` → `get_peer_socket(peer_dest)`).
+                    let result = match (&self.twin, dest) {
+                        (Some(TwinLink::Classic(ch)), _) => ch.send(&rendered),
+                        (Some(TwinLink::Extended { links, .. }), Some(peer)) => {
+                            links.send_to(peer, &rendered)
+                        }
+                        (Some(TwinLink::Extended { .. }), None) => Err(std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            "sendCmd without dest= in extended 3PCC mode",
+                        )),
+                        (None, _) => Err(std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            "no -3pcc twin socket",
+                        )),
+                    };
+                    if let Err(e) = result {
                         self.fail_call(call_id, &format!("3PCC <sendCmd> failed: {e}"));
                         return;
                     }
@@ -2999,22 +3247,37 @@ impl<'s> Engine<'s> {
                         call.index = jump;
                     }
                 }
-                Step::RecvCmd {
-                    actions, common, ..
-                } => {
-                    // Consume a queued command immediately, else block until one
-                    // arrives (Event::TwinCmd wakes the call).
-                    if let Some(cmd) = self.pending_cmds.pop_front() {
-                        if self.deliver_recv_cmd(call_id, index, actions, common, &cmd) {
-                            return;
-                        }
-                        // index advanced in place; the loop runs the next step.
+                Step::RecvCmd { optional, .. } => {
+                    // Block until a command naming this call arrives. An
+                    // optional recvCmd is transparent to SIP (SIPp's
+                    // `process_incoming` skips optional steps): the recv
+                    // window behind it stays open, so a message for the
+                    // next recv passes over it.
+                    let mandatory = if *optional {
+                        self.window_mandatory(call_id, index)
                     } else {
-                        if let Some(call) = self.calls.get_mut(call_id) {
-                            call.awaiting_cmd = true;
-                        }
+                        None
+                    };
+                    let Some(call) = self.calls.get_mut(call_id) else {
                         return;
+                    };
+                    call.awaiting_cmd = true;
+                    if *optional {
+                        call.waiting = true;
+                        if let Some((_, Some(ms))) = mandatory {
+                            call.generation += 1;
+                            let timer = self.timers.arm(
+                                Duration::from_millis(ms),
+                                Event::CallTimer {
+                                    call_id: call_id.to_owned(),
+                                    generation: call.generation,
+                                    kind: TimerKind::RecvTimeout,
+                                },
+                            );
+                            call.timer = Some((timer, TimerKind::RecvTimeout));
+                        }
                     }
+                    return;
                 }
                 Step::Label { .. } => {
                     if let Some(call) = self.calls.get_mut(call_id) {
@@ -3076,6 +3339,7 @@ impl<'s> Engine<'s> {
         while let Some(step) = scenario.steps.get(i) {
             match step {
                 Step::Recv(r) if r.optional => i += 1,
+                Step::RecvCmd { optional: true, .. } => i += 1,
                 Step::Recv(r) => {
                     // `-recv_timeout`: the default for a recv without its own.
                     let default_ms = self
@@ -3350,6 +3614,7 @@ impl<'s> Engine<'s> {
                         self.log_err(&format!(
                             "Aborting call on unexpected message for Call-Id '{call_id}': {what}"
                         ));
+                        self.send_twin_abort(&call_id);
                         self.send_abort_messages(&call_id);
                         self.remove_call(&call_id);
                     }
@@ -3495,6 +3760,7 @@ impl<'s> Engine<'s> {
         }
         call.last_recv = Some(msg.clone());
         call.waiting = false;
+        call.awaiting_cmd = false;
         call.index = si + 1;
         // Capture a digest challenge when this recv has auth="true".
         let auth = matches!(&scenario.steps[si], Step::Recv(r) if r.auth);
@@ -4330,34 +4596,175 @@ impl<'s> Engine<'s> {
         false
     }
 
-    /// A twin command arrived: hand it to a call blocked on `<recvCmd>`, or
-    /// queue it until one is.
-    fn on_twin_cmd(&mut self, cmd: String) {
-        let waiting = self
-            .calls
-            .iter()
-            .find(|(_, c)| c.awaiting_cmd)
-            .map(|(id, _)| id.clone());
-        let Some(call_id) = waiting else {
-            self.pending_cmds.push_back(cmd);
+    fn on_twin_event(&mut self, event: TwinEvent) {
+        match event {
+            TwinEvent::Command(cmd) => self.on_twin_cmd(cmd),
+            TwinEvent::Connected => self.on_twin_connected(),
+            TwinEvent::Closed => self.on_twin_closed(),
+        }
+    }
+
+    /// A peer reached our twin socket. A slave dials its own `dest=` peers
+    /// only now (SIPp `pollset_process`: `connect_to_all_peers` on the
+    /// first accepted local socket), so the master can be launched last.
+    fn on_twin_connected(&mut self) {
+        let Some(TwinLink::Extended { links, dests }) = &mut self.twin else {
             return;
         };
-        let index = self.calls.get(&call_id).map_or(0, |c| c.index);
-        let (actions, common) = match self.scenario_of(&call_id).steps.get(index) {
+        if links.is_connected() {
+            return;
+        }
+        if let Err(e) = links.connect_all(dests) {
+            eprintln!("sipr: error: {e}");
+            self.log_err(&e.to_string());
+            self.fail_all("twin peer unreachable");
+            self.hard_stop = true;
+        }
+    }
+
+    /// A twin connection ended. SIPp treats this as the run being over:
+    /// "One of the twin instances has ended -> exiting" (extended), "3PCC
+    /// controller A has ended -> exiting" (controller B); controller A just
+    /// stops creating calls. sipr drains the calls in flight.
+    fn on_twin_closed(&mut self) {
+        if self.twin_ended {
+            return;
+        }
+        self.twin_ended = true;
+        let line = match (&self.twin, twin_role(self.scenario)) {
+            (Some(TwinLink::Extended { .. }), _) => {
+                "One of the twin instances has ended -> exiting"
+            }
+            (Some(TwinLink::Classic(_)), Some(TwinRole::Listen)) => {
+                "3PCC controller A has ended -> exiting"
+            }
+            _ => "3PCC twin has ended -> no more calls",
+        };
+        eprintln!("sipr: warning: {line}");
+        self.log_err(line);
+        self.soft_stopping = true;
+    }
+
+    /// A twin command arrived. SIPp routes it like a SIP message: by the
+    /// Call-ID it carries, opening the call when this side's calls are
+    /// command-driven (controller B, slaves) and discarding it otherwise.
+    fn on_twin_cmd(&mut self, cmd: String) {
+        let Some(call_id) = command_call_id(&cmd, self.config.callid_slash_ign) else {
+            self.stats.out_of_call_msgs += 1;
+            self.log_err("twin command without Call-ID discarded");
+            return;
+        };
+        if !self.calls.contains_key(&call_id) {
+            if !self.twin_creates_calls {
+                self.stats.out_of_call_msgs += 1;
+                self.log_err(&format!(
+                    "Discarding message which can't be mapped to a known SIPp call:\n{cmd}"
+                ));
+                return;
+            }
+            if self.done_creating() {
+                self.stats.out_of_call_msgs += 1;
+                self.log_err("Discarded message for new calls while quitting");
+                return;
+            }
+            self.start_commanded_call(&call_id);
+        }
+        if is_abort_command(&cmd) {
+            // SIPp `checkInternalCmd`: the other controller dropped its half.
+            self.fail_call(&call_id, "aborted by the twin (internal-cmd: abort_call)");
+            return;
+        }
+        self.process_twin_cmd(&call_id, &cmd);
+    }
+
+    /// SIPp `process_twinSippCom`: from the call's current step, skip
+    /// optional steps and nops; the first `recvCmd` takes the command (in
+    /// extended mode only if its `src=` is the command's `From:`), while a
+    /// mandatory step of another kind means the command was unexpected and
+    /// the call is rejected.
+    fn process_twin_cmd(&mut self, call_id: &str, cmd: &str) {
+        let index = self.calls.get(call_id).map_or(0, |c| c.index);
+        let scenario = self.scenario_of(call_id);
+        let mut found = None;
+        let mut why = "no such message found";
+        for (i, step) in scenario.steps.iter().enumerate().skip(index) {
+            match step {
+                Step::RecvCmd { src, .. } => {
+                    found = Some((i, src.as_deref()));
+                    break;
+                }
+                Step::Nop { .. } | Step::Label { .. } => {}
+                Step::Recv(r) if r.optional => {}
+                _ => {
+                    why = "I was expecting a different type of message";
+                    break;
+                }
+            }
+        }
+        let Some((si, src)) = found else {
+            self.log_err(&format!(
+                "Unexpected control message received ({why}):\n{cmd}"
+            ));
+            self.reject_call(call_id);
+            return;
+        };
+        if matches!(self.twin, Some(TwinLink::Extended { .. }))
+            && let Some(src) = src
+            && command_from(cmd) != Some(src)
+        {
+            self.log_err(&format!(
+                "Unexpected sender for the received peer message\n{cmd}"
+            ));
+            self.reject_call(call_id);
+            return;
+        }
+        // Leaving the wait (and any recv window an optional recvCmd kept
+        // open).
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.awaiting_cmd = false;
+            call.waiting = false;
+            if let Some((t, _)) = call.timer.take() {
+                self.timers.cancel(t);
+            }
+            call.generation += 1;
+        }
+        let (actions, common) = match scenario.steps.get(si) {
             Some(Step::RecvCmd {
                 actions, common, ..
             }) => (actions, common),
-            _ => {
-                // The blocked call is not on a recvCmd anymore; re-queue.
-                self.pending_cmds.push_back(cmd);
-                return;
-            }
+            _ => return,
         };
-        if let Some(call) = self.calls.get_mut(&call_id) {
-            call.awaiting_cmd = false;
+        // SIPp strips the trailing CRLFs the transport added before the
+        // actions see the command.
+        let text = cmd.trim_end_matches("\r\n");
+        if !self.deliver_recv_cmd(call_id, si, actions, common, text) {
+            self.advance(call_id);
         }
-        if !self.deliver_recv_cmd(&call_id, index, actions, common, &cmd) {
-            self.advance(&call_id);
+    }
+
+    /// SIPp `rejectCall`: the call fails as unexpected, without the abort
+    /// messages an `abortCall` would send.
+    fn reject_call(&mut self, call_id: &str) {
+        let secondary = self.on_secondary(call_id);
+        self.stats_of(secondary).failed_unexpected += 1;
+        self.remove_call(call_id);
+    }
+
+    /// SIPp's `3pcc_abort` command: when a call past its first step is
+    /// aborted on an unexpected message while a classic twin is attached,
+    /// the other controller is told to drop its half (`internal-cmd:
+    /// abort_call`). Extended mode has no single twin socket, so SIPp sends
+    /// nothing there.
+    fn send_twin_abort(&mut self, call_id: &str) {
+        let Some(TwinLink::Classic(ch)) = &self.twin else {
+            return;
+        };
+        if self.calls.get(call_id).is_none_or(|c| c.index == 0) {
+            return;
+        }
+        let cmd = format!("call-id: {call_id}\ninternal-cmd: abort_call\n\n");
+        if let Err(e) = ch.send(&cmd) {
+            self.log_err(&format!("sendCmdBuffer returned an error: {e}"));
         }
     }
 
@@ -4399,6 +4806,7 @@ impl<'s> Engine<'s> {
         call.generation += 1;
         call.pause_deadline = None;
         call.waiting = false;
+        call.awaiting_cmd = false;
         call.index = target;
         if let Some((timer, _)) = pending {
             self.timers.cancel(timer);
@@ -5222,6 +5630,7 @@ impl<'s> Engine<'s> {
             let ok = self.default_msgs.ok.clone();
             self.send_default_message(call_id, index, &ok);
         }
+        self.send_twin_abort(call_id);
         self.stats_of(secondary).failed_unexpected += 1;
         self.remove_call(call_id);
     }
@@ -5674,7 +6083,7 @@ fn scan_for_match_guarded(
         let mut i = window_start;
         while let Some(step) = scenario.steps.get(i) {
             match step {
-                Step::Label { .. } => {
+                Step::Label { .. } | Step::RecvCmd { optional: true, .. } => {
                     i += 1;
                 }
                 Step::Recv(r) => {
@@ -6637,6 +7046,37 @@ mod tests {
         assert_eq!(trim_call_id("twin///real@h", true), "twin///real@h");
         assert_eq!(trim_call_id("plain@h", false), "plain@h");
         assert_eq!(trim_call_id("a///b///c", false), "b///c");
+    }
+
+    #[test]
+    fn twin_commands_name_their_call_sender_and_abort() {
+        // Call-ID in either spelling, case folded, `///` trimmed like SIPp.
+        assert_eq!(
+            command_call_id("Call-ID: abc@h\r\nFrom: m\r\n", false).as_deref(),
+            Some("abc@h")
+        );
+        assert_eq!(
+            command_call_id("call-id: twin///abc@h\ninternal-cmd: abort_call\n\n", false)
+                .as_deref(),
+            Some("abc@h")
+        );
+        assert_eq!(
+            command_call_id("i: abc@h", true).as_deref(),
+            Some("abc@h"),
+            "compact form"
+        );
+        assert_eq!(command_call_id("From: m\nContent-Type: x", false), None);
+        assert_eq!(command_call_id("Call-ID:   \n", false), None);
+        // The sender is the first token of the From: line (check_peer_src).
+        assert_eq!(command_from("Call-ID: c\nFrom: s1 extra\n"), Some("s1"));
+        assert_eq!(command_from("Call-ID: c\nfrom:\tm\r\n"), Some("m"));
+        assert_eq!(command_from("Call-ID: c\n"), None);
+        // SIPp's 3pcc_abort default message.
+        assert!(is_abort_command("call-id: c\ninternal-cmd: abort_call\n\n"));
+        assert!(!is_abort_command("call-id: c\ninternal-cmd: hangup\n"));
+        assert!(!is_abort_command(
+            "call-id: c\nContent-Type: application/sdp\n"
+        ));
     }
 
     #[test]

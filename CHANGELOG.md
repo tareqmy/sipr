@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Extended 3PCC (M43): `-master NAME`/`-slave NAME` with `-slave_cfg FILE`
+  (`name;host:port` lines), `sendCmd dest=` routed to the named peer and
+  `recvCmd src=` checked against the command's `From:` line, on SIPp's
+  wiring (every instance listens on its table address; the master dials
+  its `dest=` peers at start-up, a slave dials back on first contact).
+  Twin commands are now routed by their Call-ID like SIP messages, and
+  the 3PCC server sides (classic controller B, every slave) open their
+  calls on the commands that name them; an optional `recvCmd` lets a SIP
+  message for the recv behind it pass; a closed twin connection drains
+  the run with SIPp's warning; `internal-cmd: abort_call` is honored, and
+  a classic controller sends it when it aborts a call on an unexpected
+  message.
 - A documentation site at https://tareqmy.github.io/sipr/, built with
   mdBook from `docs/` and deployed from `master` by the new Docs workflow.
 - Timer and behavior knobs at parity (M42): `-max_invite_retrans`,
@@ -53,6 +65,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- A 3PCC twin command must carry the call's `Call-ID:` (SIPp routes by
+  it); sipr used to hand a command to whichever call was waiting. Classic
+  controller B no longer paces its calls with `-r`: as in SIPp they open
+  when controller A's command arrives.
 - Non-INVITE messages retransmit up to 9 times by default (SIPp's
   `-max_non_invite_retrans`), not 5; an aborted client call now sends
   SIPp's BYE/CANCEL/ACK unless `-nd` or `-default_behaviors …,-bye`; a

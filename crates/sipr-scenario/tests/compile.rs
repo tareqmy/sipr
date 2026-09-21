@@ -164,12 +164,41 @@ fn threepcc_send_and_recv_cmd_compile() {
 }
 
 #[test]
-fn extended_3pcc_attrs_are_rejected() {
-    let xml = wrap(r#"<recvCmd src="s1"/>"#);
+fn extended_3pcc_attrs_compile_to_peer_names() {
+    let xml = wrap(&format!(
+        r#"<recvCmd src="m">
+             <action><ereg regexp="Content-Type:.*" search_in="msg" assign_to="1"/></action>
+           </recvCmd>
+           {invite}
+           <recv response="200"/>
+           <sendCmd dest="m"><![CDATA[
+             Call-ID: [call_id]
+             From: s1
+             [$1]
+           ]]></sendCmd>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    assert!(matches!(&sc.steps[0], Step::RecvCmd { src: Some(s), .. } if s == "m"));
+    assert!(matches!(&sc.steps[3], Step::SendCmd { dest: Some(d), .. } if d == "m"));
+    // The classic form carries no names.
+    let classic = wrap(&format!(
+        r#"{invite}<recv response="200"/><sendCmd><![CDATA[Call-ID: [call_id]]]></sendCmd><recvCmd/>"#,
+        invite = send_invite()
+    ));
+    let sc = compile("test", &classic).scenario.expect("compiles");
+    assert!(matches!(&sc.steps[2], Step::SendCmd { dest: None, .. }));
+    assert!(matches!(&sc.steps[3], Step::RecvCmd { src: None, .. }));
+    // An empty name is an error, not a silent fallback to the classic twin.
+    let empty = wrap(r#"<recvCmd src=""/><recv response="200"/>"#);
     assert!(
-        errors(&xml).iter().any(|e| e.contains("extended 3PCC")),
+        errors(&empty)
+            .iter()
+            .any(|e| e.contains("must name a peer")),
         "{:?}",
-        errors(&xml)
+        errors(&empty)
     );
 }
 

@@ -1752,13 +1752,13 @@ close the §6 note as no divergence).
       question closed (SIPp replies to the source address too); the `-nd`
       sentence; CHANGELOG.
 
-### M43 — Extended 3PCC: `-master`/`-slave`/`-slave_cfg`, `sendCmd dest=`, `recvCmd src=`
+### M43 — Extended 3PCC: `-master`/`-slave`/`-slave_cfg`, `sendCmd dest=`, `recvCmd src=` ✅
 
 The last "Not yet" README item with a real user base (IMS and
-conference testing). `sendCmd dest=` and `recvCmd src=` are compile
+conference testing). `sendCmd dest=` and `recvCmd src=` were compile
 errors ("extended 3PCC is not supported yet — classic -3pcc only");
-`-master`, `-slave`, `-slave_cfg` are unknown options; optional
-`recvCmd` fall-through and twin reconnection are listed as unsupported
+`-master`, `-slave`, `-slave_cfg` were unknown options; optional
+`recvCmd` fall-through and twin reconnection were listed as unsupported
 in SIPP_COMPAT §6 M10.
 
 Behavioral oracle: `sipp.cpp` the twin-socket setup for extended mode
@@ -1770,18 +1770,31 @@ reconnection on a dropped twin), `call.cpp` `E_AT_SEND_CMD` with `dest`
 (routing by name) and `recvCmd src` (accept only from that peer;
 `optional`? — the fall-through rule), `docs/3pcc.rst` "Extended 3PCC".
 
-- [ ] Scenario: `dest=`/`src=` attributes compile to peer names; the
+- [x] Scenario: `dest=`/`src=` attributes compile to peer names; the
       classic form stays the default.
-- [ ] Net/engine: named peer connections from `-slave_cfg`, master
+- [x] Net/engine: named peer connections from `-slave_cfg`, master
       accept loop, slave dial with reconnection, commands routed by
       name; `recvCmd src=` matched by origin; fall-through for optional
       `recvCmd`.
-- [ ] Tests: unit tests for the cfg parser and routing; e2e with three
+- [x] Tests: unit tests for the cfg parser and routing; e2e with three
       sipr processes (master + two slaves); interop: sipr master with
       sipp slaves and the reverse, on SIPp's documented extended 3PCC
       example scenarios.
-- [ ] Docs: SIPP_COMPAT §1 and §6 M10 note; README "Not yet" loses
+- [x] Docs: SIPP_COMPAT §1 and §6 M10 note; README "Not yet" loses
       extended 3PCC.
+
+Findings (from the C++; the full note is SIPP_COMPAT §6 M43): SIPp has
+no twin reconnection at all — a closed control connection ends the run
+with a warning, in classic mode too — so "slave dial with reconnection"
+became "slave dials back on first contact, and a closed twin drains the
+run". `src=` is matched against the command's own `From:` line, not the
+socket; commands are routed by their Call-ID like SIP messages, and the
+3PCC server sides (controller B, slaves) open calls on the commands that
+name them. Both of those replaced sipr's earlier "hand it to whichever
+call is waiting" routing, so classic peers must now echo the Call-ID.
+Extended mode never sends `3pcc_abort`; classic mode does on an
+unexpected-message abort, and both sides now honor `internal-cmd:
+abort_call`. `-trace_msg` still does not log twin commands.
 
 ### M44 — Leftovers that still reject loudly
 

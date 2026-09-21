@@ -266,6 +266,12 @@ pub struct Cli {
     pub rfc3339: bool,
     /// `-3pcc HOST:PORT`: classic 3PCC twin control socket.
     pub three_pcc: Option<String>,
+    /// `-master NAME`: extended 3PCC, this instance is the master `NAME`.
+    pub master: Option<String>,
+    /// `-slave NAME`: extended 3PCC, this instance is the slave `NAME`.
+    pub slave: Option<String>,
+    /// `-slave_cfg FILE`: extended 3PCC peer table (`name;host:port` lines).
+    pub slave_cfg: Option<PathBuf>,
     /// `-users N`: closed-loop mode with N constant concurrent users.
     pub users: Option<usize>,
     /// `-tls_cert`: TLS certificate file (SIPp default: `cacert.pem`).
@@ -392,6 +398,9 @@ impl Default for Cli {
             dynamic_step: None,
             rfc3339: false,
             three_pcc: None,
+            master: None,
+            slave: None,
+            slave_cfg: None,
             users: None,
             tls_cert: PathBuf::from("cacert.pem"),
             tls_key: PathBuf::from("cakey.pem"),
@@ -1038,6 +1047,24 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "3PCC twin control socket (sendCmd/recvCmd)",
     ),
     (
+        "master",
+        true,
+        "NAME",
+        "3pcc extended mode: this instance is the master named NAME",
+    ),
+    (
+        "slave",
+        true,
+        "NAME",
+        "3pcc extended mode: this instance is the slave named NAME",
+    ),
+    (
+        "slave_cfg",
+        true,
+        "FILE",
+        "3pcc extended mode: the file of master and slave addresses (name;host:port)",
+    ),
+    (
         "users",
         true,
         "N",
@@ -1334,6 +1361,9 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "max_retrans" => cli.max_retrans = Some(parse_num(flag, &val(value))?),
         "inf" => cli.inf.push(std::path::PathBuf::from(val(value))),
         "3pcc" => cli.three_pcc = Some(val(value)),
+        "master" => cli.master = Some(val(value)),
+        "slave" => cli.slave = Some(val(value)),
+        "slave_cfg" => cli.slave_cfg = Some(std::path::PathBuf::from(val(value))),
         "users" => cli.users = Some(parse_num(flag, &val(value))?),
         "rsa" => cli.remote_sending = Some(val(value)),
         "ip_field" => cli.ip_field = parse_num(flag, &val(value))?,

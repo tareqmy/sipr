@@ -35,4 +35,4 @@ pub use tcp::{TcpCallConn, TcpFramer, TcpTransport};
 pub use timer::{TimerQueue, TimerService};
 pub use tls::{TlsCallConn, TlsConfig, TlsTransport, TlsVersion};
 pub use transport::{InboundPacket, NetEvent, TransportConfig, UdpCallSocket, UdpTransport};
-pub use twin::{EscFramer, TwinChannel};
+pub use twin::{EscFramer, PeerLinks, PeerTable, TwinChannel, TwinEvent};

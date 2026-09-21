@@ -49,7 +49,7 @@ Manual transactions (`start_txn`/`ack_txn`/`response_txn`) shipped in
 M36, `exec command=` and `setdest` in M37, statistical pauses and `sample`
 in M38 — the tier is complete. `index` as a standalone action stays out — sipr builds the index from `-infindex` at load,
 not from a scenario action. Extended 3PCC (`-master`/`-slave`/`-slave_cfg` with
-`dest=`/`src=` peer routing) also stays out; classic `-3pcc` is supported.
+`dest=`/`src=` peer routing) shipped in M43; classic `-3pcc` in M10 (both in §6).
 
 `-inf` injection + `[fieldN]` and `lookup`/`insert`/`replace` shipped in M7,
 classic 3PCC (`sendCmd`/`recvCmd`) in M10 (see §6).
@@ -403,8 +403,71 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   with `ereg` searching the raw command text (SIPp strips a trailing CRLF and
   matches against the blob). Commands are opaque text used to pass SDP/tags
   between the two controllers, e.g. `<sendCmd>` a captured offer then
-  `<recvCmd>` the answer. Not supported: extended master/slave 3PCC, optional
-  `recvCmd` fall-through, and twin reconnection.
+  `<recvCmd>` the answer. Extended master/slave 3PCC, the optional-`recvCmd`
+  fall-through, command routing by Call-ID and the twin-closed rule came in
+  M43 (next note); SIPp has no twin reconnection to mirror.
+- Extended 3PCC `-master NAME`/`-slave NAME`/`-slave_cfg FILE` with
+  `sendCmd dest=` and `recvCmd src=` (M43, verified in `sipp.cpp`
+  `SIPP_OPTION_3PCC_EXTENDED`/`SIPP_OPTION_SLAVE_CFG`, `scenario.cpp`
+  `parse_slave_cfg`/`computeSippMode`/the `sendCmd`/`recvCmd` parse,
+  `socket.cpp` `open_connections`/`connect_to_all_peers`/`pollset_process`/
+  `read_error`/`process_message`, `call.cpp` `sendCmdMessage`/
+  `process_twinSippCom`/`check_peer_src`/`checkInternalCmd`,
+  `docs/3PCC_extended.rst`):
+  - The table is one `name;host:port` per line — the first two `;`-fields,
+    anything after them ignored, a line without `;` skipped (sipr warns).
+    `-slave_cfg` needs `-master` or `-slave`, which exclude each other and
+    `-3pcc`; the own name and every `dest=` must be in the table
+    ("get_peer_addr: Peer X not found"). The scenario's role must match the
+    flag ("Inconsistency between command line and scenario: master scenario
+    but -master option not set" / "slave scenario but -slave option not
+    set"): a master scenario reaches `sendCmd` before any `recvCmd`, a slave
+    the other way round. In extended mode every `sendCmd` needs `dest=` and
+    every `recvCmd` `src=` ("You must specify a 'dest' for sendCmd with
+    extended 3pcc mode!").
+  - Wiring: each instance listens on its own table address. The master
+    dials every `dest=` peer at start-up — so it is launched last — while a
+    slave dials its own `dest=` peers only when the first peer connects to
+    it (`connect_to_all_peers` from the accept path); a slave that never
+    `sendCmd`s dials nobody. A pair is joined by two one-way TCP
+    connections and a command leaves on the sender's dialed link to that
+    peer. There is no reconnection: any control connection closing ends
+    the run — WARNING "One of the twin instances has ended -> exiting", the
+    calls in flight drain (`quitting += 20`). Classic controller B does the
+    same ("3PCC controller A has ended -> exiting"); controller A only stops
+    creating calls.
+  - Routing: a twin command is keyed by its own `Call-ID:` line exactly like
+    a SIP message (`get_trimmed_call_id`, `///` marker included; a command
+    without one is discarded). An unknown Call-ID opens a new outgoing call
+    with that id on the 3PCC "server" sides — controller B and every slave,
+    whose first send/recv/sendCmd/recvCmd is a `recvCmd` (`computeSippMode`
+    → `MODE_SERVER` creation) — so `[call_id]` on a slave is the master's
+    and the pacer plays no part there (`-m` still caps them); a master or
+    controller A discards it ("Discarding message which can't be mapped to
+    a known SIPp call"). `src=` is checked against the first token of the
+    command's own `From:` line, never against the socket it came in on: the
+    sender writes its name into the command (`From: m`, as the SIPp docs
+    show). A mismatch is WARNING "Unexpected sender for the received peer
+    message" and the call is rejected.
+  - Matching (`process_twinSippCom`): from the current step forward,
+    optional steps and nops are skipped and the first `recvCmd` takes the
+    command (trailing CRLFs stripped before its actions run); a mandatory
+    step of any other kind is "Unexpected control message received" and the
+    call is rejected (`rejectCall`: a failed call, no abort messages). The
+    same skip rule in `process_incoming` is the optional-`recvCmd`
+    fall-through: a SIP message for the recv behind an optional `recvCmd`
+    passes over it, so sipr keeps that recv window open while it waits.
+    `internal-cmd: abort_call` (SIPp's `3pcc_abort` default message,
+    `call-id: [call_id]`) fails the named call; a controller sends it to its
+    twin when it aborts a call past its first step on an unexpected message
+    or BYE/CANCEL — classic mode only, extended mode has no single twin
+    socket and sends nothing.
+  - sipr before M43 handed a twin command to whichever call was blocked on
+    `recvCmd` and queued early ones, so a peer's reply did not need the
+    Call-ID; it must carry it now, as with SIPp. Controller B used to pace
+    its calls with `-r`; they now open on the commands that name them.
+    Still open: `-trace_msg` does not log twin commands (SIPp logs them
+    tagged "control").
 - `-users N` closed loop (M11, verified in `call_generation_task.cpp`
   `run`/`free_user`/`set_users`, `call.cpp` `init` line assignment and
   `[userid]`/`[users]` keywords, `sipp.cpp` `SIPP_OPTION_USERS`): instead of

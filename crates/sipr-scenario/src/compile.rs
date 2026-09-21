@@ -711,14 +711,11 @@ impl Compiler {
 
     /// `<sendCmd>` — a 3PCC control command whose CDATA is the message body
     /// (SIPp appends an ESC delimiter on the wire; the engine does that).
+    /// `dest=` names the peer in extended mode; whether it is required or
+    /// even known is the engine's call, since that depends on the command
+    /// line (`-slave_cfg`).
     fn compile_send_cmd(&mut self, el: &Element) {
-        // `dest=` (extended 3pcc peer routing) is not supported.
-        if el.attr("dest").is_some() {
-            self.diags.error(
-                Some(el.line),
-                "sendCmd 'dest' (extended 3PCC) is not supported yet — classic -3pcc only",
-            );
-        }
+        let dest = self.peer_name_attr(el, "dest");
         let common = self.parse_common(el, &["dest"]);
         let mut body = String::new();
         let mut cdata_line = el.line;
@@ -747,18 +744,32 @@ impl Compiler {
                 .error(Some(el.line), "<sendCmd> has no command body (CDATA)");
         }
         let template = self.templ(&normalized, cdata_line);
-        self.steps.push(Step::SendCmd { template, common });
+        self.steps.push(Step::SendCmd {
+            template,
+            common,
+            dest,
+        });
+    }
+
+    /// `dest=` / `src=`: a peer name for extended 3PCC. Present but empty
+    /// names nothing and is an error rather than a silent classic fallback.
+    fn peer_name_attr(&mut self, el: &Element, attr: &str) -> Option<String> {
+        let value = el.attr(attr)?.trim();
+        if value.is_empty() {
+            self.diags.error(
+                Some(el.line),
+                format!("<{}> '{attr}' must name a peer from -slave_cfg", el.name),
+            );
+            return None;
+        }
+        Some(value.to_owned())
     }
 
     /// `<recvCmd>` — wait for a twin command; its `<action>`s run against the
-    /// received command text.
+    /// received command text. `src=` names the peer the command must come
+    /// from in extended mode.
     fn compile_recv_cmd(&mut self, el: &Element) {
-        if el.attr("src").is_some() {
-            self.diags.error(
-                Some(el.line),
-                "recvCmd 'src' (extended 3PCC) is not supported yet — classic -3pcc only",
-            );
-        }
+        let src = self.peer_name_attr(el, "src");
         let common = self.parse_common(el, &["optional", "src"]);
         let optional = self.parse_bool_attr(el, "optional");
         let mut actions = Vec::new();
@@ -776,6 +787,7 @@ impl Compiler {
             actions,
             common,
             optional,
+            src,
         });
     }
 

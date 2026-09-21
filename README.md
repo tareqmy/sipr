@@ -101,8 +101,9 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   `[fieldN]` pulls a field, with `file=NAME` and `line=[$var]` selectors.
 - Indexed injection: `-infindex FILE FIELD` plus `<lookup>`/`<insert>`/
   `<replace>` actions for keyed, mutable CSV data.
-- Classic 3PCC (`-3pcc HOST:PORT`) with `<sendCmd>`/`<recvCmd>` over an
-  ESC-framed twin socket.
+- 3PCC: classic (`-3pcc HOST:PORT`) with `<sendCmd>`/`<recvCmd>` over an
+  ESC-framed twin socket, and extended master/slave mode
+  (`-master`/`-slave` + `-slave_cfg`, `sendCmd dest=`, `recvCmd src=`).
 - Closed-loop `-users N` mode with `[userid]`/`[users]` and per-user USER-mode
   injection (line = user id − 1); `<User variables>` persist per user id
   across its calls and `<Global variables>` across the run (seed one with
@@ -175,8 +176,6 @@ Parts of SIPp that sipr does not implement, and where that is deliberate:
 
 - The standalone `<index>` action (sipr builds injection indexes from
   `-infindex` at load time).
-- Extended 3PCC (`-master`/`-slave`/`-slave_cfg`, `sendCmd dest=`,
-  `recvCmd src=`); classic `-3pcc` is supported.
 - `PRINTF=` virtual-line injection files.
 - `<rtp_echo variable=…>` (only `value="0|1"`).
 - WebSocket transport (`-t ws`).

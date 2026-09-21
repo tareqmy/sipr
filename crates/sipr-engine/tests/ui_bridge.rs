@@ -74,6 +74,7 @@ fn uas_config() -> EngineConfig {
         reconnect_close: true,
         reconnect_sleep: std::time::Duration::from_millis(1000),
         twin_addr: None,
+        extended_3pcc: None,
         users: None,
         tls: None,
         media_ip: None,

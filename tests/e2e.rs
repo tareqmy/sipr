@@ -1474,8 +1474,15 @@ fn threepcc_controller_a_round_trips_a_command() {
             framer.push(&buf[..n]);
             if let Some(cmd) = framer.next_command() {
                 // A's command carries "X-Offer: hello"; reply with the answer.
+                // The reply must name the call: SIPp (and sipr) route twin
+                // commands by their Call-ID, like any SIP message.
                 assert!(cmd.contains("X-Offer: hello"), "got twin cmd: {cmd:?}");
-                let reply = "Call-ID: c\r\nX-Answer: WORLD";
+                let call_id = cmd
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Call-ID:"))
+                    .map(str::trim)
+                    .expect("command names its call");
+                let reply = format!("Call-ID: {call_id}\r\nX-Answer: WORLD");
                 stream.write_all(reply.as_bytes()).expect("twin reply");
                 stream.write_all(&[0x1b]).expect("twin esc");
                 stream.flush().ok();
@@ -7610,4 +7617,377 @@ fn timeout_retrans_and_loss_knobs() {
     assert!(err.contains("successful 0 failed 1"), "{err}");
     let stats = uas.join().expect("uas");
     assert_eq!(stats.invites, 0, "nothing reached the UAS");
+}
+
+/// Extended 3PCC (SIPp `-master`/`-slave`/`-slave_cfg`): one sipr master
+/// drives two sipr slaves over named twin links. Each instance places its
+/// own leg against the scripted UAS; the master hands each slave the token
+/// from its 200 (`sendCmd dest=`), each slave places a leg carrying it,
+/// reports the token it got back (`sendCmd dest="m"`, `From: sN`), and the
+/// master stamps both answers into its ACK. Proving `X-Answer1: m+s1` and
+/// `X-Answer2: m+s2` reach the master's ACK exercises the whole mesh:
+/// routing by peer name, `src=` checked against the sender, calls opened
+/// on the slaves by the master's command (same Call-ID on all three legs).
+#[test]
+fn extended_3pcc_master_drives_two_slaves() {
+    // The scripted UAS: 200 with `X-Token: <From user>` or
+    // `<X-Offer>+<From user>`; the master's ACK answers are recorded.
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uas");
+    let uas_addr = sock.local_addr().expect("uas addr");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut answers: Option<(String, String)> = None;
+        let mut byes = 0;
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            let user = msg
+                .header("From")
+                .and_then(|f| {
+                    f.split("sip:")
+                        .nth(1)
+                        .map(|u| u.split('@').next().unwrap_or("").to_owned())
+                })
+                .unwrap_or_default();
+            match msg.method() {
+                Some("INVITE") => {
+                    let token = match msg.header("X-Offer") {
+                        Some(offer) => format!("{offer}+{user}"),
+                        None => user.clone(),
+                    };
+                    let mut ok = String::from("SIP/2.0 200 OK\r\n");
+                    for h in msg.header_lines("Via") {
+                        ok.push_str(h);
+                        ok.push_str("\r\n");
+                    }
+                    for h in msg.header_lines("From") {
+                        ok.push_str(h);
+                        ok.push_str("\r\n");
+                    }
+                    let to = msg.header("To").unwrap_or_default();
+                    ok.push_str(&format!("To: {to};tag=uas{user}\r\n"));
+                    ok.push_str(&format!(
+                        "Call-ID: {}\r\n",
+                        msg.call_id().unwrap_or_default()
+                    ));
+                    ok.push_str(&format!(
+                        "CSeq: {}\r\n",
+                        msg.header("CSeq").unwrap_or_default()
+                    ));
+                    ok.push_str(&format!("X-Token: {token}\r\nContent-Length: 0\r\n\r\n"));
+                    let _ = sock.send_to(ok.as_bytes(), from);
+                }
+                Some("ACK") if user == "m" => {
+                    answers = Some((
+                        msg.header("X-Answer1").unwrap_or_default().to_owned(),
+                        msg.header("X-Answer2").unwrap_or_default().to_owned(),
+                    ));
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                    byes += 1;
+                    if byes == 3 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (answers, byes)
+    });
+
+    let leg = |name: &str, extra_headers: &str| {
+        format!(
+            r#"  <send retrans="500"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:{name}@[local_ip]:[local_port]>;tag=[pid]{name}[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:{name}@[local_ip]:[local_port]>
+    Max-Forwards: 70
+{extra_headers}    Content-Length: 0
+
+  ]]></send>
+  <recv response="200">
+    <action><ereg regexp="X-Token: ([^\r\n]*)" search_in="msg" assign_to="1,2"/></action>
+  </recv>
+"#
+        )
+    };
+    let bye = |name: &str| {
+        format!(
+            r#"  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:{name}@[local_ip]:[local_port]>;tag=[pid]{name}[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+"#
+        )
+    };
+    let ack = |name: &str, extra_headers: &str| {
+        format!(
+            r#"  <send><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:{name}@[local_ip]:[local_port]>;tag=[pid]{name}[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+{extra_headers}    Content-Length: 0
+
+  ]]></send>
+"#
+        )
+    };
+    let master = format!(
+        r#"<scenario name="master">
+{leg}  <sendCmd dest="s1"><![CDATA[
+    Call-ID: [call_id]
+    From: m
+    X-Offer: [$2]
+  ]]></sendCmd>
+  <recvCmd src="s1">
+    <action><ereg regexp="X-Answer: ([^\r\n]*)" search_in="msg" assign_to="3,4"/></action>
+  </recvCmd>
+  <sendCmd dest="s2"><![CDATA[
+    Call-ID: [call_id]
+    From: m
+    X-Offer: [$2]
+  ]]></sendCmd>
+  <recvCmd src="s2">
+    <action><ereg regexp="X-Answer: ([^\r\n]*)" search_in="msg" assign_to="5,6"/></action>
+  </recvCmd>
+{ack}{bye}  <Reference variables="1,3,5"/>
+</scenario>"#,
+        leg = leg("m", ""),
+        ack = ack("m", "    X-Answer1: [$4]\n    X-Answer2: [$6]\n"),
+        bye = bye("m"),
+    );
+    let slave = |name: &str| {
+        format!(
+            r#"<scenario name="{name}">
+  <recvCmd src="m">
+    <action><ereg regexp="X-Offer: ([^\r\n]*)" search_in="msg" assign_to="3,4"/></action>
+  </recvCmd>
+{leg}{ack}  <sendCmd dest="m"><![CDATA[
+    Call-ID: [call_id]
+    From: {name}
+    X-Answer: [$2]
+  ]]></sendCmd>
+{bye}  <Reference variables="1,3"/>
+</scenario>"#,
+            leg = leg(name, "    X-Offer: [$4]\n"),
+            ack = ack(name, ""),
+            bye = bye(name),
+        )
+    };
+
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let cfg_path = dir.join(format!("sipr-3pcc-ext-{pid}.cfg"));
+    let master_path = dir.join(format!("sipr-3pcc-ext-master-{pid}.xml"));
+    let s1_path = dir.join(format!("sipr-3pcc-ext-s1-{pid}.xml"));
+    let s2_path = dir.join(format!("sipr-3pcc-ext-s2-{pid}.xml"));
+    let (pm, p1, p2) = (free_port(), free_port(), free_port());
+    std::fs::write(
+        &cfg_path,
+        format!("m;127.0.0.1:{pm}\ns1;127.0.0.1:{p1}\ns2;127.0.0.1:{p2}\n"),
+    )
+    .expect("write cfg");
+    std::fs::write(&master_path, &master).expect("write master");
+    std::fs::write(&s1_path, slave("s1")).expect("write s1");
+    std::fs::write(&s2_path, slave("s2")).expect("write s2");
+    let cfg = cfg_path.to_str().expect("utf8");
+    let target = uas_addr.to_string();
+    let slave_args = |path: &std::path::Path, name: &str| {
+        vec![
+            "-sf".to_owned(),
+            path.to_str().expect("utf8").to_owned(),
+            "-slave".to_owned(),
+            name.to_owned(),
+            "-slave_cfg".to_owned(),
+            cfg.to_owned(),
+            "-m".to_owned(),
+            "1".to_owned(),
+            "-timeout".to_owned(),
+            "20".to_owned(),
+            "-bg".to_owned(),
+            target.clone(),
+        ]
+    };
+    // Slaves first; the master is launched last (SIPp's rule: it dials them).
+    let a1 = slave_args(&s1_path, "s1");
+    let (mut s1, s1_err) = spawn_sipr_bg(&a1.iter().map(String::as_str).collect::<Vec<_>>());
+    let a2 = slave_args(&s2_path, "s2");
+    let (mut s2, s2_err) = spawn_sipr_bg(&a2.iter().map(String::as_str).collect::<Vec<_>>());
+    std::thread::sleep(Duration::from_millis(600));
+    let out = run_sipr(&[
+        "-sf",
+        master_path.to_str().expect("utf8"),
+        "-master",
+        "m",
+        "-slave_cfg",
+        cfg,
+        "-m",
+        "1",
+        "-timeout",
+        "20",
+        "-bg",
+        &target,
+    ]);
+    let master_err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let s1_code = wait_exit(&mut s1, Duration::from_secs(20));
+    let s2_code = wait_exit(&mut s2, Duration::from_secs(20));
+    let s1_err = s1_err.join().expect("s1 stderr");
+    let s2_err = s2_err.join().expect("s2 stderr");
+    for p in [&cfg_path, &master_path, &s1_path, &s2_path] {
+        let _ = std::fs::remove_file(p);
+    }
+    let (answers, byes) = uas.join().expect("uas thread");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "master:\n{master_err}\ns1:\n{s1_err}\ns2:\n{s2_err}"
+    );
+    assert!(
+        master_err.contains("successful 1 failed 0"),
+        "master:\n{master_err}"
+    );
+    assert_eq!(s1_code, Some(0), "s1:\n{s1_err}");
+    assert!(s1_err.contains("successful 1 failed 0"), "s1:\n{s1_err}");
+    assert_eq!(s2_code, Some(0), "s2:\n{s2_err}");
+    assert!(s2_err.contains("successful 1 failed 0"), "s2:\n{s2_err}");
+    assert_eq!(byes, 3, "every leg hung up");
+    assert_eq!(
+        answers,
+        Some(("m+s1".to_owned(), "m+s2".to_owned())),
+        "both slaves' answers must reach the master's ACK"
+    );
+}
+
+/// The extended-mode option checks are SIPp's, and a slave rejects a
+/// command from the wrong sender (`src=` against the command's `From:`).
+#[test]
+fn extended_3pcc_option_checks_and_wrong_sender() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let cfg_path = dir.join(format!("sipr-3pcc-chk-{pid}.cfg"));
+    let sc_path = dir.join(format!("sipr-3pcc-chk-{pid}.xml"));
+    let slave_port = free_port();
+    // The fake master listens so the slave's dial-back succeeds.
+    let master_listener = TcpListener::bind("127.0.0.1:0").expect("bind master");
+    let master_port = master_listener.local_addr().expect("addr").port();
+    std::fs::write(
+        &cfg_path,
+        format!("m;127.0.0.1:{master_port}\ns1;127.0.0.1:{slave_port}\n"),
+    )
+    .expect("write cfg");
+    let cfg = cfg_path.to_str().expect("utf8");
+    std::fs::write(
+        &sc_path,
+        r#"<scenario name="slave">
+  <recvCmd src="m"/>
+  <send><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:s1@[local_ip]:[local_port]>;tag=[pid]s1[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>"#,
+    )
+    .expect("write scenario");
+    let sc = sc_path.to_str().expect("utf8");
+    let stderr_of = |args: &[&str]| String::from_utf8_lossy(&run_sipr(args).stderr).into_owned();
+    // SIPp's wording for the option conflicts.
+    let err = stderr_of(&[
+        "-sf",
+        sc,
+        "-master",
+        "m",
+        "-slave",
+        "s1",
+        "-slave_cfg",
+        cfg,
+        "127.0.0.1:1",
+    ]);
+    assert!(
+        err.contains("-slave and -master options are not compatible"),
+        "{err}"
+    );
+    let err = stderr_of(&["-sf", sc, "-slave", "s1", "127.0.0.1:1"]);
+    assert!(
+        err.contains("-slave_cfg option must be used with -slave or -master option"),
+        "{err}"
+    );
+    let err = stderr_of(&[
+        "-sf",
+        sc,
+        "-3pcc",
+        "127.0.0.1:1",
+        "-slave_cfg",
+        cfg,
+        "127.0.0.1:1",
+    ]);
+    assert!(
+        err.contains("-3pcc and -slave_cfg options are not compatible"),
+        "{err}"
+    );
+    let err = stderr_of(&["-sf", sc, "-slave", "s9", "-slave_cfg", cfg, "127.0.0.1:1"]);
+    assert!(err.contains("Peer s9 not found"), "{err}");
+    // A slave scenario run as the master is SIPp's inconsistency error.
+    let err = stderr_of(&["-sf", sc, "-master", "m", "-slave_cfg", cfg, "127.0.0.1:1"]);
+    assert!(
+        err.contains("slave scenario but -slave option not set"),
+        "{err}"
+    );
+    // A command from the wrong sender rejects the call it opened.
+    let (mut slave, slave_err) = spawn_sipr_bg(&[
+        "-sf",
+        sc,
+        "-slave",
+        "s1",
+        "-slave_cfg",
+        cfg,
+        "-m",
+        "1",
+        "-timeout",
+        "10",
+        "-trace_err",
+        "-bg",
+        "127.0.0.1:1",
+    ]);
+    std::thread::sleep(Duration::from_millis(500));
+    // Play the master: dial the slave and send a command claiming to be s2.
+    // (A slave dials back only the peers it `sendCmd`s to — SIPp's `peers`
+    // map is filled from `dest=` — and this scenario has none, so the
+    // listener stays quiet.)
+    let mut stream = TcpStream::connect(("127.0.0.1", slave_port)).expect("dial slave");
+    stream
+        .write_all(b"Call-ID: wrong-sender@test\r\nFrom: s2\r\nX-Offer: x\x1b")
+        .expect("send");
+    stream.flush().ok();
+    let code = wait_exit(&mut slave, Duration::from_secs(15));
+    let err = slave_err.join().expect("stderr");
+    drop(stream);
+    drop(master_listener);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("failed 1"), "{err}");
+    let _ = std::fs::remove_file(&cfg_path);
+    let _ = std::fs::remove_file(&sc_path);
 }

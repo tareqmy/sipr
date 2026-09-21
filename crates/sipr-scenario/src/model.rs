@@ -271,6 +271,9 @@ pub enum Step {
         template: MsgTemplate,
         /// Shared attributes.
         common: StepCommon,
+        /// Extended 3PCC: the peer to send to (`dest=`), a name from the
+        /// `-slave_cfg` table. `None` is the classic single twin.
+        dest: Option<String>,
     },
     /// 3PCC: wait for a command from the twin, then run actions against its
     /// text (`<recvCmd>`).
@@ -279,6 +282,9 @@ pub enum Step {
         actions: Vec<Action>,
         /// Shared attributes.
         common: StepCommon,
+        /// Extended 3PCC: the peer the command must come from (`src=`),
+        /// checked against the `From:` line of the command text.
+        src: Option<String>,
         /// `optional="true"`.
         optional: bool,
     },
@@ -865,15 +871,20 @@ impl Scenario {
                 Step::Nop { actions, common } => {
                     format!("nop actions={}{}", actions.len(), common_suffix(common))
                 }
-                Step::SendCmd { common, .. } => {
-                    format!("sendCmd (3pcc){}", common_suffix(common))
-                }
+                Step::SendCmd { common, dest, .. } => format!(
+                    "sendCmd (3pcc){}{}",
+                    dest.as_ref()
+                        .map_or(String::new(), |d| format!(" dest={d}")),
+                    common_suffix(common)
+                ),
                 Step::RecvCmd {
                     actions,
                     common,
                     optional,
+                    src,
                 } => format!(
-                    "recvCmd (3pcc) actions={}{}{}",
+                    "recvCmd (3pcc){} actions={}{}{}",
+                    src.as_ref().map_or(String::new(), |s| format!(" src={s}")),
                     actions.len(),
                     if *optional { " optional" } else { "" },
                     common_suffix(common)

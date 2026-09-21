@@ -1,0 +1,53 @@
+<!-- Extended 3PCC (SIPp docs/3PCC_extended.rst): a slave that waits for the
+     master's command, places its own leg, then reports back. `src=`/`dest=`
+     name peers from the -slave_cfg table; the command text carries the
+     sender in its From: line, which is what `src=` is checked against. -->
+<scenario name="extended 3pcc slave">
+  <recvCmd src="m">
+    <action><ereg regexp="Content-Type:.*" search_in="msg" assign_to="1"/></action>
+  </recvCmd>
+  <send retrans="500"><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag05[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    [$1]
+  ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="200">
+    <action><ereg regexp="Content-Type:.*" search_in="msg" assign_to="2"/></action>
+  </recv>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag05[call_number]
+    To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Contact: sip:sipp@[local_ip]:[local_port]
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <sendCmd dest="m"><![CDATA[
+    Call-ID: [call_id]
+    From: s1
+    [$2]
+  ]]></sendCmd>
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+</scenario>
