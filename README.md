@@ -102,6 +102,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   and `line=[$var]` selectors.
 - Indexed injection: `-infindex FILE FIELD` plus `<lookup>`/`<insert>`/
   `<replace>` actions for keyed, mutable CSV data.
+- pcap replay (`exec play_pcap_audio|video|image=`) from classic pcap *and*
+  pcapng captures — no libpcap, no raw socket, no root.
 - 3PCC: classic (`-3pcc HOST:PORT`) with `<sendCmd>`/`<recvCmd>` over an
   ESC-framed twin socket, and extended master/slave mode
   (`-master`/`-slave` + `-slave_cfg`, `sendCmd dest=`, `recvCmd src=`).

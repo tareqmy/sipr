@@ -585,9 +585,16 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   independent — playing one does not cancel another; (4) a port-0 (held)
   `m=` line is skipped in favour of a later live one (SIPp's rtpstream path
   does this, its pcap path does not); (5) 802.11 captures are rejected
-  (unsupported link type) — recapture on the wired side. `play_pcap=` (in
-  the DTD, never implemented by SIPp) is an error pointing at
-  `play_pcap_audio=`. `-key` shipped in M39 (§6).
+  (unsupported link type) — recapture on the wired side; (6) **pcapng**
+  captures are read too (M44), which SIPp's `pcap_open_offline` refuses —
+  its `-s0` advice covers only the classic format. An in-tree block reader
+  (`sipr-media::pcapng`, no crate) handles Section Header, Interface
+  Description (`if_tsresol`, decimal and binary), Enhanced Packet, Simple
+  Packet and the obsolete Packet block, in either byte order and across
+  sections; other block types are skipped by their length. The resulting
+  stream is identical to the classic reader's, so everything above applies
+  unchanged. `play_pcap=` (in the DTD, never implemented by SIPp) is an
+  error pointing at `play_pcap_audio=`. `-key` shipped in M39 (§6).
 - `exec rtp_stream=` / `exec play_dtmf=` (M15; verified in `rtpstream.cpp`
   `rtpstream_playrtptask` (~l.603), `rtpstream_get_localport` (~l.1789),
   `rtpstream_cache_file` / `get_wav_header_size` (~l.1619/2240),

@@ -1822,10 +1822,12 @@ Small, independent items; ship in any order, each its own commit:
       are `socket2` calls in the new `sipr-net::sockopt`, applied to
       every SIP socket; `-sendbuffer_warn` follows SIPp's code rather
       than its inverted help text. SIPP_COMPAT §6 M44.
-- [ ] pcapng input for `play_pcap_*` (sipr addition: `tcpdump`/Wireshark
+- [x] pcapng input for `play_pcap_*` (sipr addition: `tcpdump`/Wireshark
       write pcapng by default now; SIPp rejects it — keep the `-s0`
       advice for the classic format). Sanctioned-dependency check: an
-      in-tree block reader, no crate.
+      in-tree block reader, no crate. Done: `sipr-media::pcapng`, std
+      only; `pcap::parse` dispatches on the section-header magic so no
+      caller changed.
 - [ ] Decide and document the three "left as is" divergences in
       SIPP_COMPAT §6 M37 (`[next_url]` without `rrs`, `[last_*]` inside
       the matching recv's own actions, and the M35 action-step

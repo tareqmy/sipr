@@ -2003,6 +2003,56 @@ fn pcap_uac_scenario(pcap_path: &str) -> String {
     )
 }
 
+/// pcapng is what `tcpdump` and Wireshark write by default; SIPp's libpcap
+/// reader rejects it, sipr replays it (M44). Same stream, same wire.
+#[test]
+fn play_pcap_audio_accepts_a_pcapng_capture() {
+    let (addr, _media, uas, sink) = spawn_media_uas(Duration::from_secs(2));
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let pcap_path = dir.join(format!("sipr-e2e-ng-{pid}.pcapng"));
+    let capture = sipr_media::pcapng::build::rtp_capture(10, 20_000, 6000);
+    std::fs::write(&pcap_path, &capture).expect("write pcapng");
+    let expected = sipr_media::pcap::parse(&capture).expect("parse");
+    let scenario_path = dir.join(format!("sipr-e2e-ng-{pid}.xml"));
+    std::fs::write(
+        &scenario_path,
+        pcap_uac_scenario(pcap_path.to_str().expect("utf8")),
+    )
+    .expect("write scenario");
+    let out = run_sipr(&[
+        "-sf",
+        scenario_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-mp",
+        &free_port_block(8).to_string(),
+        "-r",
+        "10",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&pcap_path);
+    let _ = std::fs::remove_file(&scenario_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(err.contains("rtp-sent 10"), "{err}");
+    let _ = uas.join();
+    let got = sink.join().expect("sink");
+    assert_eq!(got.len(), 10, "frames received: {}", got.len());
+    for (_, payload) in &got {
+        assert!(
+            expected.frames.iter().any(|f| f.payload == *payload),
+            "unknown payload {payload:?}"
+        );
+    }
+}
+
 #[test]
 fn play_pcap_audio_replays_capture_to_the_sdp_endpoint() {
     let (addr, _media, uas, sink) = spawn_media_uas(Duration::from_secs(2));
