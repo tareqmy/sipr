@@ -291,7 +291,7 @@ impl FieldSource<'_> {
         if let Some(cell) = self.files.get(fi)
             && let Some(v) = cell.borrow().field(line, index)
         {
-            out.push_str(v);
+            out.push_str(&v);
         }
     }
 
@@ -316,13 +316,12 @@ impl FieldSource<'_> {
     ///
     /// # Errors
     ///
-    /// The file is unknown.
+    /// The file is unknown, or is a `PRINTF=` file (whose rows are templates).
     pub fn insert_line(&self, file: &str, value: &str) -> Result<(), String> {
         let fi = self
             .resolve_file(Some(file))
             .ok_or_else(|| format!("insert: unknown injection file '{file}'"))?;
-        self.files[fi].borrow_mut().insert(value);
-        Ok(())
+        self.files[fi].borrow_mut().insert(value)
     }
 
     /// `replace`: swap line `line` of `file` for a `;`-separated `value`.

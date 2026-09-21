@@ -1800,10 +1800,13 @@ abort_call`. `-trace_msg` still does not log twin commands.
 
 Small, independent items; ship in any order, each its own commit:
 
-- [ ] `PRINTF=` virtual-line injection files (`infile.cpp`: a header
+- [x] `PRINTF=` virtual-line injection files (`infile.cpp`: a header
       line `PRINTF=<n>` and a `printf`-style template expanded to n
       lines — verify the exact substitution) — the last injection-file
-      mode missing.
+      mode missing. Done: `PRINTF=`/`PRINTFOFFSET=`/`PRINTFMULTIPLE=`,
+      `%[0-9.-]*d` and `%%`, virtual lines over cycling rows, indexing
+      and `-users` over the virtual count, `insert`/`replace` refused;
+      the two divergences are in SIPP_COMPAT §1.
 - [ ] `<rtp_echo variable="…">` (toggle from a variable, `call.cpp`
       `E_AT_RTP_ECHO`).
 - [ ] `-bind_local` (UAS listens on `-i` only, not all interfaces),

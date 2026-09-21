@@ -97,8 +97,9 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   `condexec` branching, `chance`, and named counters.
 - Keywords incl. `[call_id]`, `[branch]`, `[cseq]`, `[last_*:]`, `[$var]`,
   `[routes]`, `[peer_tag_param]`, `[len]`, `[fieldN]`, and `[authentication]`.
-- `-inf FILE` injection files (SEQUENTIAL/RANDOM/USER), one line drawn per call;
-  `[fieldN]` pulls a field, with `file=NAME` and `line=[$var]` selectors.
+- `-inf FILE` injection files (SEQUENTIAL/RANDOM/USER, and `PRINTF=` virtual
+  lines), one line drawn per call; `[fieldN]` pulls a field, with `file=NAME`
+  and `line=[$var]` selectors.
 - Indexed injection: `-infindex FILE FIELD` plus `<lookup>`/`<insert>`/
   `<replace>` actions for keyed, mutable CSV data.
 - 3PCC: classic (`-3pcc HOST:PORT`) with `<sendCmd>`/`<recvCmd>` over an
@@ -176,7 +177,6 @@ Parts of SIPp that sipr does not implement, and where that is deliberate:
 
 - The standalone `<index>` action (sipr builds injection indexes from
   `-infindex` at load time).
-- `PRINTF=` virtual-line injection files.
 - `<rtp_echo variable=…>` (only `value="0|1"`).
 - WebSocket transport (`-t ws`).
 - SIPp's SCTP socket options (`-multihome`, `-heartbeat`, `-pathmaxret`,

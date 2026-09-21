@@ -1533,7 +1533,7 @@ impl<'s> Engine<'s> {
         if per_ip {
             let first = inf_files
                 .first()
-                .and_then(|f| f.borrow().field(0, config.ip_field).map(ToOwned::to_owned))
+                .and_then(|f| f.borrow().field(0, config.ip_field).map(|v| v.into_owned()))
                 .ok_or_else(|| {
                     EngineError(
                         "-t ui needs an -inf file with an IP in the -ip_field column".into(),
@@ -1814,9 +1814,7 @@ impl<'s> Engine<'s> {
             for line in 0..file.len() {
                 let raw = file
                     .field(line, config.ip_field)
-                    .unwrap_or("")
-                    .trim()
-                    .to_owned();
+                    .map_or_else(String::new, |v| v.trim().to_owned());
                 let ip: IpAddr = raw.parse().map_err(|_| {
                     EngineError(format!(
                         "-t ui: '{raw}' (line {line}, -ip_field) is not an IP address"

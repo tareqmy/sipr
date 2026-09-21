@@ -737,8 +737,10 @@ fn digest_uri_matches_what_the_server_verifies() {
     assert!(registrar.join().expect("registrar"));
 }
 
-#[test]
-fn injection_file_fields_land_in_sent_messages() {
+/// Run `calls` UAC calls whose From user-part is `[field0]` of `inf`, and
+/// return the user-parts the UAS saw, sorted. `tag` keeps the temp files of
+/// concurrent tests apart.
+fn injected_from_users(tag: &str, inf: &str, calls: &str) -> Vec<String> {
     // A UAS that captures the From user-part of each INVITE it sees, so we can
     // prove sipr substituted [field0] from the -inf file per call.
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -783,9 +785,7 @@ fn injection_file_fields_land_in_sent_messages() {
         seen_users
     });
 
-    // A SEQUENTIAL injection file: three distinct user-parts.
-    let inf = "SEQUENTIAL\nalice;1001\nbob;1002\ncarol;1003\n";
-    let inf_path = std::env::temp_dir().join(format!("sipr-inf-{}.csv", std::process::id()));
+    let inf_path = std::env::temp_dir().join(format!("sipr-inf-{tag}-{}.csv", std::process::id()));
     std::fs::write(&inf_path, inf).expect("write inf");
 
     let scenario = r#"<scenario name="inf-uac">
@@ -825,7 +825,8 @@ fn injection_file_fields_land_in_sent_messages() {
   ]]></send>
   <recv response="200"/>
 </scenario>"#;
-    let sc_path = std::env::temp_dir().join(format!("sipr-inf-sc-{}.xml", std::process::id()));
+    let sc_path =
+        std::env::temp_dir().join(format!("sipr-inf-sc-{tag}-{}.xml", std::process::id()));
     std::fs::write(&sc_path, scenario).expect("write scenario");
 
     let out = run_sipr(&[
@@ -834,7 +835,7 @@ fn injection_file_fields_land_in_sent_messages() {
         "-inf",
         inf_path.to_str().expect("utf8"),
         "-m",
-        "3",
+        calls,
         "-d",
         "30",
         "-timeout",
@@ -846,14 +847,40 @@ fn injection_file_fields_land_in_sent_messages() {
     let _ = std::fs::remove_file(&inf_path);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
-    assert!(err.contains("successful 3 failed 0"), "{err}");
+    assert!(
+        err.contains(&format!("successful {calls} failed 0")),
+        "{err}"
+    );
 
     let mut users = uas.join().expect("uas thread");
     users.sort();
+    users
+}
+
+#[test]
+fn injection_file_fields_land_in_sent_messages() {
+    // A SEQUENTIAL injection file: three distinct user-parts.
+    let users = injected_from_users("seq", "SEQUENTIAL\nalice;1001\nbob;1002\ncarol;1003\n", "3");
     assert_eq!(
         users,
         vec!["alice", "bob", "carol"],
         "sequential fields per call"
+    );
+}
+
+#[test]
+fn printf_injection_file_generates_virtual_lines() {
+    // One template row, four virtual lines: SIPp's PRINTF= mode fills each
+    // `%d` with PRINTFOFFSET + line * PRINTFMULTIPLE (infile.cpp).
+    let users = injected_from_users(
+        "printf",
+        "SEQUENTIAL,PRINTF=4,PRINTFOFFSET=1000,PRINTFMULTIPLE=2\nuser%d;x%04d\n",
+        "4",
+    );
+    assert_eq!(
+        users,
+        vec!["user1000", "user1002", "user1004", "user1006"],
+        "one row expanded into four numbered users"
     );
 }
 

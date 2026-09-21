@@ -346,8 +346,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   graceful-stop / immediate-stop.
 - Injection files `-inf` (M7, verified in `infile.cpp` / `call.cpp`
   `getFieldFromInputFile`): line 1 is the mode, matched by SUBSTRING —
-  `SEQUENTIAL`, `RANDOM`, or `USER` (SIPp also supports `PRINTF=` virtual
-  lines; sipr does not yet). Data lines follow; a line beginning `#` is a
+  `SEQUENTIAL`, `RANDOM`, or `USER`, optionally with `PRINTF=` (below).
+  Data lines follow; a line beginning `#` is a
   comment, trailing `\r` is stripped, a blank line ends the file. Field
   separator is `;`, fields are 0-indexed (`[field0]` = first). Each call is
   assigned ONE line per file at creation (`nextLine`): SEQUENTIAL = a shared
@@ -372,8 +372,22 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `key`, `value`, `line` are all rendered templates. The typical chain is
   `lookup → [fieldN line=[$v]]`. Files are wrapped so reads (`[fieldN]`) and
   mutations (`insert`/`replace`) share them on the single engine thread. The
-  standalone `<index>` action is not supported — use `-infindex`. `PRINTF=`
-  virtual-line files remain out.
+  standalone `<index>` action is not supported — use `-infindex`.
+- `PRINTF=` injection files (M44, verified in `infile.cpp` — the header
+  parse, `getField`'s printf branch, `numLines`, `insert`/`replace`): a
+  header `PRINTF=<n>` (plus optional `PRINTFOFFSET=<o>`, default 0, and
+  `PRINTFMULTIPLE=<m>`, default 1) makes the data lines *templates*. The
+  file then has `n` virtual lines; virtual line `l` reads real line
+  `l % rows` and every `%d` conversion in the field is filled with
+  `o + l * m`, `%%` being a literal `%`. So one row,
+  `SEQUENTIAL,PRINTF=10000\nuser%05d;[...]`, is ten thousand users. Only
+  `%[0-9.-]*d` is a legal conversion; `insert`/`replace` on such a file are
+  refused, as in SIPp. Two deliberate divergences: sipr splits the header
+  into `,`/whitespace tokens, so `PRINTFOFFSET=` may precede `PRINTF=`
+  (SIPp finds each with `strstr`, and that order makes its `PRINTF` match
+  land inside `PRINTFOFFSET` — a parse error); and sipr checks every
+  field's conversions at **load**, where SIPp errors at render time, the
+  first time a call reads a bad field.
 - TCP transport `-t t1` (M8): SIP over TCP is a byte stream, so message
   boundaries come from `Content-Length`, not packet edges (RFC 3261 §7.5). A
   framer reads headers up to the first `\r\n\r\n`, then exactly Content-Length
