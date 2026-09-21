@@ -6,7 +6,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::net::UdpSocket;
+use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -72,10 +72,26 @@ fn media_port_candidate() -> u16 {
     port & !1
 }
 
-/// A free UDP port on loopback (bind-then-drop; racy in theory, fine here).
+/// A free loopback port that binds on *both* TCP and UDP, drawn from the
+/// same below-ephemeral range as media ports. Tests hand this number to a
+/// spawned sipr (`-p`, `-cp`, `--sipr-http`, `-3pcc`, ...) whose transport
+/// may be TCP or TLS, so a UDP-only probe is not enough: on Windows the
+/// Hyper-V/WinNAT excluded port ranges are per protocol, and a port the OS
+/// happily allocated for UDP can fail a later TCP bind with error 10013.
 fn free_port() -> u16 {
-    let s = UdpSocket::bind("127.0.0.1:0").expect("bind");
-    s.local_addr().expect("addr").port()
+    for _ in 0..100 {
+        let port = media_port_candidate();
+        if port_binds_on_tcp_and_udp(port) {
+            return port;
+        }
+    }
+    panic!("no free TCP+UDP port");
+}
+
+/// Whether `port` can be bound on loopback for both TCP and UDP right now.
+fn port_binds_on_tcp_and_udp(port: u16) -> bool {
+    let addr = ("127.0.0.1", port);
+    TcpListener::bind(addr).is_ok() && UdpSocket::bind(addr).is_ok()
 }
 
 /// Whether this sipp build has TLS compiled in (`sipp -v` banners `-TLS`).
