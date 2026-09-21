@@ -45,9 +45,11 @@
 Sanctioned: `tokio`, `tokio-util`, `rsip`, `quick-xml`, `ratatui`,
 `crossterm`, `regex`, `hdrhistogram`, `thiserror`, `anyhow`, `tracing`,
 `tracing-subscriber`, `rand`, `md-5`, `sha2`, `dashmap`, `arc-swap`, `bytes`,
-`rustls`, `rustls-pki-types` (PEM parsing; replaced the unmaintained `rustls-pemfile`), `socket2` (only behind the `sctp` cargo feature:
-std has no SCTP, and socket2 is the safe way to open `SOCK_STREAM`/
-`IPPROTO_SCTP` sockets — decision recorded in MILESTONES.md M32),
+`rustls`, `rustls-pki-types` (PEM parsing; replaced the unmaintained `rustls-pemfile`), `socket2` (std has no SCTP, and socket2 is the safe way to open
+`SOCK_STREAM`/`IPPROTO_SCTP` sockets — decision recorded in MILESTONES.md
+M32; unconditional in `sipr-net` since M44, which needs `SO_SNDBUF`/
+`SO_RCVBUF` (`-buff_size`) and `SO_BINDTODEVICE` (`-bind_to_device`), neither
+of which std exposes and both of which would otherwise need `unsafe`),
 and for tests `proptest`, `criterion`, `assert_cmd`, `tempfile`, `rcgen`. Add them to
 `[workspace.dependencies]` when a milestone first needs them. The CLI is a
 deliberate exception: `src/cli.rs` is a bespoke table-driven parser (not clap)

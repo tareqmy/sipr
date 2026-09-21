@@ -182,6 +182,12 @@ fn run(cli: &Cli) -> ExitCode {
     let config = sipr_engine::EngineConfig {
         target,
         local_ip,
+        bind_local: cli.bind_local,
+        sockopts: sipr_engine::SocketOpts {
+            buff_size: cli.buff_size,
+            bind_device: cli.bind_to_device.clone(),
+        },
+        sendbuffer_warn: cli.sendbuffer_warn,
         port: cli.port,
         service: cli.service.clone(),
         rate: cli.rate,

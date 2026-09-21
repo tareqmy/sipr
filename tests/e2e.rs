@@ -8169,3 +8169,69 @@ fn extended_3pcc_option_checks_and_wrong_sender() {
     let _ = std::fs::remove_file(&cfg_path);
     let _ = std::fs::remove_file(&sc_path);
 }
+
+// ---- socket options: -bind_local, -buff_size (M44) ----------------------
+
+/// Without `-i`, sipr binds every interface but advertises the address the
+/// kernel would route from (SIPp's connect-probe): against a loopback target
+/// that is 127.0.0.1, not `0.0.0.0`. `-bind_local` binds it as well, and
+/// `-buff_size` resizes the socket buffers without disturbing the run.
+#[test]
+fn bind_local_and_buff_size_drive_a_call_without_an_explicit_i() {
+    let sip_port = free_port();
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sn",
+        "uas",
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &sip_port.to_string(),
+        "-cp",
+        "0",
+        "-m",
+        "1",
+        "-timeout",
+        "20",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    let dir = std::env::temp_dir().join(format!("sipr-bindlocal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let (out, _) = run_sipr_in(
+        &dir,
+        &[
+            "-sn",
+            "uac",
+            // No -i on purpose: the address is derived, then bound.
+            "-bind_local",
+            "-buff_size",
+            "262144",
+            "-trace_msg",
+            "-cp",
+            "0",
+            "-m",
+            "1",
+            "-timeout",
+            "20",
+            "-bg",
+            &format!("127.0.0.1:{sip_port}"),
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "uac stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    let messages = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_messages.log"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        messages.contains("Via: SIP/2.0/UDP 127.0.0.1:"),
+        "[local_ip] should be the routed source address, not 0.0.0.0:\n{messages}"
+    );
+    let code = wait_exit(&mut uas, Duration::from_secs(15));
+    let uerr = uas_err.join().expect("uas stderr");
+    assert_eq!(code, Some(0), "uas stderr:\n{uerr}");
+}

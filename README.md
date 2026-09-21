@@ -131,7 +131,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   `--features sctp` on Linux; streams frame by
   Content-Length and carry no SIP retransmissions (reliable transports). TLS
   takes SIPp's `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version`
-  flags with SIPp's verification semantics.
+  flags with SIPp's verification semantics. Socket knobs: `-i`/`-bind_local`
+  (advertised vs bound address), `-buff_size`, `-bind_to_device` (Linux).
 - UDP retransmission (T1→T2), recv-window matching verified against SIPp's C++.
 - Digest authentication (MD5 + SHA-256, `qop=auth`, proxy 407) and IMS AKA
   (`AKAv1-MD5` with in-tree Milenage: `[authentication aka_K=0x… aka_OP=0x…]`),

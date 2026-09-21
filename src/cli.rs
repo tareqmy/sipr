@@ -86,8 +86,16 @@ pub struct Cli {
     pub pause_ms: u64,
     /// `-p`: local port (default: a free port chosen by the system).
     pub port: Option<u16>,
-    /// `-i`: local IP address to bind.
+    /// `-i`: local IP address to bind and advertise.
     pub local_ip: Option<IpAddr>,
+    /// `-bind_local`: bind the derived local IP, not every interface.
+    pub bind_local: bool,
+    /// `-bind_to_device`: interface name for `SO_BINDTODEVICE` (Linux).
+    pub bind_to_device: Option<String>,
+    /// `-buff_size`: `SO_SNDBUF`/`SO_RCVBUF` on every socket.
+    pub buff_size: Option<usize>,
+    /// `-sendbuffer_warn`: a failed default-message send ends the run.
+    pub sendbuffer_warn: bool,
     /// `-mi`: media (RTP) address for `[media_ip]`; defaults to the local IP.
     pub media_ip: Option<IpAddr>,
     /// `-mp` / `-min_rtp_port`: base media port for `[media_port]`.
@@ -309,6 +317,10 @@ impl Default for Cli {
             pause_ms: 3000,
             port: None,
             local_ip: None,
+            bind_local: false,
+            bind_to_device: None,
+            buff_size: None,
+            sendbuffer_warn: false,
             media_ip: None,
             media_port: None,
             max_rtp_port: None,
@@ -492,7 +504,36 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "PORT",
         "Local port [default: system-chosen free port]",
     ),
-    ("i", true, "IP", "Local IP address to bind"),
+    (
+        "i",
+        true,
+        "IP",
+        "Local IP address: the source address messages advertise, and the one the socket binds",
+    ),
+    (
+        "bind_local",
+        false,
+        "",
+        "Bind the socket to the local IP instead of every interface (implied by -i)",
+    ),
+    (
+        "bind_to_device",
+        true,
+        "NAME",
+        "Bind every socket to a network device (SO_BINDTODEVICE; Linux only, needs privileges)",
+    ),
+    (
+        "buff_size",
+        true,
+        "BYTES",
+        "Send and receive buffer size of every socket [default: the OS default]",
+    ),
+    (
+        "sendbuffer_warn",
+        true,
+        "true|false",
+        "End the run when a default (non-scenario) message cannot be sent, instead of warning",
+    ),
     (
         "mi",
         true,
@@ -1250,6 +1291,20 @@ where
     if cli.transport == Transport::UdpPerIp && cli.inf.is_empty() {
         return Err("You must use the -inf option when using -t ui".into());
     }
+    // SO_BINDTODEVICE exists on Linux only. SIPp compiles the call out
+    // elsewhere and binds nothing, silently; say so instead.
+    if let Some(device) = &cli.bind_to_device
+        && !cfg!(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        ))
+    {
+        return Err(format!(
+            "-bind_to_device {device}: SO_BINDTODEVICE is a Linux socket option, and this \
+             host has none"
+        ));
+    }
     Ok(Invocation::Run(Box::new(cli)))
 }
 
@@ -1274,6 +1329,16 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "d" => cli.pause_ms = parse_num(flag, &val(value))?,
         "p" => cli.port = Some(parse_num(flag, &val(value))?),
         "i" => cli.local_ip = Some(parse_num(flag, &val(value))?),
+        "bind_local" => cli.bind_local = true,
+        "bind_to_device" => cli.bind_to_device = Some(val(value)),
+        "buff_size" => {
+            let n: usize = parse_num(flag, &val(value))?;
+            if n == 0 {
+                return Err("-buff_size must be at least 1".into());
+            }
+            cli.buff_size = Some(n);
+        }
+        "sendbuffer_warn" => cli.sendbuffer_warn = parse_bool_value(flag, &val(value))?,
         "mi" => cli.media_ip = Some(parse_num(flag, &val(value))?),
         "mp" | "min_rtp_port" => cli.media_port = Some(parse_num(flag, &val(value))?),
         "max_rtp_port" => cli.max_rtp_port = Some(parse_num(flag, &val(value))?),
@@ -1960,6 +2025,59 @@ mod tests {
         }
         for name in ["r", "m", "sf", "rtp_echo", "inf"] {
             assert!(no_effect_reason(name).is_none(), "-{name} is implemented");
+        }
+    }
+
+    /// The socket options SIPp sets in `sipp_customize_socket`, plus
+    /// `-bind_local` and `-sendbuffer_warn` (M44).
+    #[test]
+    fn socket_option_flags_parse() {
+        let c = cli(&["-sn", "uac", "host"]);
+        assert!(!c.bind_local, "SIPp binds every interface by default");
+        assert_eq!(c.buff_size, None, "the OS default stands unless asked");
+        assert!(!c.sendbuffer_warn);
+        assert_eq!(c.bind_to_device, None);
+
+        let c = cli(&[
+            "-sn",
+            "uac",
+            "-bind_local",
+            "-buff_size",
+            "262144",
+            "-sendbuffer_warn",
+            "true",
+            "host",
+        ]);
+        assert!(c.bind_local);
+        assert_eq!(c.buff_size, Some(262_144));
+        assert!(c.sendbuffer_warn);
+
+        let err = run(&["-buff_size", "0", "host"]).unwrap_err();
+        assert!(err.contains("at least 1"), "{err}");
+        let err = run(&["-bind_local", "yes", "host"]).unwrap_err();
+        assert!(err.contains("extra argument"), "{err}");
+        let err = run(&["-sendbuffer_warn", "maybe", "host"]).unwrap_err();
+        assert!(err.contains("expected true or false"), "{err}");
+    }
+
+    /// `-bind_to_device` needs `SO_BINDTODEVICE`, so it is a usage error off
+    /// Linux rather than a silently ignored bind (as it is in SIPp).
+    #[test]
+    fn bind_to_device_is_linux_only() {
+        let parsed = run(&["-sn", "uac", "-bind_to_device", "eth0", "host"]);
+        if cfg!(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        )) {
+            match parsed.unwrap() {
+                Invocation::Run(c) => assert_eq!(c.bind_to_device.as_deref(), Some("eth0")),
+                other => panic!("expected Run, got {other:?}"),
+            }
+        } else {
+            let err = parsed.unwrap_err();
+            assert!(err.contains("SO_BINDTODEVICE"), "{err}");
+            assert!(err.contains("eth0"), "{err}");
         }
     }
 

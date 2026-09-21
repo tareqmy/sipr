@@ -116,6 +116,8 @@ with an SCTP stack) `-ip_field <n>` (the `-inf` column holding that IP)
 `-max_socket <n>` (per-call modes share sockets past n) `-rsa <host[:port]>`
 (remote sending address) `-max_reconnect <n>` `-reconnect_close <bool>`
 `-reconnect_sleep <ms>` (TCP/TLS reconnection) `-s <service>` (called number)
+`-bind_local` `-buff_size <bytes>` `-sendbuffer_warn <bool>`
+`-bind_to_device <name>` (M44, §6)
 `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version` (TLS material,
 SIPp defaults `cacert.pem`/`cakey.pem`).
 Media: `-mi <ip>` (media address; default local IP) `-mp <port>` (base media
@@ -714,6 +716,34 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   action (`jump`, `pauserestore`, `add`, …) reads the variable; sipr makes
   this one consistent instead of copying the slip. `exec rtp_echo=`
   (the per-call SRTP echo) is M25 below.
+- Socket options and the local address (M44; verified in `socket.cpp`
+  `open_connections` ~l.2372-2560 — `bind_specific`, the connect-probe,
+  the `bind_local || peripsocket` re-resolve — `sipp_customize_socket`
+  ~l.1735-1815, `SIPpSocket::bind_to_device` ~l.1645, `call.cpp`
+  `sendBuffer` ~l.1627): SIPp keeps two addresses apart. The **advertised**
+  one is `-i`; without `-i` it is `gethostname()` resolved when there is no
+  remote host, else the source address a UDP socket connected to the remote
+  reports (no packet is sent). The **bound** one is `INADDR_ANY` unless `-i`
+  was given (which sets `bind_specific`), or `-bind_local`/`-t ui` asks for
+  the advertised address. sipr now matches that split — before M44 it bound
+  `-i` and rendered `[local_ip]` as `0.0.0.0` when `-i` was absent — with
+  one divergence: for the no-remote case sipr runs the same connect-probe
+  against the RFC 5737/3849 documentation prefixes (naming the default
+  route's address) rather than resolving `gethostname()`, which SIPp's own
+  comment calls "actually buggy". `-bind_local` is therefore a no-op
+  alongside `-i`, exactly as in SIPp. `-buff_size` sets `SO_SNDBUF` and
+  `SO_RCVBUF` on every SIP socket (`socket2`, since std exposes neither and
+  `unsafe` is forbidden) — but only when given: SIPp always applies its own
+  default of 65536, which is *below* Linux's default receive buffer and
+  costs throughput at high rate. `-bind_to_device` is `SO_BINDTODEVICE`,
+  which exists on Linux alone and needs `CAP_NET_RAW`; SIPp compiles the
+  call out elsewhere and binds nothing silently, where sipr refuses the flag
+  at argument parsing. `-sendbuffer_warn` governs a failed send of a
+  *default* (non-scenario) message: despite its help text ("Produce warnings
+  instead of errors"), SIPp's code reads `if (sendbuffer_warn) ERROR_NO(…)
+  else WARNING_NO(…)`, so the flag makes the failure **fatal** and its
+  default is the warning. sipr matches the code — the run ends with the
+  flag, warns without it — and no longer ignores the failure outright.
 - AKA resynchronisation (M19): SIPp's `auth.cpp` has an AUTS branch guarded
   by `if (1/*sqn[5] > sqn_he[5]*/)` (~l.676) whose real condition is
   commented out, so the always-taken branch stores one SQN byte into a

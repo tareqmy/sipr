@@ -1812,9 +1812,16 @@ Small, independent items; ship in any order, each its own commit:
       (`value=` xor `variable=`) and the engine reads the variable —
       where SIPp reads its literal slot and so always switches echoing
       off; SIPP_COMPAT §6 M18 records the slip.
-- [ ] `-bind_local` (UAS listens on `-i` only, not all interfaces),
+- [x] `-bind_local` (UAS listens on `-i` only, not all interfaces),
       `-buff_size`, `-sendbuffer_warn`; `-bind_to_device` on Linux
-      (`SO_BINDTODEVICE`, needs root; reject clearly elsewhere).
+      (`SO_BINDTODEVICE`, needs root; reject clearly elsewhere). Done,
+      and bigger than it looked: SIPp keeps the *advertised* address
+      apart from the *bound* one, so sipr grew SIPp's connect-probe for
+      `[local_ip]` (it used to render `0.0.0.0` without `-i`) and
+      `-bind_local` binds that address. `-buff_size`/`-bind_to_device`
+      are `socket2` calls in the new `sipr-net::sockopt`, applied to
+      every SIP socket; `-sendbuffer_warn` follows SIPp's code rather
+      than its inverted help text. SIPP_COMPAT §6 M44.
 - [ ] pcapng input for `play_pcap_*` (sipr addition: `tcpdump`/Wireshark
       write pcapng by default now; SIPp rejects it — keep the `-s0`
       advice for the classic format). Sanctioned-dependency check: an

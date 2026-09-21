@@ -34,6 +34,7 @@ use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore, ServerCo
 
 use crate::message::Inbound;
 use crate::rng::Rng;
+use crate::sockopt::SocketOpts;
 use crate::tcp::TcpFramer;
 use crate::transport::{InboundPacket, NetEvent, TransportConfig};
 
@@ -100,6 +101,7 @@ type Conns = Arc<Mutex<HashMap<SocketAddr, TlsConn>>>;
 pub struct TlsTransport {
     local_addr: SocketAddr,
     conns: Conns,
+    sockopts: SocketOpts,
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
     sink: Sender<NetEvent>,
@@ -155,6 +157,7 @@ impl TlsTransport {
     ) -> std::io::Result<Self> {
         let client_config = client_config(tls_config)?;
         let mut sock = TcpStream::connect(remote)?;
+        config.sockopts.apply(&sock)?;
         let local_addr = sock.local_addr()?;
         let peer = sock.peer_addr()?;
         // SIPp only sends SNI for named targets; ours is already a resolved
@@ -171,6 +174,7 @@ impl TlsTransport {
         Ok(Self {
             local_addr,
             conns,
+            sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0021)),
             send_loss_pct: config.send_loss_pct,
             sink,
@@ -194,6 +198,7 @@ impl TlsTransport {
         Ok(Self {
             local_addr: SocketAddr::new(ip, 0),
             conns: Arc::new(Mutex::new(HashMap::new())),
+            sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0023)),
             send_loss_pct: config.send_loss_pct,
             sink,
@@ -222,6 +227,7 @@ impl TlsTransport {
             std::io::Error::other("reconnecting needs a TLS client configuration")
         })?;
         let mut sock = TcpStream::connect(remote)?;
+        self.sockopts.apply(&sock)?;
         let peer = sock.peer_addr()?;
         let name = ServerName::from(peer.ip());
         let mut tls = Connection::from(
@@ -243,6 +249,7 @@ impl TlsTransport {
             std::io::Error::other("per-call TLS connections need a client configuration")
         })?;
         let mut sock = TcpStream::connect(remote)?;
+        self.sockopts.apply(&sock)?;
         let local_addr = sock.local_addr()?;
         let peer = sock.peer_addr()?;
         let name = ServerName::from(peer.ip());
@@ -311,10 +318,12 @@ impl TlsTransport {
         let server_config = server_config(tls_config)?;
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let listener = TcpListener::bind(SocketAddr::new(ip, config.port.unwrap_or(0)))?;
+        config.sockopts.apply(&listener)?;
         let local_addr = listener.local_addr()?;
         let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
         let accept_conns = conns.clone();
         let accept_sink = sink.clone();
+        let accept_opts = config.sockopts.clone();
         let accept = std::thread::Builder::new()
             .name("sipr-tls-accept".into())
             .spawn(move || {
@@ -323,6 +332,7 @@ impl TlsTransport {
                     let Ok(peer) = sock.peer_addr() else {
                         continue;
                     };
+                    let _ = accept_opts.apply(&sock);
                     let Ok(server_conn) = rustls::ServerConnection::new(server_config.clone())
                     else {
                         continue;
@@ -353,6 +363,7 @@ impl TlsTransport {
         Ok(Self {
             local_addr,
             conns,
+            sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0022)),
             send_loss_pct: config.send_loss_pct,
             sink,

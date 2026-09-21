@@ -28,6 +28,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::message::Inbound;
 use crate::rng::Rng;
+use crate::sockopt::SocketOpts;
 use crate::transport::{InboundPacket, NetEvent, TransportConfig};
 
 /// `IPPROTO_SCTP` (the same number on Linux, the BSDs, and macOS).
@@ -57,8 +58,13 @@ fn domain_of(addr: SocketAddr) -> Domain {
 
 /// Dial `remote`; blocks until the association is up (SIPp's SCTP_COMM_UP
 /// gating). `local` binds a specific source address/port when given.
-fn dial(remote: SocketAddr, local: Option<SocketAddr>) -> std::io::Result<TcpStream> {
+fn dial(
+    remote: SocketAddr,
+    local: Option<SocketAddr>,
+    opts: &SocketOpts,
+) -> std::io::Result<TcpStream> {
     let sock = sctp_socket(domain_of(remote))?;
+    opts.apply(&sock)?;
     if let Some(l) = local {
         sock.bind(&l.into())?;
     }
@@ -75,6 +81,7 @@ type Conns = Arc<Mutex<HashMap<SocketAddr, TcpStream>>>;
 pub struct SctpTransport {
     local_addr: SocketAddr,
     conns: Conns,
+    sockopts: SocketOpts,
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
     sink: Sender<NetEvent>,
@@ -119,7 +126,7 @@ impl SctpTransport {
                 p,
             )
         });
-        let stream = dial(remote, local)?;
+        let stream = dial(remote, local, &config.sockopts)?;
         let local_addr = stream.local_addr()?;
         let peer = stream.peer_addr()?;
         let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
@@ -127,6 +134,7 @@ impl SctpTransport {
         Ok(Self {
             local_addr,
             conns,
+            sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0031)),
             send_loss_pct: config.send_loss_pct,
             sink,
@@ -143,6 +151,7 @@ impl SctpTransport {
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let bind_at = SocketAddr::new(ip, config.port.unwrap_or(0));
         let listener = sctp_socket(domain_of(bind_at))?;
+        config.sockopts.apply(&listener)?;
         listener.bind(&bind_at.into())?;
         listener.listen(128)?;
         let local_addr = listener
@@ -152,6 +161,7 @@ impl SctpTransport {
         let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
         let accept_conns = conns.clone();
         let accept_sink = sink.clone();
+        let accept_opts = config.sockopts.clone();
         let accept = std::thread::Builder::new()
             .name("sipr-sctp-accept".into())
             .spawn(move || {
@@ -159,6 +169,7 @@ impl SctpTransport {
                     let Ok((sock, _)) = listener.accept() else {
                         continue;
                     };
+                    let _ = accept_opts.apply(&sock);
                     let stream: TcpStream = sock.into();
                     let Ok(peer) = stream.peer_addr() else {
                         continue;
@@ -170,6 +181,7 @@ impl SctpTransport {
         Ok(Self {
             local_addr,
             conns,
+            sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0032)),
             send_loss_pct: config.send_loss_pct,
             sink,
@@ -184,6 +196,7 @@ impl SctpTransport {
         Self {
             local_addr: SocketAddr::new(ip, 0),
             conns: Arc::new(Mutex::new(HashMap::new())),
+            sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0033)),
             send_loss_pct: config.send_loss_pct,
             sink,
@@ -203,7 +216,7 @@ impl SctpTransport {
     ///
     /// Connection failures (the call fails, not the run).
     pub fn connect_call(&self, remote: SocketAddr) -> std::io::Result<SctpCallConn> {
-        let stream = dial(remote, None)?;
+        let stream = dial(remote, None, &self.sockopts)?;
         let local_addr = stream.local_addr()?;
         let peer = stream.peer_addr()?;
         let read_half = stream.try_clone()?;
@@ -220,7 +233,7 @@ impl SctpTransport {
     ///
     /// Connection failures.
     pub fn reconnect(&self, remote: SocketAddr) -> std::io::Result<()> {
-        let stream = dial(remote, None)?;
+        let stream = dial(remote, None, &self.sockopts)?;
         let peer = stream.peer_addr()?;
         register(&self.conns, peer, stream, &self.sink)
     }
