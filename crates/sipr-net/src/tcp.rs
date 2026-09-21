@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use crate::message::Inbound;
 use crate::rng::Rng;
+use crate::sockopt::SocketOpts;
 use crate::transport::{InboundPacket, NetEvent, TransportConfig};
 
 /// One read from the socket; big enough to hold most whole messages, but the
@@ -130,6 +131,7 @@ type Conns = Arc<Mutex<HashMap<SocketAddr, TcpStream>>>;
 pub struct TcpTransport {
     local_addr: SocketAddr,
     conns: Conns,
+    sockopts: SocketOpts,
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
     sink: Sender<NetEvent>,
@@ -172,6 +174,7 @@ impl TcpTransport {
         remote: SocketAddr,
     ) -> std::io::Result<Self> {
         let stream = TcpStream::connect(remote)?;
+        config.sockopts.apply(&stream)?;
         let local_addr = stream.local_addr()?;
         let peer = stream.peer_addr()?;
         let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
@@ -179,6 +182,7 @@ impl TcpTransport {
         Ok(Self {
             local_addr,
             conns,
+            sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0011)),
             send_loss_pct: config.send_loss_pct,
             sink,
@@ -194,6 +198,7 @@ impl TcpTransport {
         Self {
             local_addr: SocketAddr::new(ip, 0),
             conns: Arc::new(Mutex::new(HashMap::new())),
+            sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0013)),
             send_loss_pct: config.send_loss_pct,
             sink,
@@ -218,6 +223,7 @@ impl TcpTransport {
     /// Connection failures.
     pub fn reconnect(&self, remote: SocketAddr) -> std::io::Result<()> {
         let stream = TcpStream::connect(remote)?;
+        self.sockopts.apply(&stream)?;
         let peer = stream.peer_addr()?;
         register(&self.conns, peer, stream, &self.sink)
     }
@@ -230,6 +236,7 @@ impl TcpTransport {
     /// Connection failures (the call fails, not the run).
     pub fn connect_call(&self, remote: SocketAddr) -> std::io::Result<TcpCallConn> {
         let stream = TcpStream::connect(remote)?;
+        self.sockopts.apply(&stream)?;
         let local_addr = stream.local_addr()?;
         let peer = stream.peer_addr()?;
         let read_half = stream.try_clone()?;
@@ -280,10 +287,12 @@ impl TcpTransport {
     pub fn listen(config: &TransportConfig, sink: Sender<NetEvent>) -> std::io::Result<Self> {
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let listener = TcpListener::bind(SocketAddr::new(ip, config.port.unwrap_or(0)))?;
+        config.sockopts.apply(&listener)?;
         let local_addr = listener.local_addr()?;
         let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
         let accept_conns = conns.clone();
         let accept_sink = sink.clone();
+        let accept_opts = config.sockopts.clone();
         let accept = std::thread::Builder::new()
             .name("sipr-tcp-accept".into())
             .spawn(move || {
@@ -293,6 +302,7 @@ impl TcpTransport {
                         continue;
                     };
                     // A dead connection here is a per-peer problem, not fatal.
+                    let _ = accept_opts.apply(&stream);
                     let _ = register(&accept_conns, peer, stream, &accept_sink);
                 }
             })
@@ -300,6 +310,7 @@ impl TcpTransport {
         Ok(Self {
             local_addr,
             conns,
+            sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0012)),
             send_loss_pct: config.send_loss_pct,
             sink,

@@ -12,7 +12,7 @@
 //! retransmission cancel on any matched recv.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -23,8 +23,8 @@ use sipr_media::sdp::CryptoAttr;
 use sipr_media::{MediaEvent, MediaPlayer, PcapStream, Source, StreamSpec};
 use sipr_net::timer::TimerId;
 use sipr_net::{
-    Inbound, NetEvent, PeerLinks, RetransCaps, RetransSchedule, TcpCallConn, TcpTransport,
-    TimerService, TlsCallConn, TlsTransport, TransportConfig, TwinChannel, TwinEvent,
+    Inbound, NetEvent, PeerLinks, RetransCaps, RetransSchedule, SocketOpts, TcpCallConn,
+    TcpTransport, TimerService, TlsCallConn, TlsTransport, TransportConfig, TwinChannel, TwinEvent,
     UdpCallSocket, UdpTransport,
 };
 #[cfg(feature = "sctp")]
@@ -43,8 +43,18 @@ use crate::render::{RenderCtx, render};
 pub struct EngineConfig {
     /// Remote target for outbound calls (required for UAC scenarios).
     pub target: Option<SocketAddr>,
-    /// Local IP to bind (`-i`).
+    /// Local IP to bind (`-i`). Without it sipr binds every interface and
+    /// derives the address `[local_ip]` renders (see `bind_local`).
     pub local_ip: Option<IpAddr>,
+    /// `-bind_local`: bind the derived local IP instead of every interface.
+    /// No effect with `-i`, which already binds that address (as in SIPp,
+    /// where `-i` sets `bind_specific`).
+    pub bind_local: bool,
+    /// `-buff_size` / `-bind_to_device`: socket options for every SIP socket.
+    pub sockopts: SocketOpts,
+    /// `-sendbuffer_warn`: make a failed send of a *default* (non-scenario)
+    /// message end the run instead of warning — SIPp's inverted flag.
+    pub sendbuffer_warn: bool,
     /// Local port to bind (`-p`).
     pub port: Option<u16>,
     /// `[service]` value (`-s`).
@@ -455,6 +465,42 @@ impl DefaultMessages {
             ),
         }
     }
+}
+
+/// The address `[local_ip]` renders, and the one `-bind_local` binds, when
+/// `-i` was not given (SIPp `socket.cpp` ~l.2372-2430).
+///
+/// With a target, SIPp opens a UDP socket, `connect`s it to the remote and
+/// reads back `getsockname` — the source address the kernel would route
+/// there. No packet is sent. Without a target SIPp resolves `gethostname()`
+/// instead, which its own comment calls "actually buggy"; sipr runs the same
+/// probe against the documentation prefixes (RFC 5737 / RFC 3849) to name the
+/// default route's address. Either way, `None` (no route at all) leaves the
+/// old behavior: whatever the socket bound to.
+fn derive_local_ip(target: Option<SocketAddr>) -> Option<IpAddr> {
+    if let Some(remote) = target {
+        return probe_source_ip(remote);
+    }
+    const V4_DOC: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9);
+    const V6_DOC: SocketAddr = SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
+        9,
+    );
+    probe_source_ip(V4_DOC).or_else(|| probe_source_ip(V6_DOC))
+}
+
+/// The local address a datagram to `remote` would leave from, or `None` when
+/// there is no route. Connecting a UDP socket sends nothing.
+fn probe_source_ip(remote: SocketAddr) -> Option<IpAddr> {
+    let any = if remote.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    };
+    let socket = std::net::UdpSocket::bind(any).ok()?;
+    socket.connect(remote).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
 }
 
 /// A finished call kept for `-deadcall_wait` (SIPp `deadcall`): a late
@@ -1519,12 +1565,21 @@ impl<'s> Engine<'s> {
         if let Some((SecondaryKind::Receive, rx)) = secondary {
             validate_field_files(rx, &inf_files, inf_default_files)?;
         }
+        // SIPp `socket.cpp` ~l.2372: `-i` binds that address; otherwise the
+        // socket takes every interface and the *advertised* address is
+        // derived, unless `-bind_local` asks to bind it too.
+        let advertised_ip = config.local_ip.or_else(|| derive_local_ip(config.target));
         let mut tcfg = TransportConfig {
-            local_ip: config.local_ip,
+            local_ip: if config.bind_local {
+                advertised_ip
+            } else {
+                config.local_ip
+            },
             port: config.port,
             send_loss_pct: 0.0,
             recv_loss_pct: 0.0,
             loss_seed: config.seed,
+            sockopts: config.sockopts.clone(),
         };
         let per_call = config.transport.per_call() && scenario.role == Role::Uac;
         // `-t ui`: the main socket binds the first injected IP (SIPp: "on some
@@ -1533,7 +1588,7 @@ impl<'s> Engine<'s> {
         if per_ip {
             let first = inf_files
                 .first()
-                .and_then(|f| f.borrow().field(0, config.ip_field).map(ToOwned::to_owned))
+                .and_then(|f| f.borrow().field(0, config.ip_field).map(|v| v.into_owned()))
                 .ok_or_else(|| {
                     EngineError(
                         "-t ui needs an -inf file with an IP in the -ip_field column".into(),
@@ -1630,6 +1685,7 @@ impl<'s> Engine<'s> {
         // like SIPp; the port that bound is what [media_port] renders.
         let echo_ip = config
             .media_ip
+            .or(advertised_ip)
             .unwrap_or_else(|| transport.local_addr().ip());
         let mut media_port = config.media_port.unwrap_or(DEFAULT_MEDIA_PORT);
         let echo = if config.rtp_echo {
@@ -1814,9 +1870,7 @@ impl<'s> Engine<'s> {
             for line in 0..file.len() {
                 let raw = file
                     .field(line, config.ip_field)
-                    .unwrap_or("")
-                    .trim()
-                    .to_owned();
+                    .map_or_else(String::new, |v| v.trim().to_owned());
                 let ip: IpAddr = raw.parse().map_err(|_| {
                     EngineError(format!(
                         "-t ui: '{raw}' (line {line}, -ip_field) is not an IP address"
@@ -2011,16 +2065,17 @@ impl<'s> Engine<'s> {
             last_snapshot: (Instant::now(), 0),
             soft_stopping: false,
             hard_stop: false,
-            local_ip_str: config
-                .local_ip
-                .unwrap_or_else(|| local_addr.ip())
-                .to_string(),
+            local_ip_str: advertised_ip.unwrap_or_else(|| local_addr.ip()).to_string(),
             pid: std::process::id(),
             media,
             pcaps,
-            media_ip: config.media_ip.unwrap_or_else(|| local_addr.ip()),
+            media_ip: config
+                .media_ip
+                .or(advertised_ip)
+                .unwrap_or_else(|| local_addr.ip()),
             media_ip_str: config
                 .media_ip
+                .or(advertised_ip)
                 .unwrap_or_else(|| local_addr.ip())
                 .to_string(),
             media_port,
@@ -5614,10 +5669,30 @@ impl<'s> Engine<'s> {
             return;
         };
         let buf = text.into_bytes();
-        if self.send_for_call(call_id, &buf, remote, None).is_ok() {
-            self.call_stats(call_id).messages_sent += 1;
-            self.trace_send(&buf, remote);
+        match self.send_for_call(call_id, &buf, remote, None) {
+            Ok(_) => {
+                self.call_stats(call_id).messages_sent += 1;
+                self.trace_send(&buf, remote);
+            }
+            Err(e) => self.on_send_buffer_error(&format!("Error sending raw message: {e}")),
         }
+    }
+
+    /// SIPp `call::sendBuffer`: a *default* (non-scenario) message that could
+    /// not be sent. SIPp's `-sendbuffer_warn` reads backwards from its help
+    /// text — the flag makes this an `ERROR_NO`, which ends the run, and its
+    /// default (false) is the `WARNING_NO`. sipr matches the code, not the
+    /// help (SIPP_COMPAT §6 M44).
+    fn on_send_buffer_error(&mut self, line: &str) {
+        self.log_err(line);
+        if !self.config.sendbuffer_warn {
+            eprintln!("sipr: warning: {line}");
+            return;
+        }
+        eprintln!("sipr: error: {line}");
+        self.fatal = Some(line.to_owned());
+        self.fail_all("cannot send message");
+        self.hard_stop = true;
     }
 
     /// SIPp `E_AM_UNEXP_BYE`/`E_AM_UNEXP_CANCEL`: with `abortunexp` the

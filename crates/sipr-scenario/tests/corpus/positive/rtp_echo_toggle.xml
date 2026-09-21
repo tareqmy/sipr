@@ -12,6 +12,12 @@
   ]]></send>
   <nop><action><rtp_echo value="0"/></action></nop>
   <pause milliseconds="100"/>
-  <nop><action><rtp_echo value="1"/></action></nop>
+  <!-- The same switch driven from a variable (SIPp's handle_rhs form). -->
+  <nop>
+    <action>
+      <add assign_to="echo_on" value="1"/>
+      <rtp_echo variable="echo_on"/>
+    </action>
+  </nop>
   <recv request="BYE"/>
 </scenario>

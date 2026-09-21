@@ -116,6 +116,8 @@ with an SCTP stack) `-ip_field <n>` (the `-inf` column holding that IP)
 `-max_socket <n>` (per-call modes share sockets past n) `-rsa <host[:port]>`
 (remote sending address) `-max_reconnect <n>` `-reconnect_close <bool>`
 `-reconnect_sleep <ms>` (TCP/TLS reconnection) `-s <service>` (called number)
+`-bind_local` `-buff_size <bytes>` `-sendbuffer_warn <bool>`
+`-bind_to_device <name>` (M44, §6)
 `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version` (TLS material,
 SIPp defaults `cacert.pem`/`cakey.pem`).
 Media: `-mi <ip>` (media address; default local IP) `-mp <port>` (base media
@@ -149,6 +151,12 @@ Behavior toggles: `-aa` (auto-answer OPTIONS/INFO/UPDATE/NOTIFY in-dialog),
 Keywords (M39): `-key <keyword> <value>` (repeatable), `-tdmmap <map>`,
 `-dynamicStart`/`-dynamicMax`/`-dynamicStep` (the `[dynamic_id]` counter),
 `-rfc3339` (`[timestamp]` form).
+Accepted with a "no effect in sipr" warning (M44, §6): `-watchdog_interval`
+`-watchdog_reset` `-watchdog_minor_threshold` `-watchdog_major_threshold`
+`-watchdog_minor_maxtriggers` `-watchdog_major_maxtriggers`
+`-max_recv_loops` `-max_sched_loops` `-rtp_threadtasks` `-skip_rlimit`
+`-plugin` and the SCTP socket options `-multihome` `-heartbeat`
+`-assocmaxret` `-pathmaxret` `-pmtu` `-gracefulclose`.
 
 Where sipr needs a flag SIPp lacks, prefix long-form `--sipr-*` to keep the two
 namespaces distinct.
@@ -156,6 +164,21 @@ namespaces distinct.
 `hide="true"` and `display="…"` on any message command (M22): the scenario
 screen skips hidden rows while `set hide true` (default) holds, and shows
 `display` text instead of the derived label.
+
+### 3.1 Flags accepted but without effect
+
+These steer machinery sipr does not have: SIPp's event-loop scheduler and
+watchdog task (`-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`), its
+RTP playback thread pool (`-rtp_threadtasks`), its file-descriptor rlimit
+tuning (`-skip_rlimit`), its `dlopen` plugins (`-plugin`), and the SCTP
+socket options only libsctp can set (`-multihome`, `-heartbeat`,
+`-assocmaxret`, `-pathmaxret`, `-pmtu`, `-gracefulclose`). sipr parses each,
+prints one `sipr: warning: -<flag> has no effect in sipr: <why>` line, and
+carries on, so a CI wrapper written for sipp keeps working instead of dying
+at argument parsing. This is the **only** sanctioned exception to "an
+unknown flag is an error": a flag not in this list and not implemented is
+still a usage error. `-send_timeout` and `-timer_resol` (M42) warn the same
+way for the same reason.
 
 ## 4. Runtime key bindings (TUI)
 
@@ -346,8 +369,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   graceful-stop / immediate-stop.
 - Injection files `-inf` (M7, verified in `infile.cpp` / `call.cpp`
   `getFieldFromInputFile`): line 1 is the mode, matched by SUBSTRING —
-  `SEQUENTIAL`, `RANDOM`, or `USER` (SIPp also supports `PRINTF=` virtual
-  lines; sipr does not yet). Data lines follow; a line beginning `#` is a
+  `SEQUENTIAL`, `RANDOM`, or `USER`, optionally with `PRINTF=` (below).
+  Data lines follow; a line beginning `#` is a
   comment, trailing `\r` is stripped, a blank line ends the file. Field
   separator is `;`, fields are 0-indexed (`[field0]` = first). Each call is
   assigned ONE line per file at creation (`nextLine`): SEQUENTIAL = a shared
@@ -372,8 +395,22 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `key`, `value`, `line` are all rendered templates. The typical chain is
   `lookup → [fieldN line=[$v]]`. Files are wrapped so reads (`[fieldN]`) and
   mutations (`insert`/`replace`) share them on the single engine thread. The
-  standalone `<index>` action is not supported — use `-infindex`. `PRINTF=`
-  virtual-line files remain out.
+  standalone `<index>` action is not supported — use `-infindex`.
+- `PRINTF=` injection files (M44, verified in `infile.cpp` — the header
+  parse, `getField`'s printf branch, `numLines`, `insert`/`replace`): a
+  header `PRINTF=<n>` (plus optional `PRINTFOFFSET=<o>`, default 0, and
+  `PRINTFMULTIPLE=<m>`, default 1) makes the data lines *templates*. The
+  file then has `n` virtual lines; virtual line `l` reads real line
+  `l % rows` and every `%d` conversion in the field is filled with
+  `o + l * m`, `%%` being a literal `%`. So one row,
+  `SEQUENTIAL,PRINTF=10000\nuser%05d;[...]`, is ten thousand users. Only
+  `%[0-9.-]*d` is a legal conversion; `insert`/`replace` on such a file are
+  refused, as in SIPp. Two deliberate divergences: sipr splits the header
+  into `,`/whitespace tokens, so `PRINTFOFFSET=` may precede `PRINTF=`
+  (SIPp finds each with `strstr`, and that order makes its `PRINTF` match
+  land inside `PRINTFOFFSET` — a parse error); and sipr checks every
+  field's conversions at **load**, where SIPp errors at render time, the
+  first time a call reads a bad field.
 - TCP transport `-t t1` (M8): SIP over TCP is a byte stream, so message
   boundaries come from `Content-Length`, not packet edges (RFC 3261 §7.5). A
   framer reads headers up to the first `\r\n\r\n`, then exactly Content-Length
@@ -548,9 +585,16 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   independent — playing one does not cancel another; (4) a port-0 (held)
   `m=` line is skipped in favour of a later live one (SIPp's rtpstream path
   does this, its pcap path does not); (5) 802.11 captures are rejected
-  (unsupported link type) — recapture on the wired side. `play_pcap=` (in
-  the DTD, never implemented by SIPp) is an error pointing at
-  `play_pcap_audio=`. `-key` shipped in M39 (§6).
+  (unsupported link type) — recapture on the wired side; (6) **pcapng**
+  captures are read too (M44), which SIPp's `pcap_open_offline` refuses —
+  its `-s0` advice covers only the classic format. An in-tree block reader
+  (`sipr-media::pcapng`, no crate) handles Section Header, Interface
+  Description (`if_tsresol`, decimal and binary), Enhanced Packet, Simple
+  Packet and the obsolete Packet block, in either byte order and across
+  sections; other block types are skipped by their length. The resulting
+  stream is identical to the classic reader's, so everything above applies
+  unchanged. `play_pcap=` (in the DTD, never implemented by SIPp) is an
+  error pointing at `play_pcap_audio=`. `-key` shipped in M39 (§6).
 - `exec rtp_stream=` / `exec play_dtmf=` (M15; verified in `rtpstream.cpp`
   `rtpstream_playrtptask` (~l.603), `rtpstream_get_localport` (~l.1789),
   `rtpstream_cache_file` / `get_wav_header_size` (~l.1619/2240),
@@ -656,8 +700,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   (probing in steps of two only when `-rtp_echo` is on — otherwise
   `media_port` never moves), each thread `recvfrom`s with a 100 ms timeout
   and `sendto`s the bytes back unless the process-wide `rtp_echo_state`
-  (default true, toggled by the `<rtp_echo value=>` action from *any*
-  call) is false; counters `rtp_pckts`/`rtp_bytes` (1st stream) and
+  (default true, toggled by the `<rtp_echo>` action from *any* call) is
+  false; counters `rtp_pckts`/`rtp_bytes` (1st stream) and
   `rtp2_*` (2nd). The RTP check lives inside the `rtp_stream` sender:
   after every successful send it `select`s + `recv`s on the same socket
   and `memcmp`s the payload of what arrived with the payload just sent; a
@@ -672,8 +716,41 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   matches the echo sockets, probing, counters, toggle action, compare
   semantics, and exit code, with these divergences: (1) a stream is
   judged **only when `-audiotolerance`/`-videotolerance` was given**;
-  (2) `<rtp_echo variable=>` is rejected (value only). `exec rtp_echo=`
+  (2) `<rtp_echo variable="v"/>` (M44) reads `v`, where SIPp parses the
+  attribute through `handle_rhs` and then calls `getDoubleValue()` rather
+  than `get_rhs()` — its literal slot, which `variable=` never fills — so
+  in SIPp that form always switches echoing **off**. Every other rhs
+  action (`jump`, `pauserestore`, `add`, …) reads the variable; sipr makes
+  this one consistent instead of copying the slip. `exec rtp_echo=`
   (the per-call SRTP echo) is M25 below.
+- Socket options and the local address (M44; verified in `socket.cpp`
+  `open_connections` ~l.2372-2560 — `bind_specific`, the connect-probe,
+  the `bind_local || peripsocket` re-resolve — `sipp_customize_socket`
+  ~l.1735-1815, `SIPpSocket::bind_to_device` ~l.1645, `call.cpp`
+  `sendBuffer` ~l.1627): SIPp keeps two addresses apart. The **advertised**
+  one is `-i`; without `-i` it is `gethostname()` resolved when there is no
+  remote host, else the source address a UDP socket connected to the remote
+  reports (no packet is sent). The **bound** one is `INADDR_ANY` unless `-i`
+  was given (which sets `bind_specific`), or `-bind_local`/`-t ui` asks for
+  the advertised address. sipr now matches that split — before M44 it bound
+  `-i` and rendered `[local_ip]` as `0.0.0.0` when `-i` was absent — with
+  one divergence: for the no-remote case sipr runs the same connect-probe
+  against the RFC 5737/3849 documentation prefixes (naming the default
+  route's address) rather than resolving `gethostname()`, which SIPp's own
+  comment calls "actually buggy". `-bind_local` is therefore a no-op
+  alongside `-i`, exactly as in SIPp. `-buff_size` sets `SO_SNDBUF` and
+  `SO_RCVBUF` on every SIP socket (`socket2`, since std exposes neither and
+  `unsafe` is forbidden) — but only when given: SIPp always applies its own
+  default of 65536, which is *below* Linux's default receive buffer and
+  costs throughput at high rate. `-bind_to_device` is `SO_BINDTODEVICE`,
+  which exists on Linux alone and needs `CAP_NET_RAW`; SIPp compiles the
+  call out elsewhere and binds nothing silently, where sipr refuses the flag
+  at argument parsing. `-sendbuffer_warn` governs a failed send of a
+  *default* (non-scenario) message: despite its help text ("Produce warnings
+  instead of errors"), SIPp's code reads `if (sendbuffer_warn) ERROR_NO(…)
+  else WARNING_NO(…)`, so the flag makes the failure **fatal** and its
+  default is the warning. sipr matches the code — the run ends with the
+  flag, warns without it — and no longer ignores the failure outright.
 - AKA resynchronisation (M19): SIPp's `auth.cpp` has an AUTS branch guarded
   by `if (1/*sqn[5] > sqn_he[5]*/)` (~l.676) whose real condition is
   commented out, so the always-taken branch stores one SQN byte into a
@@ -1046,8 +1123,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   returns after a `<nop>`'s `next()`), sipr runs a call until its first
   blocking step — so two calls started in the same tick interleave their
   action steps differently (both `<nop>`s before either `<send>` in
-  SIPp), which only shows through shared (global) variables. Left as is;
-  the M35 interop test normalises it.
+  SIPp), which only shows through shared (global) variables. Settled as a
+  permanent divergence in M44 below; the M35 interop test normalises it.
 - Variable value semantics (v0.24.0; verified in `variables.cpp` ~l.33-46
   `CCallVariable::isSet`, `call.cpp` ~l.3968-3978 `E_Message_Variable`,
   ~l.1933 `call::next`, ~l.2241 `condexec`): a variable "is set" when it
@@ -1148,16 +1225,57 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   otherwise the keyword falls back to the last *received* request's URI,
   which a UAC never has — so the documented setdest example silently
   depends on `rrs="true"` on the `recv response="200"`. sipr renders the
-  last received Contact regardless of `rrs` (pre-existing, left as is:
-  it is what the example intends). (c) `[last_*]` inside the actions of
+  last received Contact regardless of `rrs` (settled as permanent in
+  M44 below: it is what the example intends). (c) `[last_*]` inside the actions of
   the recv that just matched (`call.cpp` ~l.5517 `executeAction` before
   ~l.5641 `last_recv_msg = …`): SIPp still names the *previous* received
   message — empty on a call's first recv — so SIPp's own
   `<exec command="echo [last_From] >> from_list.log"/>` example writes
-  blank lines; sipr's `[last_*]` name the message just received
-  (pre-existing, left as is; the interop test accepts both). (d) The
+  blank lines; sipr's `[last_*]` name the message just received (settled
+  as permanent in M44 below; the interop test accepts both). (d) The
   example's unquoted From also breaks under any shell (`<`, `>` and `;`
   are redirections and a command separator) — quote it.
+- The three divergences M37 and M35 left open, settled (M44). Each was
+  "left as is" with no decision recorded; each is now **permanent**, with
+  no `--sipr-strict-sipp` flag, and the first two are pinned by
+  `next_url_and_last_headers_follow_siprs_reading_not_sipps` in
+  `tests/e2e.rs`.
+  (1) **`[next_url]` without `rrs`** (`call.cpp` ~l.5570-5580): SIPp fills
+  `next_req_url` only on a recv carrying `rrs="true"` and otherwise falls
+  back to the last received *request's* URI, which a UAC never has — so its
+  own documented `setdest` example depends on an `rrs` nobody writes, and
+  the keyword renders **empty** without it. sipr renders the last received
+  Contact either way. A scenario written SIPp's way behaves identically in
+  both; matching SIPp could only turn a working scenario into one that
+  sends to an empty URI, which is no one's test.
+  (2) **`[last_*]` inside the matching recv's own actions** (`call.cpp`
+  ~l.5517 `executeAction` runs before ~l.5641 `last_recv_msg = …`): SIPp's
+  keywords still name the *previous* received message, empty on a call's
+  first recv — which is why SIPp's own `echo [last_From]` example logs
+  blank lines. Matching it would mean rendering `[last_*]` from the
+  previous message while `ereg` in the same action list still searches the
+  new one: two different "current messages" in one `<action>` block, for a
+  behavior no scenario depends on deliberately.
+  (3) **Action-step interleaving** (`call.cpp` `call::run` returns after a
+  `<nop>`'s `next()`): SIPp's scheduler runs one message step per call per
+  turn, sipr runs a call until its first blocking step, so two calls
+  started in the same tick interleave their `<nop>`s differently. Matching
+  it means SIPp's one-step-per-turn scheduler, the opposite of the runtime
+  model in ARCHITECTURE §3, for a difference observable only through a
+  `<Global>` variable two such calls both write.
+- sipp frees the socket it is still sending on when a TCP peer resets
+  (found M44 while closing the interop gate; `socket.cpp` ~l.2151, the
+  `default:` arm of `write_primitive`). After the far end closes a `-t t1`
+  connection, sipp 3.7.7 reaches a `SIPpSocket` whose `ss_transport` reads
+  back as garbage — the same run logs "Unable to send UDP message" for a
+  TCP run, and then dies on the fatal "Internal error, unknown transport
+  type 1024" instead of reconnecting. Reproducible on macOS; the mirror
+  direction (sipr's UAC reconnecting to a sipp UAS) is unaffected, so this
+  is sipp's bookkeeping, not a protocol difference. Nothing sipr can do
+  about it — closing the connection is what the test is *for* — so
+  `real_sipp_tcp_uac_reconnects_to_sipr` skips **visibly** when sipp's
+  error log shows it, alongside the pre-existing "Unable to bind TCP
+  socket" guard.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)
 - Statistical pauses and `<sample>` (M38; verified in `scenario.cpp`

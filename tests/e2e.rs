@@ -737,8 +737,10 @@ fn digest_uri_matches_what_the_server_verifies() {
     assert!(registrar.join().expect("registrar"));
 }
 
-#[test]
-fn injection_file_fields_land_in_sent_messages() {
+/// Run `calls` UAC calls whose From user-part is `[field0]` of `inf`, and
+/// return the user-parts the UAS saw, sorted. `tag` keeps the temp files of
+/// concurrent tests apart.
+fn injected_from_users(tag: &str, inf: &str, calls: &str) -> Vec<String> {
     // A UAS that captures the From user-part of each INVITE it sees, so we can
     // prove sipr substituted [field0] from the -inf file per call.
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -783,9 +785,7 @@ fn injection_file_fields_land_in_sent_messages() {
         seen_users
     });
 
-    // A SEQUENTIAL injection file: three distinct user-parts.
-    let inf = "SEQUENTIAL\nalice;1001\nbob;1002\ncarol;1003\n";
-    let inf_path = std::env::temp_dir().join(format!("sipr-inf-{}.csv", std::process::id()));
+    let inf_path = std::env::temp_dir().join(format!("sipr-inf-{tag}-{}.csv", std::process::id()));
     std::fs::write(&inf_path, inf).expect("write inf");
 
     let scenario = r#"<scenario name="inf-uac">
@@ -825,7 +825,8 @@ fn injection_file_fields_land_in_sent_messages() {
   ]]></send>
   <recv response="200"/>
 </scenario>"#;
-    let sc_path = std::env::temp_dir().join(format!("sipr-inf-sc-{}.xml", std::process::id()));
+    let sc_path =
+        std::env::temp_dir().join(format!("sipr-inf-sc-{tag}-{}.xml", std::process::id()));
     std::fs::write(&sc_path, scenario).expect("write scenario");
 
     let out = run_sipr(&[
@@ -834,7 +835,7 @@ fn injection_file_fields_land_in_sent_messages() {
         "-inf",
         inf_path.to_str().expect("utf8"),
         "-m",
-        "3",
+        calls,
         "-d",
         "30",
         "-timeout",
@@ -846,14 +847,40 @@ fn injection_file_fields_land_in_sent_messages() {
     let _ = std::fs::remove_file(&inf_path);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
-    assert!(err.contains("successful 3 failed 0"), "{err}");
+    assert!(
+        err.contains(&format!("successful {calls} failed 0")),
+        "{err}"
+    );
 
     let mut users = uas.join().expect("uas thread");
     users.sort();
+    users
+}
+
+#[test]
+fn injection_file_fields_land_in_sent_messages() {
+    // A SEQUENTIAL injection file: three distinct user-parts.
+    let users = injected_from_users("seq", "SEQUENTIAL\nalice;1001\nbob;1002\ncarol;1003\n", "3");
     assert_eq!(
         users,
         vec!["alice", "bob", "carol"],
         "sequential fields per call"
+    );
+}
+
+#[test]
+fn printf_injection_file_generates_virtual_lines() {
+    // One template row, four virtual lines: SIPp's PRINTF= mode fills each
+    // `%d` with PRINTFOFFSET + line * PRINTFMULTIPLE (infile.cpp).
+    let users = injected_from_users(
+        "printf",
+        "SEQUENTIAL,PRINTF=4,PRINTFOFFSET=1000,PRINTFMULTIPLE=2\nuser%d;x%04d\n",
+        "4",
+    );
+    assert_eq!(
+        users,
+        vec!["user1000", "user1002", "user1004", "user1006"],
+        "one row expanded into four numbered users"
     );
 }
 
@@ -1976,6 +2003,56 @@ fn pcap_uac_scenario(pcap_path: &str) -> String {
     )
 }
 
+/// pcapng is what `tcpdump` and Wireshark write by default; SIPp's libpcap
+/// reader rejects it, sipr replays it (M44). Same stream, same wire.
+#[test]
+fn play_pcap_audio_accepts_a_pcapng_capture() {
+    let (addr, _media, uas, sink) = spawn_media_uas(Duration::from_secs(2));
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let pcap_path = dir.join(format!("sipr-e2e-ng-{pid}.pcapng"));
+    let capture = sipr_media::pcapng::build::rtp_capture(10, 20_000, 6000);
+    std::fs::write(&pcap_path, &capture).expect("write pcapng");
+    let expected = sipr_media::pcap::parse(&capture).expect("parse");
+    let scenario_path = dir.join(format!("sipr-e2e-ng-{pid}.xml"));
+    std::fs::write(
+        &scenario_path,
+        pcap_uac_scenario(pcap_path.to_str().expect("utf8")),
+    )
+    .expect("write scenario");
+    let out = run_sipr(&[
+        "-sf",
+        scenario_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-mp",
+        &free_port_block(8).to_string(),
+        "-r",
+        "10",
+        "-m",
+        "1",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let _ = std::fs::remove_file(&pcap_path);
+    let _ = std::fs::remove_file(&scenario_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(err.contains("rtp-sent 10"), "{err}");
+    let _ = uas.join();
+    let got = sink.join().expect("sink");
+    assert_eq!(got.len(), 10, "frames received: {}", got.len());
+    for (_, payload) in &got {
+        assert!(
+            expected.frames.iter().any(|f| f.payload == *payload),
+            "unknown payload {payload:?}"
+        );
+    }
+}
+
 #[test]
 fn play_pcap_audio_replays_capture_to_the_sdp_endpoint() {
     let (addr, _media, uas, sink) = spawn_media_uas(Duration::from_secs(2));
@@ -2939,6 +3016,137 @@ fn rtpcheck_against_a_silent_peer_exits_253_when_a_tolerance_is_set() {
     assert_eq!(out.status.code(), Some(253), "{err}");
     assert!(err.contains("successful 1 failed 0"), "{err}");
     assert!(err.contains("rtpcheck 1/1 failed"), "{err}");
+}
+
+/// `<rtp_echo variable="v"/>` reads the variable at run time, where
+/// `<rtp_echo value="…"/>` reads a literal: the same `-rtp_echo` UAS echoes
+/// or stays silent purely on `v`, and the UAC's rtpcheck sees the difference.
+#[test]
+fn rtp_echo_variable_switches_the_echo_at_run_time() {
+    for (echo_on, expect_failed) in [("1", 0), ("0", 1)] {
+        let sip_port = free_port();
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let uas_path = dir.join(format!("sipr-e2e-echovar-uas-{echo_on}-{pid}.xml"));
+        // `add` on an unset variable leaves it at the literal, which is the
+        // shortest way to hand <rtp_echo> a variable the compiler sees written.
+        std::fs::write(
+            &uas_path,
+            format!(
+                r#"<scenario name="uas-echo-from-variable">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]v[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Type: application/sdp
+    Content-Length: [len]
+
+    v=0
+    o=sipr 0 0 IN IP[local_ip_type] [local_ip]
+    s=-
+    c=IN IP[media_ip_type] [media_ip]
+    t=0 0
+    m=audio [media_port] RTP/AVP 8
+    a=rtpmap:8 PCMA/8000
+
+  ]]></send>
+  <nop>
+    <action>
+      <add assign_to="echo_on" value="{echo_on}"/>
+      <rtp_echo variable="echo_on"/>
+    </action>
+  </nop>
+  <recv request="ACK" optional="true"/>
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>
+"#
+            ),
+        )
+        .expect("write uas scenario");
+        let (mut uas, uas_err) = spawn_sipr_bg(&[
+            "-sf",
+            uas_path.to_str().expect("utf8"),
+            "-i",
+            "127.0.0.1",
+            "-p",
+            &sip_port.to_string(),
+            "-mi",
+            "127.0.0.1",
+            "-mp",
+            &free_port_block(4).to_string(),
+            "-rtp_echo",
+            "-cp",
+            "0",
+            "-m",
+            "1",
+            "-timeout",
+            "20",
+            "-bg",
+        ]);
+        std::thread::sleep(Duration::from_millis(400));
+        let uac_path = dir.join(format!("sipr-e2e-echovar-uac-{echo_on}-{pid}.xml"));
+        std::fs::write(
+            &uac_path,
+            rtp_stream_uac_scenario("unused")
+                .replace(
+                    r#"rtp_stream="unused,2,8,PCMA/8000""#,
+                    r#"rtp_stream="apattern,1,8""#,
+                )
+                .replace(
+                    r#"<nop><action><exec play_dtmf="1,50"/></action></nop>"#,
+                    "",
+                ),
+        )
+        .expect("write uac scenario");
+        let out = run_sipr(&[
+            "-sf",
+            uac_path.to_str().expect("utf8"),
+            "-i",
+            "127.0.0.1",
+            "-mp",
+            &free_port_block(4).to_string(),
+            // 0.9: only a dead echo path (every check missed) fails; a loaded
+            // CI host can miss half the 20 ms echo windows and must still pass.
+            "-audiotolerance",
+            "0.9",
+            "-cp",
+            "0",
+            "-m",
+            "1",
+            "-timeout",
+            "20",
+            "-bg",
+            &format!("127.0.0.1:{sip_port}"),
+        ]);
+        let _ = std::fs::remove_file(&uac_path);
+        let _ = std::fs::remove_file(&uas_path);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("successful 1 failed 0"),
+            "echo_on={echo_on}\n{err}"
+        );
+        assert!(
+            err.contains(&format!("rtpcheck {expect_failed}/1 failed")),
+            "echo_on={echo_on}\n{err}"
+        );
+        let _ = wait_exit(&mut uas, Duration::from_secs(15));
+        let _ = uas_err.join();
+    }
 }
 
 #[test]
@@ -8010,4 +8218,191 @@ fn extended_3pcc_option_checks_and_wrong_sender() {
     assert!(err.contains("failed 1"), "{err}");
     let _ = std::fs::remove_file(&cfg_path);
     let _ = std::fs::remove_file(&sc_path);
+}
+
+// ---- socket options: -bind_local, -buff_size (M44) ----------------------
+
+/// Without `-i`, sipr binds every interface but advertises the address the
+/// kernel would route from (SIPp's connect-probe): against a loopback target
+/// that is 127.0.0.1, not `0.0.0.0`. `-bind_local` binds it as well, and
+/// `-buff_size` resizes the socket buffers without disturbing the run.
+#[test]
+fn bind_local_and_buff_size_drive_a_call_without_an_explicit_i() {
+    let sip_port = free_port();
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sn",
+        "uas",
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &sip_port.to_string(),
+        "-cp",
+        "0",
+        "-m",
+        "1",
+        "-timeout",
+        "20",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    let dir = std::env::temp_dir().join(format!("sipr-bindlocal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let (out, _) = run_sipr_in(
+        &dir,
+        &[
+            "-sn",
+            "uac",
+            // No -i on purpose: the address is derived, then bound.
+            "-bind_local",
+            "-buff_size",
+            "262144",
+            "-trace_msg",
+            "-cp",
+            "0",
+            "-m",
+            "1",
+            "-timeout",
+            "20",
+            "-bg",
+            &format!("127.0.0.1:{sip_port}"),
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "uac stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    let messages = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_messages.log"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        messages.contains("Via: SIP/2.0/UDP 127.0.0.1:"),
+        "[local_ip] should be the routed source address, not 0.0.0.0:\n{messages}"
+    );
+    let code = wait_exit(&mut uas, Duration::from_secs(15));
+    let uerr = uas_err.join().expect("uas stderr");
+    assert_eq!(code, Some(0), "uas stderr:\n{uerr}");
+}
+
+// ---- the M44 settled divergences ---------------------------------------
+
+/// Two keyword divergences from SIPp, settled as permanent in M44 and
+/// pinned here (SIPP_COMPAT §6 M44):
+///
+/// 1. `[next_url]` renders the last received Contact whether or not the
+///    recv carried `rrs="true"`. SIPp fills `next_req_url` only under
+///    `rrs`, and otherwise falls back to the last received *request's* URI
+///    — which a UAC never has, so the keyword renders empty there.
+/// 2. `[last_*]` inside the actions of the recv that just matched names
+///    *that* message. SIPp runs the actions before it stores the message,
+///    so its `[last_*]` name the previous one — empty on a call's first
+///    recv, which is why SIPp's own `echo [last_From]` example logs blanks.
+#[test]
+fn next_url_and_last_headers_follow_siprs_reading_not_sipps() {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().expect("addr");
+    sock.set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("timeout");
+    let uas = std::thread::spawn(move || {
+        let mut buf = [0u8; 65_535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            match msg.method() {
+                // A Contact that is distinguishable from the request URI.
+                Some("INVITE") => {
+                    let _ = sock.send_to(&ok_with_contact(&msg, 9), from);
+                }
+                Some("BYE") => {
+                    let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+                }
+                _ => {}
+            }
+        }
+    });
+    // The 200 has no rrs="true", and its actions are the call's first recv.
+    let scenario = r#"<scenario name="settled">
+  <send retrans="500"><![CDATA[
+    INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:sipr@[local_ip]:[local_port]>
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200">
+    <action>
+      <log message="next_url=[next_url] last=[last_CSeq:]"/>
+    </action>
+  </recv>
+  <send><![CDATA[
+    ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Content-Length: 0
+
+  ]]></send>
+  <send retrans="500"><![CDATA[
+    BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipr@[local_ip]:[local_port]>;tag=[pid]t[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 2 BYE
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+</scenario>
+"#;
+    let dir = std::env::temp_dir().join(format!("sipr-settled-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("settled.xml");
+    std::fs::write(&path, scenario).expect("write scenario");
+    let (out, _) = run_sipr_in(
+        &dir,
+        &[
+            "-sf",
+            path.to_str().expect("utf8"),
+            "-i",
+            "127.0.0.1",
+            "-trace_logs",
+            "-cp",
+            "0",
+            "-m",
+            "1",
+            "-timeout",
+            "15",
+            "-bg",
+            &addr.to_string(),
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    let logs = std::fs::read_dir(&dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_logs.log"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    drop(uas);
+    assert!(
+        logs.contains("next_url=sip:svc@127.0.0.1:9 "),
+        "[next_url] must be the received Contact without rrs:\n{logs}"
+    );
+    assert!(
+        logs.contains("last=CSeq: 1 INVITE"),
+        "[last_*] must name the message this recv just matched:\n{logs}"
+    );
 }

@@ -19,6 +19,7 @@ pub mod retrans;
 pub mod rng;
 #[cfg(feature = "sctp")]
 pub mod sctp;
+pub mod sockopt;
 pub mod table;
 pub mod tcp;
 pub mod timer;
@@ -30,6 +31,7 @@ pub use message::{Inbound, MsgKind, ParseError};
 pub use retrans::{RetransCaps, RetransSchedule};
 #[cfg(feature = "sctp")]
 pub use sctp::{SctpCallConn, SctpTransport};
+pub use sockopt::SocketOpts;
 pub use table::CallTable;
 pub use tcp::{TcpCallConn, TcpFramer, TcpTransport};
 pub use timer::{TimerQueue, TimerService};

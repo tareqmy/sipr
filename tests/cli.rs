@@ -648,3 +648,43 @@ fn tdmmap_rejects_a_bad_map_with_sipps_wording() {
     let o = sipr(&["-dynamicStart", "ten", "-sn", "uac", "127.0.0.1"]);
     assert_code(&o, 2);
 }
+
+/// SIPp's scheduler, process and SCTP knobs (M44) are accepted so that a
+/// wrapper script written for sipp still runs: each warns once on stderr and
+/// the run proceeds.
+#[test]
+fn no_effect_sipp_flags_warn_but_do_not_stop_the_run() {
+    let o = sipr(&[
+        "-sn",
+        "uac",
+        "--check",
+        "-watchdog_interval",
+        "400",
+        "-max_sched_loops",
+        "2000",
+        "-skip_rlimit",
+        "-plugin",
+        "extras.so",
+        "-gracefulclose",
+        "false",
+    ]);
+    assert_code(&o, 0);
+    let err = stderr(&o);
+    for flag in [
+        "-watchdog_interval",
+        "-max_sched_loops",
+        "-skip_rlimit",
+        "-plugin",
+        "-gracefulclose",
+    ] {
+        assert!(
+            err.contains(&format!("warning: {flag} has no effect in sipr")),
+            "missing warning for {flag}:\n{err}"
+        );
+    }
+    assert!(stdout(&o).contains("role=UAC"), "the scenario still loaded");
+    // A flag that is neither implemented nor in the no-effect set still fails.
+    let o = sipr(&["-sn", "uac", "--check", "-watchdog_frobnicate", "1"]);
+    assert_code(&o, 2);
+    assert!(stderr(&o).contains("unknown option"), "{}", stderr(&o));
+}

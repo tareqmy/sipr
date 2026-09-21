@@ -399,7 +399,10 @@ fn run_one(
         },
         Action::RtpStream(cmd) => ActionOutcome::RtpStream(cmd.clone()),
         Action::PlayDtmf(t) => ActionOutcome::PlayDtmf(render_with_store(t, store, base_ctx)),
-        Action::RtpEchoState(on) => ActionOutcome::RtpEcho(*on),
+        Action::RtpEchoState(operand) => ActionOutcome::RtpEcho(match operand {
+            Operand::Value(v) => *v != 0.0,
+            Operand::Var(id) => store.get(*id).as_num() != 0.0,
+        }),
         Action::RtpEcho(cmd) => ActionOutcome::RtpEchoCmd(cmd.clone()),
         Action::ExecCommand(command) => {
             ActionOutcome::ExecCommand(render_with_store(command, store, base_ctx))

@@ -97,10 +97,13 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   `condexec` branching, `chance`, and named counters.
 - Keywords incl. `[call_id]`, `[branch]`, `[cseq]`, `[last_*:]`, `[$var]`,
   `[routes]`, `[peer_tag_param]`, `[len]`, `[fieldN]`, and `[authentication]`.
-- `-inf FILE` injection files (SEQUENTIAL/RANDOM/USER), one line drawn per call;
-  `[fieldN]` pulls a field, with `file=NAME` and `line=[$var]` selectors.
+- `-inf FILE` injection files (SEQUENTIAL/RANDOM/USER, and `PRINTF=` virtual
+  lines), one line drawn per call; `[fieldN]` pulls a field, with `file=NAME`
+  and `line=[$var]` selectors.
 - Indexed injection: `-infindex FILE FIELD` plus `<lookup>`/`<insert>`/
   `<replace>` actions for keyed, mutable CSV data.
+- pcap replay (`exec play_pcap_audio|video|image=`) from classic pcap *and*
+  pcapng captures — no libpcap, no raw socket, no root.
 - 3PCC: classic (`-3pcc HOST:PORT`) with `<sendCmd>`/`<recvCmd>` over an
   ESC-framed twin socket, and extended master/slave mode
   (`-master`/`-slave` + `-slave_cfg`, `sendCmd dest=`, `recvCmd src=`).
@@ -130,7 +133,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
   `--features sctp` on Linux; streams frame by
   Content-Length and carry no SIP retransmissions (reliable transports). TLS
   takes SIPp's `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version`
-  flags with SIPp's verification semantics.
+  flags with SIPp's verification semantics. Socket knobs: `-i`/`-bind_local`
+  (advertised vs bound address), `-buff_size`, `-bind_to_device` (Linux).
 - UDP retransmission (T1→T2), recv-window matching verified against SIPp's C++.
 - Digest authentication (MD5 + SHA-256, `qop=auth`, proxy 407) and IMS AKA
   (`AKAv1-MD5` with in-tree Milenage: `[authentication aka_K=0x… aka_OP=0x…]`),
@@ -176,15 +180,17 @@ Parts of SIPp that sipr does not implement, and where that is deliberate:
 
 - The standalone `<index>` action (sipr builds injection indexes from
   `-infindex` at load time).
-- `PRINTF=` virtual-line injection files.
-- `<rtp_echo variable=…>` (only `value="0|1"`).
 - WebSocket transport (`-t ws`).
-- SIPp's SCTP socket options (`-multihome`, `-heartbeat`, `-pathmaxret`,
-  `-pmtu`, `-assocmaxret`, `-gracefulclose`) — out of reach without libsctp.
+- SIPp's plugins (`-plugin`), its scheduler and watchdog knobs
+  (`-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`,
+  `-rtp_threadtasks`, `-skip_rlimit`) and its SCTP socket options
+  (`-multihome`, `-heartbeat`, `-pathmaxret`, `-pmtu`, `-assocmaxret`,
+  `-gracefulclose`) — none of that machinery exists in sipr.
 
-None of these is ignored: a scenario element or flag from this list is
-rejected up front with a message naming it. `docs/SIPP_COMPAT.md` lists the
-exact supported surface.
+None of these is ignored: a scenario element from this list is rejected up
+front with a message naming it, and the flags are accepted with one loud
+"no effect in sipr" warning each so that sipp wrapper scripts keep running.
+`docs/SIPP_COMPAT.md` lists the exact supported surface.
 
 ## Brand
 

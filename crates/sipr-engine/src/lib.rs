@@ -22,4 +22,4 @@ pub use engine::{
 // Re-exported so the binary can build a TLS config without depending on
 // sipr-net directly.
 pub use render::{FieldSource, RenderCtx, RenderError, VarCtx, render};
-pub use sipr_net::{PeerTable, TlsConfig, TlsVersion};
+pub use sipr_net::{PeerTable, SocketOpts, TlsConfig, TlsVersion};

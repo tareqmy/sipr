@@ -1,4 +1,4 @@
-//! Classic pcap file reader: UDP payloads + relative timing, nothing else.
+//! pcap file reader: UDP payloads + relative timing, nothing else.
 //!
 //! What is kept per packet mirrors SIPp's `prepare_pcap.c`: the UDP
 //! destination port (so multi-port captures such as RTP+RTCP replay to
@@ -6,6 +6,11 @@
 //! never rewritten — every call replaying the same file emits the same SSRC
 //! and sequence numbers, exactly like SIPp), and the capture timestamp,
 //! turned into a monotone offset from the first kept packet.
+//!
+//! [`parse`] takes either capture format: the classic one this module reads,
+//! and pcapng (which `tcpdump` and Wireshark write by default), handed to
+//! [`crate::pcapng`] — a sipr addition, since SIPp's libpcap reader rejects
+//! pcapng outright.
 //!
 //! Supported: microsecond and nanosecond magic in either byte order; link
 //! types Ethernet (with one 802.1Q tag), raw IP, Linux cooked v1/v2, and
@@ -83,8 +88,16 @@ impl PcapStream {
 pub enum PcapError {
     /// Shorter than a pcap global header.
     TooShort,
-    /// Not a classic pcap magic number (pcapng is not supported).
+    /// Neither a classic pcap magic number nor a pcapng section header.
     BadMagic(u32),
+    /// A pcapng block that is malformed or references an undeclared
+    /// interface. `index` is the 0-based block number.
+    BadBlock {
+        /// 0-based block index in the file.
+        index: usize,
+        /// What was wrong with it.
+        why: &'static str,
+    },
     /// A link-layer type this reader does not decode.
     UnsupportedLinkType(u32),
     /// Record `index` has `caplen < len`: the capture was made with a snap
@@ -105,10 +118,12 @@ impl std::fmt::Display for PcapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooShort => write!(f, "file is shorter than a pcap header"),
-            Self::BadMagic(m) => write!(
-                f,
-                "not a classic pcap file (magic {m:#010x}; pcapng is not supported)"
-            ),
+            Self::BadMagic(m) => {
+                write!(f, "not a pcap or pcapng capture (leading bytes {m:#010x})")
+            }
+            Self::BadBlock { index, why } => {
+                write!(f, "pcapng block {index}: {why}")
+            }
             Self::UnsupportedLinkType(t) => write!(f, "unsupported link-layer type {t}"),
             Self::TruncatedPacket { index } => write!(
                 f,
@@ -186,6 +201,9 @@ impl Layout {
 /// [`PcapError`] for a malformed or unsupported file. Packets that are not
 /// UDP/IP are skipped (counted in [`PcapStream::skipped`]), never fatal.
 pub fn parse(bytes: &[u8]) -> Result<PcapStream, PcapError> {
+    if crate::pcapng::is_pcapng(bytes) {
+        return crate::pcapng::parse(bytes);
+    }
     if bytes.len() < GLOBAL_HEADER_LEN {
         return Err(PcapError::TooShort);
     }
@@ -193,16 +211,7 @@ pub fn parse(bytes: &[u8]) -> Result<PcapStream, PcapError> {
     let layout =
         Layout::from_magic(magic).ok_or_else(|| PcapError::BadMagic(u32::from_le_bytes(magic)))?;
     let link_type = layout.u32(&bytes[20..24]);
-    if !matches!(
-        link_type,
-        LINKTYPE_NULL
-            | LINKTYPE_ETHERNET
-            | LINKTYPE_RAW_LEGACY
-            | LINKTYPE_RAW
-            | LINKTYPE_LOOP
-            | LINKTYPE_LINUX_SLL
-            | LINKTYPE_LINUX_SLL2
-    ) {
+    if !link_type_supported(link_type) {
         return Err(PcapError::UnsupportedLinkType(link_type));
     }
 
@@ -258,9 +267,23 @@ pub fn parse(bytes: &[u8]) -> Result<PcapStream, PcapError> {
     Ok(stream)
 }
 
+/// True for the link-layer types [`udp_payload`] can decode.
+pub(crate) fn link_type_supported(link_type: u32) -> bool {
+    matches!(
+        link_type,
+        LINKTYPE_NULL
+            | LINKTYPE_ETHERNET
+            | LINKTYPE_RAW_LEGACY
+            | LINKTYPE_RAW
+            | LINKTYPE_LOOP
+            | LINKTYPE_LINUX_SLL
+            | LINKTYPE_LINUX_SLL2
+    )
+}
+
 /// Peel the link and IP layers off one captured frame; `None` when it is
 /// not an unfragmented UDP/IP packet we can replay.
-fn udp_payload(link_type: u32, data: &[u8]) -> Option<(u16, &[u8])> {
+pub(crate) fn udp_payload(link_type: u32, data: &[u8]) -> Option<(u16, &[u8])> {
     let ip = match link_type {
         LINKTYPE_ETHERNET => {
             let ethertype = be16(data, 12)?;
@@ -646,8 +669,12 @@ mod tests {
     fn errors_are_specific() {
         assert_eq!(parse(&[0u8; 10]), Err(PcapError::TooShort));
         let mut junk = vec![0u8; 24];
-        junk[..4].copy_from_slice(&0x0a0d_0d0au32.to_le_bytes()); // pcapng
+        junk[..4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
         assert!(matches!(parse(&junk), Err(PcapError::BadMagic(_))));
+        // A pcapng section header with nothing behind it.
+        let mut headless = vec![0u8; 24];
+        headless[..4].copy_from_slice(&0x0a0d_0d0au32.to_le_bytes());
+        assert!(matches!(parse(&headless), Err(PcapError::BadBlock { .. })));
         let wifi = pcap_file(105, &[]);
         assert_eq!(parse(&wifi), Err(PcapError::UnsupportedLinkType(105)));
         let mut trunc = rtp_capture(1, 0, 6000);

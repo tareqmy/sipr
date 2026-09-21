@@ -35,6 +35,11 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> ExitCode {
+    // SIPp flags sipr accepts but cannot act on (cli::no_effect_reason).
+    for warning in &cli.warnings {
+        eprintln!("sipr: warning: {warning}");
+    }
+
     // -sd: dump an embedded scenario and exit.
     if let Some(name) = cli.sd.as_deref() {
         return match sipr_scenario::embedded(name) {
@@ -177,6 +182,12 @@ fn run(cli: &Cli) -> ExitCode {
     let config = sipr_engine::EngineConfig {
         target,
         local_ip,
+        bind_local: cli.bind_local,
+        sockopts: sipr_engine::SocketOpts {
+            buff_size: cli.buff_size,
+            bind_device: cli.bind_to_device.clone(),
+        },
+        sendbuffer_warn: cli.sendbuffer_warn,
         port: cli.port,
         service: cli.service.clone(),
         rate: cli.rate,

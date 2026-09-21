@@ -13,6 +13,9 @@ fn uas_config() -> EngineConfig {
     EngineConfig {
         target: None,
         local_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        bind_local: false,
+        sockopts: sipr_engine::SocketOpts::default(),
+        sendbuffer_warn: false,
         port: None,
         service: "service".into(),
         rate: 10.0,

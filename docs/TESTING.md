@@ -54,7 +54,16 @@ Locating sipp: `$SIPP_BIN` env var, else `sipp` on PATH, else skip with a
 from `../../cprojects/sipp` (`cmake . -DUSE_GSL=1 && make`, or
 `./build.sh`; GSL — `libgsl-dev` / `brew install gsl` — is what lets sipp
 run statistical pauses, so the M38 interop test's sipp-side half skips
-visibly without it) or `apt/brew install sipp`. Tests bind ephemeral ports on 127.0.0.1 and must run
+visibly without it) or `apt/brew install sipp`.
+Building it on macOS needs a little more than `./build.sh --common` says
+(M44): `git submodule update --init` first (pugixml is required and gtest
+must exist for the `sipp_unittest` target CMake references), `pkg-config`
+must be installed or CMake cannot see Homebrew's OpenSSL, and GSL's headers
+are not on clang's default search path — sipp adds the GSL *library* but
+never its include directory, so pass
+`-DCMAKE_C_FLAGS=-I/opt/homebrew/include -DCMAKE_CXX_FLAGS=-I/opt/homebrew/include`.
+Configuring in-tree also writes `include/version.cmake`; `cmake -B <dir> -S
+<src>` keeps the build out of the checkout. Tests bind ephemeral ports on 127.0.0.1 and must run
 in parallel safely; each test gets its own port pair.
 
 Lessons from driving real sipp in tests (M26): a scenario file handed to

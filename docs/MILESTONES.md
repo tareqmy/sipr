@@ -1796,36 +1796,59 @@ Extended mode never sends `3pcc_abort`; classic mode does on an
 unexpected-message abort, and both sides now honor `internal-cmd:
 abort_call`. `-trace_msg` still does not log twin commands.
 
-### M44 — Leftovers that still reject loudly
+### M44 — Leftovers that still reject loudly ✅
 
 Small, independent items; ship in any order, each its own commit:
 
-- [ ] `PRINTF=` virtual-line injection files (`infile.cpp`: a header
+- [x] `PRINTF=` virtual-line injection files (`infile.cpp`: a header
       line `PRINTF=<n>` and a `printf`-style template expanded to n
       lines — verify the exact substitution) — the last injection-file
-      mode missing.
-- [ ] `<rtp_echo variable="…">` (toggle from a variable, `call.cpp`
-      `E_AT_RTP_ECHO`).
-- [ ] `-bind_local` (UAS listens on `-i` only, not all interfaces),
+      mode missing. Done: `PRINTF=`/`PRINTFOFFSET=`/`PRINTFMULTIPLE=`,
+      `%[0-9.-]*d` and `%%`, virtual lines over cycling rows, indexing
+      and `-users` over the virtual count, `insert`/`replace` refused;
+      the two divergences are in SIPP_COMPAT §1.
+- [x] `<rtp_echo variable="…">` (toggle from a variable, `call.cpp`
+      `E_AT_RTP_ECHO`). Done: the action takes SIPp's `handle_rhs` pair
+      (`value=` xor `variable=`) and the engine reads the variable —
+      where SIPp reads its literal slot and so always switches echoing
+      off; SIPP_COMPAT §6 M18 records the slip.
+- [x] `-bind_local` (UAS listens on `-i` only, not all interfaces),
       `-buff_size`, `-sendbuffer_warn`; `-bind_to_device` on Linux
-      (`SO_BINDTODEVICE`, needs root; reject clearly elsewhere).
-- [ ] pcapng input for `play_pcap_*` (sipr addition: `tcpdump`/Wireshark
+      (`SO_BINDTODEVICE`, needs root; reject clearly elsewhere). Done,
+      and bigger than it looked: SIPp keeps the *advertised* address
+      apart from the *bound* one, so sipr grew SIPp's connect-probe for
+      `[local_ip]` (it used to render `0.0.0.0` without `-i`) and
+      `-bind_local` binds that address. `-buff_size`/`-bind_to_device`
+      are `socket2` calls in the new `sipr-net::sockopt`, applied to
+      every SIP socket; `-sendbuffer_warn` follows SIPp's code rather
+      than its inverted help text. SIPP_COMPAT §6 M44.
+- [x] pcapng input for `play_pcap_*` (sipr addition: `tcpdump`/Wireshark
       write pcapng by default now; SIPp rejects it — keep the `-s0`
       advice for the classic format). Sanctioned-dependency check: an
-      in-tree block reader, no crate.
-- [ ] Decide and document the three "left as is" divergences in
+      in-tree block reader, no crate. Done: `sipr-media::pcapng`, std
+      only; `pcap::parse` dispatches on the section-header magic so no
+      caller changed.
+- [x] Decide and document the three "left as is" divergences in
       SIPP_COMPAT §6 M37 (`[next_url]` without `rrs`, `[last_*]` inside
       the matching recv's own actions, and the M35 action-step
       interleaving): either match SIPp behind a `--sipr-strict-sipp`
       flag or state them as permanent in §6 with the reason. No silent
-      status quo.
-- [ ] `-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`,
+      status quo. Decided: all three permanent, no flag — SIPP_COMPAT §6
+      M44 gives the reason for each, and an e2e test pins the first two.
+      In short: (1) matching SIPp makes `[next_url]` render empty for a
+      UAC, (2) matching SIPp would put two different "current messages"
+      in one `<action>` block, and (3) matching SIPp means its
+      one-step-per-turn scheduler, which contradicts ARCHITECTURE §3.
+- [x] `-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`,
       `-rtp_threadtasks`, `-skip_rlimit`, `-plugin` and the SCTP socket
       options (`-multihome` etc.): accept with one loud
       "no effect in sipr" warning each (they tune SIPp's scheduler and
       process, which sipr does not have) so wrapper scripts written for
       sipp keep running. This is the one sanctioned exception to "unknown
       flag is an error": each is named in the table with the reason.
+      Done: `cli::no_effect_reason` is the single list, a unit test keeps
+      it in step with the flag table, and the six SCTP options moved from
+      a hard error to a warning; SIPP_COMPAT §3.1.
 
 ### M45+ — sipr's own additions (after parity)
 

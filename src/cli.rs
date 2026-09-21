@@ -86,8 +86,16 @@ pub struct Cli {
     pub pause_ms: u64,
     /// `-p`: local port (default: a free port chosen by the system).
     pub port: Option<u16>,
-    /// `-i`: local IP address to bind.
+    /// `-i`: local IP address to bind and advertise.
     pub local_ip: Option<IpAddr>,
+    /// `-bind_local`: bind the derived local IP, not every interface.
+    pub bind_local: bool,
+    /// `-bind_to_device`: interface name for `SO_BINDTODEVICE` (Linux).
+    pub bind_to_device: Option<String>,
+    /// `-buff_size`: `SO_SNDBUF`/`SO_RCVBUF` on every socket.
+    pub buff_size: Option<usize>,
+    /// `-sendbuffer_warn`: a failed default-message send ends the run.
+    pub sendbuffer_warn: bool,
     /// `-mi`: media (RTP) address for `[media_ip]`; defaults to the local IP.
     pub media_ip: Option<IpAddr>,
     /// `-mp` / `-min_rtp_port`: base media port for `[media_port]`.
@@ -284,6 +292,9 @@ pub struct Cli {
     pub tls_crl: Option<PathBuf>,
     /// `-tls_version`: pin the TLS protocol version.
     pub tls_version: TlsVersionArg,
+    /// Warnings collected while parsing (the no-effect SIPp flags); the
+    /// binary prints them before starting so parsing stays pure.
+    pub warnings: Vec<String>,
 }
 
 impl Default for Cli {
@@ -306,6 +317,10 @@ impl Default for Cli {
             pause_ms: 3000,
             port: None,
             local_ip: None,
+            bind_local: false,
+            bind_to_device: None,
+            buff_size: None,
+            sendbuffer_warn: false,
             media_ip: None,
             media_port: None,
             max_rtp_port: None,
@@ -407,6 +422,7 @@ impl Default for Cli {
             tls_ca: None,
             tls_crl: None,
             tls_version: TlsVersionArg::Auto,
+            warnings: Vec::new(),
         }
     }
 }
@@ -488,7 +504,36 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "PORT",
         "Local port [default: system-chosen free port]",
     ),
-    ("i", true, "IP", "Local IP address to bind"),
+    (
+        "i",
+        true,
+        "IP",
+        "Local IP address: the source address messages advertise, and the one the socket binds",
+    ),
+    (
+        "bind_local",
+        false,
+        "",
+        "Bind the socket to the local IP instead of every interface (implied by -i)",
+    ),
+    (
+        "bind_to_device",
+        true,
+        "NAME",
+        "Bind every socket to a network device (SO_BINDTODEVICE; Linux only, needs privileges)",
+    ),
+    (
+        "buff_size",
+        true,
+        "BYTES",
+        "Send and receive buffer size of every socket [default: the OS default]",
+    ),
+    (
+        "sendbuffer_warn",
+        true,
+        "true|false",
+        "End the run when a default (non-scenario) message cannot be sent, instead of warning",
+    ),
     (
         "mi",
         true,
@@ -949,37 +994,23 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "N",
         "Maximum UDP retransmissions per message",
     ),
-    (
-        "multihome",
-        true,
-        "IP",
-        "SIPp SCTP option: not supported by sipr (SCTP socket options are out of reach)",
-    ),
-    (
-        "heartbeat",
-        true,
-        "MS",
-        "SIPp SCTP option: not supported by sipr",
-    ),
-    (
-        "assocmaxret",
-        true,
-        "N",
-        "SIPp SCTP option: not supported by sipr",
-    ),
-    (
-        "pathmaxret",
-        true,
-        "N",
-        "SIPp SCTP option: not supported by sipr",
-    ),
-    ("pmtu", true, "N", "SIPp SCTP option: not supported by sipr"),
-    (
-        "gracefulclose",
-        true,
-        "true|false",
-        "SIPp SCTP option: not supported by sipr",
-    ),
+    ("multihome", true, "IP", NO_EFFECT_HELP),
+    ("heartbeat", true, "MS", NO_EFFECT_HELP),
+    ("assocmaxret", true, "N", NO_EFFECT_HELP),
+    ("pathmaxret", true, "N", NO_EFFECT_HELP),
+    ("pmtu", true, "N", NO_EFFECT_HELP),
+    ("gracefulclose", true, "true|false", NO_EFFECT_HELP),
+    ("plugin", true, "FILE", NO_EFFECT_HELP),
+    ("skip_rlimit", false, "", NO_EFFECT_HELP),
+    ("rtp_threadtasks", true, "N", NO_EFFECT_HELP),
+    ("max_recv_loops", true, "N", NO_EFFECT_HELP),
+    ("max_sched_loops", true, "N", NO_EFFECT_HELP),
+    ("watchdog_interval", true, "MS", NO_EFFECT_HELP),
+    ("watchdog_reset", true, "MS", NO_EFFECT_HELP),
+    ("watchdog_minor_threshold", true, "MS", NO_EFFECT_HELP),
+    ("watchdog_major_threshold", true, "MS", NO_EFFECT_HELP),
+    ("watchdog_minor_maxtriggers", true, "N", NO_EFFECT_HELP),
+    ("watchdog_major_maxtriggers", true, "N", NO_EFFECT_HELP),
     (
         "ip_field",
         true,
@@ -1106,6 +1137,38 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
     ("version", false, "", "Print version"),
 ];
 
+/// Shared help text for the flags in [`no_effect_reason`].
+const NO_EFFECT_HELP: &str = "Accepted for sipp compatibility; no effect in sipr (warns)";
+
+/// SIPp flags that steer machinery sipr does not have — its event-loop
+/// scheduler and watchdog task, its RTP playback thread pool, its process
+/// rlimit tuning, its `dlopen` plugins, and SCTP socket options that need
+/// libsctp. sipr accepts them with one loud warning each instead of failing,
+/// so wrapper scripts written for sipp keep running; this is the one
+/// sanctioned exception to "an unknown flag is an error"
+/// (docs/SIPP_COMPAT.md §6 M44).
+fn no_effect_reason(flag: &str) -> Option<&'static str> {
+    Some(match flag {
+        "multihome" | "heartbeat" | "assocmaxret" | "pathmaxret" | "pmtu" | "gracefulclose" => {
+            "it sets an SCTP socket option through libsctp, which sipr's socket2-based \
+             SCTP transport cannot reach"
+        }
+        "plugin" => {
+            "sipr has no plugin loader; a scenario needing the plugin's keywords \
+                     will fail to compile"
+        }
+        "skip_rlimit" => "sipr never tunes the file-descriptor rlimit",
+        "rtp_threadtasks" => "sipr has no RTP playback thread pool to size",
+        "max_recv_loops" | "max_sched_loops" => {
+            "it sizes SIPp's event-loop batches; sipr's engine loop has no such limit"
+        }
+        f if f.starts_with("watchdog_") => {
+            "it tunes SIPp's watchdog task, which sipr does not have"
+        }
+        _ => return None,
+    })
+}
+
 fn flag_spec(name: &str) -> Option<&'static (&'static str, bool, &'static str, &'static str)> {
     FLAGS.iter().find(|(n, ..)| *n == name)
 }
@@ -1228,6 +1291,20 @@ where
     if cli.transport == Transport::UdpPerIp && cli.inf.is_empty() {
         return Err("You must use the -inf option when using -t ui".into());
     }
+    // SO_BINDTODEVICE exists on Linux only. SIPp compiles the call out
+    // elsewhere and binds nothing, silently; say so instead.
+    if let Some(device) = &cli.bind_to_device
+        && !cfg!(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        ))
+    {
+        return Err(format!(
+            "-bind_to_device {device}: SO_BINDTODEVICE is a Linux socket option, and this \
+             host has none"
+        ));
+    }
     Ok(Invocation::Run(Box::new(cli)))
 }
 
@@ -1252,6 +1329,16 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "d" => cli.pause_ms = parse_num(flag, &val(value))?,
         "p" => cli.port = Some(parse_num(flag, &val(value))?),
         "i" => cli.local_ip = Some(parse_num(flag, &val(value))?),
+        "bind_local" => cli.bind_local = true,
+        "bind_to_device" => cli.bind_to_device = Some(val(value)),
+        "buff_size" => {
+            let n: usize = parse_num(flag, &val(value))?;
+            if n == 0 {
+                return Err("-buff_size must be at least 1".into());
+            }
+            cli.buff_size = Some(n);
+        }
+        "sendbuffer_warn" => cli.sendbuffer_warn = parse_bool_value(flag, &val(value))?,
         "mi" => cli.media_ip = Some(parse_num(flag, &val(value))?),
         "mp" | "min_rtp_port" => cli.media_port = Some(parse_num(flag, &val(value))?),
         "max_rtp_port" => cli.max_rtp_port = Some(parse_num(flag, &val(value))?),
@@ -1367,11 +1454,11 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "users" => cli.users = Some(parse_num(flag, &val(value))?),
         "rsa" => cli.remote_sending = Some(val(value)),
         "ip_field" => cli.ip_field = parse_num(flag, &val(value))?,
-        "multihome" | "heartbeat" | "assocmaxret" | "pathmaxret" | "pmtu" | "gracefulclose" => {
-            return Err(format!(
-                "-{flag} sets an SCTP socket option (libsctp) that sipr's SCTP transport \
-                 cannot reach; it is not supported (docs/SIPP_COMPAT.md §6)"
-            ));
+        _ if no_effect_reason(flag).is_some() => {
+            // Parsed and dropped on purpose — see NO_EFFECT_HELP.
+            let reason = no_effect_reason(flag).unwrap_or_default();
+            cli.warnings
+                .push(format!("-{flag} has no effect in sipr: {reason}"));
         }
         "max_reconnect" => cli.max_reconnect = parse_num(flag, &val(value))?,
         "reconnect_close" => cli.reconnect_close = parse_bool_value(flag, &val(value))?,
@@ -1711,8 +1798,10 @@ mod tests {
         );
         assert_eq!(cli(&["-t", "s1", "host"]).transport, Transport::SctpMono);
         assert_eq!(cli(&["-t", "sn", "host"]).transport, Transport::SctpPerCall);
-        let err = run(&["-t", "s1", "-heartbeat", "500", "host"]).unwrap_err();
-        assert!(err.contains("not supported"), "{err}");
+        // The SCTP socket options parse and warn rather than failing (M44).
+        let c = cli(&["-t", "s1", "-heartbeat", "500", "host"]);
+        assert_eq!(c.transport, Transport::SctpMono);
+        assert_eq!(c.warnings.len(), 1);
         assert_eq!(cli(&["-ip_field", "2", "host"]).ip_field, 2);
         let err = run(&["-t", "ui", "host"]).unwrap_err();
         assert!(err.contains("-inf"), "{err}");
@@ -1881,6 +1970,114 @@ mod tests {
         let help = help_text();
         for (name, ..) in FLAGS {
             assert!(help.contains(&format!("-{name}")), "help missing -{name}");
+        }
+    }
+
+    /// SIPp's scheduler, process and SCTP knobs parse and warn rather than
+    /// failing, so a wrapper script written for sipp still runs (M44).
+    #[test]
+    fn no_effect_flags_are_accepted_with_one_warning_each() {
+        let with_values = [
+            "multihome",
+            "heartbeat",
+            "assocmaxret",
+            "pathmaxret",
+            "pmtu",
+            "gracefulclose",
+            "plugin",
+            "rtp_threadtasks",
+            "max_recv_loops",
+            "max_sched_loops",
+            "watchdog_interval",
+            "watchdog_reset",
+            "watchdog_minor_threshold",
+            "watchdog_major_threshold",
+            "watchdog_minor_maxtriggers",
+            "watchdog_major_maxtriggers",
+        ];
+        for flag in with_values {
+            let c = cli(&["-sn", "uac", &format!("-{flag}"), "1"]);
+            assert_eq!(c.warnings.len(), 1, "-{flag}");
+            assert!(
+                c.warnings[0].starts_with(&format!("-{flag} has no effect in sipr: ")),
+                "-{flag}: {}",
+                c.warnings[0]
+            );
+            assert!(c.warnings[0].len() > format!("-{flag} has no effect in sipr: ").len() + 20);
+        }
+        // The one that takes no value, and the count when several are given.
+        let c = cli(&["-sn", "uac", "-skip_rlimit", "-max_recv_loops", "2000"]);
+        assert_eq!(c.warnings.len(), 2);
+        // An ordinary run warns about nothing.
+        assert!(cli(&["-sn", "uac"]).warnings.is_empty());
+    }
+
+    /// Every flag in the no-effect set is in the flag table (so it parses and
+    /// `-h` lists it), and no flag sipr actually implements slipped into it.
+    #[test]
+    fn no_effect_set_matches_the_flag_table() {
+        for (name, _, _, help) in FLAGS {
+            assert_eq!(
+                no_effect_reason(name).is_some(),
+                *help == NO_EFFECT_HELP,
+                "-{name}: help text and no_effect_reason disagree"
+            );
+        }
+        for name in ["r", "m", "sf", "rtp_echo", "inf"] {
+            assert!(no_effect_reason(name).is_none(), "-{name} is implemented");
+        }
+    }
+
+    /// The socket options SIPp sets in `sipp_customize_socket`, plus
+    /// `-bind_local` and `-sendbuffer_warn` (M44).
+    #[test]
+    fn socket_option_flags_parse() {
+        let c = cli(&["-sn", "uac", "host"]);
+        assert!(!c.bind_local, "SIPp binds every interface by default");
+        assert_eq!(c.buff_size, None, "the OS default stands unless asked");
+        assert!(!c.sendbuffer_warn);
+        assert_eq!(c.bind_to_device, None);
+
+        let c = cli(&[
+            "-sn",
+            "uac",
+            "-bind_local",
+            "-buff_size",
+            "262144",
+            "-sendbuffer_warn",
+            "true",
+            "host",
+        ]);
+        assert!(c.bind_local);
+        assert_eq!(c.buff_size, Some(262_144));
+        assert!(c.sendbuffer_warn);
+
+        let err = run(&["-buff_size", "0", "host"]).unwrap_err();
+        assert!(err.contains("at least 1"), "{err}");
+        let err = run(&["-bind_local", "yes", "host"]).unwrap_err();
+        assert!(err.contains("extra argument"), "{err}");
+        let err = run(&["-sendbuffer_warn", "maybe", "host"]).unwrap_err();
+        assert!(err.contains("expected true or false"), "{err}");
+    }
+
+    /// `-bind_to_device` needs `SO_BINDTODEVICE`, so it is a usage error off
+    /// Linux rather than a silently ignored bind (as it is in SIPp).
+    #[test]
+    fn bind_to_device_is_linux_only() {
+        let parsed = run(&["-sn", "uac", "-bind_to_device", "eth0", "host"]);
+        if cfg!(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "linux"
+        )) {
+            match parsed.unwrap() {
+                Invocation::Run(c) => assert_eq!(c.bind_to_device.as_deref(), Some("eth0")),
+                other => panic!("expected Run, got {other:?}"),
+            }
+        } else {
+            let err = parsed.unwrap_err();
+            assert!(err.contains("SO_BINDTODEVICE"), "{err}");
+            assert!(err.contains("eth0"), "{err}");
         }
     }
 

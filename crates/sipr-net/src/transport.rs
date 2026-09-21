@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use crate::message::{Inbound, ParseError};
 use crate::rng::Rng;
+use crate::sockopt::SocketOpts;
 
 /// Maximum UDP datagram we accept (RFC 3261 suggests messages fit well
 /// under the 65k UDP ceiling; jumbo inbound is truncated at this size).
@@ -75,12 +76,16 @@ pub struct TransportConfig {
     pub recv_loss_pct: f64,
     /// RNG seed for reproducible loss patterns (0 → fixed default seed).
     pub loss_seed: u64,
+    /// `-buff_size` / `-bind_to_device`, applied to every socket opened
+    /// from this config (SIPp's `sipp_customize_socket`).
+    pub sockopts: SocketOpts,
 }
 
 /// The `u1` UDP transport (also the main socket of `un`).
 pub struct UdpTransport {
     socket: UdpSocket,
     local_addr: SocketAddr,
+    sockopts: SocketOpts,
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
     recv_loss_pct: f64,
@@ -199,6 +204,7 @@ impl UdpTransport {
     pub fn bind(config: &TransportConfig, sink: Sender<NetEvent>) -> std::io::Result<Self> {
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let socket = UdpSocket::bind(SocketAddr::new(ip, config.port.unwrap_or(0)))?;
+        config.sockopts.apply(&socket)?;
         let local_addr = socket.local_addr()?;
         let recv_socket = socket.try_clone()?;
         let recv_loss_pct = config.recv_loss_pct;
@@ -211,6 +217,7 @@ impl UdpTransport {
         Ok(Self {
             socket,
             local_addr,
+            sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0001)),
             send_loss_pct: config.send_loss_pct,
             recv_loss_pct: config.recv_loss_pct,
@@ -239,6 +246,7 @@ impl UdpTransport {
     /// use).
     pub fn open_call_socket_at(&self, at: SocketAddr) -> std::io::Result<UdpCallSocket> {
         let socket = UdpSocket::bind(at)?;
+        self.sockopts.apply(&socket)?;
         let local_addr = socket.local_addr()?;
         let recv_socket = socket.try_clone()?;
         let sink = self.sink.clone();

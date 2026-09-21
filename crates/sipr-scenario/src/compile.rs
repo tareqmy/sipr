@@ -1432,24 +1432,7 @@ impl Compiler {
             }
             "rtp_echo" => {
                 self.warn_unknown_attrs(el, &["value", "variable"]);
-                if el.attr("variable").is_some() {
-                    self.diags.error(
-                        Some(line),
-                        "<rtp_echo variable=…> is not supported yet — use value=\"0|1\"",
-                    );
-                    return None;
-                }
-                let value = self.require_attr(el, "value")?;
-                match value.trim().parse::<f64>() {
-                    Ok(v) => Some(Action::RtpEchoState(v != 0.0)),
-                    Err(_) => {
-                        self.diags.error(
-                            Some(line),
-                            format!("<rtp_echo value=\"{value}\">: expected a number (0 = off)"),
-                        );
-                        None
-                    }
-                }
+                Some(Action::RtpEchoState(self.parse_operand(el, line)))
             }
             other => {
                 self.diags
