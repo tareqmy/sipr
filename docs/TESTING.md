@@ -99,3 +99,10 @@ and from each tool's own `-trace_stat` CSV. Results and their caveats live in
 
 fmt → clippy → unit+golden+property → build sipp (cached) → interop → benches
 (benches on-demand/nightly, not per-PR).
+
+Both benches run from `.github/workflows/bench.yml` on a nightly cron and on
+`workflow_dispatch` (which takes the rates and the window as inputs). Neither
+job fails the build: a shared runner's numbers move enough between runs that
+gating on them would cost more in false alarms than it caught, so the results
+go to the job summary and an artifact, and a >10% move is for a human to
+judge against `benches/BASELINES.md`.

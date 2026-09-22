@@ -1,0 +1,94 @@
+name: Benchmarks
+
+# Benches are on-demand and nightly, never per-PR (docs/TESTING.md §5): they
+# take minutes and a shared runner's numbers move enough between runs that
+# gating a pull request on them would cost more in false alarms than it caught.
+# Nothing here fails the build — the results are reported, not enforced.
+on:
+  workflow_dispatch:
+    inputs:
+      rates:
+        description: 'Call rates to compare, space separated'
+        default: '500 2000 5000'
+      window:
+        description: 'Seconds of load per rate'
+        default: '10'
+  schedule:
+    # 04:15 UTC daily, away from the hour when everyone else's crons fire.
+    - cron: '15 4 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The headline comparison: sipr and real sipp driving the same call flow at
+  # the same rates on the same machine (docs/PERFORMANCE.md).
+  vs-sipp:
+    name: sipr vs real sipp
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `time` is the GNU /usr/bin/time the script reads CPU and peak RSS
+      # from; it is not installed on the runner image by default.
+      - name: Install build and measurement tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y time cmake libpcap-dev libncurses-dev libssl-dev libgsl-dev
+      # Same oracle as the interop job: SIPp 3.7 from source, since the distro
+      # package is 3.6. SCTP is off — this is a UDP comparison.
+      - name: Build real SIPp 3.7
+        run: |
+          git clone --depth 1 --branch v3.7.7 https://github.com/SIPp/sipp.git /tmp/sipp
+          cd /tmp/sipp && cmake . -DUSE_PCAP=1 -DUSE_SSL=1 -DUSE_GSL=1 && make -j"$(nproc)"
+          /tmp/sipp/sipp -v | head -1
+      - name: Build sipr (release)
+        run: cargo build --release --locked
+      - name: Compare under load
+        env:
+          SIPP_BIN: /tmp/sipp/sipp
+          RATES: ${{ inputs.rates || '500 2000 5000' }}
+          WINDOW: ${{ inputs.window || '10' }}
+        run: |
+          {
+            echo "## sipr vs sipp"
+            echo
+            echo "Runner: \`$(uname -srm)\`, $(nproc) cores. Both ends of every"
+            echo "call run on this one machine, so treat the figures as"
+            echo "comparative, not as a throughput ceiling (docs/PERFORMANCE.md)."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          scripts/bench-vs-sipp.sh | tee bench-vs-sipp.txt
+          cat bench-vs-sipp.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-vs-sipp
+          path: bench-vs-sipp.txt
+
+  # The three primitives ARCHITECTURE §3 makes rules about, in isolation.
+  hot-path:
+    name: Hot-path micro-benches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run criterion benches
+        run: cargo bench --bench hot_path --locked | tee hot-path.txt
+      - name: Summarise
+        run: |
+          {
+            echo "## Hot-path micro-benches"
+            echo
+            echo "Runner: \`$(uname -srm)\`, $(nproc) cores. Compare against"
+            echo "\`benches/BASELINES.md\`; >10% slower wants investigating."
+            echo
+            echo '```'
+            grep -E 'time:|^(template_fill|inbound_parse|timer_churn)' hot-path.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hot-path
+          path: hot-path.txt

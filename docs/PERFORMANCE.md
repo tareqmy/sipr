@@ -11,6 +11,12 @@ Reproduce it with:
 make bench-vs-sipp            # SIPP_BIN=... if sipp is not in the sibling checkout
 ```
 
+On Debian and Ubuntu that needs the `time` package: the script reads CPU and
+peak RSS from `/usr/bin/time`, not the shell's `time` keyword.
+
+The same comparison runs nightly on Linux from `.github/workflows/bench.yml`,
+which is where to look for numbers off this laptop — see the caveats below.
+
 ## Method
 
 `scripts/bench-vs-sipp.sh` runs both tools against themselves — sipr-UAC to

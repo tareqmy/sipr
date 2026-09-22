@@ -34,6 +34,12 @@ done
 SIPR_BIN=$(cd "$(dirname "$SIPR_BIN")" && pwd)/$(basename "$SIPR_BIN")
 SIPP_BIN=$(cd "$(dirname "$SIPP_BIN")" && pwd)/$(basename "$SIPP_BIN")
 
+# CPU and RSS come from /usr/bin/time, not the shell's `time` keyword. On
+# Debian and Ubuntu that binary is the separate `time` package.
+[ -x /usr/bin/time ] || {
+  echo "error: /usr/bin/time is missing (Debian/Ubuntu: apt-get install time)" >&2
+  exit 1
+}
 case $(uname -s) in
   Darwin|*BSD) time_flag=-l ;;
   *)           time_flag=-v ;;
