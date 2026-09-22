@@ -50,7 +50,9 @@ Sanctioned: `tokio`, `tokio-util`, `rsip`, `quick-xml`, `ratatui`,
 M32; unconditional in `sipr-net` since M44, which needs `SO_SNDBUF`/
 `SO_RCVBUF` (`-buff_size`) and `SO_BINDTODEVICE` (`-bind_to_device`), neither
 of which std exposes and both of which would otherwise need `unsafe`),
-and for tests `proptest`, `criterion`, `assert_cmd`, `tempfile`, `rcgen`. Add them to
+and for tests `proptest`, `criterion` (bench-only, `default-features = false`:
+its `html_reports` pulls in plotters and a pile of transitive crates for output
+nobody reads in CI), `assert_cmd`, `tempfile`, `rcgen`. Add them to
 `[workspace.dependencies]` when a milestone first needs them. The CLI is a
 deliberate exception: `src/cli.rs` is a bespoke table-driven parser (not clap)
 because SIPp's single-dash multi-char flags don't fit clap's model — extend

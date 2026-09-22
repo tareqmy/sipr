@@ -79,6 +79,23 @@ Both grow with concurrency, as expected when every live call holds state.
 times at 5000 cps, i.e. it dropped or delayed enough inbound messages under
 its own load to trip the UDP timers.
 
+## Where the per-call time actually goes
+
+`cargo bench --bench hot_path` measures the three primitives §3 makes rules
+about, in isolation (numbers in `benches/BASELINES.md`): filling the INVITE
+template costs 739 ns, parsing a 200 OK and reading the four fields needed to
+route it 1.14 µs, arming and cancelling a retransmission timer 53 ns.
+
+A call in this scenario carries about six messages, so those primitives
+account for roughly **12 µs of the ~130 µs of CPU a call costs at 5000 cps** —
+under a tenth. The rest is syscalls, call-table bookkeeping and stats.
+
+That is worth knowing before anyone optimises: the hot path the rules protect
+is already cheap, and the remaining cost is in the machinery around it. The
+one primitive with obvious headroom is message routing, where the accessors
+(`call_id`, `cseq`, `top_via_branch`) re-scan headers the parse already
+walked, costing about as much again as the parse itself.
+
 ## Caveats, and what these numbers are not
 
 - **One machine, both processes.** UAC and UAS contend for the same cores, so

@@ -39,6 +39,10 @@ socket2 = "0.6"
 # PEM fixtures in the repo).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tempfile = "3"
+# Bench-only: the hot-path micro-benches promised in docs/TESTING.md §5.
+# `html_reports` pulls in plotters and a pile of transitive crates for output
+# nobody reads in CI, so it stays off.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -92,6 +96,11 @@ sipr-media = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "hot_path"
+harness = false
 
 [lints]
 workspace = true

@@ -1850,18 +1850,48 @@ Small, independent items; ship in any order, each its own commit:
       it in step with the flag table, and the six SCTP options moved from
       a hard error to a warning; SIPP_COMPAT §3.1.
 
-### M45+ — sipr's own additions (after parity)
+### M45 — Measuring the hot path: criterion + `make bench-vs-sipp` ✅
 
-Candidates, to be promoted into numbered milestones once M38–M44 are
-done and in the order the users of the HTTP API ask for them:
+The first of sipr's own additions, taken first because it is the only
+one that checks a claim the project already makes: the hot-path rules in
+`docs/ARCHITECTURE.md` §3 were designed from the start and never
+measured against the tool they exist to match.
+
+- [x] `criterion` benches for the three primitives `docs/TESTING.md` §5
+      has specified since M3 — template fill, inbound parse + route,
+      timer churn — in `benches/hot_path.rs`, with the numbers in
+      `benches/BASELINES.md` under the >10% regression rule.
+- [x] `make bench-vs-sipp` (`scripts/bench-vs-sipp.sh`): both tools
+      against themselves on loopback at 500/2000/5000 cps, reporting
+      CPU, peak RSS, retransmissions and peak concurrency for each.
+      Everything is read the same way for both — `/usr/bin/time` around
+      each process, and each tool's own `-trace_stat` CSV parsed by
+      column name, which works because sipr writes SIPp's columns
+      byte-for-byte (M40).
+- [x] `docs/PERFORMANCE.md` (in `docs/SUMMARY.md`), with the results,
+      what they mean, and an explicit list of what they are not.
+
+Findings: both tools complete every call at all three rates. sipp's CPU
+is flat at ~9.9 s (UAC) whatever the rate — its polling loop, not
+per-call work — where sipr's scales with traffic (1.0 s at 500 cps,
+6.7 s at 5000). Per call that is 0.13 ms for sipr against 0.20 ms for
+sipp at 5000 cps, and ~10x apart at 500 cps. Peak RSS is consistently
+lower, under half on the UAS side at 5000 cps; sipp retransmitted ~24
+times at 5000 cps under its own load, sipr none. The micro-benches then
+show the primitives §3 protects account for only ~12 µs of the ~130 µs a
+call costs — the rest is syscalls and bookkeeping — so that is where any
+future optimisation should look, not at template fill. Found on the way:
+`RunInfo`/`DynamicId` were not re-exported from `sipr-engine`, which made
+the public `RenderCtx` impossible to construct outside the crate; both
+are exported now.
+
+### M46+ — sipr's own additions (after parity)
+
+Candidates, to be promoted into numbered milestones in the order the
+users of the HTTP API ask for them:
 
 - Structured stats: `--sipr-stats-json <file>` (the 1 s snapshot as
   JSON lines) and a Prometheus `/metrics` on the existing HTTP API.
-- A load-comparison bench: criterion + a documented `make bench-vs-sipp`
-  that runs both tools at 500/2000/5000 cps on loopback and records
-  CPU, memory, retransmissions and max concurrent calls in
-  `docs/PERFORMANCE.md`; the hot-path rules were designed but never
-  measured against SIPp.
 - Library API: `sipr-engine` embedded in another Rust test harness
   (scenario in, stats out, no CLI, no TUI) — needs a stable
   `EngineConfig` and a documented public surface.

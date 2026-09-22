@@ -21,5 +21,7 @@ pub use engine::{
 };
 // Re-exported so the binary can build a TLS config without depending on
 // sipr-net directly.
-pub use render::{FieldSource, RenderCtx, RenderError, VarCtx, render};
+// `RunInfo` and `DynamicId` are fields of the public `RenderCtx`, so they
+// have to be nameable for anyone outside the crate to build one.
+pub use render::{DynamicId, FieldSource, RenderCtx, RenderError, RunInfo, VarCtx, render};
 pub use sipr_net::{PeerTable, SocketOpts, TlsConfig, TlsVersion};
