@@ -1871,19 +1871,30 @@ measured against the tool they exist to match.
 - [x] `docs/PERFORMANCE.md` (in `docs/SUMMARY.md`), with the results,
       what they mean, and an explicit list of what they are not.
 
-Findings: both tools complete every call at all three rates. sipp's CPU
-is flat at ~9.9 s (UAC) whatever the rate — its polling loop, not
-per-call work — where sipr's scales with traffic (1.0 s at 500 cps,
-6.7 s at 5000). Per call that is 0.13 ms for sipr against 0.20 ms for
-sipp at 5000 cps, and ~10x apart at 500 cps. Peak RSS is consistently
-lower, under half on the UAS side at 5000 cps; sipp retransmitted ~24
-times at 5000 cps under its own load, sipr none. The micro-benches then
-show the primitives §3 protects account for only ~12 µs of the ~130 µs a
-call costs — the rest is syscalls and bookkeeping — so that is where any
-future optimisation should look, not at template fill. Found on the way:
-`RunInfo`/`DynamicId` were not re-exported from `sipr-engine`, which made
-the public `RenderCtx` impossible to construct outside the crate; both
-are exported now.
+Findings (Linux CI numbers; `docs/PERFORMANCE.md` has both hosts): both
+tools complete every call at all three rates. **Generating** load, sipp's
+UAC burns ~10 s of CPU whatever the rate — a pacing loop spinning, not
+per-call work — where sipr's scales with traffic, so sipr costs 0.079 ms
+per call against sipp's 0.201 ms at 5000 cps and is 20x cheaper at 500.
+**Answering** it, sipp is ~20% cheaper per call than sipr (0.065 ms
+against 0.084 ms at 5000 cps): its C receive path with `epoll` still has
+the edge, and sipr is not faster at everything. Peak RSS is sipr's
+clearest win and widens with load — 83 MiB against 421 MiB on the UAS at
+5000 cps. sipp retransmitted 50 times at 5000 cps under its own load,
+sipr none. The micro-benches then show the primitives §3 protects account
+for ~8 µs of the ~79 µs a UAC call costs — the rest is syscalls and
+bookkeeping — so that is where any future optimisation should look, not
+at template fill.
+
+Two traps found on the way. (1) `RunInfo`/`DynamicId` were not
+re-exported from `sipr-engine`, which made the public `RenderCtx`
+impossible to construct outside the crate; both are exported now. (2) The
+first nightly run would not build: M44's `-bind_to_device` calls
+`socket2`'s `SockRef::bind_device`, which needs that crate's `all`
+feature, and because the call sits in a `#[cfg(linux)]` branch the macOS
+gates had never compiled it — CI had been red since the M44 merge. Fixed,
+and AGENTS.md now says that the local gates prove nothing about a `cfg`
+branch they do not compile.
 
 ### M46+ — sipr's own additions (after parity)
 

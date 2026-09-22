@@ -36,9 +36,16 @@ isolation. Regression rule (docs/TESTING.md §5): a >10% drop blocks merge.
 | 2026-09-22 | MacBook (Darwin 27, arm64) | `inbound_parse/parse_and_route` | 1.14 µs |
 | 2026-09-22 | MacBook (Darwin 27, arm64) | `timer_churn/arm_then_cancel` | 53 ns |
 | 2026-09-22 | MacBook (Darwin 27, arm64) | `timer_churn/arm_1000_then_drain` | 50 µs (50 ns/timer) |
+| 2026-09-22 | GitHub Actions (Linux 6.17, x86_64) | `template_fill/invite` | 531 ns |
+| 2026-09-22 | GitHub Actions (Linux 6.17, x86_64) | `template_fill/ack_with_last_headers` | 255 ns |
+| 2026-09-22 | GitHub Actions (Linux 6.17, x86_64) | `inbound_parse/response_200` | 385 ns |
+| 2026-09-22 | GitHub Actions (Linux 6.17, x86_64) | `inbound_parse/parse_and_route` | 842 ns |
+| 2026-09-22 | GitHub Actions (Linux 6.17, x86_64) | `timer_churn/arm_then_cancel` | 54 ns |
+| 2026-09-22 | GitHub Actions (Linux 6.17, x86_64) | `timer_churn/arm_1000_then_drain` | 51 µs (51 ns/timer) |
 
 Notes: `parse_and_route` is the parse plus the four fields the engine reads to
 route a message to its call, and costs roughly twice the parse alone — the
 accessors re-scan headers. That is the one number here with obvious headroom,
 though see `docs/PERFORMANCE.md` for why it is not where the per-call time
-actually goes.
+actually goes. The runner's numbers move ~15% between runs of the same commit,
+so treat the >10% rule as a prompt to look, not a gate.

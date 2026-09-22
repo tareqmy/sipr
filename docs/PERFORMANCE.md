@@ -40,8 +40,23 @@ Everything measured comes from the same two sources for both tools:
 
 ## Results
 
-Host: MacBook (Darwin 27.0.0, arm64), sipr 0.27.1 release build, sipp
-v3.7.7-40-g5dff0ec. 10 s per rate, both processes on the same machine.
+Two hosts. The Linux figures come from `.github/workflows/bench.yml` and are
+the ones worth quoting; the macOS ones are the development host, kept because
+they show how much the platform matters.
+
+**Linux** (GitHub Actions, `Linux 6.17 x86_64`, 4 cores), sipr 0.27.1 release,
+sipp v3.7.7, 10 s per rate:
+
+| Tool | Rate (cps) | Created | OK | Failed | Retrans | CPU UAC | CPU UAS | RSS UAC (MiB) | RSS UAS (MiB) | Peak concurrent |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sipr | 500 | 5000 | 5000 | 0 | 0 | 0.49 s | 0.51 s | 6.2 | 14.2 | 10 |
+| sipp | 500 | 5000 | 5000 | 0 | 0 | 10.01 s | 0.42 s | 15.0 | 54.1 | 6 |
+| sipr | 2000 | 20000 | 20000 | 0 | 0 | 1.59 s | 1.70 s | 9.4 | 43.9 | 41 |
+| sipp | 2000 | 20000 | 20000 | 0 | 0 | 10.02 s | 1.38 s | 21.6 | 176.1 | 24 |
+| sipr | 5000 | 50000 | 50000 | 0 | 0 | 3.93 s | 4.22 s | 13.6 | 83.4 | 101 |
+| sipp | 5000 | 50000 | 50000 | 0 | 50 | 10.07 s | 3.27 s | 32.6 | 421.3 | 70 |
+
+**macOS** (MacBook, Darwin 27.0.0, arm64), same versions and window:
 
 | Tool | Rate (cps) | Created | OK | Failed | Retrans | CPU UAC | CPU UAS | RSS UAC (MiB) | RSS UAS (MiB) | Peak concurrent |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -52,49 +67,68 @@ v3.7.7-40-g5dff0ec. 10 s per rate, both processes on the same machine.
 | sipr | 5000 | 50000 | 50000 | 0 | 0 | 6.67 s | 6.88 s | 16.8 | 196.5 | 125 |
 | sipp | 5000 | 50000 | 50000 | 0 | 24 | 9.97 s | 13.96 s | 23.1 | 419.2 | 70 |
 
-Both tools placed and completed every call at every rate, with no failures.
-CPU and RSS reproduced within a few percent across runs.
+Both tools placed and completed every call at every rate on both hosts, with
+no failures. CPU and RSS reproduce within a few percent across runs on the
+same host.
 
 ### What the numbers say
 
-**sipp's CPU is flat; sipr's scales with load.** sipp burns ~9.9 s of CPU on
-the UAC and ~13.9 s on the UAS whatever the rate — 500 cps costs it the same
-as 5000. That is its event loop polling, not work done per call. sipr spends
-1.0 s at 500 cps and 6.7 s at 5000, roughly in proportion to the traffic.
+The two sides of a run behave differently, and the honest summary needs them
+apart. Per call:
 
-Normalising to CPU per call makes the comparison fair to sipp, since its
-constant cost is amortised as the rate climbs:
+| Rate | UAC: sipr | UAC: sipp | UAS: sipr | UAS: sipp |
+|---|---|---|---|---|
+| 500 cps | 0.098 ms | 2.00 ms | 0.102 ms | 0.084 ms |
+| 2000 cps | 0.080 ms | 0.501 ms | 0.085 ms | 0.069 ms |
+| 5000 cps | 0.079 ms | 0.201 ms | 0.084 ms | 0.065 ms |
 
-| Rate | sipr | sipp |
-|---|---|---|
-| 500 cps | 0.21 ms/call | 1.99 ms/call |
-| 2000 cps | 0.15 ms/call | 0.50 ms/call |
-| 5000 cps | 0.13 ms/call | 0.20 ms/call |
+**Generating load: sipr costs a fraction of sipp.** sipp's UAC burns ~10 s of
+CPU whatever the rate — 500 cps costs it exactly what 5000 does, which is a
+pacing loop spinning, not work done per call. sipr's scales with traffic, so
+it is 2.6x cheaper per call at 5000 cps and 20x cheaper at 500. At low rates
+sipr is genuinely idle where sipp is not, which is the difference between a
+generator you can leave running next to the thing you are testing and one you
+cannot.
 
-sipr's per-call cost *falls* as the rate rises (fixed start-up amortised, and
-batching helps), converging toward ~0.13 ms. sipp converges toward ~0.20 ms.
-At the rates that matter, sipr does the same work for roughly two-thirds of
-the CPU; at low rates it is idle where sipp is not, which is the difference
-between a generator you can leave running and one you cannot.
+**Answering load: sipp is slightly cheaper.** On Linux sipp's UAS spends about
+20% less CPU per call than sipr's (0.065 ms against 0.084 ms at 5000 cps).
+sipr is not faster at everything, and this is the half where SIPp's C receive
+path with `epoll` still has the edge. sipr also carries more calls
+concurrently at the same rate (101 against 70 at 5000 cps), i.e. its calls
+live a little longer, which is consistent with spending a little more per
+call on the answering side.
 
-**Memory.** sipr's peak RSS is consistently lower — about 70% of sipp's on
-the UAC side and under half on the UAS side (196 MiB vs 419 MiB at 5000 cps).
-Both grow with concurrency, as expected when every live call holds state.
+**Beware the macOS UAS column.** There sipp's UAS looks catastrophic — a flat
+~13.9 s — and that is an artifact, not a property of sipp. A macOS build of
+sipp reports `Looking for sys/epoll.h - not found` and falls back to
+`poll`/`select`; on Linux the same code is efficient. Anyone comparing
+receive-side cost should use the Linux table.
 
-**Retransmissions.** sipr sent none at any rate. sipp retransmitted ~24-30
-times at 5000 cps, i.e. it dropped or delayed enough inbound messages under
-its own load to trip the UDP timers.
+**Memory is sipr's clearest win, and it grows with the load.** Peak RSS is
+lower everywhere, and on the UAS at 5000 cps it is 83 MiB against 421 MiB —
+a fifth. Both tools grow with concurrency, as they must when every live call
+holds state, but sipp grows far faster.
+
+**Retransmissions.** sipr sent none at any rate on either host. sipp
+retransmitted 50 times at 5000 cps on Linux (24 on macOS): under its own load
+it dropped or delayed enough inbound messages to trip the UDP timers.
 
 ## Where the per-call time actually goes
 
 `cargo bench --bench hot_path` measures the three primitives §3 makes rules
-about, in isolation (numbers in `benches/BASELINES.md`): filling the INVITE
-template costs 739 ns, parsing a 200 OK and reading the four fields needed to
-route it 1.14 µs, arming and cancelling a retransmission timer 53 ns.
+about, in isolation (numbers in `benches/BASELINES.md`): on the Linux runner,
+filling the INVITE template costs 531 ns, parsing a 200 OK and reading the
+four fields needed to route it 842 ns, arming and cancelling a retransmission
+timer 54 ns.
 
 A call in this scenario carries about six messages, so those primitives
-account for roughly **12 µs of the ~130 µs of CPU a call costs at 5000 cps** —
-under a tenth. The rest is syscalls, call-table bookkeeping and stats.
+account for roughly **8 µs of the ~79 µs of CPU a call costs on the UAC at
+5000 cps** — a tenth. The rest is syscalls, call-table bookkeeping and stats.
+
+Two CI runs of the same commit put `parse_and_route` at 842 ns and 973 ns, a
+15% spread on identical code. That is why the >10% regression rule is a
+prompt to investigate by hand and not a gate: on a shared runner the noise
+reaches the threshold on its own.
 
 That is worth knowing before anyone optimises: the hot path the rules protect
 is already cheap, and the remaining cost is in the machinery around it. The
