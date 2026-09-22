@@ -34,7 +34,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", features = ["std"] }
 # SCTP (`-t s1|sn`, cargo feature `sctp`): std has no SCTP; socket2 opens
 # SOCK_STREAM/IPPROTO_SCTP sockets safely (docs/CONVENTIONS.md §Dependencies).
-socket2 = "0.6"
+# `all` unlocks the platform-specific setsockopt wrappers: `bind_device`
+# (SO_BINDTODEVICE, `-bind_to_device`) is behind it, and without it the Linux
+# build fails while macOS compiles the cfg'd-out fallback happily (M45).
+socket2 = { version = "0.6", features = ["all"] }
 # Test-only: generate self-signed certificates at test time (no expiring
 # PEM fixtures in the repo).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

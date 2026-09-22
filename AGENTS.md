@@ -64,6 +64,17 @@ scenario code: `cargo test -p sipr --test interop` (requires a built `sipp` bina
 see `docs/TESTING.md`). Never mark a milestone item done with failing or skipped
 acceptance tests.
 
+**Those four gates are necessary, not sufficient, and they lie about
+platform-gated code.** A `#[cfg(target_os = ...)]` branch is only *compiled* on
+that target, so a green macOS run says nothing about the Linux arm and vice
+versa — M45 found `-bind_to_device` calling a `socket2` method that needed the
+`all` feature, which had been breaking the Linux build since M44 while every
+local gate passed. When you touch `#[cfg]`-gated platform code, cross-check the
+other target (`rustup target add x86_64-unknown-linux-gnu`, then `cargo check
+--target …` on the affected crate — the full workspace will not cross-compile,
+`ring` needs a C cross-compiler), and **always read the CI run after pushing**:
+Linux CI is the only place every branch of every `cfg` is built.
+
 ## Hard rules
 
 - **Compatibility is the product.** Anything in the v1 tier of `docs/SIPP_COMPAT.md`
