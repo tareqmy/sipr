@@ -8,6 +8,7 @@
 - [SIPp compatibility surface](SIPP_COMPAT.md)
 - [Runtime control: control socket and HTTP API](CONTROL_API.md)
 - [Glossary](GLOSSARY.md)
+- [Performance vs sipp](PERFORMANCE.md)
 - [Performance baselines](benchmarks.md)
 
 # Developing sipr

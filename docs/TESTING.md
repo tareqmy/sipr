@@ -89,6 +89,12 @@ CI logs. Regression rule: >10% drop on hot-path benches blocks merge. Baselines
 kept in `benches/BASELINES.md` per machine class. Target trajectory: match
 single-core SIPp cps by M3 review; exceed it multi-core by v1.
 
+`make bench-vs-sipp` (M45) is the other half: `scripts/bench-vs-sipp.sh` runs
+sipr and real sipp against themselves at 500/2000/5000 cps and reports CPU,
+peak RSS, retransmissions and concurrency for each, read from `/usr/bin/time`
+and from each tool's own `-trace_stat` CSV. Results and their caveats live in
+`docs/PERFORMANCE.md`; rerun it when the engine's hot path changes.
+
 ## CI order
 
 fmt → clippy → unit+golden+property → build sipp (cached) → interop → benches

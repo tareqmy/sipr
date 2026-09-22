@@ -4,6 +4,10 @@ Loopback cps runs of the embedded uac scenario (`-d 10`, release build)
 against a scripted Python UAS (8 MB rcvbuf). Wall time ≈ m/r + drain.
 Update this file when the number moves materially (docs/TESTING.md §5).
 
+These are sipr-only throughput runs. For the side-by-side comparison against
+real sipp — CPU, memory, retransmissions and concurrency at 500/2000/5000 cps
+— see `docs/PERFORMANCE.md` (`make bench-vs-sipp`).
+
 | Date | Machine | Command | Result |
 |---|---|---|---|
 | 2026-08-16 | cloud sandbox (Linux, shared vCPUs) | `-r 500 -m 5000` | 5000/5000 ok, 0 retrans, 10.1s |

@@ -85,6 +85,10 @@ bench: release ## Loopback throughput: sipr-UAC vs sipr-UAS at $(RATE) cps
 	$(BIN) -sn uac -r $(RATE) -m $(CALLS) -d 10 -timeout 120 127.0.0.1:$(PORT); \
 	wait $$UAS; tail -1 /tmp/sipr-bench-uas.log
 
+.PHONY: bench-vs-sipp
+bench-vs-sipp: release ## Side-by-side load comparison against real sipp (docs/PERFORMANCE.md)
+	SIPP_BIN=$(SIPP_BIN) scripts/bench-vs-sipp.sh
+
 # ---- releasing ---------------------------------------------------------
 
 .PHONY: publish
