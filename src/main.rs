@@ -349,6 +349,7 @@ fn run(cli: &Cli) -> ExitCode {
             },
         },
         http_token: cli.http_token.clone(),
+        stats_json: cli.stats_json.clone(),
         trace_name_base: Some(format!("{base}_{pid}")),
         // pcap paths resolve next to the scenario file first (SIPp find_file).
         scenario_dir: cli

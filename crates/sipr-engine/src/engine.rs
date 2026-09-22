@@ -243,6 +243,10 @@ pub struct EngineConfig {
     /// `--sipr-http-token`: bearer token for the HTTP API (required when
     /// `http_addr` is not loopback).
     pub http_token: Option<String>,
+    /// `--sipr-stats-json`: append every statistics snapshot to this file as
+    /// one JSON object per line, the same shape the HTTP API's `/stats`
+    /// returns. Written on the engine's own 1 s tick.
+    pub stats_json: Option<std::path::PathBuf>,
     /// `<scenario>_<pid>`: the stem for trace files opened at runtime by
     /// `trace messages|error on` (SIPp's naming).
     pub trace_name_base: Option<String>,
@@ -1428,6 +1432,8 @@ struct Engine<'s> {
     dtmf_ssrc_counter: u32,
     /// Latest snapshot for the HTTP API, when it is enabled.
     control_snapshot: Option<Arc<Mutex<sipr_stats::Snapshot>>>,
+    /// `--sipr-stats-json`: the JSON-lines stream of snapshots.
+    stats_json: Option<sipr_stats::TraceFile>,
     /// Keeps the HTTP listener alive for the run.
     _http: Option<sipr_control::http::HttpServer>,
     /// `set rate-scale`: the step multiplier for the rate keys.
@@ -1800,6 +1806,18 @@ impl<'s> Engine<'s> {
             control_snapshot = Some(snapshot);
             http = Some(server);
         }
+        // Fail at start-up rather than silently dropping the stream: an
+        // unwritable path is a mistake in the command line, not a runtime
+        // condition to degrade through.
+        let stats_json = match config.stats_json.as_deref() {
+            None => None,
+            Some(path) => Some(sipr_stats::TraceFile::create(path).map_err(|e| {
+                EngineError(format!(
+                    "cannot create --sipr-stats-json {}: {e}",
+                    path.display()
+                ))
+            })?),
+        };
         if let Some(uri) = &config.auth_uri
             && (uri.starts_with("sip:") || uri.starts_with("sips:"))
         {
@@ -2094,6 +2112,7 @@ impl<'s> Engine<'s> {
             },
             dtmf_ssrc_counter: 0,
             control_snapshot,
+            stats_json,
             _http: http,
             rate_scale: config.rate_scale.unwrap_or(1.0),
             echo,
@@ -2181,7 +2200,12 @@ impl<'s> Engine<'s> {
         self.sample_media_counters();
         self.collect_final_media_events();
         // Final rows of every statistics file, then flush all trace files.
+        // The snapshot goes out once more so the JSON stream's last line is
+        // the run's final state: the 1 s tick almost never lands on the end,
+        // and a consumer reading the file afterwards wants the totals, not
+        // whatever was true a fraction of a second earlier.
         self.dump_statistics();
+        self.publish_snapshot();
         self.flush_rtt(true);
         for f in [
             &mut self.trace_msg,
@@ -2193,6 +2217,7 @@ impl<'s> Engine<'s> {
             &mut self.trace_logs,
             &mut self.trace_shortmsg,
             &mut self.trace_calldebug,
+            &mut self.stats_json,
         ]
         .into_iter()
         .flatten()
@@ -2262,7 +2287,10 @@ impl<'s> Engine<'s> {
     }
 
     fn publish_snapshot(&mut self) {
-        if self.snapshot_tx.is_none() && self.control_snapshot.is_none() {
+        if self.snapshot_tx.is_none()
+            && self.control_snapshot.is_none()
+            && self.stats_json.is_none()
+        {
             return;
         }
         let snap = self.build_snapshot();
@@ -2270,6 +2298,12 @@ impl<'s> Engine<'s> {
             && let Ok(mut slot) = shared.lock()
         {
             *slot = snap.clone();
+        }
+        // One JSON object per line, flushed each tick: the point of the
+        // stream is that something else can tail it while the run is live.
+        if let Some(file) = self.stats_json.as_mut() {
+            file.write(&format!("{}\n", sipr_control::api::snapshot_json(&snap)));
+            file.flush();
         }
         if let Some(tx) = self.snapshot_tx.as_ref() {
             let _ = tx.send(snap); // UI gone → ignored; run continues headless

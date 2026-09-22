@@ -688,3 +688,120 @@ fn no_effect_sipp_flags_warn_but_do_not_stop_the_run() {
     assert_code(&o, 2);
     assert!(stderr(&o).contains("unknown option"), "{}", stderr(&o));
 }
+
+/// `--sipr-stats-json` writes one JSON object per snapshot tick, the same
+/// shape the HTTP API's `/stats` returns (M46).
+#[test]
+fn stats_json_writes_one_object_per_tick() {
+    let dir = std::env::temp_dir().join(format!("sipr-statsjson-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("snaps.jsonl");
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .args([
+            "-sn",
+            "uas",
+            "-i",
+            "127.0.0.1",
+            "-p",
+            "0",
+            "-cp",
+            "0",
+            "--sipr-stats-json",
+            path.to_str().expect("utf8"),
+            "-m",
+            "1",
+            "-timeout",
+            "3",
+            "-bg",
+        ])
+        .output()
+        .expect("spawn sipr");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    // 99: the UAS timed out having processed no calls (SIPP_COMPAT §5). The
+    // point here is the file, but the run must still have been orderly.
+    assert_eq!(out.status.code(), Some(99), "stderr:\n{}", stderr(&out));
+
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        lines.len() >= 2,
+        "a ~3 s run ticks at least twice, got {}:\n{text}",
+        lines.len()
+    );
+    for line in &lines {
+        // Each line stands alone: that is the point of JSON lines.
+        assert!(line.starts_with('{') && line.ends_with('}'), "{line}");
+        for key in [
+            "\"scenario\":",
+            "\"created\":",
+            "\"elapsed_ms\":",
+            "\"live\":",
+        ] {
+            assert!(line.contains(key), "missing {key} in {line}");
+        }
+    }
+    // elapsed_ms must advance between ticks, i.e. these are real snapshots
+    // and not the same one written twice.
+    let elapsed = |l: &str| -> u64 {
+        let at = l.find("\"elapsed_ms\":").expect("key") + "\"elapsed_ms\":".len();
+        l[at..]
+            .split(|c: char| !c.is_ascii_digit())
+            .find(|s| !s.is_empty())
+            .and_then(|s| s.parse().ok())
+            .expect("number")
+    };
+    assert!(
+        elapsed(lines[1]) > elapsed(lines[0]),
+        "elapsed_ms should advance: {lines:?}"
+    );
+}
+
+/// The stream's last line is the run's final state, not whatever the 1 s
+/// tick happened to catch: a consumer reading the file afterwards wants the
+/// totals. Driven by a real call so the counters are non-zero (M46).
+#[test]
+fn stats_json_last_line_is_the_final_state() {
+    let dir = std::env::temp_dir().join(format!("sipr-statsjson-final-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("snaps.jsonl");
+    // A UAC with no peer: every call fails, which is a definite end state.
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .args([
+            "-sn",
+            "uac",
+            "-i",
+            "127.0.0.1",
+            "-cp",
+            "0",
+            "--sipr-stats-json",
+            path.to_str().expect("utf8"),
+            "-r",
+            "2",
+            "-m",
+            "2",
+            "-timeout",
+            "4",
+            "-bg",
+            "127.0.0.1:9",
+        ])
+        .output()
+        .expect("spawn sipr");
+    let err = stderr(&out);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let summary = err
+        .lines()
+        .find(|l| l.contains("run complete:"))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(summary.contains("created 2"), "{err}");
+    let last = text.lines().rfind(|l| !l.is_empty()).unwrap_or("");
+    assert!(
+        last.contains("\"created\":2"),
+        "final line should carry the final totals\nsummary: {summary}\nline: {last}"
+    );
+    assert!(last.contains("\"live\":0"), "no calls left live: {last}");
+}

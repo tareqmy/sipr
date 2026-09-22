@@ -130,6 +130,8 @@ pub struct Cli {
     pub control_ip: Option<IpAddr>,
     /// `--sipr-http`: HTTP control API bind, `PORT` or `HOST:PORT`.
     pub http: Option<String>,
+    /// `--sipr-stats-json`: JSON-lines snapshot stream.
+    pub stats_json: Option<PathBuf>,
     /// `--sipr-http-token`: bearer token for the HTTP API.
     pub http_token: Option<String>,
     /// `-t`: transport mode.
@@ -339,6 +341,7 @@ impl Default for Cli {
             control_ip: None,
             http: None,
             http_token: None,
+            stats_json: None,
             transport: Transport::UdpMono,
             max_socket: None,
             remote_sending: None,
@@ -649,6 +652,12 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         true,
         "TOKEN",
         "Bearer token for the HTTP API (required off loopback)",
+    ),
+    (
+        "sipr-stats-json",
+        true,
+        "FILE",
+        "Append each statistics snapshot to FILE as one JSON object per line (sipr addition)",
     ),
     (
         "t",
@@ -1376,6 +1385,7 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "cp" => cli.control_port = Some(parse_num(flag, &val(value))?),
         "ci" => cli.control_ip = Some(parse_num(flag, &val(value))?),
         "sipr-http" => cli.http = Some(val(value)),
+        "sipr-stats-json" => cli.stats_json = Some(PathBuf::from(val(value))),
         "sipr-http-token" => cli.http_token = Some(val(value)),
         "t" => cli.transport = parse_transport(&val(value))?,
         "s" => cli.service = val(value),
@@ -2079,6 +2089,18 @@ mod tests {
             assert!(err.contains("SO_BINDTODEVICE"), "{err}");
             assert!(err.contains("eth0"), "{err}");
         }
+    }
+
+    #[test]
+    fn stats_json_flag_parses() {
+        assert_eq!(cli(&["-sn", "uac", "host"]).stats_json, None);
+        let c = cli(&["-sn", "uac", "--sipr-stats-json", "/tmp/s.jsonl", "host"]);
+        assert_eq!(
+            c.stats_json.as_deref(),
+            Some(std::path::Path::new("/tmp/s.jsonl"))
+        );
+        let err = run(&["--sipr-stats-json"]).unwrap_err();
+        assert!(err.contains("requires a value"), "{err}");
     }
 
     #[test]

@@ -153,6 +153,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
 - Runtime control: SIPp's UDP control socket (`-cp`) and an HTTP/JSON API
   (`--sipr-http 8080`: `/stats`, `/control`, `/quit`, `/command`; see
   `docs/CONTROL_API.md`).
+- Machine-readable statistics: `GET /metrics` in Prometheus format, and
+  `--sipr-stats-json FILE` for one JSON object per second to tail or replay.
 - Live TUI, `-bg` headless stat lines, `-trace_msg`/`-trace_err`/`-trace_stat`
   files, RTDs and repartition tables.
 

@@ -16,6 +16,7 @@ fn uas_config() -> EngineConfig {
         bind_local: false,
         sockopts: sipr_engine::SocketOpts::default(),
         sendbuffer_warn: false,
+        stats_json: None,
         port: None,
         service: "service".into(),
         rate: 10.0,

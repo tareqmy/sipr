@@ -130,7 +130,9 @@ Auth: `-au`/`-ap` (username/password defaults for `[authentication]`)
 `remote_ip:remote_port`, M21).
 Control (M17): `-cp <port>` `-ci <ip>` (SIPp's UDP control socket; `-cp 0`
 disables — sipr addition) and sipr's `--sipr-http [HOST:]PORT` /
-`--sipr-http-token` (docs/CONTROL_API.md).
+`--sipr-http-token` (docs/CONTROL_API.md). Statistics out (M46, sipr
+additions): `--sipr-stats-json <file>` (a JSON object per snapshot tick) and
+the `/metrics` endpoint on that API (Prometheus text). SIPp has neither.
 Tracing/output: `-trace_msg` `-trace_err` `-trace_stat` `-stf <file>`
 `-fd <interval s>` (default 60, the `(P)` period) `-f <interval s>` (screen
 and `-bg` line refresh, default 1) `-trace_rtt` `-rtt_freq <n>`

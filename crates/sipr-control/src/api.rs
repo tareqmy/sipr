@@ -5,6 +5,7 @@
 //! |--------|-------------|--------|
 //! | GET    | `/health`   | `{"status":"ok","version":...}` |
 //! | GET    | `/stats`    | the latest statistics snapshot |
+//! | GET    | `/metrics`  | the same snapshot in Prometheus text format |
 //! | GET    | `/control`  | rate / pause / users / limit / quit state |
 //! | POST   | `/control`  | partial update: `rate`, `rate_scale`, `paused`, `users`, `limit` |
 //! | POST   | `/quit`     | `{"force":bool}` — drain (default) or abort |
@@ -50,6 +51,10 @@ fn route(link: &ControlLink, token: Option<&str>, req: &Request) -> Response {
             let snap = link.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
             Response::json(200, snapshot_json(&snap).to_string())
         }
+        ("GET", "/metrics") => {
+            let snap = link.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
+            Response::prometheus(200, crate::prometheus::render(&snap))
+        }
         ("GET", "/control") => reply(ask(link, ControlCmd::Query)),
         ("POST", "/control") => match parse_body(req) {
             Err(e) => error(400, &e),
@@ -89,9 +94,10 @@ fn route(link: &ControlLink, token: Option<&str>, req: &Request) -> Response {
             ])
             .to_string(),
         ),
-        (_, "/health" | "/stats" | "/control" | "/quit" | "/command" | "/scenario") => {
-            error(405, "method not allowed")
-        }
+        (
+            _,
+            "/health" | "/stats" | "/metrics" | "/control" | "/quit" | "/command" | "/scenario",
+        ) => error(405, "method not allowed"),
         _ => error(404, "no such endpoint"),
     }
 }
@@ -358,6 +364,39 @@ mod tests {
         let status: u16 = out[9..12].parse().unwrap();
         let body = out.split("\r\n\r\n").nth(1).unwrap_or("null");
         (status, json::parse(body).unwrap())
+    }
+
+    /// `/metrics` answers Prometheus text, not JSON, and honours the token
+    /// like every other path but `/health`.
+    #[test]
+    fn metrics_endpoint_serves_prometheus_text() {
+        let (link, _seen) = fake_engine();
+        let server = HttpServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            handler(link, Some("s3cret".into())),
+        )
+        .unwrap();
+        let a = server.local_addr();
+        let mut sock = TcpStream::connect(a).unwrap();
+        sock.write_all(b"GET /metrics?token=s3cret HTTP/1.1\r\n\r\n")
+            .unwrap();
+        let mut out = String::new();
+        sock.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+        assert!(
+            out.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8"),
+            "scrapers pick the parser from this header:\n{out}"
+        );
+        let body = out.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(
+            body.contains("# TYPE sipr_calls_created_total counter"),
+            "{body}"
+        );
+        assert!(body.contains("sipr_calls_created_total 7"), "{body}");
+
+        // No token: refused, like the other guarded paths.
+        let (st, _) = call(a, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert_eq!(st, 401);
     }
 
     #[test]

@@ -67,6 +67,17 @@ impl Response {
         }
     }
 
+    /// A Prometheus exposition response. The version parameter is what
+    /// scrapers look for to pick the text parser.
+    #[must_use]
+    pub fn prometheus(status: u16, body: String) -> Self {
+        Self {
+            status,
+            content_type: "text/plain; version=0.0.4; charset=utf-8",
+            body: body.into_bytes(),
+        }
+    }
+
     /// A plain-text response.
     #[must_use]
     pub fn text(status: u16, body: &str) -> Self {

@@ -1896,13 +1896,42 @@ gates had never compiled it — CI had been red since the M44 merge. Fixed,
 and AGENTS.md now says that the local gates prove nothing about a `cfg`
 branch they do not compile.
 
-### M46+ — sipr's own additions (after parity)
+### M46 — Structured stats: JSON lines and a Prometheus endpoint ✅
+
+Two ways to get the numbers out of a run without parsing a screen: one
+for a dashboard scraping a live run, one for a CI job reading the file
+afterwards. Both carry the snapshot `/stats` already returned, so the
+three never disagree.
+
+- [x] `--sipr-stats-json FILE`: one JSON object per snapshot tick,
+      appended and flushed each second so it can be tailed live. The
+      file is truncated at start-up and an unwritable path is a
+      start-up error, not a silent skip.
+- [x] `GET /metrics` on the existing HTTP API: Prometheus text
+      exposition (`crates/sipr-control/src/prometheus.rs`, in-tree by
+      the same policy as the JSON — no client library, no registry),
+      served with `Content-Type: text/plain; version=0.0.4` and guarded
+      by the bearer token like every path but `/health`.
+- [x] Docs: `docs/CONTROL_API.md` §3, with a scrape config and a
+      `tail -f | jq` example.
+
+Notes: names are prefixed `sipr_`, counters end in `_total`, durations
+are converted to **seconds** (the snapshot holds milliseconds, and
+seconds is the base unit Prometheus expects), and what would be several
+near-identical names is one metric with a label — failures by `reason`,
+messages by `kind`, per-step counters by `step` and `label`. Label values
+are escaped, since a scenario name is free text and an unescaped quote
+would corrupt every series after it. Found on the way: the 1 s tick
+almost never lands on the end of a run, so the stream's last line was not
+the final state; the engine now publishes one more snapshot next to the
+final `-trace_stat` row, and a test pins that the last line matches the
+run summary.
+
+### M47+ — sipr's own additions (after parity)
 
 Candidates, to be promoted into numbered milestones in the order the
 users of the HTTP API ask for them:
 
-- Structured stats: `--sipr-stats-json <file>` (the 1 s snapshot as
-  JSON lines) and a Prometheus `/metrics` on the existing HTTP API.
 - Library API: `sipr-engine` embedded in another Rust test harness
   (scenario in, stats out, no CLI, no TUI) — needs a stable
   `EngineConfig` and a documented public surface.

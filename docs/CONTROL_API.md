@@ -71,6 +71,7 @@ connection, JSON in and out. Every error is `{"error":"..."}` with a
 | POST | `/quit` | `{"force":false}` (default) drains, `true` aborts | `202` + control state |
 | POST | `/command` | `{"command":"set rate 10"}` — any control-socket command line | the control state, or `400` + warning |
 | GET | `/scenario` | — | `{"name","role","steps":[...]}` (the `--check` dump) |
+| GET | `/metrics` | — | the same snapshot in Prometheus text format (below) |
 
 Control state:
 
@@ -102,8 +103,56 @@ Statistics snapshot — SIPp's counter names, durations in `_ms`:
 The snapshot is the same object the TUI renders and the `-bg` stat line
 summarizes, so the three never disagree.
 
+## 3. Machine-readable statistics (M46)
+
+Two ways out, both carrying the same snapshot as `/stats`.
+
+**Scraping — `GET /metrics`.** Prometheus text exposition format, served
+with `Content-Type: text/plain; version=0.0.4`, so a scrape config needs
+nothing but the address:
+
+```yaml
+scrape_configs:
+  - job_name: sipr
+    static_configs: [{ targets: ['localhost:8080'] }]
+```
+
+Names are prefixed `sipr_`, cumulative counters end in `_total`, durations
+are in **seconds** (the snapshot's milliseconds converted, since that is the
+base unit Prometheus expects), and what would be several near-identical
+names is one metric with a label:
+
+```
+sipr_run_info{scenario="uac",role="UAC",display="main"} 1
+sipr_calls_created_total 20000
+sipr_calls_failed_total{reason="recv_timeout"} 3
+sipr_messages_total{kind="retrans_sent"} 12
+sipr_calls_active 41
+sipr_rtd_seconds{rtd="1",stat="p99"} 0.020000
+sipr_step_messages_total{step="0",label="send INVITE",kind="sent"} 20000
+```
+
+`/metrics` needs the token like every path but `/health`. Prometheus sends
+it with `authorization: { credentials: TOKEN }` in the scrape config.
+
+**Streaming to a file — `--sipr-stats-json FILE`.** One JSON object per
+snapshot tick, appended and flushed each second, so it can be tailed while
+the run is live and replayed afterwards:
+
+```bash
+sipr -sn uac -r 10 -m 1000 --sipr-stats-json snaps.jsonl 127.0.0.1:5060
+tail -f snaps.jsonl | jq -c '{t: .elapsed_ms, live, created, failed}'
+```
+
+Each line is exactly the object `/stats` returns, so anything that reads one
+reads the other. The file is truncated at start-up; an unwritable path is a
+start-up error, not a silent skip. This needs no HTTP listener — it is the
+option for a CI job that wants the numbers afterwards rather than a dashboard
+during.
+
 ### What the API does not do (yet)
 
-No streaming/WebSocket (poll `/stats`), no scenario replacement, no
-per-call detail, no Prometheus endpoint. The API is a control plane for
-one run; orchestration of many runs belongs in whatever launches them.
+No streaming/WebSocket over HTTP (poll `/stats`, or use
+`--sipr-stats-json`), no scenario replacement, no per-call detail. The API is
+a control plane for one run; orchestration of many runs belongs in whatever
+launches them.
