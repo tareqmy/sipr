@@ -8777,3 +8777,140 @@ fn a_recv_cmd_waits_with_recv_timeout() {
         twin_thread.join().expect("twin");
     }
 }
+
+// ---- a matched recv follows its next=, test= and chance= -----------------
+
+/// A UAS tail: `recvs` (an INFO recv, maybe behind others), a mandatory
+/// UPDATE recv the UAC never sends (SIPp refuses an optional recv right
+/// before a send), then three BYEs, told apart by `X-Branch`:
+/// `fell-through` (the UPDATE recv, reached, timed out after 500 ms),
+/// `jumped` (label `jumped`) and `timedout` (label `timedout`).
+fn branching_recv_tail(recvs: &str) -> String {
+    format!(
+        r#"{recvs}
+  <recv request="UPDATE" timeout="500" ontimeout="fell"/>
+  <label id="fell"/>
+{fell}  <label id="jumped"/>
+{jumped}  <label id="timedout"/>
+{timedout}  <label id="done"/>
+"#,
+        fell = branch_bye("fell-through", r#" next="done""#),
+        jumped = branch_bye("jumped", r#" next="done""#),
+        timedout = branch_bye("timedout", ""),
+    )
+}
+
+/// The branching cases (mirrored in `tests/interop.rs`): a name, the recvs,
+/// the `X-Branch` of the BYE the UAS sends once the INFO (sent 1 s after
+/// the ACK) matched, and when, in ms after the ACK — a fall-through shows
+/// 500 ms after the INFO, once the UPDATE recv has timed out. `flag` is
+/// set only when the `<ereg>` matches the INFO.
+const RECV_BRANCH_CASES: [(&str, &str, &str, u64); 7] = [
+    (
+        "a mandatory recv follows next=",
+        r#"  <recv request="INFO" next="jumped" counter="infos" timeout="2000" ontimeout="timedout"/>"#,
+        "jumped",
+        1000,
+    ),
+    (
+        "a mandatory recv moves on when test= is unset",
+        r#"  <recv request="INFO" next="jumped" test="flag" timeout="2000" ontimeout="timedout">
+    <action><ereg regexp="X-Nope" search_in="msg" assign_to="flag"/></action>
+  </recv>"#,
+        "fell-through",
+        1500,
+    ),
+    (
+        "an optional recv follows next= when test= is set",
+        r#"  <recv request="INFO" optional="true" next="jumped" test="flag" timeout="2000" ontimeout="timedout">
+    <action><ereg regexp="INFO" search_in="msg" assign_to="flag"/></action>
+  </recv>"#,
+        "jumped",
+        1000,
+    ),
+    (
+        "an optional recv stays when test= is unset",
+        r#"  <recv request="INFO" optional="true" next="jumped" test="flag" timeout="2000" ontimeout="timedout">
+    <action><ereg regexp="X-Nope" search_in="msg" assign_to="flag"/></action>
+  </recv>"#,
+        "timedout",
+        2000,
+    ),
+    (
+        "the stay keeps the call at the recv it waited at",
+        r#"  <recv request="OPTIONS" optional="true" timeout="2000" ontimeout="timedout"/>
+  <recv request="INFO" optional="true" next="jumped" test="flag">
+    <action><ereg regexp="X-Nope" search_in="msg" assign_to="flag"/></action>
+  </recv>"#,
+        "timedout",
+        2000,
+    ),
+    (
+        "an optional recv without test= follows next=",
+        r#"  <recv request="INFO" optional="true" next="jumped" chance="1" timeout="2000" ontimeout="timedout"/>"#,
+        "jumped",
+        1000,
+    ),
+    (
+        "chance=0 never jumps",
+        r#"  <recv request="INFO" optional="true" next="jumped" chance="0" timeout="2000" ontimeout="timedout"/>"#,
+        "fell-through",
+        1500,
+    ),
+];
+
+/// A matched recv leaves through SIPp's `next()` (`call.cpp` ~l.1920): to
+/// its `next=` when the `test=` variable (if any) is set and the `chance=`
+/// draw (if any) is won, else to the message after it. The exception
+/// (`process_incoming` ~l.5653): an optional recv whose `test=` variable is
+/// unset leaves the call where it waited, and the receive timeout already
+/// running there keeps running — the INFO at 1 s does not restart it, so
+/// the 2 s timeout fires at 2 s, not 3 s. The recv's actions run first, so
+/// an `<ereg>` on it decides its own `test=`.
+#[test]
+fn a_matched_recv_follows_next_test_and_chance() {
+    let runs = std::thread::scope(|scope| {
+        let handles: Vec<_> = RECV_BRANCH_CASES
+            .iter()
+            .map(|&(_, recvs, ..)| {
+                scope.spawn(move || {
+                    let uas = recv_timeout_uas_xml(&branching_recv_tail(recvs));
+                    run_recv_timeout_call(
+                        &uas,
+                        &[],
+                        Some(Duration::from_millis(1000)),
+                        Duration::from_millis(3500),
+                        Duration::from_secs(6),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("run"))
+            .collect::<Vec<_>>()
+    });
+    // Which BYE came back, and when, to the nearest 500 ms.
+    let outcome = |run: &RecvTimeoutRun| {
+        run.request.as_ref().map(|(branch, after)| {
+            let rounded = (after.as_millis() + 250) / 500 * 500;
+            (branch.clone(), u64::try_from(rounded).expect("ms"))
+        })
+    };
+    let got: Vec<_> = RECV_BRANCH_CASES
+        .iter()
+        .zip(&runs)
+        .map(|(&(name, ..), run)| (name, outcome(run)))
+        .collect();
+    let expected: Vec<_> = RECV_BRANCH_CASES
+        .iter()
+        .map(|&(name, _, branch, at_ms)| (name, Some((branch.to_owned(), at_ms))))
+        .collect();
+    assert_eq!(got, expected, "which BYE the UAS sent, and when");
+    for (&(name, ..), run) in RECV_BRANCH_CASES.iter().zip(&runs) {
+        let err = &run.stderr;
+        assert!(!err.contains("warning"), "{name}: {err}");
+        assert_eq!(run.code, Some(0), "{name}:\n{err}");
+        assert!(err.contains("successful 1 failed 0"), "{name}:\n{err}");
+    }
+}

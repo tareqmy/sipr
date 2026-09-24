@@ -1619,10 +1619,37 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   counted as a success; and a `<recvCmd>` never timed out. So a
   `timeout=` on the 200 of `100 optional`, `180 optional`, `200` arms
   only once a provisional has moved the call onto the 200. Until then it
-  waits for the 100, as it always did in SIPp. **Open:** (1) SIPp takes
+  waits for the 100, as it always did in SIPp. **Open:** SIPp takes
   `ontimeout=` on a `<recvCmd>` (a common attribute); sipr warns it away
-  as unknown, so a recvCmd that times out always fails the call. (2)
-  sipr ignores `next=`, `test=`, `chance=` and `counter=` on a `<recv>`
-  (a matched recv never consults them), so it neither follows the jump
-  nor, for an optional recv whose `test=` variable is unset, keeps
-  `msg_index` and the running deadline as SIPp's "stay" branch does.
+  as unknown, so a recvCmd that times out always fails the call. (The
+  other item once open here, a matched recv's `next=`/`test=`/`chance=`,
+  is fixed since: see the next note.)
+- Branching on a matched `<recv>` (verified in `call.cpp` ~l.5653-5687
+  `process_incoming`, ~l.1920-1945 `next()`, ~l.1777 `do_bookkeeping`,
+  and `scenario.cpp` ~l.1860-1876, which reads `test=` and `chance=` only
+  beside a `next=`; confirmed against real sipp, the
+  `a_matched_recv_branches_like_real_sipp` interop test). A matched recv
+  leaves through `next()`, as a send, pause or nop does: to its `next=`
+  when its `test=` variable, if any, is set and its `chance=` draw, if
+  any, is won, else to the message after it. The recv's actions run
+  first, so an `<ereg assign_to=>` on the recv decides its own `test=`.
+  The exception is an optional recv whose `test=` variable is unset:
+  `process_incoming` skips `next()`, so `msg_index` stays at the message
+  the call waited at — the window's first recv, not the one that matched
+  — and the `recv_timeout` running there keeps its deadline (sipr
+  re-arms it unchanged). The rest of the match still happens: the
+  message counts as received, becomes the `[last_*]` message and stops
+  a retransmission, and its RTDs and `counter=` are booked
+  (`do_bookkeeping` runs before the branch). A mandatory recv never
+  stays, whatever its `test=`, and `test=` without `next=` does nothing.
+  sipr used to ignore `next=`, `test=`, `chance=` and `counter=` on a
+  recv: it never jumped, and always moved to the message after the
+  match. `counter=` now ticks on a recv as on the other steps, but sipr
+  reports no generic counters (the `-trace_stat` note above), so nothing
+  shows it yet. **Divergence, on purpose:** SIPp tests `next` there as a
+  C boolean (`next && …`), and a `next=` label before the first message
+  resolves to index 0, which reads as false. So in SIPp an optional recv
+  whose `next=` names message 0 stays where it waited, `test=` or not,
+  and never takes the jump (checked by hand against real sipp). sipr
+  takes it: silently dropping a `next=` is a SIPp failure mode sipr does
+  not inherit.

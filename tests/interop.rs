@@ -5365,3 +5365,166 @@ fn recv_timeouts_arm_like_real_sipp() {
         assert_eq!(jump(&theirs.error_log).as_deref(), warning, "{name}");
     }
 }
+
+// ---- a matched recv follows its next=, test= and chance= -----------------
+
+/// A UAS tail: `recvs` (an INFO recv, maybe behind others), a mandatory
+/// UPDATE recv the UAC never sends (SIPp refuses an optional recv right
+/// before a send), then three BYEs, told apart by `X-Branch`:
+/// `fell-through` (the UPDATE recv, reached, timed out after 500 ms),
+/// `jumped` (label `jumped`) and `timedout` (label `timedout`).
+fn branching_recv_tail(recvs: &str) -> String {
+    format!(
+        r#"{recvs}
+  <recv request="UPDATE" timeout="500" ontimeout="fell"/>
+  <label id="fell"/>
+{fell}  <label id="jumped"/>
+{jumped}  <label id="timedout"/>
+{timedout}  <label id="done"/>
+"#,
+        fell = branch_bye("fell-through", r#" next="done""#),
+        jumped = branch_bye("jumped", r#" next="done""#),
+        timedout = branch_bye("timedout", ""),
+    )
+}
+
+/// Branching on a matched recv at parity with real sipp (docs/SIPP_COMPAT.md
+/// §6, `call.cpp` ~l.5653 `process_incoming` and ~l.1920 `next()`): the
+/// recv's `next=` is followed when its `test=` variable (if any) is set and
+/// its `chance=` draw (if any) is won, else the call moves to the message
+/// after it — except that an optional recv whose `test=` variable is unset
+/// leaves the call at the recv it waited at, with that recv's receive
+/// timeout still running from where it started. The same cases as e2e's
+/// `a_matched_recv_follows_next_test_and_chance`, each run under both tools
+/// against the same scripted UAC, which sends an INFO 1 s after the ACK.
+#[test]
+fn a_matched_recv_branches_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::a_matched_recv_branches_like_real_sipp — no sipp.");
+        return;
+    };
+    let sipr = std::path::Path::new(env!("CARGO_BIN_EXE_sipr"));
+    let unset = r#"<action><ereg regexp="X-Nope" search_in="msg" assign_to="flag"/></action>"#;
+    let set = r#"<action><ereg regexp="INFO" search_in="msg" assign_to="flag"/></action>"#;
+    let info = |attrs: &str, body: &str| {
+        format!(
+            r#"  <recv request="INFO"{attrs} timeout="2000" ontimeout="timedout">{body}</recv>"#
+        )
+    };
+    let behind = format!(
+        r#"  <recv request="OPTIONS" optional="true" timeout="2000" ontimeout="timedout"/>
+  <recv request="INFO" optional="true" next="jumped" test="flag">{unset}</recv>"#
+    );
+    // Name, recvs, and what real sipp does: the BYE's `X-Branch`, when it
+    // came (in 500 ms units after the ACK), and the timeout warning.
+    let cases: [(&str, String, &str, u128, Option<&str>); 7] = [
+        (
+            "a mandatory recv follows next=",
+            info(r#" next="jumped" counter="infos""#, ""),
+            "jumped",
+            2,
+            None,
+        ),
+        (
+            "a mandatory recv moves on when test= is unset",
+            info(r#" next="jumped" test="flag""#, unset),
+            "fell-through",
+            3,
+            Some("recv-timeout-uas:4, jumping to label 5"),
+        ),
+        (
+            "an optional recv follows next= when test= is set",
+            info(r#" optional="true" next="jumped" test="flag""#, set),
+            "jumped",
+            2,
+            None,
+        ),
+        (
+            "an optional recv stays when test= is unset",
+            info(r#" optional="true" next="jumped" test="flag""#, unset),
+            "timedout",
+            4,
+            Some("recv-timeout-uas:3, jumping to label 7"),
+        ),
+        (
+            "the stay keeps the call at the recv it waited at",
+            behind,
+            "timedout",
+            4,
+            Some("recv-timeout-uas:3, jumping to label 8"),
+        ),
+        (
+            "an optional recv without test= follows next=",
+            info(r#" optional="true" next="jumped" chance="1""#, ""),
+            "jumped",
+            2,
+            None,
+        ),
+        (
+            "chance=0 never jumps",
+            info(r#" optional="true" next="jumped" chance="0""#, ""),
+            "fell-through",
+            3,
+            Some("recv-timeout-uas:4, jumping to label 5"),
+        ),
+    ];
+    let jump = |log: &str| {
+        log.lines()
+            .find_map(|l| l.split_once(", receive timeout on message "))
+            .map(|(_, rest)| rest.to_owned())
+    };
+    let listen = Duration::from_millis(3500);
+    let info_after = Some(Duration::from_millis(1000));
+    // Every run on its own port and directory, all at once: the cases are
+    // mostly waiting.
+    let outcomes = std::thread::scope(|scope| {
+        let runs: Vec<_> = cases
+            .iter()
+            .map(|(_, recvs, ..)| {
+                let xml = recv_timeout_uas_xml(&branching_recv_tail(recvs));
+                let sipp = &sipp;
+                let theirs = {
+                    let xml = xml.clone();
+                    scope.spawn(move || run_recv_timeout_uas(sipp, &xml, &[], info_after, listen))
+                };
+                let ours =
+                    scope.spawn(move || run_recv_timeout_uas(sipr, &xml, &[], info_after, listen));
+                (theirs, ours)
+            })
+            .collect();
+        runs.into_iter()
+            .map(|(theirs, ours)| {
+                (
+                    theirs.join().expect("sipp run"),
+                    ours.join().expect("sipr run"),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    for ((name, _, branch, at, warning), (theirs, ours)) in cases.iter().zip(outcomes) {
+        // Pin what real sipp does, so the comparison cannot pass vacuously.
+        assert_eq!(theirs.code, Some(0), "{name}: real sipp's exit code");
+        assert_eq!(
+            theirs.request.as_ref().map(|(b, t)| (b.as_str(), *t)),
+            Some((*branch, *at)),
+            "{name}: real sipp's BYE"
+        );
+        assert_eq!(
+            jump(&theirs.error_log).as_deref(),
+            *warning,
+            "{name}: real sipp's timeout warning"
+        );
+        assert_eq!(
+            ours.code, theirs.code,
+            "{name}: exit code\n{theirs:?}\n{ours:?}"
+        );
+        assert_eq!(ours.request, theirs.request, "{name}: the BYE sent");
+        assert_eq!(
+            jump(&ours.error_log),
+            jump(&theirs.error_log),
+            "{name}: the timeout warning\n{}\n{}",
+            theirs.error_log,
+            ours.error_log
+        );
+    }
+}

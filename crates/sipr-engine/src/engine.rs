@@ -663,6 +663,27 @@ struct RetransCtx {
     timer: TimerId,
 }
 
+/// Where a call waited when a message matched, kept for a match that
+/// leaves it waiting there (an optional recv whose `test` is unset).
+#[derive(Debug, Clone, Copy)]
+struct Wait {
+    index: usize,
+    waiting: bool,
+    awaiting_cmd: bool,
+    deadline: Option<Instant>,
+}
+
+impl Wait {
+    fn of(call: &CallState) -> Self {
+        Self {
+            index: call.index,
+            waiting: call.waiting,
+            awaiting_cmd: call.awaiting_cmd,
+            deadline: call.recv_deadline,
+        }
+    }
+}
+
 /// A call's view of one manual transaction (SIPp `txnInstanceInfo`).
 #[derive(Debug, Clone, Default)]
 struct TxnInstance {
@@ -734,6 +755,10 @@ struct CallState {
     timer: Option<(TimerId, TimerKind)>,
     /// Bumped whenever timers are (re)armed; stale fires are ignored.
     generation: u64,
+    /// When the receive timeout of the recv the call waits at fires (SIPp
+    /// `recv_timeout`), set whenever a wait begins; `None` waits for good.
+    /// A match that leaves the call waiting re-arms it unchanged.
+    recv_deadline: Option<Instant>,
     /// The running `<pause>`: its step index and when it ends (SIPp's
     /// `msg_index` / `paused_until`), for `_unexp.retaddr` / `pausedaddr`
     /// — `index` already points past the pause while it runs.
@@ -3385,15 +3410,19 @@ impl<'s> Engine<'s> {
         self.advance(call_id);
     }
 
-    /// Where execution goes after `index` finishes: `next` (with `chance`),
-    /// else the following step.
+    /// Where execution goes after `index` finishes (see [`Self::next_step`]),
+    /// ticking the step's counter on the way.
     fn jump_target(&mut self, common: &StepCommon, index: usize, call_id: &str) -> usize {
-        // A named counter ticks when its step executes.
-        if let Some(name) = &common.counter {
-            if let Some(call) = self.calls.get_mut(call_id) {
-                *call.counters.entry(name.clone()).or_insert(0) += 1;
-            }
+        if let Some(call) = self.calls.get_mut(call_id) {
+            tick_counter(call, common);
         }
+        self.next_step(common, index, call_id)
+    }
+
+    /// SIPp `next()` (`call.cpp` ~l.1920): the step's `next` when its `test`
+    /// variable, if any, is set and its `chance` draw, if any, is won; else
+    /// the following step.
+    fn next_step(&mut self, common: &StepCommon, index: usize, call_id: &str) -> usize {
         if let Some(dest) = common.next {
             let test_ok = match common.test {
                 Some(v) => self
@@ -3416,15 +3445,25 @@ impl<'s> Engine<'s> {
     /// arms `curmsg->timeout`, the message at `msg_index`. Without either
     /// the call waits for good.
     fn arm_recv_timeout(&mut self, call_id: &str, index: usize) {
-        let Some(timeout) = self.recv_timeout_of(call_id, index) else {
-            return;
-        };
+        let deadline = self
+            .recv_timeout_of(call_id, index)
+            .map(|timeout| Instant::now() + timeout);
+        self.arm_recv_deadline(call_id, deadline);
+    }
+
+    /// Arm the receive timeout of the call's wait to fire at `deadline`
+    /// (`None`: no timeout), and remember it.
+    fn arm_recv_deadline(&mut self, call_id: &str, deadline: Option<Instant>) {
         let Some(call) = self.calls.get_mut(call_id) else {
             return;
         };
+        call.recv_deadline = deadline;
+        let Some(deadline) = deadline else {
+            return;
+        };
         call.generation += 1;
-        let timer = self.timers.arm(
-            timeout,
+        let timer = self.timers.arm_at(
+            deadline,
             Event::CallTimer {
                 call_id: call_id.to_owned(),
                 generation: call.generation,
@@ -3784,20 +3823,22 @@ impl<'s> Engine<'s> {
             s.recv += 1;
         }
         let scenario = self.scenario_of(call_id);
-        let (rrs, ignore_sdp, response_txn, common) = match &scenario.steps[si] {
+        let (rrs, ignore_sdp, response_txn, optional, common) = match &scenario.steps[si] {
             Step::Recv(r) => (
                 r.record_route_set,
                 r.ignore_sdp,
                 r.response_txn,
+                r.optional,
                 r.common.clone(),
             ),
-            _ => (false, false, None, StepCommon::default()),
+            _ => (false, false, None, false, StepCommon::default()),
         };
         let has_media = self.media.is_some();
         let now = Instant::now();
         let Some(call) = self.calls.get_mut(call_id) else {
             return;
         };
+        let waited = Wait::of(call);
         // SIPp: an ACK received establishes the call, a 200 received leaves
         // an ACK pending (abort sends ACK+BYE rather than CANCEL), and the
         // last INVITE's CSeq guards later ACKs (`cseq` behavior).
@@ -3811,7 +3852,8 @@ impl<'s> Engine<'s> {
             call.last_recv_invite_cseq = msg.cseq().map(|(n, _)| n);
         }
         // A matched recv cancels the pending retransmission
-        // (call.cpp: next_retrans = 0) and the window timeout.
+        // (call.cpp: next_retrans = 0) and the window timeout (re-armed
+        // below if the call stays waiting).
         if let Some(r) = call.retrans.take() {
             self.timers.cancel(r.timer);
         }
@@ -3841,12 +3883,15 @@ impl<'s> Engine<'s> {
                 .collect();
         }
         let on_secondary = call.secondary;
+        // SIPp `do_bookkeeping`: RTDs and the counter, whether or not the
+        // match moves the call on.
         apply_rtds(
             call,
             stats_for(&mut self.stats, self.secondary.as_mut(), on_secondary),
             &common,
             now,
         );
+        tick_counter(call, &common);
         call.last_recv_key = Some(key);
         if has_media && !ignore_sdp {
             learn_remote_media(call, msg);
@@ -3877,7 +3922,44 @@ impl<'s> Engine<'s> {
         if !recv_actions.is_empty() && self.run_step_actions(call_id, &recv_actions, si) {
             return;
         }
+        // SIPp `process_incoming` ~l.5653, after the actions (which may set
+        // the `test` variable): an optional recv whose `test` variable is
+        // unset leaves the call waiting where it was; any other match moves
+        // it on through `next()`.
+        if optional && self.test_unset(&common, call_id) {
+            self.resume_wait(call_id, waited);
+            return;
+        }
+        let next = self.next_step(&common, si, call_id);
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.index = next;
+        }
         self.advance(call_id);
+    }
+
+    /// Whether the step names a `test` variable, beside a `next` (SIPp
+    /// reads `test=` only there), that is unset.
+    fn test_unset(&self, common: &StepCommon, call_id: &str) -> bool {
+        let Some(test) = common.test.filter(|_| common.next.is_some()) else {
+            return false;
+        };
+        !self
+            .calls
+            .get(call_id)
+            .is_some_and(|c| test_truthy(&c.store.get(test)))
+    }
+
+    /// Put the call back into the wait a match took it out of, with its
+    /// receive timeout re-armed at the same deadline: SIPp keeps
+    /// `msg_index` and the running `recv_timeout`.
+    fn resume_wait(&mut self, call_id: &str, wait: Wait) {
+        let Some(call) = self.calls.get_mut(call_id) else {
+            return;
+        };
+        call.index = wait.index;
+        call.waiting = wait.waiting;
+        call.awaiting_cmd = wait.awaiting_cmd;
+        self.arm_recv_deadline(call_id, wait.deadline);
     }
 
     /// Execute a step's actions against the call's store. Returns true when a
@@ -6097,6 +6179,7 @@ fn new_call(
         retrans: None,
         timer: None,
         generation: 0,
+        recv_deadline: None,
         pause_deadline: None,
         paused_until: None,
         socket: None,
@@ -6136,6 +6219,13 @@ fn stats_for<'a>(
     match secondary {
         Some(o) if on_secondary => &mut o.stats,
         _ => main,
+    }
+}
+
+/// A step's named counter (`counter=`) ticks when the step executes.
+fn tick_counter(call: &mut CallState, common: &StepCommon) {
+    if let Some(name) = &common.counter {
+        *call.counters.entry(name.clone()).or_insert(0) += 1;
     }
 }
 

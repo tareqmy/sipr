@@ -143,6 +143,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A matched `<recv>` follows its `next=`, `test=` and `chance=` as in
+  SIPp: it jumps to the `next=` label when the `test=` variable, if any,
+  is set and the `chance=` draw, if any, is won, and otherwise moves on
+  to the message after it. The recv's actions run first, so an `<ereg>`
+  on the recv can decide its own `test=`. An optional recv whose `test=`
+  variable is unset leaves the call waiting where it was, and the
+  receive timeout keeps its original deadline. sipr ignored these
+  attributes on a recv, so it never took the jump. One divergence is
+  deliberate: SIPp never takes an optional recv's `next=` to a label
+  before the first message (it reads index 0 as false); sipr takes it.
 - Receive timeouts follow SIPp: the recv the call waits at arms its own
   `timeout=` (else `-recv_timeout`), optional or not, and its `ontimeout`
   is the one taken. sipr armed the timeout of the window's mandatory recv
