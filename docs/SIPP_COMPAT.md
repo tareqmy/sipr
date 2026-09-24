@@ -103,7 +103,8 @@ scenario, client mode only, M33) `-rxsf <file>` / `-rxsn uas|…` (mixed
 mode: a server-mode receive scenario next to the client-mode main one,
 M34) `-rxinf <file>` (injection files loaded after the `-inf` ones, for
 `[fieldN file=NAME]` in either scenario) `--check` (sipr addition: lint
-scenario — and the ooc/rx one — and exit).
+scenario — and the ooc/rx one — and exit; the lints are in
+[LINTS.md](LINTS.md)).
 Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 `-d <pause ms default>` `-users` (v1.x closed loop) `-set <variable>
 <value>` (seed a `<Global>` variable, M35) `-rate_increase <n>`
@@ -336,6 +337,29 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   *attributes* warn and are ignored; unknown *keywords* warn and pass through
   verbatim (IPv6 literals like `[2001:db8::1]` in URIs depend on this).
   `--check` treats any diagnostic, warnings included, as failure.
+- Load-time checks SIPp makes and sipr does not (verified in M47 in
+  `scenario.cpp`: `checkOptionalRecv` ~l.688 and the `found_timewait`
+  check ~l.835; confirmed against real sipp): SIPp refuses a scenario in
+  which an optional `<recv>`/`<recvCmd>` is followed, labels aside, by a
+  `<send>`, `<pause>`, `<timewait>`, `<nop>` or `<sendCmd>` (`<recv> before
+  <send> sequence without a mandatory message. Please remove one
+  'optional=true'`), and one with any message after a `<timewait>`. sipr
+  compiles and runs both: the optional recv then holds the call exactly
+  as a mandatory one would, and the step after the `<timewait>` never
+  runs. `--check` reports them as the `optional-window` and `unreachable`
+  lints (docs/LINTS.md). SIPp does not look at the end of the scenario:
+  a trailing optional recv loads, and without a timeout it holds the call
+  forever in both tools, which `optional-window` also flags. Two
+  divergences found on the way are **open**. (1) SIPp arms the waiting
+  recv's *own* timeout (`call.cpp` ~l.2195, `curmsg->timeout`, else
+  `-recv_timeout`), optional or not. sipr's engine
+  (`window_mandatory`) arms only the window's mandatory recv's, so an
+  optional recv's `timeout=`/`ontimeout=` does nothing, and a trailing
+  `optional timeout="1000" ontimeout="end"` recv ends the call after 1 s
+  in SIPp but hangs in sipr. (2) `<jump value="N"/>` is a SIPp *message*
+  index, and a `<label>` is not a message (`labelMap[id] =
+  messages.size()`), but sipr counts labels as steps, so N lands
+  elsewhere when a label precedes it.
 - Template CDATA normalization (M1, `template::normalize_cdata`): every line
   left-trimmed, line endings → CRLF, leading/trailing blank lines dropped,
   single trailing CRLF appended; internal blank line (header/body separator)

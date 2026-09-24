@@ -484,7 +484,7 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "check",
         false,
         "",
-        "Lint the scenario, print its compiled form, exit",
+        "Lint the scenario, print its compiled form, exit (1 on any warning)",
     ),
     ("r", true, "RATE", "New calls per rate period [default: 10]"),
     (

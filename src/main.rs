@@ -72,13 +72,15 @@ fn run(cli: &Cli) -> ExitCode {
 
     // Compile to the step IR; every diagnostic is printed, loudly.
     // `-key` names render as literals instead of drawing the unknown-keyword
-    // warning; the compiler needs them to tell the two apart.
+    // warning; the compiler needs them to tell the two apart. `--check` also
+    // lints: scenarios that run but do not do what they say.
     let compile_options = sipr_scenario::CompileOptions {
         generic_keywords: cli
             .generic_keywords
             .iter()
             .map(|(k, _)| k.clone())
             .collect(),
+        lint: cli.check,
     };
     let outcome = sipr_scenario::compile_with(&scenario_name, &source, &compile_options);
     for d in &outcome.diagnostics {

@@ -1,7 +1,8 @@
 //! Golden corpus runner (docs/TESTING.md §2).
 //!
 //! `tests/corpus/positive/*.xml` must compile with zero diagnostics — not
-//! even warnings, so the corpus stays an example of clean scenario style.
+//! even warnings, lints included — so the corpus stays an example of clean
+//! scenario style.
 //! `tests/corpus/negative/*.xml` must FAIL, and the first line of each file
 //! carries `<!-- expect: substring -->` that must appear in an error message.
 
@@ -10,8 +11,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use sipr_scenario::compile;
 use sipr_scenario::diag::Severity;
+use sipr_scenario::{CompileOptions, compile, compile_with};
 
 fn corpus_dir(kind: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -36,7 +37,11 @@ fn positive_corpus_compiles_without_diagnostics() {
     for path in xml_files("positive") {
         let name = path.display().to_string();
         let text = fs::read_to_string(&path).expect("readable");
-        let out = compile(&name, &text);
+        let lint = CompileOptions {
+            lint: true,
+            ..CompileOptions::default()
+        };
+        let out = compile_with(&name, &text, &lint);
         assert!(
             out.diagnostics.is_empty(),
             "{name}: expected clean compile, got: {:#?}",

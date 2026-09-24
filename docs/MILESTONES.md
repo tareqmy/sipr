@@ -1927,7 +1927,55 @@ the final state; the engine now publishes one more snapshot next to the
 final `-trace_stat` row, and a test pins that the last line matches the
 run summary.
 
-### M47+ — sipr's own additions (after parity)
+### M47 — Scenario lints under `--check` ✅
+
+Scenarios that load and run but do not do what they say: the folklore of
+SIPP_COMPAT §6 turned into diagnostics. `--check` already failed on any
+warning; the lints add the traps a compile error cannot see. Oracle: SIPp's
+own load-time checks (`scenario.cpp` `checkOptionalRecv`, the
+`<timewait>`-last rule) and run-time behavior (`call.cpp`), checked against
+real sipp.
+
+- [x] `crates/sipr-scenario/src/lint.rs`: four lints over the compiled
+      IR, run only under `--check` (`CompileOptions::lint`) and printed
+      as `warning[NAME]` so the name to silence is in the message:
+      `optional-window` (an optional recv no mandatory recv follows —
+      SIPp refuses the scenario when a send/pause/nop comes next, and a
+      trailing one without a timeout hangs the call), `unreachable`
+      (steps no path reaches, including anything after `<timewait>`),
+      `body-separator` (SDP lines among the headers: the blank line is
+      missing), `content-length` (a literal Content-Length that is wrong
+      in CRLF bytes, or cannot be right because the body holds keywords,
+      or none at all on a message with a body).
+- [x] `<!-- sipr-lint: allow NAME[, NAME…] -->` directly before a step
+      silences those lints for that step; unknown names, malformed or
+      misplaced directives warn instead of doing nothing silently.
+- [x] Clean where it should be: every embedded scenario, the positive
+      corpus (now compiled with lints on) and all 105 of SIPp's
+      `sipp_scenarios/*.xml` produce no finding. The corpus test lints
+      the positive corpus from now on.
+- [x] Docs: `docs/LINTS.md` (new, in `SUMMARY.md`), SIPP_COMPAT §6.
+
+Notes: the milestone's "`[len]` without a body" turned out to be the
+missing header/body separator. `[len]` in a message with no body
+correctly renders 0. What goes wrong is SDP written straight under the
+headers, which the lint recognises by its `x=` line shape. Of SIPp's 147
+message bodies, none lacks a Content-Length, so a body without one is
+flagged: harmless over UDP, unframeable over TCP/TLS. `unreachable` is
+conservative, keeping the fall-through open past any condition or `jump`
+action and giving up on `jump variable=` (except the `_unexp.retaddr`
+return). SIPp's own `docs/branchc.xml` demo, which jumps over a step on
+purpose, is its one finding outside sipr's tests. Found on the way, and
+filed separately rather than fixed here: sipr runs the two scenario shapes
+SIPp refuses at load (now `optional-window` and `unreachable` findings);
+`jump value=N` counts `<label>`s as steps where SIPp's message indices do
+not; and an optional recv's own `timeout=` is ignored by the engine,
+which arms only the window's mandatory recv's (SIPp arms the current
+recv's, so a trailing `optional timeout=… ontimeout=…` recv ends in SIPp
+and hangs in sipr). The positive corpus's `pcap_play.xml` had the first
+shape and now puts its optional recv before the mandatory one.
+
+### M48+ — sipr's own additions (after parity)
 
 Candidates, to be promoted into numbered milestones in the order the
 users of the HTTP API ask for them:
@@ -1935,6 +1983,3 @@ users of the HTTP API ask for them:
 - Library API: `sipr-engine` embedded in another Rust test harness
   (scenario in, stats out, no CLI, no TUI) — needs a stable
   `EngineConfig` and a documented public surface.
-- Scenario linting beyond `--check`: unreachable labels, `optional`
-  recv ordering traps, `[len]` without a body — the folklore in
-  SIPP_COMPAT §6 turned into diagnostics.

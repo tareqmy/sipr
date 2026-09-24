@@ -16,6 +16,7 @@ mod compile;
 pub mod diag;
 pub mod distribution;
 pub mod inject;
+pub mod lint;
 pub mod model;
 pub mod regex;
 pub mod template;
@@ -63,8 +64,13 @@ mod tests {
 
     #[test]
     fn embedded_scenarios_compile_clean() {
+        // Lints included: `sipr --check -sn uac` must pass.
+        let lint = CompileOptions {
+            lint: true,
+            ..CompileOptions::default()
+        };
         for name in EMBEDDED_NAMES {
-            let out = compile(name, embedded(name).unwrap());
+            let out = compile_with(name, embedded(name).unwrap(), &lint);
             assert!(out.diagnostics.is_empty(), "{name}: {:?}", out.diagnostics);
             assert!(out.scenario.is_some(), "{name}: no scenario");
         }

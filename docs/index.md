@@ -54,7 +54,7 @@ Run your own scenario, lint it first, or dump a built-in one:
 
 ```sh
 sipr -sf my_scenario.xml -r 10 sip.example.com
-sipr -sf my_scenario.xml --check      # compile + print the IR, exit non-zero on any issue
+sipr -sf my_scenario.xml --check      # compile, lint, print the IR; exit non-zero on any issue
 sipr -sd uac                          # print an embedded scenario to stdout
 ```
 

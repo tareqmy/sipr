@@ -1482,6 +1482,7 @@ fn m39_keywords_compile_and_fill_reads_its_variable() {
     assert_eq!(compile("test", &xml).diagnostics.len(), 1);
     let opts = sipr_scenario::CompileOptions {
         generic_keywords: vec!["pbx".to_owned()],
+        ..Default::default()
     };
     let out = sipr_scenario::compile_with("test", &xml, &opts);
     assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);

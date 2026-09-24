@@ -3,8 +3,8 @@
     INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
     Call-ID: [call_id]
   ]]></send>
+  <recv response="183" optional="true" ignoresdp="true"/>
   <recv response="200"/>
-  <recv response="200" optional="true" ignoresdp="true"/>
   <nop>
     <action><exec play_pcap_audio="pcap/g711a.pcap"/></action>
   </nop>

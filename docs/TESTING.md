@@ -23,7 +23,8 @@ Colocated `#[cfg(test)]` modules. Required coverage by crate:
 ## 2. Golden corpus tests
 
 `crates/sipr-scenario/tests/corpus/` contains scenario XML files that must
-compile without warnings, plus `*.expected` IR dumps for a subset.
+compile without warnings — `--check` lints included (docs/LINTS.md) — plus
+`*.expected` IR dumps for a subset.
 Seed corpus: the embedded uac/uas defaults, signaling-only files from
 `../../cprojects/sipp/sipp_scenarios/` (registration ones: `mcd_register.xml`,
 `uc360_register*.xml`), and examples from SIPp docs. `play_pcap_*` scenarios

@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Scenario lints under `--check` (M47): `optional-window` (an optional
+  recv that no mandatory recv follows, which SIPp refuses to load before a
+  send or pause and which hangs the call at the end of a scenario),
+  `unreachable` (steps no path reaches, including anything after
+  `<timewait>`), `body-separator` (SDP lines among the headers) and
+  `content-length` (a literal Content-Length that is wrong, or cannot be
+  right because the body holds keywords, or none on a message with a
+  body). Findings print as `warning[NAME]`, and
+  `<!-- sipr-lint: allow NAME -->` right before a step silences one for
+  that step. See `docs/LINTS.md`.
 - Extended 3PCC (M43): `-master NAME`/`-slave NAME` with `-slave_cfg FILE`
   (`name;host:port` lines), `sendCmd dest=` routed to the named peer and
   `recvCmd src=` checked against the command's `From:` line, on SIPp's
@@ -66,6 +76,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `--check` fails on the new lint findings like any other warning, so a
+  scenario that passed it before may now exit 1. Normal runs do not lint.
 - A 3PCC twin command must carry the call's `Call-ID:` (SIPp routes by
   it); sipr used to hand a command to whichever call was waiting. Classic
   controller B no longer paces its calls with `-r`: as in SIPp they open

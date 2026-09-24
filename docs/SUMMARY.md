@@ -6,6 +6,7 @@
 
 - [Installation](INSTALLATION.md)
 - [SIPp compatibility surface](SIPP_COMPAT.md)
+- [Scenario lints (`--check`)](LINTS.md)
 - [Runtime control: control socket and HTTP API](CONTROL_API.md)
 - [Glossary](GLOSSARY.md)
 - [Performance vs sipp](PERFORMANCE.md)

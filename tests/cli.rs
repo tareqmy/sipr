@@ -165,6 +165,40 @@ fn check_mode_fails_on_warnings_or_errors() {
 }
 
 #[test]
+fn check_mode_lints_and_a_directive_silences_a_finding() {
+    let scenario = |directive: &str| {
+        format!(
+            r#"<scenario name="l">
+             <send><![CDATA[
+               OPTIONS sip:[service]@[remote_ip] SIP/2.0
+               Call-ID: [call_id]
+             ]]></send>
+             {directive}
+             <recv response="200" optional="true"/>
+             <pause milliseconds="10"/>
+           </scenario>"#
+        )
+    };
+    let flagged = TempScenario::new("lint-flagged.xml", &scenario(""));
+    let o = sipr(&["-sf", flagged.path(), "--check"]);
+    assert_code(&o, 1);
+    let err = stderr(&o);
+    assert!(err.contains(":7: warning[optional-window]: "), "{err}");
+
+    let allowed = TempScenario::new(
+        "lint-allowed.xml",
+        &scenario("<!-- sipr-lint: allow optional-window -->"),
+    );
+    let o = sipr(&["-sf", allowed.path(), "--check"]);
+    assert_code(&o, 0);
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
+
+    // A run does not lint: the same scenario draws no warning outside --check.
+    let o = sipr(&["-sf", flagged.path(), "-timeout", "1", "127.0.0.1:9"]);
+    assert!(!stderr(&o).contains("optional-window"), "{}", stderr(&o));
+}
+
+#[test]
 fn sf_uas_scenario_needs_no_target() {
     let uas = TempScenario::new(
         "uas.xml",

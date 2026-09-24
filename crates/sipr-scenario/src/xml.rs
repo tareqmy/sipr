@@ -30,6 +30,9 @@ pub enum Node {
     Text(String),
     /// A `<![CDATA[...]]>` section, verbatim.
     CData { text: String, line: u32 },
+    /// A `<!-- ... -->` comment, its text verbatim. Kept for the
+    /// `sipr-lint:` directives; everything else ignores comments.
+    Comment { text: String, line: u32 },
 }
 
 impl Element {
@@ -175,11 +178,20 @@ impl Parser {
     }
 
     fn skip_comment(&mut self) {
+        self.parse_comment();
+    }
+
+    /// Consume a comment and return its text.
+    fn parse_comment(&mut self) -> String {
         // Caller guarantees "<!--".
         self.eat("<!--");
+        let mut text = String::new();
         while !self.at_end() && !self.eat("-->") {
-            self.bump();
+            if let Some(c) = self.bump() {
+                text.push(c);
+            }
         }
+        text
     }
 
     fn parse_name(&mut self) -> Result<String, XmlError> {
@@ -287,7 +299,12 @@ impl Parser {
                 children.push(Node::CData { text: cdata, line });
             } else if self.starts_with("<!--") {
                 text_flushed(&mut children, &mut text);
-                self.skip_comment();
+                let line = self.line;
+                let comment = self.parse_comment();
+                children.push(Node::Comment {
+                    text: comment,
+                    line,
+                });
             } else if self.starts_with("</") {
                 text_flushed(&mut children, &mut text);
                 self.eat("</");
@@ -425,8 +442,17 @@ mod tests {
     }
 
     #[test]
-    fn comments_inside_elements_are_skipped() {
-        let root = parse("<a><!-- hi --><b/><!-- bye --></a>").unwrap();
+    fn comments_inside_elements_are_kept_as_nodes() {
+        let root = parse("<a><!-- hi --><b/>\n<!-- bye --></a>").unwrap();
         assert_eq!(root.child_elements().count(), 1);
+        let comments: Vec<(&str, u32)> = root
+            .children
+            .iter()
+            .filter_map(|n| match n {
+                Node::Comment { text, line } => Some((text.as_str(), *line)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(comments, [(" hi ", 1), (" bye ", 2)]);
     }
 }

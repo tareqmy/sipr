@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use crate::diag::{Diagnostic, Diagnostics};
 use crate::distribution::Distribution;
+use crate::lint::{self, Lint, LintInput};
 use crate::model::{
     Action, ArithOp, CompareOp, Expect, IntCmd, JumpTarget, MediaKind, Operand, PauseSpec,
     RecvStep, Role, RtpEchoCmd, RtpEchoVerb, RtpSource, RtpStreamCmd, Scenario, SearchIn, SendStep,
@@ -48,6 +49,9 @@ pub struct CompileOptions {
     /// `-key KEYWORD VALUE` names: `[KEYWORD]` compiles to a generic
     /// keyword instead of drawing the unknown-keyword warning.
     pub generic_keywords: Vec<String>,
+    /// `--check`: also run the lints ([`crate::lint`]), honouring the
+    /// `<!-- sipr-lint: allow NAME -->` directives.
+    pub lint: bool,
 }
 
 /// [`compile`] with [`CompileOptions`].
@@ -67,6 +71,10 @@ pub fn compile_with(source_name: &str, xml_text: &str, options: &CompileOptions)
     let mut c = Compiler {
         diags,
         generic_keywords: options.generic_keywords.clone(),
+        lint: options.lint,
+        lint_allows: Vec::new(),
+        directive_lines: Vec::new(),
+        send_lines: Vec::new(),
         vars: VarTable::default(),
         var_read: Vec::new(),
         var_written: Vec::new(),
@@ -81,6 +89,9 @@ pub fn compile_with(source_name: &str, xml_text: &str, options: &CompileOptions)
         call_length_repartition: Vec::new(),
     };
     c.compile_root(&root, source_name);
+    if c.lint {
+        c.warn_misplaced_directives(xml_text);
+    }
     c.finish()
 }
 
@@ -132,6 +143,16 @@ struct Compiler {
     diags: Diagnostics,
     /// `-key` names (see [`CompileOptions`]).
     generic_keywords: Vec<String>,
+    /// Run the lints (`--check`).
+    lint: bool,
+    /// `sipr-lint: allow` directives: the step each one precedes, and the
+    /// lints it silences there.
+    lint_allows: Vec<(StepIndex, Vec<Lint>)>,
+    /// Source lines of the directives found where they belong (directly
+    /// inside `<scenario>`), to tell the misplaced ones apart.
+    directive_lines: Vec<u32>,
+    /// Each `<send>`'s step and the source line its message starts on.
+    send_lines: Vec<(StepIndex, u32)>,
     vars: VarTable,
     var_read: Vec<bool>,
     var_written: Vec<bool>,
@@ -441,10 +462,106 @@ impl Compiler {
             .attr("name")
             .map_or_else(|| source_name.to_owned(), ToOwned::to_owned);
         self.warn_unknown_attrs(root, &["name"]);
-        // Collect elements first so labels can be registered in step order.
-        let children: Vec<&Element> = root.child_elements().collect();
-        for el in children {
-            self.compile_element(el);
+        // A `sipr-lint:` directive applies to the step the next element
+        // compiles to.
+        let mut pending: Option<(u32, Vec<Lint>)> = None;
+        for node in &root.children {
+            match node {
+                Node::Element(el) => {
+                    let step = self.steps.len();
+                    self.compile_element(el);
+                    if let Some((line, lints)) = pending.take() {
+                        if self.steps.len() > step {
+                            self.lint_allows.push((step, lints));
+                        } else if self.lint {
+                            self.diags.warn_at(
+                                line,
+                                format!(
+                                    "sipr-lint directive has no effect: it must come right \
+                                     before a step, not before <{}>",
+                                    el.name
+                                ),
+                            );
+                        }
+                    }
+                }
+                Node::Comment { text, line } => {
+                    if let Some(lints) = self.lint_directive(text, *line) {
+                        let (_, allowed) = pending.get_or_insert_with(|| (*line, Vec::new()));
+                        allowed.extend(lints);
+                    }
+                }
+                Node::Text(_) | Node::CData { .. } => {}
+            }
+        }
+        if let Some((line, _)) = pending
+            && self.lint
+        {
+            self.diags.warn_at(
+                line,
+                "sipr-lint directive has no effect: no step follows it",
+            );
+        }
+    }
+
+    /// Parse `sipr-lint: allow NAME[, NAME…]`. `None` for any other
+    /// comment; an unknown name or a malformed directive warns (under
+    /// `--check`, the only time directives matter) and keeps what it can.
+    fn lint_directive(&mut self, comment: &str, line: u32) -> Option<Vec<Lint>> {
+        let rest = comment.trim().strip_prefix("sipr-lint:")?;
+        // The line the directive itself is on, for a comment that opens on
+        // an earlier one.
+        let opening = comment.len() - comment.trim_start().len();
+        let newlines = comment[..opening].matches('\n').count();
+        let line = line.saturating_add(u32::try_from(newlines).unwrap_or(0));
+        self.directive_lines.push(line);
+        let names = rest
+            .trim()
+            .strip_prefix("allow")
+            .filter(|names| names.starts_with(char::is_whitespace) && !names.trim().is_empty());
+        let Some(names) = names else {
+            if self.lint {
+                self.diags.warn_at(
+                    line,
+                    "malformed sipr-lint directive: write 'sipr-lint: allow NAME[, NAME…]'",
+                );
+            }
+            return Some(Vec::new());
+        };
+        let mut lints = Vec::new();
+        for name in names.split(|c: char| c == ',' || c.is_whitespace()) {
+            if name.is_empty() {
+                continue;
+            }
+            match Lint::from_name(name) {
+                Some(lint) => lints.push(lint),
+                None if self.lint => {
+                    let known: Vec<&str> = Lint::ALL.iter().map(|l| l.name()).collect();
+                    self.diags.warn_at(
+                        line,
+                        format!(
+                            "unknown lint '{name}' in sipr-lint directive (known: {})",
+                            known.join(", ")
+                        ),
+                    );
+                }
+                None => {}
+            }
+        }
+        Some(lints)
+    }
+
+    /// A directive anywhere but directly inside `<scenario>` — before the
+    /// root, inside a `<send>` — would silently do nothing; say so.
+    fn warn_misplaced_directives(&mut self, xml_text: &str) {
+        for (line, text) in (1u32..).zip(xml_text.lines()) {
+            if text.contains("sipr-lint:") && !self.directive_lines.contains(&line) {
+                self.diags.warn_at(
+                    line,
+                    "sipr-lint directive has no effect here: put it directly inside \
+                     <scenario>, right before the step it is for",
+                );
+            }
         }
     }
 
@@ -523,6 +640,7 @@ impl Compiler {
                     Some(a.line),
                     format!("unexpected <{}> inside <send>", a.name),
                 ),
+                Node::Comment { .. } => {}
             }
         }
         let normalized = template::normalize_cdata(&body);
@@ -537,6 +655,11 @@ impl Compiler {
             .to_owned();
         let (start_txn, ack_txn) = self.parse_send_txns(el, &first_word);
         let tmpl = self.templ(&normalized, cdata_line);
+        // Normalization drops the blank lines before the start line (the
+        // rest of the `<![CDATA[` line, typically).
+        let leading_blank = body.lines().take_while(|l| l.trim().is_empty()).count();
+        let first_line = cdata_line.saturating_add(u32::try_from(leading_blank).unwrap_or(0));
+        self.send_lines.push((self.steps.len(), first_line));
         self.steps.push(Step::Send(SendStep {
             template: tmpl,
             retrans_ms,
@@ -736,6 +859,7 @@ impl Compiler {
                     Some(a.line),
                     format!("unexpected <{}> inside <sendCmd>", a.name),
                 ),
+                Node::Comment { .. } => {}
             }
         }
         let normalized = template::normalize_cdata(&body);
@@ -1658,6 +1782,25 @@ impl Compiler {
 
     // ---- finalization --------------------------------------------------
 
+    /// Run the lints and report the findings no directive silences.
+    fn run_lints(&mut self) {
+        let input = LintInput {
+            steps: &self.steps,
+            send_lines: &self.send_lines,
+            unexpected_jump: self.labels.get("_unexp.main").copied(),
+            unexp_retaddr: self.vars.find("_unexp.retaddr"),
+        };
+        for finding in lint::run(&input) {
+            let allowed = self
+                .lint_allows
+                .iter()
+                .any(|(step, lints)| *step == finding.step && lints.contains(&finding.lint));
+            if !allowed {
+                self.diags.lint(finding.lint, finding.line, finding.message);
+            }
+        }
+    }
+
     fn finish(mut self) -> CompileOutcome {
         // Resolve label references.
         for p in std::mem::take(&mut self.pending) {
@@ -1746,6 +1889,10 @@ impl Compiler {
                 ),
                 _ => {}
             }
+        }
+        // Lint only what compiled: a broken scenario's flow means nothing.
+        if self.lint && !self.diags.has_errors() {
+            self.run_lints();
         }
         let scenario = if self.diags.has_errors() {
             None
