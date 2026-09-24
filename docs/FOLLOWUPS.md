@@ -1,9 +1,14 @@
 # Follow-up tasks
 
-SIPp divergences found while fixing message indices (commit `5d28c1c`,
-"count messages, not labels, in jumps and indices") and left out of that
-change so it stayed one logical fix. Each entry stands alone and can be
-handed to an agent as is. Delete an entry when its fix lands.
+Work found while fixing something else and left out of that change so it
+stayed one logical fix. Each entry stands alone and can be handed to an
+agent as is. Delete an entry when its fix lands.
+
+- **1-4** are SIPp divergences found while fixing message indices (commit
+  `5d28c1c`, "count messages, not labels, in jumps and indices").
+- **5-6** are test-harness problems found while fixing the interop
+  port-probe race (commit `4ff94ca`). They change only tests, so each one
+  replaces steps 1 and 2 below with the check it describes.
 
 The SIPp C++ source is at `../../cprojects/sipp/src` (relative to the
 repo root). Read it to confirm the behavior, and never copy it (GPL).
@@ -116,3 +121,54 @@ Scope: `fix(stats)`. SIPP_COMPAT §6, the M40 statistics-files note.
   columns because of this divergence
   (`jumps_and_message_indices_skip_labels_like_real_sipp` in
   `tests/interop.rs`). Make it compare the full header.
+
+## 5. Stop e2e children inheriting port-probe sockets
+
+Scope: `test(e2e)`.
+
+- **The race:** macOS has no `SOCK_CLOEXEC`, so std sets `FD_CLOEXEC` on
+  a new socket a moment after `socket()`. A child spawned from another
+  test thread in that gap inherits a `free_port()` probe socket. It then
+  keeps the probed port bound for as long as it lives, and the sipr the
+  port is handed to exits with "Address already in use".
+  `docs/TESTING.md` §4 has the details.
+- **Fixed in interop** (commit `4ff94ca`): in `tests/interop.rs`, probes
+  hold `PORT_PROBES` exclusively through `probing()`. Every child starts
+  through `spawn_outside_probes()` or `output_outside_probes()`, which
+  hold it shared. That took `recv_timeouts_arm_like_real_sipp` from 5/35
+  failed runs to 0/55.
+- **Still open in e2e:** `tests/e2e.rs` has its own `free_port()` and
+  `free_port_block()` and 19 unguarded spawn sites (8 `.spawn()`, 11
+  `.output()`). cargo runs its tests in parallel threads, and each one
+  probes and spawns, so any of them can inherit another's probe socket.
+- **Fix:** port the interop guard, or move both copies into a shared
+  `tests/common/mod.rs`. Keep `output_outside_probes()`'s shape: it
+  spawns under the lock and waits outside it. Most e2e `.output()` calls
+  run sipr to completion, so holding the lock across the wait would
+  stall every other test's probes.
+- **Verify:** loop the e2e suite about 10 times before and after the
+  fix. The tests need sockets, so run them outside the sandbox.
+
+## 6. Pass `-nostdin` to every sipp the interop suite starts
+
+Scope: `test(interop)`.
+
+- **The spin:** a sipp whose stdin is `/dev/null` busy-polls it: `poll()`
+  returns at once, forever, so each sipp burns a full core, mostly in
+  the kernel. `-bg` does not help, because its forked child points stdin
+  at `/dev/null` too. Measured on macOS: a sipp UAS runs at 99.6% CPU,
+  and at 1.5% with `-nostdin`. Five full interop runs used ~405 s of
+  system CPU in ~117 s of wall time.
+- **Done so far:** only `run_recv_timeout_uas` passes `-nostdin` (commit
+  `4ff94ca`). That took one run of `recv_timeouts_arm_like_real_sipp`
+  from ~14 s of CPU to ~0.4 s.
+- **Fix:** pass `-nostdin` to every sipp that `tests/interop.rs` starts.
+  Pass it to sipr too where the two share an argument list: sipr accepts
+  the flag (`src/cli.rs`). A helper would give new tests the flag by
+  default.
+- **Verify:** time the interop test binary before and after, and loop
+  the full suite a few times. Also check whether
+  `real_sipp_tcp_uac_reconnects_to_sipr` is steadier with the load gone.
+  It failed once in 13 full runs after `4ff94ca`: sipp hit its known
+  freed-socket bug and hung past `-timeout`, without logging the text
+  the test's skip looks for.
