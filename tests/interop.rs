@@ -5074,3 +5074,294 @@ fn jumps_and_message_indices_skip_labels_like_real_sipp() {
         "-trace_counts send columns differ"
     );
 }
+
+// ---- recv timeouts: the recv the call waits at owns the timeout ----------
+
+/// A UAS that answers the INVITE, takes the ACK, then waits in a recv
+/// window whose timeout jumps are told apart by the `X-Branch` of the BYE
+/// each label sends. Messages: 0 INVITE, 1 200, 2 ACK, 3 INFO (optional),
+/// then the tail's.
+fn recv_timeout_uas_xml(tail: &str) -> String {
+    format!(
+        r#"<scenario name="recv-timeout-uas">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+{tail}</scenario>
+"#
+    )
+}
+
+/// The BYE a timeout jump to `branch` sends back to the UAC.
+fn branch_bye(branch: &str, attrs: &str) -> String {
+    format!(
+        r"  <send{attrs}><![CDATA[
+    BYE sip:uac@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:svc@[local_ip]:[local_port]>;tag=[pid]SIPpTag01[call_number]
+    To: <sip:uac@[remote_ip]:[remote_port]>;tag=rt-uac
+    Call-ID: [call_id]
+    CSeq: 1 BYE
+    X-Branch: {branch}
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+"
+    )
+}
+
+/// One call against a recv-timeout UAS: its exit code (`None`: still
+/// running, reaped), the first request it sent back (`X-Branch`, delay
+/// after the ACK to the nearest 500 ms) and its `-trace_err` log.
+#[derive(Debug)]
+struct RecvTimeoutOutcome {
+    code: Option<i32>,
+    request: Option<(String, u128)>,
+    error_log: String,
+}
+
+/// Run `uas_bin` on `xml` (plus `extra`) and place one call on it from a
+/// raw UDP UAC: INVITE, ACK the 200, an INFO `info_after` the ACK if
+/// given, then listen `listen` for a request back.
+fn run_recv_timeout_uas(
+    uas_bin: &std::path::Path,
+    xml: &str,
+    extra: &[&str],
+    info_after: Option<Duration>,
+    listen: Duration,
+) -> RecvTimeoutOutcome {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("recv_timeout_uas.xml");
+    std::fs::write(&path, xml).expect("write uas");
+    let port = free_port();
+    let mut uas = Reaper(
+        Command::new(uas_bin)
+            .current_dir(dir.path())
+            .args([
+                "-sf",
+                path.to_str().expect("utf8"),
+                "-i",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "1",
+                "-timeout",
+                "6",
+                "-trace_err",
+            ])
+            .args(extra)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let uas_addr = format!("127.0.0.1:{port}");
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uac");
+    let local = sock.local_addr().expect("uac addr");
+    let request = |method: &str, cseq: u32, to_tag: &str| {
+        format!(
+            "{method} sip:svc@{uas_addr} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {local};branch=z9hG4bK-rt-{method}-{cseq}\r\n\
+             From: <sip:uac@{local}>;tag=rt-uac\r\n\
+             To: <sip:svc@{uas_addr}>{to_tag}\r\n\
+             Call-ID: recv-timeout-{}@127.0.0.1\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Contact: <sip:uac@{local}>\r\n\
+             Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
+            local.port()
+        )
+    };
+    let header = |text: &str, name: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(|v| v.trim().to_owned())
+    };
+    let mut buf = [0u8; 65_535];
+    sock.set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("timeout");
+    let mut to_tag = None;
+    for _ in 0..10 {
+        sock.send_to(request("INVITE", 1, "").as_bytes(), &uas_addr)
+            .expect("send invite");
+        if let Ok(n) = sock.recv(&mut buf) {
+            let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+            if text.starts_with("SIP/2.0 200") {
+                let to = header(&text, "To:").unwrap_or_default();
+                to_tag = to.split_once(";tag=").map(|(_, t)| format!(";tag={t}"));
+                break;
+            }
+        }
+    }
+    let to_tag = to_tag.expect("the UAS answered the INVITE");
+    sock.send_to(request("ACK", 1, &to_tag).as_bytes(), &uas_addr)
+        .expect("send ack");
+    let ack_at = Instant::now();
+    if let Some(delay) = info_after {
+        std::thread::sleep(delay);
+        sock.send_to(request("INFO", 2, &to_tag).as_bytes(), &uas_addr)
+            .expect("send info");
+    }
+    let mut back = None;
+    while let Some(left) = listen.checked_sub(ack_at.elapsed()) {
+        sock.set_read_timeout(Some(left.max(Duration::from_millis(1))))
+            .expect("timeout");
+        let Ok(n) = sock.recv(&mut buf) else {
+            break;
+        };
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if !text.starts_with("SIP/2.0") {
+            let branch = header(&text, "X-Branch:").unwrap_or_default();
+            back = Some((branch, (ack_at.elapsed().as_millis() + 250) / 500));
+            break;
+        }
+    }
+    let code = wait_with_timeout(&mut uas.0, Duration::from_secs(8));
+    RecvTimeoutOutcome {
+        code,
+        request: back,
+        error_log: sipp_error_log(dir.path()),
+    }
+}
+
+/// The receive timeout at parity with real sipp (docs/SIPP_COMPAT.md §6):
+/// the call waits at the first recv of its window, so that recv's own
+/// `timeout=` (else `-recv_timeout`) runs and its `ontimeout` is the one
+/// taken; an optional match moves the call on to the next recv, whose own
+/// timeout starts afresh; a label past the last message fails the call.
+/// Each case runs the same UAS under both tools against the same
+/// scripted UAC.
+#[test]
+fn recv_timeouts_arm_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::recv_timeouts_arm_like_real_sipp — no sipp.");
+        return;
+    };
+    let sipr = std::path::Path::new(env!("CARGO_BIN_EXE_sipr"));
+    let trailing = recv_timeout_uas_xml(
+        r#"  <recv request="INFO" optional="true" timeout="1000" ontimeout="end"/>
+  <label id="end"/>
+"#,
+    );
+    let window = recv_timeout_uas_xml(&format!(
+        r#"  <recv request="INFO" optional="true" timeout="1500" ontimeout="early"/>
+  <recv request="BYE" timeout="2500" ontimeout="late"/>
+  <label id="early"/>
+{early}  <label id="late"/>
+{late}  <label id="done"/>
+"#,
+        early = branch_bye("early", r#" next="done""#),
+        late = branch_bye("late", ""),
+    ));
+    let behind = recv_timeout_uas_xml(&format!(
+        r#"  <recv request="INFO" optional="true"/>
+  <recv request="BYE" timeout="1000" ontimeout="late"/>
+  <label id="late"/>
+{late}"#,
+        late = branch_bye("late", ""),
+    ));
+    let listen = Duration::from_millis(4300);
+    let info = Some(Duration::from_millis(1000));
+    let cases: [(&str, &str, &[&str], Option<Duration>); 5] = [
+        ("trailing optional", &trailing, &[], None),
+        ("window", &window, &[], None),
+        ("window, INFO at 1 s", &window, &[], info),
+        ("timeout behind an optional", &behind, &[], None),
+        (
+            "-recv_timeout, behind an optional",
+            &behind,
+            &["-recv_timeout", "800"],
+            None,
+        ),
+    ];
+    let jump = |log: &str| {
+        log.lines()
+            .find_map(|l| l.split_once(", receive timeout on message "))
+            .map(|(_, rest)| rest.to_owned())
+    };
+    // Every run on its own port and directory, all at once: the cases are
+    // mostly waiting.
+    let outcomes = std::thread::scope(|scope| {
+        let runs: Vec<_> = cases
+            .iter()
+            .map(|&(_, xml, extra, info_after)| {
+                let sipp = &sipp;
+                (
+                    scope.spawn(move || run_recv_timeout_uas(sipp, xml, extra, info_after, listen)),
+                    scope.spawn(move || run_recv_timeout_uas(sipr, xml, extra, info_after, listen)),
+                )
+            })
+            .collect();
+        runs.into_iter()
+            .map(|(theirs, ours)| {
+                (
+                    theirs.join().expect("sipp run"),
+                    ours.join().expect("sipr run"),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    for ((name, ..), (theirs, ours)) in cases.iter().zip(outcomes) {
+        let name = *name;
+        assert_eq!(
+            ours.code, theirs.code,
+            "{name}: exit code\n{theirs:?}\n{ours:?}"
+        );
+        assert_eq!(ours.request, theirs.request, "{name}: timeout jump");
+        assert_eq!(
+            jump(&ours.error_log),
+            jump(&theirs.error_log),
+            "{name}: the timeout warning\n{}\n{}",
+            theirs.error_log,
+            ours.error_log
+        );
+        // Pin what real sipp does, so the comparison cannot pass vacuously.
+        let (code, request, warning): (Option<i32>, Option<(&str, u128)>, Option<&str>) = match name
+        {
+            "trailing optional" => (
+                Some(1),
+                None,
+                Some("recv-timeout-uas:3, jumping to label 4"),
+            ),
+            "timeout behind an optional" => (Some(1), None, None),
+            "-recv_timeout, behind an optional" => (
+                Some(1),
+                None,
+                Some(
+                    "recv-timeout-uas:3 without label to jump to (ontimeout attribute): \
+                         aborting call",
+                ),
+            ),
+            "window, INFO at 1 s" => (
+                Some(0),
+                Some(("late", 7)),
+                Some("recv-timeout-uas:4, jumping to label 6"),
+            ),
+            _ => (
+                Some(0),
+                Some(("early", 3)),
+                Some("recv-timeout-uas:3, jumping to label 5"),
+            ),
+        };
+        assert_eq!(theirs.code, code, "{name}: real sipp's exit code");
+        assert_eq!(
+            theirs.request.as_ref().map(|(b, t)| (b.as_str(), *t)),
+            request,
+            "{name}: real sipp's timeout jump"
+        );
+        assert_eq!(jump(&theirs.error_log).as_deref(), warning, "{name}");
+    }
+}

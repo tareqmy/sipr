@@ -3253,26 +3253,10 @@ impl<'s> Engine<'s> {
                     call.index = jump;
                 }
                 Step::Recv(_) => {
-                    let mandatory = self.window_mandatory(call_id, index);
-                    let Some(call) = self.calls.get_mut(call_id) else {
-                        return;
-                    };
-                    call.waiting = true;
-                    if let Some((mi, timeout)) = mandatory {
-                        let _ = mi;
-                        if let Some(ms) = timeout {
-                            call.generation += 1;
-                            let timer = self.timers.arm(
-                                Duration::from_millis(ms),
-                                Event::CallTimer {
-                                    call_id: call_id.to_owned(),
-                                    generation: call.generation,
-                                    kind: TimerKind::RecvTimeout,
-                                },
-                            );
-                            call.timer = Some((timer, TimerKind::RecvTimeout));
-                        }
+                    if let Some(call) = self.calls.get_mut(call_id) {
+                        call.waiting = true;
                     }
+                    self.arm_recv_timeout(call_id, index);
                     return;
                 }
                 Step::Pause { spec, common } => {
@@ -3355,30 +3339,14 @@ impl<'s> Engine<'s> {
                     // `process_incoming` skips optional steps): the recv
                     // window behind it stays open, so a message for the
                     // next recv passes over it.
-                    let mandatory = if *optional {
-                        self.window_mandatory(call_id, index)
-                    } else {
-                        None
-                    };
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
                     call.awaiting_cmd = true;
                     if *optional {
                         call.waiting = true;
-                        if let Some((_, Some(ms))) = mandatory {
-                            call.generation += 1;
-                            let timer = self.timers.arm(
-                                Duration::from_millis(ms),
-                                Event::CallTimer {
-                                    call_id: call_id.to_owned(),
-                                    generation: call.generation,
-                                    kind: TimerKind::RecvTimeout,
-                                },
-                            );
-                            call.timer = Some((timer, TimerKind::RecvTimeout));
-                        }
                     }
+                    self.arm_recv_timeout(call_id, index);
                     return;
                 }
                 Step::Label { .. } => {
@@ -3442,28 +3410,41 @@ impl<'s> Engine<'s> {
         index + 1
     }
 
-    /// The window's mandatory recv step (index, timeout), scanning from
-    /// `start` over optional recvs and labels.
-    fn window_mandatory(&self, call_id: &str, start: usize) -> Option<(usize, Option<u64>)> {
-        let scenario = self.scenario_of(call_id);
-        let mut i = start;
-        while let Some(step) = scenario.steps.get(i) {
-            match step {
-                Step::Recv(r) if r.optional => i += 1,
-                Step::RecvCmd { optional: true, .. } => i += 1,
-                Step::Recv(r) => {
-                    // `-recv_timeout`: the default for a recv without its own.
-                    let default_ms = self
-                        .config
-                        .recv_timeout
-                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-                    return Some((i, r.timeout_ms.or(default_ms)));
-                }
-                Step::Label { .. } => i += 1,
-                _ => return None,
-            }
-        }
-        None
+    /// Arm the receive timeout of the recv (or recvCmd) the call now waits
+    /// at, `index`: its own `timeout=`, else `-recv_timeout` — optional or
+    /// not. A recv further into the window plays no part: SIPp `call::run`
+    /// arms `curmsg->timeout`, the message at `msg_index`. Without either
+    /// the call waits for good.
+    fn arm_recv_timeout(&mut self, call_id: &str, index: usize) {
+        let Some(timeout) = self.recv_timeout_of(call_id, index) else {
+            return;
+        };
+        let Some(call) = self.calls.get_mut(call_id) else {
+            return;
+        };
+        call.generation += 1;
+        let timer = self.timers.arm(
+            timeout,
+            Event::CallTimer {
+                call_id: call_id.to_owned(),
+                generation: call.generation,
+                kind: TimerKind::RecvTimeout,
+            },
+        );
+        call.timer = Some((timer, TimerKind::RecvTimeout));
+    }
+
+    /// How long the call may wait at step `index`: a recv's `timeout=`,
+    /// else `-recv_timeout` (all a recvCmd has). Zero is no timeout, as in
+    /// SIPp.
+    fn recv_timeout_of(&self, call_id: &str, index: usize) -> Option<Duration> {
+        let own = match self.scenario_of(call_id).steps.get(index) {
+            Some(Step::Recv(r)) => r.timeout_ms.filter(|&ms| ms > 0),
+            _ => None,
+        };
+        own.map(Duration::from_millis)
+            .or(self.config.recv_timeout)
+            .filter(|d| !d.is_zero())
     }
 
     fn sample_pause(&mut self, spec: &PauseSpec, call_id: &str) -> Duration {
@@ -5474,29 +5455,7 @@ impl<'s> Engine<'s> {
             _ => return, // gone or stale
         };
         match kind {
-            TimerKind::RecvTimeout => {
-                let mandatory = self.window_mandatory(call_id, index);
-                if let Some((mi, _)) = mandatory {
-                    if let Some(s) = self.call_stats(call_id).step_mut(mi) {
-                        s.timeouts += 1;
-                    }
-                }
-                let scenario = self.scenario_of(call_id);
-                let ontimeout = mandatory.and_then(|(mi, _)| match &scenario.steps[mi] {
-                    Step::Recv(RecvStep { ontimeout, .. }) => *ontimeout,
-                    _ => None,
-                });
-                match ontimeout {
-                    Some(dest) => {
-                        if let Some(call) = self.calls.get_mut(call_id) {
-                            call.waiting = false;
-                            call.index = dest;
-                        }
-                        self.advance(call_id);
-                    }
-                    None => self.fail_call(call_id, "recv timeout"),
-                }
-            }
+            TimerKind::RecvTimeout => self.on_recv_timeout(call_id, index),
             TimerKind::Pause => {
                 if let Some(call) = self.calls.get_mut(call_id) {
                     call.pause_deadline = None;
@@ -5506,6 +5465,46 @@ impl<'s> Engine<'s> {
             TimerKind::Timewait => self.complete_call(call_id),
             TimerKind::Retrans => unreachable!("handled above"),
         }
+    }
+
+    /// The receive timeout of the recv the call waits at, `index`, expired
+    /// (SIPp `call::run` ~l.2159-2194): that recv counts it and sends the
+    /// call to its `ontimeout`. Without one the call fails as a receive
+    /// timeout — and so it does when the label lies past the last
+    /// message: SIPp ends the call there as failed
+    /// (`E_FAILED_TIMEOUT_ON_RECV`), not as a jump to the end.
+    fn on_recv_timeout(&mut self, call_id: &str, index: usize) {
+        if let Some(s) = self.call_stats(call_id).step_mut(index) {
+            s.timeouts += 1;
+        }
+        let scenario = self.scenario_of(call_id);
+        let at = format!("{}:{}", scenario.name, scenario.message_index(index));
+        let ontimeout = match scenario.steps.get(index) {
+            Some(Step::Recv(RecvStep { ontimeout, .. })) => *ontimeout,
+            _ => None,
+        };
+        let Some(dest) = ontimeout else {
+            self.log_err(&format!(
+                "Call-Id: {call_id}, receive timeout on message {at} without label to jump to \
+                 (ontimeout attribute): aborting call"
+            ));
+            self.fail_call(call_id, "recv timeout");
+            return;
+        };
+        let label = scenario.message_index(dest);
+        self.log_err(&format!(
+            "Call-Id: {call_id}, receive timeout on message {at}, jumping to label {label}"
+        ));
+        if label >= scenario.message_count() {
+            self.fail_call(call_id, "recv timeout");
+            return;
+        }
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.waiting = false;
+            call.awaiting_cmd = false;
+            call.index = dest;
+        }
+        self.advance(call_id);
     }
 
     fn on_retrans_timer(&mut self, call_id: &str, generation: u64) {

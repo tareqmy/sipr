@@ -14,7 +14,7 @@ pub struct StepStats {
     pub recv: u64,
     /// Retransmissions of this step's send.
     pub retrans: u64,
-    /// Recv timeouts while this step was the mandatory expectation.
+    /// Receive timeouts while the call waited at this step.
     pub timeouts: u64,
     /// Unexpected messages while parked at this step.
     pub unexpected: u64,

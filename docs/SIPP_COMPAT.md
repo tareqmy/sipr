@@ -350,13 +350,11 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   lints (docs/LINTS.md). SIPp does not look at the end of the scenario:
   a trailing optional recv loads, and without a timeout it holds the call
   forever in both tools, which `optional-window` also flags. Two
-  divergences found on the way were **open**. (1) SIPp arms the waiting
-  recv's *own* timeout (`call.cpp` ~l.2195, `curmsg->timeout`, else
-  `-recv_timeout`), optional or not. sipr's engine
-  (`window_mandatory`) arms only the window's mandatory recv's, so an
-  optional recv's `timeout=`/`ontimeout=` does nothing, and a trailing
-  `optional timeout="1000" ontimeout="end"` recv ends the call after 1 s
-  in SIPp but hangs in sipr. (2) `<jump value="N"/>` is a SIPp *message*
+  divergences found on the way were **open**, and both are fixed since.
+  (1) SIPp arms the waiting recv's *own* timeout, optional or not, where
+  sipr armed the window's mandatory recv's, so a trailing `optional
+  timeout="1000" ontimeout="end"` recv hung in sipr — see "Receive
+  timeouts" below. (2) `<jump value="N"/>` is a SIPp *message*
   index, and a `<label>` is not a message (`labelMap[id] =
   messages.size()`), but sipr counted labels as steps, so N landed
   elsewhere when a label preceded it — fixed since, see "Message
@@ -1585,3 +1583,46 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   abort messages), `[msg_index]` prints `-1`, and `[branch]` ends in the
   current message index minus one. sipr renders the current message's
   index in both.
+- Receive timeouts (verified in `call.cpp` ~l.2150-2205 `call::run`,
+  ~l.5653-5687 `process_incoming`, ~l.1920-1945 `next()`, `task.cpp`
+  `add_paused_task`, and `scenario.cpp` ~l.33-39 the `message` defaults,
+  ~l.914/948 where `timeout` is read; confirmed against real sipp, the
+  `recv_timeouts_arm_like_real_sipp` interop test). The call waits at
+  `msg_index`, the recv (or `<recvCmd>`) it reached, and `run()` arms
+  *that* message's `timeout=`, else `-recv_timeout`, optional or not;
+  zero means none. A recv further into the window plays no part: in
+  `<recv request="INFO" optional="true"/>` `<recv request="BYE"
+  timeout="1000" ontimeout="x"/>` the BYE's timeout never runs while the
+  call waits at the INFO, and with `-recv_timeout` it is the INFO that
+  times out and, with no `ontimeout` of its own, fails the call. A
+  matched optional recv moves the call on. `process_incoming` keeps
+  `msg_index` only when `!optional || (next && test)` is false, but
+  `next` defaults to -1, which C reads as set, so every optional match
+  without a `test=` does `msg_index = search_index; next()`, and
+  `next()` zeroes `recv_timeout`: the recv after it arms its own timeout
+  afresh. (The smallest timeout of the recvs ahead, which the "stay"
+  branch computes, is thrown away: `setPaused()` reschedules from
+  `wake()` alone.) On expiry the waiting message counts the timeout
+  (`_Timeout`) and the call goes to its `ontimeout`. With none — or with
+  a label past the last message — the call fails as
+  `FailedTimeoutOnRecv`, with the `bye` behavior's abort messages. The
+  error log gets SIPp's `Call-Id: <id>, receive timeout on message
+  <scenario>:<index>, jumping to label <index>`, or `… without label to
+  jump to (ontimeout attribute): aborting call`. `<recvCmd>` has no
+  `timeout=` (SIPp reads it on `<send>` and `<recv>` only), so
+  `-recv_timeout` is its timeout, mandatory or optional. sipr used to arm
+  the window's *mandatory* recv's timeout instead: an optional recv's
+  `timeout=`/`ontimeout` did nothing, so a trailing `optional
+  timeout="1000" ontimeout="end"` recv hung where sipp fails the call
+  after 1 s; a mandatory recv's timeout ran while the call still waited
+  at the optional one in front of it; an `ontimeout` past the end
+  counted as a success; and a `<recvCmd>` never timed out. So a
+  `timeout=` on the 200 of `100 optional`, `180 optional`, `200` arms
+  only once a provisional has moved the call onto the 200. Until then it
+  waits for the 100, as it always did in SIPp. **Open:** (1) SIPp takes
+  `ontimeout=` on a `<recvCmd>` (a common attribute); sipr warns it away
+  as unknown, so a recvCmd that times out always fails the call. (2)
+  sipr ignores `next=`, `test=`, `chance=` and `counter=` on a `<recv>`
+  (a matched recv never consults them), so it neither follows the jump
+  nor, for an optional recv whose `test=` variable is unset, keeps
+  `msg_index` and the running deadline as SIPp's "stay" branch does.

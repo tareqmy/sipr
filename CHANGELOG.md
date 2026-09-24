@@ -143,6 +143,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Receive timeouts follow SIPp: the recv the call waits at arms its own
+  `timeout=` (else `-recv_timeout`), optional or not, and its `ontimeout`
+  is the one taken. sipr armed the timeout of the window's mandatory recv
+  instead, so an optional recv's `timeout=`/`ontimeout` did nothing and a
+  scenario ending in `<recv optional="true" timeout="1000"
+  ontimeout="end"/>` never ended. An `ontimeout` past the last message
+  now fails the call (`FailedTimeoutOnRecv`) as in SIPp, where it counted
+  as a success. `-recv_timeout` now also covers `<recvCmd>`, and
+  `-trace_err` logs SIPp's "receive timeout on message …" warnings.
+  Behavior change: a `timeout=` on a mandatory recv behind optional ones
+  runs only once an optional match has moved the call onto it, as in
+  SIPp.
 - `<label>`s no longer count as messages. SIPp numbers only message
   commands, and a label names the index of the message after it. sipr
   counted labels, so with a label earlier in the scenario,

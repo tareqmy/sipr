@@ -8406,3 +8406,374 @@ fn next_url_and_last_headers_follow_siprs_reading_not_sipps() {
         "[last_*] must name the message this recv just matched:\n{logs}"
     );
 }
+
+// ---- recv timeouts: the recv the call waits at owns the timeout ----------
+
+/// A UAS that answers the INVITE, takes the ACK, then runs `tail`.
+fn recv_timeout_uas_xml(tail: &str) -> String {
+    format!(
+        r#"<scenario name="recv-timeout-uas">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+{tail}</scenario>
+"#
+    )
+}
+
+/// The request a UAS sends once an `ontimeout` jump lands on `branch`:
+/// the scripted UAC learns which label the timeout chose from `X-Branch`.
+fn branch_bye(branch: &str, attrs: &str) -> String {
+    format!(
+        r"  <send{attrs}><![CDATA[
+    BYE sip:uac@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:svc@[local_ip]:[local_port]>;tag=[pid]SIPpTag01[call_number]
+    To: <sip:uac@[remote_ip]:[remote_port]>;tag=rt-uac
+    Call-ID: [call_id]
+    CSeq: 1 BYE
+    X-Branch: {branch}
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+"
+    )
+}
+
+/// What one call against a recv-timeout UAS showed.
+struct RecvTimeoutRun {
+    /// The UAS's exit code (`None`: still running at the deadline, killed).
+    code: Option<i32>,
+    /// How long after the ACK the UAS exited.
+    exited_after: Option<Duration>,
+    stderr: String,
+    /// The first request the UAS sent back: its `X-Branch` and how long
+    /// after the ACK it arrived.
+    request: Option<(String, Duration)>,
+}
+
+/// Run a sipr UAS on `uas_xml` (plus `extra` flags) and place one call on
+/// it from a raw UDP UAC: INVITE, ACK the 200, then optionally an INFO
+/// `info_after` the ACK, then listen for `listen` for a request back. The
+/// UAS gets until `exit_limit` after the ACK to exit.
+fn run_recv_timeout_call(
+    uas_xml: &str,
+    extra: &[&str],
+    info_after: Option<Duration>,
+    listen: Duration,
+    exit_limit: Duration,
+) -> RecvTimeoutRun {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "sipr-e2e-recv-timeout-{}-{}.xml",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::write(&path, uas_xml).expect("write uas");
+    let port = free_port();
+    let port_arg = port.to_string();
+    let mut args = vec![
+        "-sf",
+        path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &port_arg,
+        "-m",
+        "1",
+        "-timeout",
+        "12",
+        "-bg",
+    ];
+    args.extend_from_slice(extra);
+    let (mut uas, uas_err) = spawn_sipr_bg(&args);
+    std::thread::sleep(Duration::from_millis(300));
+    let uas_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    let (ack_at, request) = raw_uac_call(uas_addr, info_after, listen);
+    let code = wait_exit(&mut uas, exit_limit.saturating_sub(ack_at.elapsed()));
+    let exited_after = code.map(|_| ack_at.elapsed());
+    let _ = std::fs::remove_file(&path);
+    RecvTimeoutRun {
+        code,
+        exited_after,
+        stderr: uas_err.join().expect("uas stderr"),
+        request,
+    }
+}
+
+/// A scripted UAC: INVITE (retransmitted until answered), ACK the 200,
+/// optionally an INFO `info_after` the ACK, then answer the first request
+/// that arrives within `listen`. Returns when the ACK went out, and that
+/// request's `X-Branch` with its delay after the ACK.
+fn raw_uac_call(
+    uas: SocketAddr,
+    info_after: Option<Duration>,
+    listen: Duration,
+) -> (std::time::Instant, Option<(String, Duration)>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uac");
+    let local = sock.local_addr().expect("uac addr");
+    let call_id = format!("recv-timeout-{}-{}", std::process::id(), local.port());
+    let request = |method: &str, cseq: u32, to_tag: &str| {
+        format!(
+            "{method} sip:svc@{uas} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {local};branch=z9hG4bK-rt-{method}-{cseq}\r\n\
+             From: <sip:uac@{local}>;tag=rt-uac\r\n\
+             To: <sip:svc@{uas}>{to_tag}\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Contact: <sip:uac@{local}>\r\n\
+             Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
+        )
+    };
+    let mut buf = [0u8; 65_535];
+    sock.set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("timeout");
+    let mut to_tag = None;
+    for _ in 0..10 {
+        sock.send_to(request("INVITE", 1, "").as_bytes(), uas)
+            .expect("send invite");
+        if let Ok((n, _)) = sock.recv_from(&mut buf)
+            && let Ok(msg) = Inbound::parse(&buf[..n])
+            && msg.status_code() == Some(200)
+        {
+            to_tag = msg.to_tag().map(|t| format!(";tag={t}"));
+            break;
+        }
+    }
+    let to_tag = to_tag.expect("the UAS answered the INVITE");
+    sock.send_to(request("ACK", 1, &to_tag).as_bytes(), uas)
+        .expect("send ack");
+    let ack_at = std::time::Instant::now();
+    if let Some(delay) = info_after {
+        std::thread::sleep(delay);
+        sock.send_to(request("INFO", 2, &to_tag).as_bytes(), uas)
+            .expect("send info");
+    }
+    while let Some(left) = listen.checked_sub(ack_at.elapsed()) {
+        sock.set_read_timeout(Some(left.max(Duration::from_millis(1))))
+            .expect("timeout");
+        let Ok((n, from)) = sock.recv_from(&mut buf) else {
+            break;
+        };
+        let Ok(msg) = Inbound::parse(&buf[..n]) else {
+            continue;
+        };
+        if msg.method().is_some() {
+            let _ = sock.send_to(&mirror_response(&msg, "200 OK", false), from);
+            let branch = msg.header("X-Branch").unwrap_or_default().to_owned();
+            return (ack_at, Some((branch, ack_at.elapsed())));
+        }
+    }
+    (ack_at, None)
+}
+
+/// SIPp arms the timeout of the recv the call waits at, optional or not
+/// (`call.cpp` ~l.2195): a trailing optional recv with its own `timeout=`
+/// times out. Its `ontimeout` lands past the last message, which SIPp
+/// counts as a failed call (`E_FAILED_TIMEOUT_ON_RECV`), and exits 1 — real
+/// sipp does so ~1 s after the ACK.
+#[test]
+fn a_trailing_optional_recv_times_out_on_its_own_timeout() {
+    let uas = recv_timeout_uas_xml(
+        r#"  <recv request="INFO" optional="true" timeout="1000" ontimeout="end"/>
+  <label id="end"/>
+"#,
+    );
+    let run = run_recv_timeout_call(&uas, &[], None, Duration::ZERO, Duration::from_secs(6));
+    let err = &run.stderr;
+    assert_eq!(
+        run.code,
+        Some(1),
+        "the UAS must end the call on its own:\n{err}"
+    );
+    assert!(err.contains("successful 0 failed 1"), "{err}");
+    let after = run.exited_after.expect("exited");
+    assert!(
+        after >= Duration::from_millis(900) && after < Duration::from_secs(4),
+        "the optional recv's 1 s timeout ended the run after {after:?}"
+    );
+}
+
+/// In a window of recvs the call waits at the first one, so *its*
+/// `timeout=` runs and *its* `ontimeout` is taken — not the timeout of the
+/// mandatory recv behind it. An optional match moves the call on to the
+/// next recv, whose own timeout then starts afresh (SIPp's `next()` zeroes
+/// `recv_timeout`; real sipp: the INFO at 1 s lands on `late` at 3.5 s).
+#[test]
+fn the_recv_the_call_waits_at_owns_the_timeout() {
+    let uas = recv_timeout_uas_xml(&format!(
+        r#"  <recv request="INFO" optional="true" timeout="1500" ontimeout="early"/>
+  <recv request="BYE" timeout="2500" ontimeout="late"/>
+  <label id="early"/>
+{early}  <label id="late"/>
+{late}  <label id="done"/>
+"#,
+        early = branch_bye("early", r#" next="done""#),
+        late = branch_bye("late", ""),
+    ));
+    let cases = [
+        (None, "early", 1500),
+        (Some(Duration::from_millis(1000)), "late", 3500),
+    ];
+    for (info_after, expected, at_ms) in cases {
+        let run = run_recv_timeout_call(
+            &uas,
+            &[],
+            info_after,
+            Duration::from_millis(4500),
+            Duration::from_secs(7),
+        );
+        let err = &run.stderr;
+        let (branch, after) = run
+            .request
+            .unwrap_or_else(|| panic!("no timeout jump within 4.5 s ({info_after:?}):\n{err}"));
+        assert_eq!(branch, expected, "whose ontimeout ({info_after:?})");
+        let at = Duration::from_millis(at_ms);
+        assert!(
+            after >= at - Duration::from_millis(200) && after < at + Duration::from_millis(700),
+            "expected the jump at {at:?}, it came after {after:?} ({info_after:?})"
+        );
+        assert_eq!(run.code, Some(0), "{err}");
+        assert!(err.contains("successful 1 failed 0"), "{err}");
+    }
+}
+
+/// The flip side, also SIPp's: a `timeout=` on a mandatory recv behind an
+/// optional one does not arm while the call waits at the optional. With
+/// `-recv_timeout` the optional recv times out instead, and having no
+/// `ontimeout` of its own, fails the call — the mandatory recv's
+/// `ontimeout` is not consulted.
+#[test]
+fn a_timeout_behind_an_optional_recv_does_not_arm() {
+    let uas = recv_timeout_uas_xml(&format!(
+        r#"  <recv request="INFO" optional="true"/>
+  <recv request="BYE" timeout="1000" ontimeout="late"/>
+  <label id="late"/>
+{late}"#,
+        late = branch_bye("late", ""),
+    ));
+    let run = run_recv_timeout_call(
+        &uas,
+        &["-timeout", "4"],
+        None,
+        Duration::from_millis(2500),
+        Duration::from_secs(8),
+    );
+    assert_eq!(
+        run.request, None,
+        "the BYE's timeout armed:\n{}",
+        run.stderr
+    );
+    let run = run_recv_timeout_call(
+        &uas,
+        &["-recv_timeout", "800"],
+        None,
+        Duration::from_millis(2500),
+        Duration::from_secs(6),
+    );
+    let err = &run.stderr;
+    assert_eq!(run.request, None, "the BYE's ontimeout was taken:\n{err}");
+    assert_eq!(run.code, Some(1), "{err}");
+    assert!(err.contains("successful 0 failed 1"), "{err}");
+}
+
+/// A `<recvCmd>` waits like a `<recv>`: SIPp's receive timeout covers both
+/// message types, and a command has no `timeout=` of its own, so
+/// `-recv_timeout` applies — to a mandatory one, and to an optional one the
+/// call waits at ahead of a timed SIP recv.
+#[test]
+fn a_recv_cmd_waits_with_recv_timeout() {
+    let tails = [
+        "  <recvCmd/>\n".to_owned(),
+        r#"  <recvCmd optional="true"/>
+  <recv request="BYE" timeout="5000" ontimeout="late"/>
+  <label id="late"/>
+"#
+        .to_owned(),
+    ];
+    for tail in tails {
+        // A twin peer that takes the command and never answers; it gives
+        // up after 10 s so a sipr that never dials cannot hang the test.
+        let twin = TcpListener::bind("127.0.0.1:0").expect("bind twin");
+        let twin_addr = twin.local_addr().expect("twin addr");
+        twin.set_nonblocking(true).expect("nonblocking");
+        let twin_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let Ok((mut stream, _)) = twin.accept() else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
+                let mut buf = [0u8; 4096];
+                while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+                return;
+            }
+        });
+        // A SIP peer that takes the OPTIONS and never answers.
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("bind peer");
+        let scenario = format!(
+            r#"<scenario name="recv-cmd-timeout">
+  <send><![CDATA[
+    OPTIONS sip:svc@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:a@[local_ip]:[local_port]>;tag=[pid]a[call_number]
+    To: <sip:svc@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 OPTIONS
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <sendCmd><![CDATA[
+    Call-ID: [call_id]
+    X-Offer: hello
+  ]]></sendCmd>
+{tail}</scenario>"#
+        );
+        let path = std::env::temp_dir().join(format!(
+            "sipr-e2e-recvcmd-timeout-{}-{}.xml",
+            std::process::id(),
+            twin_addr.port()
+        ));
+        std::fs::write(&path, scenario).expect("write scenario");
+        let started = std::time::Instant::now();
+        let out = run_sipr(&[
+            "-sf",
+            path.to_str().expect("utf8"),
+            "-3pcc",
+            &twin_addr.to_string(),
+            "-m",
+            "1",
+            "-nr",
+            "-recv_timeout",
+            "500",
+            "-timeout",
+            "8",
+            "-bg",
+            &peer.local_addr().expect("peer addr").to_string(),
+        ]);
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_file(&path);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("successful 0 failed 1"), "{tail}\n{err}");
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "-recv_timeout 500 on the recvCmd took {elapsed:?}:\n{tail}"
+        );
+        drop(peer);
+        twin_thread.join().expect("twin");
+    }
+}
