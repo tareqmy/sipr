@@ -259,12 +259,15 @@ fn render_repartition(snap: &Snapshot, pal: &Palette) -> Vec<String> {
     out
 }
 
+/// `s` cut to `max` characters, the last one an ellipsis when cut. Counts
+/// characters, not bytes: a label is scenario text (`display=`) and may
+/// hold multi-byte ones, which a byte slice could split.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_owned()
-    } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
+    if s.chars().count() <= max {
+        return s.to_owned();
     }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 #[cfg(test)]
@@ -387,6 +390,21 @@ mod tests {
         assert_eq!(Screen::from_digit(2), Some(Screen::Main));
         assert_eq!(Screen::from_digit(3), Some(Screen::Repartition));
         assert_eq!(Screen::from_digit(4), None);
+    }
+
+    #[test]
+    fn long_labels_are_cut_on_a_character_boundary() {
+        assert_eq!(truncate("send INVITE", 22), "send INVITE");
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        // 'é' is two bytes; a byte cut at 21 would land inside one.
+        let label = "é".repeat(30);
+        let cut = truncate(&label, 22);
+        assert_eq!(cut.chars().count(), 22, "{cut}");
+        assert!(cut.ends_with('…'), "{cut}");
+        let mut s = snap();
+        s.steps[0].label = label;
+        let all = render(&s, Screen::Scenario).join("\n");
+        assert!(all.contains(&cut), "{all}");
     }
 
     #[test]

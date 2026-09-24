@@ -143,6 +143,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The scenario screen no longer panics on a step label longer than its
+  22-character column when the cut falls inside a multi-byte character
+  (a non-ASCII `display=` text). Labels are cut by character, not byte.
 - A matched `<recv>` follows its `next=`, `test=` and `chance=` as in
   SIPp: it jumps to the `next=` label when the `test=` variable, if any,
   is set and the `chance=` draw, if any, is won, and otherwise moves on
