@@ -8,7 +8,8 @@
 
 use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{PoisonError, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 fn sipp_bin() -> Option<PathBuf> {
@@ -24,9 +25,49 @@ fn sipp_bin() -> Option<PathBuf> {
         .find(|c| c.is_file())
 }
 
+/// Port probes against child spawns. macOS has no `SOCK_CLOEXEC`, so std
+/// creates a socket and only then sets `FD_CLOEXEC` on it: a child spawned
+/// from another test thread in between inherits the socket, and once the
+/// probe binds it the child holds that port for as long as it lives. The
+/// process the port is then handed to cannot bind it (sipp "Unable to bind
+/// main socket", sipr "cannot bind UDP socket": address in use) and what
+/// the test sends there lands in a socket nobody reads. Probes hold this
+/// exclusively, every spawn holds it shared (`SpawnOutsideProbes`).
+static PORT_PROBES: RwLock<()> = RwLock::new(());
+
+/// Hold off every spawn while the caller has probe sockets open.
+fn probing() -> RwLockWriteGuard<'static, ()> {
+    PORT_PROBES.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `spawn` and `output` that never overlap a port probe (`PORT_PROBES`).
+/// Every child this suite starts goes through one of these.
+trait SpawnOutsideProbes {
+    fn spawn_outside_probes(&mut self) -> std::io::Result<Child>;
+    /// `output()` with its default stdio: stdin null, stdout and stderr
+    /// captured. Only the spawn waits out a probe, not the child's run.
+    fn output_outside_probes(&mut self) -> std::io::Result<Output>;
+}
+
+impl SpawnOutsideProbes for Command {
+    fn spawn_outside_probes(&mut self) -> std::io::Result<Child> {
+        let _no_probe = PORT_PROBES.read().unwrap_or_else(PoisonError::into_inner);
+        self.spawn()
+    }
+
+    fn output_outside_probes(&mut self) -> std::io::Result<Output> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_outside_probes()?
+            .wait_with_output()
+    }
+}
+
 /// A free *even* UDP port with its `+2` also free (RTP conventions; SIPp's
 /// echo binds both).
 fn free_even_port() -> u16 {
+    let _probing = probing();
     for _ in 0..100 {
         let base = media_port_candidate();
         let a = UdpSocket::bind(("127.0.0.1", base));
@@ -41,6 +82,7 @@ fn free_even_port() -> u16 {
 /// A base port with `base..base+span` all free, for `[auto_media_port]`
 /// scenarios that spread calls over 4-port blocks.
 fn free_port_block(span: u16) -> u16 {
+    let _probing = probing();
     for _ in 0..100 {
         let base = media_port_candidate();
         let held: Vec<_> = (0..span)
@@ -79,6 +121,7 @@ fn media_port_candidate() -> u16 {
 /// Hyper-V/WinNAT excluded port ranges are per protocol, and a port the OS
 /// happily allocated for UDP can fail a later TCP bind with error 10013.
 fn free_port() -> u16 {
+    let _probing = probing();
     for _ in 0..100 {
         let port = media_port_candidate();
         if port_binds_on_tcp_and_udp(port) {
@@ -98,7 +141,7 @@ fn port_binds_on_tcp_and_udp(port: u16) -> bool {
 fn sipp_supports_tls(sipp: &std::path::Path) -> bool {
     Command::new(sipp)
         .arg("-v")
-        .output()
+        .output_outside_probes()
         .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("TLS"))
 }
 
@@ -196,7 +239,7 @@ fn uac_against_real_sipp_uas() {
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn_outside_probes();
     // Some sipp builds daemonize with -bg; retry plain if spawn failed.
     let mut sipp_proc = match sipp_child {
         Ok(c) => Reaper(c),
@@ -223,7 +266,7 @@ fn uac_against_real_sipp_uas() {
                 &format!("127.0.0.1:{port}"),
             ])
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_proc.0, Duration::from_secs(25));
@@ -274,7 +317,7 @@ fn real_sipp_uac_against_sipr_uas() {
                 "30",
             ])
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr uas"),
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -297,7 +340,7 @@ fn real_sipp_uac_against_sipr_uas() {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uac"),
     );
     let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
@@ -366,7 +409,7 @@ fn tls_uac_against_real_sipp_uas() {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("cannot spawn sipp"),
     );
     // Give the UAS a moment to bind before sipr dials its TLS connection.
@@ -396,7 +439,7 @@ fn tls_uac_against_real_sipp_uas() {
                 &format!("127.0.0.1:{port}"),
             ])
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_proc.0, Duration::from_secs(25));
@@ -458,7 +501,7 @@ fn real_sipp_tls_uac_against_sipr_uas() {
                 "30",
             ])
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr uas"),
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -495,7 +538,7 @@ fn real_sipp_tls_uac_against_sipr_uas() {
             .current_dir(log_dir.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uac"),
     );
     let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
@@ -645,7 +688,7 @@ fn uac_pcap_against_real_sipp_uas() {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uas"),
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -667,7 +710,7 @@ fn uac_pcap_against_real_sipp_uas() {
                 &format!("127.0.0.1:{port}"),
             ])
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_proc.0, Duration::from_secs(25));
@@ -796,7 +839,7 @@ fn uac_rtp_stream_against_real_sipp_uas() {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uas"),
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -818,7 +861,7 @@ fn uac_rtp_stream_against_real_sipp_uas() {
                 &format!("127.0.0.1:{port}"),
             ])
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_proc.0, Duration::from_secs(25));
@@ -949,7 +992,7 @@ fn rtpcheck_against_real_sipp_echo() {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uas"),
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -973,7 +1016,7 @@ fn rtpcheck_against_real_sipp_echo() {
                 &format!("127.0.0.1:{port}"),
             ])
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_proc.0, Duration::from_secs(25));
@@ -1129,7 +1172,7 @@ fn srtp_against_real_sipp_echo() {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -1151,7 +1194,7 @@ fn srtp_against_real_sipp_echo() {
                 &format!("127.0.0.1:{port}"),
             ])
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_proc.0, Duration::from_secs(25));
@@ -1252,7 +1295,7 @@ fn real_sipp_srtp_uac_against_sipr_echo_server() {
                 "-bg",
             ])
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -1281,7 +1324,7 @@ fn real_sipp_srtp_uac_against_sipr_echo_server() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uac"),
     );
     let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
@@ -1441,7 +1484,7 @@ fn run_verifyauth_pair(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -1462,7 +1505,7 @@ fn run_verifyauth_pair(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uac"),
     );
     let uac_code = wait_with_timeout(&mut uac.0, Duration::from_secs(15));
@@ -1619,7 +1662,7 @@ fn run_unexp_pair(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -1641,7 +1684,7 @@ fn run_unexp_pair(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uac"),
     );
     let uac_code = wait_with_timeout(&mut uac.0, Duration::from_secs(20));
@@ -1726,7 +1769,7 @@ fn sipr_uac_vs_sipp_uas(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -1752,7 +1795,7 @@ fn sipr_uac_vs_sipp_uas(
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr uac"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_uac.0, Duration::from_secs(25));
@@ -1828,7 +1871,7 @@ fn real_sipp_per_call_uac_against_sipr_uas() {
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn sipr uas"),
         );
         std::thread::sleep(Duration::from_millis(300));
@@ -1856,7 +1899,7 @@ fn real_sipp_per_call_uac_against_sipr_uas() {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn sipp uac"),
         );
         let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
@@ -1909,7 +1952,7 @@ fn rsa_both_ways_against_real_sipp() {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn"),
         )
     };
@@ -2100,7 +2143,7 @@ fn tcp_reconnect_pair(
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn uas"),
         )
     };
@@ -2136,7 +2179,7 @@ fn tcp_reconnect_pair(
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uac"),
     );
     let stderr_pipe = uac.0.stderr.take().expect("stderr");
@@ -2280,7 +2323,7 @@ fn per_ip_sockets_both_ways_against_real_sipp() {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn"),
         )
     };
@@ -2432,7 +2475,7 @@ fn sctp_both_ways_against_real_sipp() {
     };
     let banner = Command::new(&sipp)
         .arg("-v")
-        .output()
+        .output_outside_probes()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
     if !banner.contains("SCTP") || !sipr_net::sctp::available() {
@@ -2451,7 +2494,7 @@ fn sctp_both_ways_against_real_sipp() {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn"),
         )
     };
@@ -2611,7 +2654,7 @@ fn real_sipp_ooc_scenario_answers_siprs_out_of_call_options() {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -2639,7 +2682,7 @@ fn real_sipp_ooc_scenario_answers_siprs_out_of_call_options() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uac"),
     );
     let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
@@ -2730,7 +2773,7 @@ fn sipr_ooc_scenario_answers_real_sipps_out_of_call_options() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -2759,7 +2802,7 @@ fn sipr_ooc_scenario_answers_real_sipps_out_of_call_options() {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr uac"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_uac.0, Duration::from_secs(25));
@@ -2981,7 +3024,7 @@ fn real_sipp_and_sipr_terminate_each_others_calls_in_mixed_mode() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp mixed"),
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -3012,7 +3055,7 @@ fn real_sipp_and_sipr_terminate_each_others_calls_in_mixed_mode() {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr mixed"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_mixed.0, Duration::from_secs(25));
@@ -3072,7 +3115,7 @@ fn sipr_receive_scenario_answers_a_plain_real_sipp_uac() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uas"),
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -3102,7 +3145,7 @@ fn sipr_receive_scenario_answers_a_plain_real_sipp_uac() {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr mixed"),
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -3128,7 +3171,7 @@ fn sipr_receive_scenario_answers_a_plain_real_sipp_uac() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uac"),
     );
     let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(20));
@@ -3309,7 +3352,7 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -3336,7 +3379,7 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uac"),
     );
     let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
@@ -3379,7 +3422,7 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -3406,7 +3449,7 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr uac"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_uac.0, Duration::from_secs(25));
@@ -3573,7 +3616,7 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -3599,7 +3642,7 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uac"),
     );
     let sipp_code = wait_with_timeout(&mut sipp_uac.0, Duration::from_secs(25));
@@ -3641,7 +3684,7 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipp uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -3667,7 +3710,7 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn sipr uac"),
     );
     let sipr_code = wait_with_timeout(&mut sipr_uac.0, Duration::from_secs(25));
@@ -3856,7 +3899,7 @@ fn spawn_uas_bin(
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uas"),
     )
 }
@@ -3907,7 +3950,7 @@ fn exec_command_writes_the_same_hook_output_as_real_sipp() {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn uac"),
         );
         assert_eq!(
@@ -3994,7 +4037,7 @@ fn setdest_redirects_to_a_second_peer_like_real_sipp() {
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn uac"),
         );
         let uac_code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
@@ -4129,7 +4172,7 @@ fn run_sf_pair(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -4161,7 +4204,7 @@ fn run_sf_pair(
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uac"),
     );
     let uac_code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
@@ -4363,7 +4406,7 @@ fn run_with_stat_files(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -4404,7 +4447,7 @@ fn run_with_stat_files(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uac"),
     );
     let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
@@ -4547,7 +4590,7 @@ fn short_message_log_matches_real_sipps() {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn uas"),
         );
         std::thread::sleep(Duration::from_millis(400));
@@ -4580,7 +4623,7 @@ fn short_message_log_matches_real_sipps() {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn uac"),
         );
         let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
@@ -4661,7 +4704,7 @@ fn max_invite_retrans_counts_like_real_sipp() {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn"),
         );
         let _ = wait_with_timeout(&mut child.0, Duration::from_secs(25));
@@ -4845,7 +4888,7 @@ fn run_ext3pcc_pair(
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
-                .spawn()
+                .spawn_outside_probes()
                 .expect("spawn uas"),
         )
     };
@@ -4881,7 +4924,7 @@ fn run_ext3pcc_pair(
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
                     .stdin(Stdio::null())
-                    .spawn()
+                    .spawn_outside_probes()
                     .expect("spawn peer"),
             )
         };
@@ -5012,7 +5055,7 @@ fn run_jump_over_labels(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uac"),
     );
     let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
@@ -5131,6 +5174,24 @@ struct RecvTimeoutOutcome {
     error_log: String,
 }
 
+/// Where `run_recv_timeout_uas` keeps the UAS's stderr, in its tempdir.
+const UAS_STDERR: &str = "uas.stderr";
+
+/// What a UAS that never answered left behind: whether it is still running
+/// or how it exited, its stderr and its `-trace_err` log.
+fn uas_post_mortem(uas: &mut Child, dir: &std::path::Path) -> String {
+    let status = match uas.try_wait() {
+        Ok(Some(status)) => status.to_string(),
+        Ok(None) => "still running".to_owned(),
+        Err(e) => format!("unknown ({e})"),
+    };
+    let stderr = std::fs::read_to_string(dir.join(UAS_STDERR)).unwrap_or_default();
+    format!(
+        "status: {status}\n--- stderr ---\n{stderr}\n--- -trace_err ---\n{}",
+        sipp_error_log(dir)
+    )
+}
+
 /// Run `uas_bin` on `xml` (plus `extra`) and place one call on it from a
 /// raw UDP UAC: INVITE, ACK the 200, an INFO `info_after` the ACK if
 /// given, then listen `listen` for a request back.
@@ -5145,6 +5206,7 @@ fn run_recv_timeout_uas(
     let path = dir.path().join("recv_timeout_uas.xml");
     std::fs::write(&path, xml).expect("write uas");
     let port = free_port();
+    let stderr = std::fs::File::create(dir.path().join(UAS_STDERR)).expect("create uas stderr");
     let mut uas = Reaper(
         Command::new(uas_bin)
             .current_dir(dir.path())
@@ -5160,12 +5222,15 @@ fn run_recv_timeout_uas(
                 "-timeout",
                 "6",
                 "-trace_err",
+                // A foreground sipp busy-polls a /dev/null stdin at 100%
+                // CPU; a test's worth of them at once skews its timings.
+                "-nostdin",
             ])
             .args(extra)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .stdin(Stdio::null())
-            .spawn()
+            .spawn_outside_probes()
             .expect("spawn uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -5206,7 +5271,13 @@ fn run_recv_timeout_uas(
             }
         }
     }
-    let to_tag = to_tag.expect("the UAS answered the INVITE");
+    let Some(to_tag) = to_tag else {
+        panic!(
+            "{} on 127.0.0.1:{port} never answered the INVITE\n{}",
+            uas_bin.display(),
+            uas_post_mortem(&mut uas.0, dir.path()),
+        );
+    };
     sock.send_to(request("ACK", 1, &to_tag).as_bytes(), &uas_addr)
         .expect("send ack");
     let ack_at = Instant::now();

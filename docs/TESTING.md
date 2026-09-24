@@ -73,6 +73,18 @@ declaration or its loader reports "Unable to load or parse"; never assert
 on the exit code of a sipp started with `-bg` (the forked parent exits 99 at
 once) — run it in the foreground with stdin/stdout/stderr null and reap it;
 sipp as a UAS ignores SIGTERM once curses is up — kill it with SIGKILL.
+A sipp whose stdin is `/dev/null` busy-polls it, a full core each and
+mostly kernel time, so pass `-nostdin` (sipr takes it too) where a test
+runs several at once.
+
+On macOS a child can inherit a socket another test thread has only just
+created: there is no `SOCK_CLOEXEC`, so std sets `FD_CLOEXEC` a moment
+after `socket()`. A `free_port()` probe socket inherited that way keeps
+the probed port bound for as long as the child lives, and the sipp or sipr
+the port is handed to exits with "Address already in use". `tests/interop.rs`
+therefore starts every child through `spawn_outside_probes()` /
+`output_outside_probes()`, which never overlap a probe; use them for any
+new one.
 
 SCTP cannot be tested on this development host: macOS has no SCTP stack and
 the Homebrew sipp is built without `USE_SCTP` (its banner lacks `-SCTP`).
