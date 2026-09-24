@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Generic counters at parity (M48): `counter=` on a message is a
+  scenario-wide statistic, as in SIPp. The statistics screen (and
+  `-trace_screen`) shows a `Counter <name>` row per counter with its
+  periodic and cumulative values. `-trace_stat` writes a `<name>(P)` and
+  `<name>(C)` column pair per counter after `CallLengthStDev`, named
+  `GenericCounter<name>` for an all-digit name and cut to SIPp's 19
+  characters; the header matches real sipp's byte for byte. `/stats` and
+  `--sipr-stats-json` carry a `counters` list, and `/metrics` a
+  `sipr_scenario_counter_total{counter="…"}` series each. A counter is
+  booked where SIPp books it: a nop and a recvCmd count before their
+  actions run, so a `<jump>` no longer skips the count, and a send counts
+  even when sending fails. An empty counter name, or one containing `$`
+  or `,`, is now a compile error, since SIPp refuses to load such a
+  scenario. sipr used to keep a per-call tally that nothing reported.
 - Scenario lints under `--check` (M47): `optional-window` (an optional
   recv that no mandatory recv follows, which SIPp refuses to load before a
   send or pause and which hangs the call at the end of a scenario),

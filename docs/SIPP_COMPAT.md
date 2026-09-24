@@ -1411,9 +1411,9 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `FailedCmdNotSent`, `FailedRegexp*`, `FailedOutboundCongestion`,
   `FailedTimeoutOnSend`, `FailedTest*`, `FailedStrcmp*`, `Warnings`,
   `FatalErrors`, `Watchdog*`; `OutOfCallMsgs` counts messages for no
-  call, `DeadCallMsgs` those absorbed in timewait. SIPp's generic
-  `counter=` columns are not written (sipr's counters are per call,
-  M44). `-fd` defaults to 60 s as SIPp's (it was 1 s) and the final row
+  call, `DeadCallMsgs` those absorbed in timewait. The generic
+  `counter=` columns follow `CallLengthStDev(C)`, a `(P)`/`(C)` pair per
+  counter (the generic-counters note below). `-fd` defaults to 60 s as SIPp's (it was 1 s) and the final row
   is written at exit regardless; `-f` (default 1 s) paces the screen
   snapshot and the `-bg` line. `-trace_rtt` writes
   `<scenario>_<pid>_rtt.csv`: `Date_ms;response_time_ms;rtd_no`, then
@@ -1644,12 +1644,57 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   stays, whatever its `test=`, and `test=` without `next=` does nothing.
   sipr used to ignore `next=`, `test=`, `chance=` and `counter=` on a
   recv: it never jumped, and always moved to the message after the
-  match. `counter=` now ticks on a recv as on the other steps, but sipr
-  reports no generic counters (the `-trace_stat` note above), so nothing
-  shows it yet. **Divergence, on purpose:** SIPp tests `next` there as a
+  match. `counter=` now ticks on a recv as on the other steps (reported
+  since: the generic-counters note below). **Divergence, on purpose:** SIPp tests `next` there as a
   C boolean (`next && …`), and a `next=` label before the first message
   resolves to index 0, which reads as false. So in SIPp an optional recv
   whose `next=` names message 0 stays where it waited, `test=` or not,
   and never takes the jump (checked by hand against real sipp). sipr
   takes it: silently dropping a `next=` is a SIPp failure mode sipr does
   not inherit.
+- Generic counters, `counter=` (verified in `scenario.cpp` ~l.567
+  `get_counter` and ~l.1824 `getBookKeeping`; `stat.cpp` ~l.869
+  `findCounter`, ~l.999 `E_ADD_GENERIC_COUNTER`, the `RESET_*_COUNTERS`
+  macros, ~l.1273 and ~l.1388 in `dumpData`; `screen.cpp` ~l.755
+  `draw_stats_screen`; `call.cpp` ~l.1777 `do_bookkeeping` and its call
+  sites; `reporttask.cpp`; confirmed against real sipp, the
+  `generic_counters_match_real_sipps_statistics` interop test). A
+  counter is a scenario-wide statistic, not a per-call one: every step
+  that names it adds one, whichever call runs the step, on the stat set
+  of the scenario it belongs to (the main, `-oocsf` and `-rxsf`
+  scenarios each count their own, as each owns a `CStat`). The
+  scenario registers its counters as it loads, in the order it first
+  names them, so a counter no call ever reaches is still listed, at 0.
+  A name is refused at load when it is empty or holds `$` or `,` — SIPp's
+  two checks, compile errors in sipr. **When a step books it**
+  (`do_bookkeeping`, which also stops and starts the RTDs): a send
+  before its message is built, so a send that fails still counts; a
+  pause (and SIPp's timewait) on entry; a nop, and a recvCmd on
+  receipt, *before* their actions, so a `<jump>` or a stopped call does
+  not undo it; a recv when it matches, whatever branch it then takes
+  (the recv-branching note above); a sendCmd once the command is out.
+  A retransmission books nothing. **Where it shows:** the statistics
+  screen gives each counter a `Counter <name>` row, after the calls
+  created and before the successful/failed counts, with a periodic value
+  (reset at every screen refresh, SIPp's `PD` counters) and a
+  cumulative one; sipr draws the rows on its main (statistics) screen,
+  in its own layout, so they also reach `-trace_screen`. `-trace_stat`
+  gives each a `<name>(P)` and a `<name>(C)` column after
+  `CallLengthStDev(C)` and before the repartition blocks — `(P)` since
+  the last dump (`PL`), `(C)` since the start. An all-digit name heads
+  its columns `GenericCounter<name>` instead, cut to 19 characters
+  because SIPp formats it into a 20-byte buffer: `counter="1234567"` is
+  `GenericCounter12345(P)`, and two long numeric names can share a
+  column name (sipr follows this, since wrappers read columns by name).
+  The screen label is never rewritten: `Counter 1234567`. As with the
+  rest of the file, only the main scenario's counters are written.
+  sipr additions: `/stats` and `--sipr-stats-json` carry
+  `"counters":[{"name","periodic","cumulative"}]` for the displayed
+  scenario, and `/metrics` a `sipr_scenario_counter_total{counter=…}`
+  series each (docs/CONTROL_API.md). sipr kept a per-call map until
+  now, which nothing read; it also booked a nop's and a recvCmd's
+  counter only when their actions did not move the call, and a send's
+  only after a successful send. **Open:** sipr's `<timewait>` takes
+  only `milliseconds` and warns the common attributes away as unknown,
+  so `<timewait counter=…>` does not count there, where SIPp books it
+  on entry.

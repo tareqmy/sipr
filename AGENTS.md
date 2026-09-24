@@ -13,7 +13,7 @@ leftovers — `PRINTF=` injection files, `<rtp_echo variable=>`, the socket
 options, pcapng captures). `PLAN.md` is the
 master plan (its dependency choices were superseded by in-tree implementations —
 `docs/MILESTONES.md` notes record each swap); the post-v1 backlog at the bottom of
-`docs/MILESTONES.md` (M48+, sipr's own additions now that parity is done) is
+`docs/MILESTONES.md` (M49+, sipr's own additions now that parity is done) is
 what comes next; M47 added the `--check` lints (`docs/LINTS.md`). M45 measured the hot path against real sipp —
 `docs/PERFORMANCE.md` and `benches/BASELINES.md` hold the numbers, and
 `make bench-vs-sipp` reruns them.

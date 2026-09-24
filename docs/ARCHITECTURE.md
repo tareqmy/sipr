@@ -126,10 +126,12 @@ template slots → sendto. On this path:
 Per-call state: scenario index (position in the flat `Vec<Step>` IR), variable
 store, dialog state (local/remote tag, CSeq counters both directions, route
 set, remote target), last-received message per `[last_*]`, RTD start timestamps,
-retransmission context for the in-flight `send`, per-step counters, and one
+retransmission context for the in-flight `send`, and one
 slot per manual transaction of the scenario (`start_txn`/`ack_txn`/
 `response_txn`: the sent request's Via branch, the ACK step's index and the
 accepted response's hash — empty and free when the scenario names none).
+Counts are not per-call state: the per-step message counts and the generic
+`counter=` tallies live on the scenario's `StatSet`, which its calls share.
 
 Variables live in three layers, SIPp's table chain (`sipr-engine/src/vars.rs`):
 the call's own `Vec<Value>`, its user's table (one per user id, created when

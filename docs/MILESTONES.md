@@ -1975,7 +1975,54 @@ recv's, so a trailing `optional timeout=… ontimeout=…` recv ends in SIPp
 and hangs in sipr). The positive corpus's `pcap_play.xml` had the first
 shape and now puts its optional recv before the mandatory one.
 
-### M48+ — sipr's own additions (after parity)
+### M48 — Generic counters (`counter=`) at parity ✅
+
+A parity gap M40 named in its oracle and never closed: `counter=` ticked
+a per-call map nothing read, so SIPP_COMPAT §6 said "SIPp's generic
+`counter=` columns are not written". In SIPp a counter is a scenario-wide
+statistic (`stat.cpp` `findCounter`, `E_ADD_GENERIC_COUNTER`) with a
+cumulative, a periodic-display and a periodic-log value, shown on the
+statistics screen (`screen.cpp` `draw_stats_screen`) and written as
+`-trace_stat` columns (`dumpData`).
+
+- [x] `sipr-stats`: the counters live on the scenario's `StatSet`,
+      registered in first-mention order with a step → counter map, so a
+      tick on the per-message path is an index, not a name lookup;
+      `(P)` diffs against the last `-fd` dump, the screen's periodic
+      value against the last `-f` refresh, which the engine loop's tick
+      closes whether or not anything displays it (SIPp's `PL` and `PD`);
+      `reset stats` keeps the names. `-trace_stat` gets the `(P)`/`(C)`
+      pairs after `CallLengthStDev(C)`, `GenericCounter<n>` for an
+      all-digit name, cut at 19 characters as SIPp's buffer cuts it.
+- [x] Engine: steps book their counter where `do_bookkeeping` runs — a
+      send before it is built, a pause on entry, a nop and a recvCmd
+      before their actions, a recv on its match, a sendCmd once sent.
+      The per-call map is gone.
+- [x] Reporting: `Counter <name>` rows on the TUI statistics (main)
+      screen, hence in `-trace_screen`; `counters` in `/stats` and
+      `--sipr-stats-json`; `sipr_scenario_counter_total` on `/metrics`.
+- [x] Scenario: an empty counter name, or one holding `$` or `,`, is a
+      compile error (SIPp `get_counter` refuses the scenario).
+- [x] Tests: stats unit tests (first-mention order, shared names, the
+      two periods, the CSV columns, the 19-character cut), TUI, JSON and
+      Prometheus unit tests, a compile test for the name checks; e2e
+      `generic_counters_reach_the_statistics_file_screen_and_api`;
+      interop `generic_counters_match_real_sipps_statistics` — the same
+      UAC under sipr and real sipp gives byte-for-byte equal
+      `-trace_stat` headers, the same final counter values, and a
+      `Counter <name>` row per counter on both screens.
+- [x] Docs: SIPP_COMPAT §6 (a generic-counters note; the M40 and
+      recv-branching notes corrected), CONTROL_API §2–3, CHANGELOG.
+
+Found on the way: a nop's and a recvCmd's counter was booked only when
+their actions did not move the call, and a send's only after it went
+out; SIPp books all three first. Left open (SIPP_COMPAT §6): sipr's
+`<timewait>` warns `counter=` away as unknown where SIPp books it on
+entry. Also found: sipp names the `-trace_screen` file
+`<scenario>_<pid>_screen.log` (its `screen` log-file entry), not the
+`_screens.log` its help text gives and sipr copied — fixed separately.
+
+### M49+ — sipr's own additions (after parity)
 
 Candidates, to be promoted into numbered milestones in the order the
 users of the HTTP API ask for them:

@@ -676,6 +676,39 @@ fn chance_out_of_range_is_an_error() {
 }
 
 #[test]
+fn counter_names_are_checked_like_sipps() {
+    let with = |attr: &str| {
+        wrap(&format!(
+            r#"{invite}<recv response="200" counter="{attr}"/>"#,
+            invite = send_invite()
+        ))
+    };
+    let named = compile("test", &with("reg-ok"));
+    let counter = match &named.scenario.expect("compiles").steps[1] {
+        Step::Recv(r) => r.common.counter.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(counter.as_deref(), Some("reg-ok"));
+    assert!(errors(&with("7")).is_empty(), "a number is a name");
+    assert!(
+        errors(&with(""))
+            .iter()
+            .any(|e| e.contains("may not be empty")),
+        "{:?}",
+        errors(&with(""))
+    );
+    for bad in ["a$b", "a,b"] {
+        assert!(
+            errors(&with(bad))
+                .iter()
+                .any(|e| e.contains("may not contain $ or ,")),
+            "{bad}: {:?}",
+            errors(&with(bad))
+        );
+    }
+}
+
+#[test]
 fn scenario_without_messages_is_an_error() {
     let xml = wrap(r#"<pause milliseconds="100"/>"#);
     assert!(

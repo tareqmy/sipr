@@ -985,6 +985,9 @@ impl Compiler {
             }
             valid
         });
+        let counter = el
+            .attr("counter")
+            .and_then(|name| self.counter_name(el, name));
         if chance.is_some() && el.attr("next").is_none() {
             self.diags
                 .warn(Some(el.line), "'chance' without 'next' has no effect");
@@ -1012,7 +1015,7 @@ impl Compiler {
                 .map(ToOwned::to_owned)
                 .map(|v| self.var_reads(&v)),
             condexec_inverse: self.parse_bool_attr(el, "condexec_inverse"),
-            counter: el.attr("counter").map(ToOwned::to_owned),
+            counter,
             hide: self.parse_bool_attr(el, "hide"),
             display: el
                 .attr("display")
@@ -1021,6 +1024,25 @@ impl Compiler {
                 .map(ToOwned::to_owned),
             line: el.line,
         }
+    }
+
+    /// A `counter=` name, checked as SIPp checks it at load
+    /// (`scenario::get_counter`): refused when empty or when it holds `$`
+    /// or `,`, with SIPp's reasons.
+    fn counter_name(&mut self, el: &Element, name: &str) -> Option<String> {
+        if name.is_empty() {
+            self.diags
+                .error(Some(el.line), "counter names may not be empty");
+            return None;
+        }
+        if name.contains(['$', ',']) {
+            self.diags.error(
+                Some(el.line),
+                format!("counter names may not contain $ or , (got '{name}')"),
+            );
+            return None;
+        }
+        Some(name.to_owned())
     }
 
     fn warn_unknown_attrs(&mut self, el: &Element, allowed: &[&str]) {

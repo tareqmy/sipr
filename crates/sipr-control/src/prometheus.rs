@@ -139,6 +139,7 @@ pub fn render(s: &Snapshot) -> String {
     }
 
     rtp_metrics(&mut out, s);
+    counter_metrics(&mut out, s);
     rtd_metrics(&mut out, s);
     step_metrics(&mut out, s);
     out
@@ -202,6 +203,31 @@ fn rtp_metrics(out: &mut String, s: &Snapshot) {
         "sipr_rtp_streams_started_total {}",
         s.rtp_streams_started
     );
+}
+
+/// The scenario's generic counters (`counter=`), one series per name.
+/// Only the cumulative value: a scraper derives rates itself, and the
+/// periodic value depends on when the snapshot was taken, not on when it
+/// is scraped. A scenario names its counters at load, so the set is fixed
+/// for the run and a scenario without any has no family.
+fn counter_metrics(out: &mut String, s: &Snapshot) {
+    if s.counters.is_empty() {
+        return;
+    }
+    metric(
+        out,
+        "sipr_scenario_counter_total",
+        "counter",
+        "Scenario counter= tallies, by counter name.",
+    );
+    for c in &s.counters {
+        let _ = writeln!(
+            out,
+            "sipr_scenario_counter_total{{counter=\"{}\"}} {}",
+            escape(&c.name),
+            c.cumulative
+        );
+    }
 }
 
 /// Response-time distributions, one series per RTD, plus call length.
@@ -488,6 +514,34 @@ mod tests {
             .find(|l| l.starts_with("sipr_run_info{"))
             .expect("info series");
         assert!(info.ends_with(" 1"), "{info}");
+    }
+
+    /// One series per generic counter, cumulative, its name escaped as a
+    /// label value; a scenario without counters has no such family.
+    #[test]
+    fn scenario_counters_are_one_labelled_family() {
+        let plain = render(&snap());
+        assert!(!plain.contains("sipr_scenario_counter_total"), "{plain}");
+        let mut s = snap();
+        s.counters = vec![
+            sipr_stats::CounterRow {
+                name: "reg-ok".into(),
+                periodic: 2,
+                cumulative: 40,
+            },
+            sipr_stats::CounterRow {
+                name: "say \"hi\"".into(),
+                periodic: 0,
+                cumulative: 1,
+            },
+        ];
+        let text = render(&s);
+        assert!(text.contains("# TYPE sipr_scenario_counter_total counter"));
+        assert!(text.contains("sipr_scenario_counter_total{counter=\"reg-ok\"} 40"));
+        assert!(
+            text.contains(r#"sipr_scenario_counter_total{counter="say \"hi\""} 1"#),
+            "{text}"
+        );
     }
 
     /// An empty run still exposes every family, so a scrape target does not

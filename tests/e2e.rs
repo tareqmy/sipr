@@ -8914,3 +8914,163 @@ fn a_matched_recv_follows_next_test_and_chance() {
         assert!(err.contains("successful 1 failed 0"), "{name}:\n{err}");
     }
 }
+
+// ---- generic counters (`counter=`) -------------------------------------
+
+/// A UAC whose steps name counters (mirrored in `tests/interop.rs`), in
+/// first-mention order: `invites` (the INVITE), `1234567` (the 180, a
+/// numeric name longer than SIPp's column buffer), `7` (the 200 and the
+/// pause, shared), `acks`, `jumper` (a nop whose `<jump>` skips the next
+/// message) and `skipped` (that message, which never runs). Per call:
+/// 1, 1, 2, 1, 1, 0.
+fn counters_uac_xml() -> &'static str {
+    r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="counters">
+  <send retrans="500" counter="invites"><![CDATA[
+      INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:uac@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:svc@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:uac@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true" counter="1234567"/>
+  <recv response="200" counter="7"/>
+  <send counter="acks"><![CDATA[
+      ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:uac@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: <sip:uac@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]></send>
+  <nop counter="jumper">
+    <action><jump value="7"/></action>
+  </nop>
+  <nop counter="skipped"/>
+  <pause milliseconds="50" counter="7"/>
+  <send retrans="500"><![CDATA[
+      BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:uac@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Contact: <sip:uac@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]></send>
+  <recv response="200"/>
+</scenario>
+"#
+}
+
+/// Generic counters are scenario-wide stats (SIPp `E_ADD_GENERIC_COUNTER`):
+/// `-trace_stat` gives each a `(P)`/`(C)` pair after `CallLengthStDev`,
+/// named as written or `GenericCounter<n>` for a number (cut at SIPp's 19
+/// characters), and in first-mention order, a never-run counter included;
+/// the statistics screen (`-trace_screen`) shows a `Counter <name>` row
+/// each, and the `/stats` document (`--sipr-stats-json`) carries them. A
+/// nop books its counter before its `<jump>` action runs, as SIPp's
+/// `do_bookkeeping` does.
+#[test]
+fn generic_counters_reach_the_statistics_file_screen_and_api() {
+    let (addr, _uas) = spawn_uas(Duration::from_secs(3));
+    let dir = std::env::temp_dir().join(format!("sipr-counters-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let scenario = dir.join("counters.xml");
+    std::fs::write(&scenario, counters_uac_xml()).expect("write scenario");
+    let json = dir.join("snaps.jsonl");
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(&dir)
+        .arg("-sf")
+        .arg(&scenario)
+        .args(["-m", "3", "-r", "10", "-timeout", "15"])
+        .args(["-trace_stat", "-trace_screen", "-bg"])
+        .arg("--sipr-stats-json")
+        .arg(&json)
+        .arg(addr.to_string())
+        .output()
+        .expect("run sipr");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+    let read = |suffix: &str| -> String {
+        let name = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no *{suffix} in {}", dir.display()));
+        std::fs::read_to_string(dir.join(name)).expect("read")
+    };
+
+    let stat = read("_.csv");
+    let header: Vec<&str> = stat.lines().next().expect("header").split(';').collect();
+    let at = header
+        .iter()
+        .position(|c| *c == "CallLengthStDev(C)")
+        .expect("CallLengthStDev(C)")
+        + 1;
+    let names = [
+        "invites",
+        "GenericCounter12345",
+        "GenericCounter7",
+        "acks",
+        "jumper",
+        "skipped",
+    ];
+    let expected_header: Vec<String> = names
+        .iter()
+        .flat_map(|n| [format!("{n}(P)"), format!("{n}(C)")])
+        .collect();
+    assert_eq!(&header[at..at + 12], expected_header.as_slice(), "{stat}");
+    // No repartitions in this scenario: the counters close the header,
+    // which ends with the delimiter.
+    assert_eq!(&header[at + 12..], [""], "{stat}");
+    let last: Vec<&str> = stat.lines().last().expect("row").split(';').collect();
+    assert_eq!(last.len(), header.len(), "{stat}");
+    let cumulative: Vec<&str> = (0..6).map(|i| last[at + 2 * i + 1]).collect();
+    assert_eq!(cumulative, ["3", "3", "6", "3", "3", "0"], "{stat}");
+
+    let screens = read("_screens.log");
+    for (name, total) in [
+        ("invites", 3),
+        ("1234567", 3),
+        ("7", 6),
+        ("acks", 3),
+        ("jumper", 3),
+        ("skipped", 0),
+    ] {
+        let line = screens
+            .lines()
+            .find(|l| l.contains(&format!("Counter {name} ")))
+            .unwrap_or_else(|| panic!("no Counter {name} row:\n{screens}"));
+        assert!(
+            line.contains(&format!(" {total} cumulative")),
+            "{line}\n{screens}"
+        );
+    }
+
+    let snaps = std::fs::read_to_string(&json).expect("stats json");
+    let final_state = snaps.lines().last().expect("a snapshot");
+    assert!(
+        final_state.contains(r#"{"cumulative":6,"name":"7","periodic":"#),
+        "{final_state}"
+    );
+    assert!(
+        final_state.contains(r#"{"cumulative":0,"name":"skipped","periodic":0}"#),
+        "{final_state}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

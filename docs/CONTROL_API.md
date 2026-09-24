@@ -93,12 +93,19 @@ Statistics snapshot — SIPp's counter names, durations in `_ms`:
  "auto_answered":0,"unexpected":0,"garbage":0,
  "rtp_streams_started":0,"rtp_packets_sent":0,"rtp_bytes_sent":0,"rtp_bytes_received":0,
  "rtp_echo_packets":0,"rtp_echo2_packets":0,"rtp_check_ok":0,"rtp_check_failed":0,
+ "counters":[{"name":"reg-ok","periodic":10,"cumulative":117}],
  "rtd":[{"name":"1","count":117,"mean_ms":12.5,"stddev_ms":3.1,"p99_ms":22,"max_ms":40}],
  "call_length":{"count":117,"mean_ms":3010.2,"max_ms":3050},
  "response_time_repartition":[{"label":"<10","count":40}],
  "call_length_repartition":[],
  "steps":[{"label":"send INVITE","hidden":false,"sent":120,"recv":0,"retrans":0,"timeouts":0,"unexpected":0}]}
 ```
+
+`counters` are the scenario's generic counters (`counter=` on a message),
+in the order the scenario first names them: `periodic` is what each gained
+in the last refresh period (`-f`, one second by default, the snapshot's
+own tick), `cumulative` since the start (SIPp's statistics-screen
+columns). A scenario without `counter=` gives `[]`.
 
 The snapshot is the same object the TUI renders and the `-bg` stat line
 summarizes, so the three never disagree.
@@ -129,8 +136,13 @@ sipr_calls_failed_total{reason="recv_timeout"} 3
 sipr_messages_total{kind="retrans_sent"} 12
 sipr_calls_active 41
 sipr_rtd_seconds{rtd="1",stat="p99"} 0.020000
+sipr_scenario_counter_total{counter="reg-ok"} 19500
 sipr_step_messages_total{step="0",label="send INVITE",kind="sent"} 20000
 ```
+
+`sipr_scenario_counter_total` has one series per generic counter
+(`counter=`), cumulative only — a scraper takes rates itself; a scenario
+without counters has no such family.
 
 `step` is SIPp's message index: the number `[msg_index]` renders,
 `<jump value=>` takes and the `/scenario` dump shows. A `<label>` is not a

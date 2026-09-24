@@ -94,7 +94,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
 - SIPp-compatible XML scenarios: `send`/`recv`/`pause`/`nop`/`label`/`timewait`,
   the full v1 action set (`ereg` with capture groups, arithmetic, `test`/
   `strcmp`, `jump`, `log`/`warning`/`error`, `exec int_cmd`, ...), `test`/
-  `condexec` branching, `chance`, and named counters.
+  `condexec` branching, `chance`, and named counters (`counter=`, on the
+  statistics screen and in `-trace_stat` as in SIPp).
 - Keywords incl. `[call_id]`, `[branch]`, `[cseq]`, `[last_*:]`, `[$var]`,
   `[routes]`, `[peer_tag_param]`, `[len]`, `[fieldN]`, and `[authentication]`.
 - `-inf FILE` injection files (SEQUENTIAL/RANDOM/USER, and `PRINTF=` virtual

@@ -6,16 +6,15 @@
 //! writers are plain buffered writers owned by the same thread; a load run
 //! with `-trace_msg` enabled is expected to pay for its I/O (same as SIPp).
 //!
-//! CSV format: a pragmatic subset of SIPp's `-trace_stat` columns with
-//! SIPp-style `(P)`/`(C)` periodic/cumulative naming, semicolon-separated.
-//! Full column parity is a v1-polish item — recorded in SIPP_COMPAT §6.
+//! CSV format: SIPp's `-trace_stat` columns in SIPp's order, with its
+//! `(P)`/`(C)` periodic/cumulative naming (M40; SIPP_COMPAT §6).
 
 pub mod clock;
 mod histogram;
 mod snapshot;
 
 pub use histogram::{Histogram, Repartition};
-pub use snapshot::{Display, RtdRow, Snapshot, StepRow, StepStats};
+pub use snapshot::{CounterRow, Display, RtdRow, Snapshot, StepRow, StepStats};
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -127,6 +126,39 @@ pub struct StatSet {
     /// Buffered `-trace_rtt` rows: (seconds since start, rtt in seconds,
     /// rtd name).
     rtt_rows: Vec<(f64, f64, String)>,
+    /// The scenario's generic counters (`counter=`), in the order the
+    /// scenario first names them.
+    counters: Vec<GenericCounter>,
+    /// Each step's counter, as an index into `counters`, so a tick on the
+    /// per-message path is an index and not a name lookup.
+    step_counters: Vec<Option<usize>>,
+}
+
+/// One generic counter (SIPp `E_ADD_GENERIC_COUNTER`): a scenario-wide
+/// tally that every step naming it adds one to, whichever call runs it.
+#[derive(Debug, Clone)]
+struct GenericCounter {
+    /// The name as the scenario writes it.
+    name: String,
+    /// Ticks since the start of the run (SIPp `GENERIC_C`).
+    total: u64,
+    /// `total` at the last `-fd` dump: the `(P)` column is the difference
+    /// (SIPp resets its `GENERIC_PL` value after each dump).
+    at_dump: u64,
+    /// `total` at the last screen refresh: the screen's periodic value is
+    /// the difference (SIPp resets `GENERIC_PD` at each refresh).
+    at_display: u64,
+}
+
+impl GenericCounter {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            total: 0,
+            at_dump: 0,
+            at_display: 0,
+        }
+    }
 }
 
 /// What a scenario step is, for the `-trace_counts` columns.
@@ -256,16 +288,21 @@ impl StatSet {
             rtd_period: HashMap::new(),
             call_length_period: Histogram::new(),
             rtt_rows: Vec::new(),
+            counters: Vec::new(),
+            step_counters: Vec::new(),
         }
     }
 
     /// Zero every counter (SIPp's `set reset`), keeping the scenario-shaped
-    /// data: step labels, kinds and hide flags, RTD names, dump options.
+    /// data: step labels, kinds and hide flags, RTD and counter names, dump
+    /// options.
     pub fn reset(&mut self) {
         let labels = std::mem::take(&mut self.step_labels);
         let hidden = std::mem::take(&mut self.step_hidden);
         let kinds = std::mem::take(&mut self.step_kinds);
         let rtd_names = std::mem::take(&mut self.rtd_names);
+        let counters = std::mem::take(&mut self.counters);
+        let step_counters = std::mem::take(&mut self.step_counters);
         let dump = self.dump.clone();
         let response_bounds = self.response_repartition.bounds();
         let call_length_bounds = self.call_length_repartition.bounds();
@@ -274,6 +311,11 @@ impl StatSet {
         self.step_hidden = hidden;
         self.step_kinds = kinds;
         self.rtd_names = rtd_names;
+        self.counters = counters
+            .into_iter()
+            .map(|c| GenericCounter::new(c.name))
+            .collect();
+        self.step_counters = step_counters;
         self.dump = dump;
     }
 
@@ -364,6 +406,56 @@ impl StatSet {
         self.step_kinds = kinds;
     }
 
+    /// Each step's `counter=` name, in step order. Registers the counters
+    /// in the order the scenario first names them, which is the order of
+    /// their screen rows and CSV columns (SIPp `findCounter`, called as the
+    /// scenario loads), and maps each step to its counter.
+    pub fn set_step_counters(&mut self, per_step: Vec<Option<String>>) {
+        self.counters.clear();
+        self.step_counters = per_step
+            .into_iter()
+            .map(|name| {
+                let name = name?;
+                let id = match self.counters.iter().position(|c| c.name == name) {
+                    Some(id) => id,
+                    None => {
+                        self.counters.push(GenericCounter::new(name));
+                        self.counters.len() - 1
+                    }
+                };
+                Some(id)
+            })
+            .collect();
+    }
+
+    /// Step `step` ran: add one to its counter, if it names one (SIPp
+    /// `do_bookkeeping`). Out-of-range steps are ignored.
+    pub fn tick_counter(&mut self, step: usize) {
+        if let Some(Some(id)) = self.step_counters.get(step)
+            && let Some(counter) = self.counters.get_mut(*id)
+        {
+            counter.total += 1;
+        }
+    }
+
+    /// Counter `name`'s value since the start of the run; `None` when the
+    /// scenario names no such counter.
+    #[must_use]
+    pub fn counter(&self, name: &str) -> Option<u64> {
+        self.counters
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.total)
+    }
+
+    /// Start a new screen period (SIPp `E_RESET_PD_COUNTERS`, run at every
+    /// screen refresh): the counters' periodic values restart from zero.
+    pub fn end_display_period(&mut self) {
+        for c in &mut self.counters {
+            c.at_display = c.total;
+        }
+    }
+
     fn counters(&self) -> Counters {
         Counters {
             incoming: self.incoming_created,
@@ -392,6 +484,9 @@ impl StatSet {
         self.period_start = Instant::now();
         self.rtd_period.clear();
         self.call_length_period = Histogram::new();
+        for c in &mut self.counters {
+            c.at_dump = c.total;
+        }
         if self.dump.periodic_rtd {
             self.response_repartition.reset();
             self.call_length_repartition.reset();
@@ -450,8 +545,9 @@ impl StatSet {
 
     /// The `-trace_stat` header: SIPp's `CStat::dumpData` columns in its
     /// order — the fixed counter set, `ResponseTime<rtd>` mean and standard
-    /// deviation per RTD, `CallLength`, then a repartition block per RTD and
-    /// for the call length (each a name column plus `_<b` … `_>=last`).
+    /// deviation per RTD, `CallLength`, a `(P)`/`(C)` pair per generic
+    /// counter, then a repartition block per RTD and for the call length
+    /// (each a name column plus `_<b` … `_>=last`).
     #[must_use]
     pub fn csv_header(&self) -> String {
         let d = self.dump.delimiter.as_str();
@@ -479,6 +575,10 @@ impl StatSet {
         ] {
             out.push_str(col);
             out.push_str(d);
+        }
+        for c in &self.counters {
+            let name = csv_counter_name(&c.name);
+            let _ = write!(out, "{name}(P){d}{name}(C){d}");
         }
         let response_bounds = self.response_repartition.bounds();
         for rtd in &self.rtd_names {
@@ -574,6 +674,9 @@ impl StatSet {
         cols.push(hhmmss_us(self.call_length.mean_ms()));
         cols.push(hhmmss_us(self.call_length_period.stddev_ms()));
         cols.push(hhmmss_us(self.call_length.stddev_ms()));
+        for c in &self.counters {
+            pc(&mut cols, c.total, c.at_dump);
+        }
         let mut out = cols.join(d);
         out.push_str(d);
         let response_bounds = self.response_repartition.bounds();
@@ -809,6 +912,20 @@ const CSV_FIXED_COLUMNS: &[&str] = &[
     "WatchdogMinor(P)",
     "WatchdogMinor(C)",
 ];
+
+/// A generic counter's `-trace_stat` column name (SIPp `findCounter`): the
+/// name as written, or `GenericCounter<name>` for an all-digit one — cut
+/// to 19 characters, as SIPp formats it into a 20-byte buffer, so
+/// `counter="123456"` heads `GenericCounter12345`.
+fn csv_counter_name(name: &str) -> String {
+    const SIPP_BUFFER_CHARS: usize = 19;
+    if !name.bytes().all(|b| b.is_ascii_digit()) {
+        return name.to_owned();
+    }
+    let mut column = format!("GenericCounter{name}");
+    column.truncate(SIPP_BUFFER_CHARS);
+    column
+}
 
 /// SIPp `sRepartitionHeader`: `Name;Name_<b0;…;Name_<bn;Name_>=bn;` — the
 /// name column, one `<bound` column per bound, one `>=last`. Empty
@@ -1255,6 +1372,102 @@ mod tests {
         s.end_period();
         assert_eq!(s.response_repartition.rows()[0].1, 0);
         assert_eq!(s.rtd_repartitions["1"].rows()[0].1, 0);
+    }
+
+    /// Steps 0 and 2 share `reg`, step 1 names `7`, step 3 names none.
+    fn counting_stat_set() -> StatSet {
+        let mut s = StatSet::new(&[], &[500]);
+        s.set_step_counters(vec![
+            Some("reg".to_owned()),
+            Some("7".to_owned()),
+            Some("reg".to_owned()),
+            None,
+        ]);
+        s
+    }
+
+    #[test]
+    fn counters_are_scenario_wide_and_named_in_first_mention_order() {
+        let mut s = counting_stat_set();
+        for step in [0, 2, 2, 1, 3, 99] {
+            s.tick_counter(step);
+        }
+        assert_eq!(s.counter("reg"), Some(3), "steps 0 and 2 share it");
+        assert_eq!(s.counter("7"), Some(1));
+        assert_eq!(s.counter("other"), None);
+        let mut snap = Snapshot::default();
+        s.fill_snapshot(&mut snap, 0);
+        let names: Vec<&str> = snap.counters.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["reg", "7"]);
+        // `reset stats` zeroes the values and keeps the counters.
+        s.reset();
+        assert_eq!(s.counter("reg"), Some(0));
+        s.tick_counter(2);
+        assert_eq!(s.counter("reg"), Some(1));
+    }
+
+    #[test]
+    fn counters_periodic_value_restarts_at_each_screen_refresh() {
+        let mut s = counting_stat_set();
+        s.tick_counter(0);
+        s.tick_counter(0);
+        let mut snap = Snapshot::default();
+        s.fill_snapshot(&mut snap, 0);
+        assert_eq!(
+            (snap.counters[0].periodic, snap.counters[0].cumulative),
+            (2, 2)
+        );
+        s.end_display_period();
+        s.tick_counter(2);
+        s.fill_snapshot(&mut snap, 0);
+        assert_eq!(
+            (snap.counters[0].periodic, snap.counters[0].cumulative),
+            (1, 3)
+        );
+        // The screen period and the `-fd` dump period are separate clocks.
+        let row = s.csv_row(0, 1.0, None);
+        let cols: Vec<&str> = row.split(';').collect();
+        assert_eq!(&cols[72..76], &["3", "3", "0", "0"], "{row}");
+    }
+
+    #[test]
+    fn counters_take_csv_columns_after_the_call_length() {
+        let mut s = counting_stat_set();
+        s.tick_counter(0);
+        s.tick_counter(1);
+        let header = s.csv_header();
+        let cols: Vec<&str> = header.split(';').collect();
+        // No RTDs: the call length takes columns 68-71.
+        assert_eq!(cols[71], "CallLengthStDev(C)");
+        assert_eq!(
+            &cols[72..77],
+            &[
+                "reg(P)",
+                "reg(C)",
+                "GenericCounter7(P)",
+                "GenericCounter7(C)",
+                "CallLengthRepartition"
+            ]
+        );
+        let row = s.csv_row(0, 1.0, None);
+        let vals: Vec<&str> = row.split(';').collect();
+        assert_eq!(vals.len(), cols.len(), "{header}{row}");
+        assert_eq!(&vals[72..76], &["1", "1", "1", "1"]);
+        // `(P)` is since the last dump, `(C)` since the start.
+        s.end_period();
+        s.tick_counter(2);
+        let row = s.csv_row(0, 1.0, None);
+        let vals: Vec<&str> = row.split(';').collect();
+        assert_eq!(&vals[72..76], &["1", "2", "0", "1"], "{row}");
+    }
+
+    #[test]
+    fn numeric_counter_columns_are_cut_like_sipps_buffer() {
+        assert_eq!(csv_counter_name("reg-ok"), "reg-ok");
+        assert_eq!(csv_counter_name("12"), "GenericCounter12");
+        assert_eq!(csv_counter_name("12345"), "GenericCounter12345");
+        assert_eq!(csv_counter_name("1234567"), "GenericCounter12345");
+        assert_eq!(csv_counter_name("12a"), "12a");
     }
 
     #[test]

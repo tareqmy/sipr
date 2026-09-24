@@ -54,6 +54,19 @@ pub struct RtdRow {
     pub max_ms: u64,
 }
 
+/// One generic counter (`counter=`) for the statistics screen: SIPp's
+/// `Counter <name>` row with its periodic and cumulative values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterRow {
+    /// The name as the scenario writes it.
+    pub name: String,
+    /// Ticks since the last screen refresh, which comes every `-f`
+    /// (SIPp's periodic value).
+    pub periodic: u64,
+    /// Ticks since the start of the run.
+    pub cumulative: u64,
+}
+
 /// Which scenario the screens show (SIPp `display_scenario`, switched with
 /// `set display main|ooc|rx`). Every counter in the snapshot — the main
 /// screen, the statistics and repartition screens and the scenario page —
@@ -157,6 +170,8 @@ pub struct Snapshot {
     pub rtp_check_ok: u64,
     /// RTP checks failed.
     pub rtp_check_failed: u64,
+    /// The scenario's generic counters, in the order it first names them.
+    pub counters: Vec<CounterRow>,
     /// RTD summaries, sorted by name.
     pub rtds: Vec<RtdRow>,
     /// Call-length summary (count, mean ms, max ms).
@@ -234,6 +249,15 @@ impl crate::StatSet {
         snap.response_rows = self.response_repartition.rows();
         snap.call_length_rows = self.call_length_repartition.rows();
         snap.steps = self.step_rows();
+        snap.counters = self
+            .counters
+            .iter()
+            .map(|c| CounterRow {
+                name: c.name.clone(),
+                periodic: c.total.saturating_sub(c.at_display),
+                cumulative: c.total,
+            })
+            .collect();
     }
 
     /// The per-step rows of the scenario screen.

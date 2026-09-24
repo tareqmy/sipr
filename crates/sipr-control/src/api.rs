@@ -233,6 +233,17 @@ pub fn snapshot_json(s: &Snapshot) -> Json {
                 .collect(),
         )
     };
+    let counters = s
+        .counters
+        .iter()
+        .map(|c| {
+            object([
+                ("name", text(c.name.clone())),
+                ("periodic", num_u64(c.periodic)),
+                ("cumulative", num_u64(c.cumulative)),
+            ])
+        })
+        .collect();
     let steps = s
         .steps
         .iter()
@@ -285,6 +296,7 @@ pub fn snapshot_json(s: &Snapshot) -> Json {
         ("rtp_echo2_packets", num_u64(s.rtp_echo2_packets)),
         ("rtp_check_ok", num_u64(s.rtp_check_ok)),
         ("rtp_check_failed", num_u64(s.rtp_check_failed)),
+        ("counters", Json::Array(counters)),
         ("rtd", Json::Array(rtds)),
         (
             "call_length",
@@ -397,6 +409,36 @@ mod tests {
         // No token: refused, like the other guarded paths.
         let (st, _) = call(a, "GET /metrics HTTP/1.1\r\n\r\n");
         assert_eq!(st, 401);
+    }
+
+    /// `/stats` carries the generic counters in the scenario's order, each
+    /// with its periodic and cumulative value; none gives an empty list.
+    #[test]
+    fn stats_document_lists_the_generic_counters() {
+        let empty = snapshot_json(&Snapshot::default());
+        assert_eq!(empty.get("counters").unwrap().to_string(), "[]");
+        let snap = Snapshot {
+            counters: vec![
+                sipr_stats::CounterRow {
+                    name: "reg-ok".into(),
+                    periodic: 2,
+                    cumulative: 40,
+                },
+                sipr_stats::CounterRow {
+                    name: "7".into(),
+                    periodic: 0,
+                    cumulative: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let doc = snapshot_json(&snap);
+        // The JSON writer sorts object keys; the array keeps its order.
+        assert_eq!(
+            doc.get("counters").unwrap().to_string(),
+            "[{\"cumulative\":40,\"name\":\"reg-ok\",\"periodic\":2},\
+             {\"cumulative\":1,\"name\":\"7\",\"periodic\":0}]"
+        );
     }
 
     #[test]

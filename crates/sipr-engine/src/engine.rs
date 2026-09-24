@@ -720,8 +720,6 @@ struct CallState {
     store: crate::actions::VarStore,
     /// One slot per manual transaction of the call's scenario.
     txns: Vec<TxnInstance>,
-    /// Named counters (`counter` step attribute).
-    counters: std::collections::HashMap<String, u64>,
     /// Stable client nonce for digest auth.
     cnonce: String,
     /// Pending digest challenge captured by a `recv auth="true"`.
@@ -2215,6 +2213,10 @@ impl<'s> Engine<'s> {
                     eprintln!("sipr: {}", self.stats.line(self.live_main()));
                 }
                 self.publish_snapshot();
+                // SIPp `screentask`: every refresh resets the displayed
+                // scenario's periodic (PD) values, shown or not, so a
+                // counter's periodic value covers one `-f` period.
+                self.stats_of(self.display_secondary).end_display_period();
             }
             if last_stat_dump.elapsed() >= self.config.stat_interval {
                 last_stat_dump = Instant::now();
@@ -3154,6 +3156,7 @@ impl<'s> Engine<'s> {
             }
             match step {
                 Step::Send(send) => {
+                    self.book_counter(call_id, index);
                     let first = template_first_word(&send.template).unwrap_or_default();
                     let is_req = first != "SIP/2.0";
                     let method_is_new_txn = is_req && first != "ACK" && first != "CANCEL";
@@ -3203,7 +3206,7 @@ impl<'s> Engine<'s> {
                     self.trace_send(&buf, remote);
                     let retrans_ms = send.retrans_ms;
                     let lost_pct = send.lost_pct.or(self.config.lost);
-                    let jump = self.jump_target(&send.common, index, call_id);
+                    let jump = self.next_step(&send.common, index, call_id);
                     let now = Instant::now();
                     let common = send.common.clone();
                     let Some(call) = self.calls.get_mut(call_id) else {
@@ -3286,7 +3289,8 @@ impl<'s> Engine<'s> {
                 }
                 Step::Pause { spec, common } => {
                     let dur = self.sample_pause(spec, call_id);
-                    let jump = self.jump_target(common, index, call_id);
+                    self.book_counter(call_id, index);
+                    let jump = self.next_step(common, index, call_id);
                     // SIPp `curmsg->sessions++` on entering the pause.
                     if let Some(s) = self.call_stats(call_id).step_mut(index) {
                         s.sessions += 1;
@@ -3309,13 +3313,14 @@ impl<'s> Engine<'s> {
                     return;
                 }
                 Step::Nop { common, actions } => {
+                    self.book_counter(call_id, index);
                     if !actions.is_empty() && self.run_step_actions(call_id, actions, index) {
                         return;
                     }
                     // A jump action may have moved us; only advance if not.
                     let moved = self.calls.get(call_id).is_some_and(|c| c.index != index);
                     if !moved {
-                        let jump = self.jump_target(common, index, call_id);
+                        let jump = self.next_step(common, index, call_id);
                         if let Some(call) = self.calls.get_mut(call_id) {
                             call.index = jump;
                         }
@@ -3353,7 +3358,8 @@ impl<'s> Engine<'s> {
                     if let Some(s) = self.call_stats(call_id).step_mut(index) {
                         s.sent += 1;
                     }
-                    let jump = self.jump_target(common, index, call_id);
+                    self.book_counter(call_id, index);
+                    let jump = self.next_step(common, index, call_id);
                     if let Some(call) = self.calls.get_mut(call_id) {
                         call.index = jump;
                     }
@@ -3410,13 +3416,16 @@ impl<'s> Engine<'s> {
         self.advance(call_id);
     }
 
-    /// Where execution goes after `index` finishes (see [`Self::next_step`]),
-    /// ticking the step's counter on the way.
-    fn jump_target(&mut self, common: &StepCommon, index: usize, call_id: &str) -> usize {
-        if let Some(call) = self.calls.get_mut(call_id) {
-            tick_counter(call, common);
+    /// SIPp `do_bookkeeping`'s counter: step `index` ran for this call, so
+    /// its `counter=`, if any, adds one on the scenario's stat set, which
+    /// every call of the scenario shares. SIPp books a step before its
+    /// actions run (a nop, a recvCmd) and before a send is built, so a step
+    /// whose action jumps away, or whose send fails, still counts.
+    fn book_counter(&mut self, call_id: &str, index: usize) {
+        if let Some(call) = self.calls.get(call_id) {
+            let secondary = call.secondary;
+            self.stats_of(secondary).tick_counter(index);
         }
-        self.next_step(common, index, call_id)
     }
 
     /// SIPp `next()` (`call.cpp` ~l.1920): the step's `next` when its `test`
@@ -3885,13 +3894,9 @@ impl<'s> Engine<'s> {
         let on_secondary = call.secondary;
         // SIPp `do_bookkeeping`: RTDs and the counter, whether or not the
         // match moves the call on.
-        apply_rtds(
-            call,
-            stats_for(&mut self.stats, self.secondary.as_mut(), on_secondary),
-            &common,
-            now,
-        );
-        tick_counter(call, &common);
+        let stats = stats_for(&mut self.stats, self.secondary.as_mut(), on_secondary);
+        apply_rtds(call, stats, &common, now);
+        stats.tick_counter(si);
         call.last_recv_key = Some(key);
         if has_media && !ignore_sdp {
             learn_remote_media(call, msg);
@@ -4760,12 +4765,13 @@ impl<'s> Engine<'s> {
         if let Some(s) = self.call_stats(call_id).step_mut(index) {
             s.recv += 1;
         }
+        self.book_counter(call_id, index);
         if !actions.is_empty() && self.run_step_actions_inner(call_id, actions, index, Some(cmd)) {
             return true; // actions jumped/failed/stopped
         }
         let moved = self.calls.get(call_id).is_some_and(|c| c.index != index);
         if !moved {
-            let jump = self.jump_target(common, index, call_id);
+            let jump = self.next_step(common, index, call_id);
             if let Some(call) = self.calls.get_mut(call_id) {
                 call.index = jump;
             }
@@ -6160,7 +6166,6 @@ fn new_call(
         field_lines,
         store,
         txns,
-        counters: std::collections::HashMap::new(),
         cnonce,
         challenge: None,
         peer_tag: None,
@@ -6198,6 +6203,13 @@ fn new_stat_set(scenario: &Scenario) -> sipr_stats::StatSet {
     stats.init_steps(scenario.steps.iter().map(step_label).collect());
     stats.set_rtd_names(rtd_names(scenario));
     stats.set_step_kinds(scenario.steps.iter().map(step_kind).collect());
+    stats.set_step_counters(
+        scenario
+            .steps
+            .iter()
+            .map(|s| step_common(s).and_then(|c| c.counter.clone()))
+            .collect(),
+    );
     stats.set_step_hidden(
         scenario
             .steps
@@ -6219,13 +6231,6 @@ fn stats_for<'a>(
     match secondary {
         Some(o) if on_secondary => &mut o.stats,
         _ => main,
-    }
-}
-
-/// A step's named counter (`counter=`) ticks when the step executes.
-fn tick_counter(call: &mut CallState, common: &StepCommon) {
-    if let Some(name) = &common.counter {
-        *call.counters.entry(name.clone()).or_insert(0) += 1;
     }
 }
 

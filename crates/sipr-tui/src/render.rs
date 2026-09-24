@@ -184,6 +184,10 @@ fn render_main(snap: &Snapshot, pal: &Palette) -> Vec<String> {
         ));
     }
     out.push(String::new());
+    if !snap.counters.is_empty() {
+        out.extend(counter_lines(snap, pal));
+        out.push(String::new());
+    }
     for r in &snap.rtds {
         let tag = pal.paint(pal.label, &format!("RTD {:<4}", r.name));
         out.push(format!(
@@ -198,6 +202,23 @@ fn render_main(snap: &Snapshot, pal: &Palette) -> Vec<String> {
         ));
     }
     out
+}
+
+/// The scenario's generic counters (`counter=`), one row each as on SIPp's
+/// statistics screen: `Counter <name>` in a 22-character field, then the
+/// value since the last refresh and the value since the start.
+fn counter_lines(snap: &Snapshot, pal: &Palette) -> Vec<String> {
+    snap.counters
+        .iter()
+        .map(|c| {
+            let label = truncate(&format!("Counter {}", c.name), 22);
+            let label = pal.paint(pal.label, &format!("{label:<22}"));
+            format!(
+                "  {label} {:>8} periodic   {:>8} cumulative",
+                c.periodic, c.cumulative
+            )
+        })
+        .collect()
 }
 
 fn render_scenario(snap: &Snapshot, pal: &Palette) -> Vec<String> {
@@ -273,7 +294,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sipr_stats::{RtdRow, StepRow, StepStats};
+    use sipr_stats::{CounterRow, RtdRow, StepRow, StepStats};
 
     fn snap() -> Snapshot {
         Snapshot {
@@ -390,6 +411,35 @@ mod tests {
         assert_eq!(Screen::from_digit(2), Some(Screen::Main));
         assert_eq!(Screen::from_digit(3), Some(Screen::Repartition));
         assert_eq!(Screen::from_digit(4), None);
+    }
+
+    #[test]
+    fn statistics_screen_lists_the_generic_counters() {
+        let quiet = render(&snap(), Screen::Main).join("\n");
+        assert!(!quiet.contains("Counter"), "{quiet}");
+        let mut s = snap();
+        s.counters = vec![
+            CounterRow {
+                name: "reg-ok".into(),
+                periodic: 3,
+                cumulative: 120,
+            },
+            CounterRow {
+                name: "a-very-long-counter-name".into(),
+                periodic: 0,
+                cumulative: 7,
+            },
+        ];
+        let lines = render(&s, Screen::Main);
+        let reg = lines.iter().find(|l| l.contains("Counter reg-ok")).unwrap();
+        assert!(reg.contains("3 periodic"), "{reg}");
+        assert!(reg.contains("120 cumulative"), "{reg}");
+        // SIPp's 22-character label field.
+        let long = lines.iter().find(|l| l.contains("Counter a-very")).unwrap();
+        assert!(long.contains("Counter a-very-long-c…"), "{long}");
+        // The counters come before the response times, as in SIPp.
+        let at = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap();
+        assert!(at("Counter reg-ok") < at("RTD 1"));
     }
 
     #[test]

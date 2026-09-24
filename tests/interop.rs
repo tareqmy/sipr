@@ -5599,3 +5599,195 @@ fn a_matched_recv_branches_like_real_sipp() {
         );
     }
 }
+
+// ---- generic counters (`counter=`) -------------------------------------
+
+/// A UAC whose steps name counters (mirrored in `tests/e2e.rs`), in
+/// first-mention order: `invites` (the INVITE), `1234567` (the 180, a
+/// numeric name longer than SIPp's column buffer), `7` (the 200 and the
+/// pause, shared), `acks`, `jumper` (a nop whose `<jump>` skips the next
+/// message) and `skipped` (that message, which never runs). Per call:
+/// 1, 1, 2, 1, 1, 0.
+fn counters_uac_xml() -> &'static str {
+    r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="counters">
+  <send retrans="500" counter="invites"><![CDATA[
+      INVITE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:uac@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:svc@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:uac@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]></send>
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true" counter="1234567"/>
+  <recv response="200" counter="7"/>
+  <send counter="acks"><![CDATA[
+      ACK sip:svc@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:uac@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: <sip:uac@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]></send>
+  <nop counter="jumper">
+    <action><jump value="7"/></action>
+  </nop>
+  <nop counter="skipped"/>
+  <pause milliseconds="50" counter="7"/>
+  <send retrans="500"><![CDATA[
+      BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:uac@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:svc@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Contact: <sip:uac@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]></send>
+  <recv response="200"/>
+</scenario>
+"#
+}
+
+/// Run `counters_uac_xml()` for 3 calls on `uac_bin` with `-trace_stat`
+/// and `-trace_screen` against `uas_bin -sn uas`, in a fresh directory;
+/// return the directory and the UAC's exit code.
+fn run_counters_uac(
+    uas_bin: &std::path::Path,
+    uac_bin: &std::path::Path,
+    tag: &str,
+) -> (std::path::PathBuf, Option<i32>) {
+    let dir = std::env::temp_dir().join(format!(
+        "sipr-interop-counters-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let scenario = dir.join("counters.xml");
+    std::fs::write(&scenario, counters_uac_xml()).expect("write scenario");
+    let port = free_port();
+    let mut uas = Reaper(
+        Command::new(uas_bin)
+            .current_dir(&dir)
+            .args(["-sn", "uas", "-i", "127.0.0.1", "-p", &port.to_string()])
+            .args(["-m", "3", "-timeout", "30", "-nostdin"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let mut uac = Command::new(uac_bin);
+    uac.current_dir(&dir)
+        .arg("-sf")
+        .arg(&scenario)
+        .args(["-i", "127.0.0.1", "-r", "10", "-m", "3", "-timeout", "20"])
+        .args(["-trace_stat", "-trace_screen", "-nostdin"]);
+    // sipp's `-bg` forks and the parent exits at once (docs/TESTING.md):
+    // real sipp runs in the foreground with its screen on a null stdout.
+    if uac_bin == std::path::Path::new(env!("CARGO_BIN_EXE_sipr")) {
+        uac.arg("-bg");
+    }
+    let mut uac = Reaper(
+        uac.arg(format!("127.0.0.1:{port}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uac"),
+    );
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    let _ = wait_with_timeout(&mut uas.0, Duration::from_secs(15));
+    (dir, code)
+}
+
+/// The file in `dir` whose name ends with `suffix`.
+fn read_file_ending(dir: &std::path::Path, suffix: &str) -> String {
+    let name = std::fs::read_dir(dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.ends_with(suffix))
+        .unwrap_or_else(|| panic!("no *{suffix} in {}", dir.display()));
+    std::fs::read_to_string(dir.join(name)).expect("read")
+}
+
+/// The `(C)` values of the six counters in the last `-trace_stat` row,
+/// found by their header names.
+fn final_counter_values(stat: &str) -> Vec<String> {
+    let header: Vec<&str> = stat.lines().next().expect("header").split(';').collect();
+    let last: Vec<&str> = stat.lines().last().expect("row").split(';').collect();
+    assert_eq!(last.len(), header.len(), "row width:\n{stat}");
+    [
+        "invites(C)",
+        "GenericCounter12345(C)",
+        "GenericCounter7(C)",
+        "acks(C)",
+        "jumper(C)",
+        "skipped(C)",
+    ]
+    .iter()
+    .map(|name| {
+        let at = header
+            .iter()
+            .position(|c| c == name)
+            .unwrap_or_else(|| panic!("no {name} column:\n{stat}"));
+        last[at].to_owned()
+    })
+    .collect()
+}
+
+/// Generic counters at parity (SIPp `E_ADD_GENERIC_COUNTER`): sipr and real
+/// sipp run the same UAC, and their `-trace_stat` headers are byte-for-byte
+/// equal — the counters' `(P)`/`(C)` pairs after `CallLengthStDev`, in
+/// first-mention order, `GenericCounter<n>` for a numeric name cut at 19
+/// characters, a counter that never runs included. The final rows agree on
+/// every counter, and a nop books its counter before its `<jump>` action.
+/// Both statistics screens (`-trace_screen`) list a `Counter <name>` row.
+#[test]
+fn generic_counters_match_real_sipps_statistics() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::generic_counters_match_real_sipps_statistics — no sipp.");
+        return;
+    };
+    let sipr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let (sipr_dir, sipr_code) = run_counters_uac(&sipp, &sipr, "sipr");
+    let (sipp_dir, sipp_code) = run_counters_uac(&sipr, &sipp, "sipp");
+    assert_eq!(sipp_code, Some(0), "real sipp's uac");
+    assert_eq!(sipr_code, Some(0), "sipr's uac");
+    let ours = read_file_ending(&sipr_dir, "_.csv");
+    let theirs = read_file_ending(&sipp_dir, "_.csv");
+    assert_eq!(
+        ours.lines().next(),
+        theirs.lines().next(),
+        "-trace_stat header"
+    );
+    // Pin what real sipp counts, so the comparison cannot pass vacuously.
+    let expected = ["3", "3", "6", "3", "3", "0"];
+    assert_eq!(final_counter_values(&theirs), expected, "sipp:\n{theirs}");
+    assert_eq!(final_counter_values(&ours), expected, "sipr:\n{ours}");
+    for (dir, who) in [(&sipp_dir, "sipp"), (&sipr_dir, "sipr")] {
+        // The screen dump, the only log file either run writes.
+        let screens = read_file_ending(dir, ".log");
+        for name in ["invites", "1234567", "7", "acks", "jumper", "skipped"] {
+            assert!(
+                screens.contains(&format!("Counter {name} ")),
+                "{who}: no Counter {name} row:\n{screens}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&sipr_dir);
+    let _ = std::fs::remove_dir_all(&sipp_dir);
+}
