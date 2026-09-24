@@ -26,5 +26,6 @@
 
 - [Implementation plan](plan.md)
 - [Milestones and acceptance criteria](MILESTONES.md)
+- [Follow-up tasks](FOLLOWUPS.md)
 - [Changelog](changelog.md)
 - [Security policy](security.md)
