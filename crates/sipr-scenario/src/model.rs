@@ -359,9 +359,11 @@ pub enum Operand {
 /// The destination of a `<jump>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JumpTarget {
-    /// `value="N"`: absolute step index.
+    /// `value="N"`: the step that runs SIPp message N, resolved at compile
+    /// time (`steps.len()` when N is the message count: the call ends).
     Index(StepIndex),
-    /// `variable="v"`: the step index held in `v` at execution time.
+    /// `variable="v"`: the SIPp message index held in `v` at execution
+    /// time, mapped to a step with [`Scenario::step_of_message`].
     Var(VarId),
 }
 
@@ -674,6 +676,55 @@ pub enum Action {
     },
 }
 
+/// SIPp numbers messages, not steps. A `<label>` is a step here (the
+/// scenario screen and the lints place it) but not a message in SIPp, where
+/// a label names the index of the message after it (`scenario.cpp`
+/// `labelMap[id] = messages.size()`). Every index a scenario or its output
+/// speaks — `<jump value=|variable=>`, `[msg_index]`, `[branch]`,
+/// `_unexp.retaddr`, the `-trace_counts` columns — is a message index.
+#[derive(Debug, Clone)]
+pub(crate) struct MessageNumbering {
+    /// The message index of each step; a label gets the next message's.
+    of_step: Vec<usize>,
+    /// The step of each message, then `steps.len()` for one past the last.
+    step_of: Vec<StepIndex>,
+}
+
+impl MessageNumbering {
+    pub(crate) fn new(steps: &[Step]) -> Self {
+        let mut of_step = Vec::with_capacity(steps.len());
+        let mut step_of = Vec::with_capacity(steps.len() + 1);
+        for (index, step) in steps.iter().enumerate() {
+            of_step.push(step_of.len());
+            if !matches!(step, Step::Label { .. }) {
+                step_of.push(index);
+            }
+        }
+        step_of.push(steps.len());
+        Self { of_step, step_of }
+    }
+
+    /// How many messages the scenario has.
+    pub(crate) fn count(&self) -> usize {
+        self.step_of.len() - 1
+    }
+
+    /// The message index of `step`; past the last step, the message count.
+    pub(crate) fn message_index(&self, step: StepIndex) -> usize {
+        self.of_step
+            .get(step)
+            .copied()
+            .unwrap_or_else(|| self.count())
+    }
+
+    /// The step that runs message `index`. The message count itself maps
+    /// to one past the last step: SIPp accepts a jump there, and the call
+    /// ends. Anything beyond is `None`.
+    pub(crate) fn step(&self, index: usize) -> Option<StepIndex> {
+        self.step_of.get(index).copied()
+    }
+}
+
 /// A compiled scenario.
 #[derive(Debug, Clone)]
 pub struct Scenario {
@@ -695,14 +746,38 @@ pub struct Scenario {
     /// unexpected-message handler (`scenario.cpp` `unexpected_jump`).
     pub unexpected_jump: Option<StepIndex>,
     /// `_unexp.retaddr`, when the scenario mentions it: receives the
-    /// interrupted step index on an `_unexp.main` jump.
+    /// interrupted step's message index on an `_unexp.main` jump.
     pub unexp_retaddr: Option<VarId>,
     /// `_unexp.pausedaddr`, when mentioned: receives the interrupted pause's
     /// deadline (ms since start, 0 = no pause) on an `_unexp.main` jump.
     pub unexp_pausedaddr: Option<VarId>,
+    /// SIPp's message numbering of `steps`.
+    pub(crate) numbering: MessageNumbering,
 }
 
 impl Scenario {
+    /// SIPp's message index of `step` — the number `[msg_index]`,
+    /// `[branch]` and `_unexp.retaddr` carry. Labels are not messages: one
+    /// shares the index of the message after it.
+    #[must_use]
+    pub fn message_index(&self, step: StepIndex) -> usize {
+        self.numbering.message_index(step)
+    }
+
+    /// The step that runs SIPp message `index` (a `jump variable=` target).
+    /// The message count maps to `steps.len()` — a jump past the last
+    /// message, which SIPp accepts and which ends the call; `None` beyond.
+    #[must_use]
+    pub fn step_of_message(&self, index: usize) -> Option<StepIndex> {
+        self.numbering.step(index)
+    }
+
+    /// How many messages (steps other than labels) the scenario has.
+    #[must_use]
+    pub fn message_count(&self) -> usize {
+        self.numbering.count()
+    }
+
     /// Every action of every step, in step order.
     pub fn all_actions(&self) -> impl Iterator<Item = &Action> {
         self.steps.iter().flat_map(|step| match step {
@@ -784,9 +859,9 @@ impl Scenario {
         };
         let _ = writeln!(
             out,
-            "scenario '{}': role={role}, {} steps, {} variables",
+            "scenario '{}': role={role}, {} messages, {} variables",
             self.name,
-            self.steps.len(),
+            self.message_count(),
             self.vars.len()
         );
         for scope in [VarScope::User, VarScope::Global] {
@@ -827,7 +902,7 @@ impl Scenario {
                     if !s.actions.is_empty() {
                         let _ = write!(extra, " actions={}", s.actions.len());
                     }
-                    format!("send{extra}{}: {first}", common_suffix(&s.common))
+                    format!("send{extra}{}: {first}", self.common_suffix(&s.common))
                 }
                 Step::Recv(r) => {
                     let what = match &r.expect {
@@ -851,12 +926,12 @@ impl Scenario {
                         let _ = write!(extra, " timeout={t}ms");
                     }
                     if let Some(d) = r.ontimeout {
-                        let _ = write!(extra, " ontimeout->{d}");
+                        let _ = write!(extra, " ontimeout->{}", self.message_index(d));
                     }
                     if !r.actions.is_empty() {
                         let _ = write!(extra, " actions={}", r.actions.len());
                     }
-                    format!("recv {what}{extra}{}", common_suffix(&r.common))
+                    format!("recv {what}{extra}{}", self.common_suffix(&r.common))
                 }
                 Step::Pause { spec, common } => {
                     let what = match spec {
@@ -867,16 +942,20 @@ impl Scenario {
                             format!("{} {}", d.kind(), d.describe())
                         }
                     };
-                    format!("pause {what}{}", common_suffix(common))
+                    format!("pause {what}{}", self.common_suffix(common))
                 }
                 Step::Nop { actions, common } => {
-                    format!("nop actions={}{}", actions.len(), common_suffix(common))
+                    format!(
+                        "nop actions={}{}",
+                        actions.len(),
+                        self.common_suffix(common)
+                    )
                 }
                 Step::SendCmd { common, dest, .. } => format!(
                     "sendCmd (3pcc){}{}",
                     dest.as_ref()
                         .map_or(String::new(), |d| format!(" dest={d}")),
-                    common_suffix(common)
+                    self.common_suffix(common)
                 ),
                 Step::RecvCmd {
                     actions,
@@ -888,32 +967,40 @@ impl Scenario {
                     src.as_ref().map_or(String::new(), |s| format!(" src={s}")),
                     actions.len(),
                     if *optional { " optional" } else { "" },
-                    common_suffix(common)
+                    self.common_suffix(common)
                 ),
                 Step::Label { id, .. } => format!("label '{id}'"),
                 Step::Timewait { ms, .. } => format!("timewait {ms}ms"),
             };
-            let _ = writeln!(out, "  {i:>3}: {line}");
+            // Numbered as SIPp numbers messages, so the numbers are what
+            // `<jump value=>` and `[msg_index]` mean; a label has none.
+            if matches!(step, Step::Label { .. }) {
+                let _ = writeln!(out, "       {line}");
+            } else {
+                let _ = writeln!(out, "  {:>3}: {line}", self.message_index(i));
+            }
         }
         out
     }
-}
 
-fn common_suffix(c: &StepCommon) -> String {
-    let mut s = String::new();
-    if let Some(next) = c.next {
-        s.push_str(&format!(" next->{next}"));
+    /// The dump's rendering of the shared attributes; `next` as the
+    /// message index it continues at.
+    fn common_suffix(&self, c: &StepCommon) -> String {
+        let mut s = String::new();
+        if let Some(next) = c.next {
+            s.push_str(&format!(" next->{}", self.message_index(next)));
+        }
+        if c.test.is_some() {
+            s.push_str(" (test)");
+        }
+        if c.chance.is_some() {
+            s.push_str(" (chance)");
+        }
+        if c.condexec.is_some() {
+            s.push_str(" (condexec)");
+        }
+        s
     }
-    if c.test.is_some() {
-        s.push_str(" (test)");
-    }
-    if c.chance.is_some() {
-        s.push_str(" (chance)");
-    }
-    if c.condexec.is_some() {
-        s.push_str(" (condexec)");
-    }
-    s
 }
 
 fn first_line(t: &MsgTemplate) -> String {

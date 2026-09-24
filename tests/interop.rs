@@ -4925,3 +4925,152 @@ fn extended_3pcc_both_ways_against_real_sipp() {
     );
     assert_eq!(m, Some(0), "sipp master:\n{m_err}\nsipr slave:\n{s_err}");
 }
+
+// ---- message indices: labels are not messages ---------------------------
+
+/// A UAC whose jumps cross labels. Every `<send>` names itself in
+/// `X-Landed` next to its `[msg_index]`, and carries `[branch]` in its Via.
+/// SIPp numbers messages, not labels: message 0 jumps to 3 (`value=`), 4
+/// jumps to 7 (`variable=`, set by an `add` to the unset variable), so only
+/// `target-a` and `target-b` go out.
+fn jump_over_labels_uac_xml() -> String {
+    let send = |name: &str| {
+        format!(
+            r"  <send><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 OPTIONS
+    Max-Forwards: 70
+    X-Landed: {name} [msg_index]
+    Content-Length: 0
+
+  ]]></send>
+"
+        )
+    };
+    format!(
+        r#"<scenario name="jump-over-labels">
+  <nop><action><jump value="3"/></action></nop>
+  <label id="a"/>
+{skipped1}{skipped2}  <label id="b"/>
+{target_a}  <nop>
+    <action>
+      <add assign_to="back" value="7"/>
+      <jump variable="back"/>
+    </action>
+  </nop>
+{skipped3}{skipped4}  <label id="c"/>
+{target_b}</scenario>
+"#,
+        skipped1 = send("skipped-1"),
+        skipped2 = send("skipped-2"),
+        target_a = send("target-a"),
+        skipped3 = send("skipped-3"),
+        skipped4 = send("skipped-4"),
+        target_b = send("target-b"),
+    )
+}
+
+/// Run `uac_bin` on [`jump_over_labels_uac_xml`] against a UDP sink. Returns
+/// the exit code, what the sink saw (`X-Landed` value plus the Via branch's
+/// message-index suffix, retransmissions collapsed) and the `-trace_counts`
+/// header's send columns. Only those: SIPp also gives every `<nop>` Pause
+/// columns, which sipr does not (docs/SIPP_COMPAT.md §6), and the send
+/// columns' index prefixes are what a label would shift.
+fn run_jump_over_labels(
+    uac_bin: &std::path::Path,
+    tag: &str,
+) -> (Option<i32>, Vec<String>, Vec<String>) {
+    let dir = std::env::temp_dir().join(format!("sipr-interop-jump-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let xml = dir.join("jump_over_labels.xml");
+    std::fs::write(&xml, jump_over_labels_uac_xml()).expect("write uac");
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let mut args = vec![
+        "-sf".to_owned(),
+        xml.to_str().expect("utf8").to_owned(),
+        "-i".to_owned(),
+        "127.0.0.1".to_owned(),
+        "-m".to_owned(),
+        "1".to_owned(),
+        "-timeout".to_owned(),
+        "20".to_owned(),
+        "-trace_counts".to_owned(),
+    ];
+    if uac_bin == std::path::Path::new(env!("CARGO_BIN_EXE_sipr")) {
+        args.push("-bg".to_owned());
+    }
+    args.push(sink.local_addr().expect("sink addr").to_string());
+    let mut uac = Reaper(
+        Command::new(uac_bin)
+            .current_dir(&dir)
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn uac"),
+    );
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    // The run is over: everything it sent is queued on the sink.
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut seen: Vec<String> = Vec::new();
+    let mut buf = [0u8; 65_535];
+    while let Ok(n) = sink.recv(&mut buf) {
+        let text = String::from_utf8_lossy(&buf[..n]);
+        let header = |name: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        };
+        let branch = header("Via:");
+        let branch_index = branch.rsplit('-').next().unwrap_or_default().to_owned();
+        let entry = format!("{} {branch_index}", header("X-Landed:"));
+        if seen.last() != Some(&entry) {
+            seen.push(entry);
+        }
+    }
+    let counts = stat_file_header(&dir, "_counts.csv")
+        .split(';')
+        .filter(|column| column.contains("_OPTIONS_"))
+        .map(ToOwned::to_owned)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    (code, seen, counts)
+}
+
+/// `<jump value=>`, `<jump variable=>`, `[msg_index]`, `[branch]` and the
+/// `-trace_counts` column names all count SIPp messages, which labels are
+/// not (docs/SIPP_COMPAT.md §6): the same UAC sends the same messages, with
+/// the same indices, under sipr and real sipp.
+#[test]
+fn jumps_and_message_indices_skip_labels_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::jumps_and_message_indices_skip_labels_like_real_sipp — no sipp."
+        );
+        return;
+    };
+    let (code, theirs, their_counts) = run_jump_over_labels(&sipp, "sipp");
+    assert_eq!(code, Some(0), "real sipp uac");
+    assert_eq!(theirs, ["target-a 3 3", "target-b 7 7"], "real sipp");
+    assert_eq!(
+        their_counts.first().map(String::as_str),
+        Some("1_OPTIONS_Sent")
+    );
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let (code, ours, our_counts) = run_jump_over_labels(&sipr, "sipr");
+    assert_eq!(code, Some(0), "sipr uac");
+    assert_eq!(ours, theirs, "sipr sent different messages than real sipp");
+    assert_eq!(
+        our_counts, their_counts,
+        "-trace_counts send columns differ"
+    );
+}

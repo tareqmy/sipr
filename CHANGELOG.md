@@ -143,6 +143,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `<label>`s no longer count as messages. SIPp numbers only message
+  commands, and a label names the index of the message after it. sipr
+  counted labels, so with a label earlier in the scenario,
+  `<jump value="N"/>` and `<jump variable=>` landed on the wrong step,
+  and `[msg_index]`, `[branch]`, `_unexp.retaddr` and the `-trace_counts`
+  column prefixes were off. A jump to the message count (past the last
+  message) is now accepted and ends the call, as in SIPp. The `--check`
+  dump, `/scenario`, `/metrics` `step=`, `dump tasks` and the call-debug
+  trace use the same message numbering.
 - Without `-i`, `[local_ip]` rendered `0.0.0.0`. It now renders the
   address the remote is reached from, found as SIPp does by connecting a
   UDP socket and reading it back (no packet is sent). Sockets still bind

@@ -348,7 +348,7 @@ fn check_mode_lints_the_ooc_scenario_too() {
     let out = stdout(&o);
     assert!(out.contains("scenario 'Basic Sipstone UAC'"), "{out}");
     assert!(
-        out.contains("out-of-call scenario 'Out-of-call UAS': role=UAS, 3 steps"),
+        out.contains("out-of-call scenario 'Out-of-call UAS': role=UAS, 3 messages"),
         "{out}"
     );
     // An unknown element in the ooc scenario fails the lint like the main one.

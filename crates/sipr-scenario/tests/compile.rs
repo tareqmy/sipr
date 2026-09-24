@@ -57,6 +57,80 @@ fn label_and_next_resolve_to_indices() {
     assert!(matches!(&sc.steps[3], Step::Label { id, .. } if id == "done"));
 }
 
+/// Where a `<jump value="N"/>` in step `nop` lands, as a step index.
+fn jump_value_step(sc: &sipr_scenario::model::Scenario, nop: usize) -> usize {
+    use sipr_scenario::model::JumpTarget;
+    let Step::Nop { actions, .. } = &sc.steps[nop] else {
+        panic!("step {nop} is not a nop")
+    };
+    let Action::Jump {
+        dest: JumpTarget::Index(step),
+    } = actions[0]
+    else {
+        panic!("not a jump value=")
+    };
+    step
+}
+
+/// SIPp numbers message commands only — a label names the index of the
+/// message after it (`scenario.cpp` `labelMap[id] = messages.size()`) — and
+/// `<jump value="N"/>` continues at message N. So a label before the target
+/// must not shift where the jump lands.
+#[test]
+fn jump_value_counts_messages_not_labels() {
+    let xml = wrap(&format!(
+        r#"{invite}
+           <nop><action><jump value="3"/></action></nop>
+           <label id="skipped"/>
+           <recv response="100"/>
+           <recv response="200"/>"#,
+        invite = send_invite()
+    ));
+    // messages: 0 send, 1 nop,           2 recv 100, 3 recv 200
+    // steps:    0 send, 1 nop, 2 label,  3 recv 100, 4 recv 200
+    let sc = compile("test", &xml).scenario.expect("compiles");
+    let step = jump_value_step(&sc, 1);
+    assert!(
+        matches!(&sc.steps[step], Step::Recv(r) if r.expect == Expect::Response("200".into())),
+        "jump value=3 must land on message 3 (recv 200), not step {step}"
+    );
+    // Message numbering both ways: a label shares the next message's index.
+    let indices: Vec<usize> = (0..sc.steps.len()).map(|s| sc.message_index(s)).collect();
+    assert_eq!(indices, [0, 1, 2, 2, 3]);
+    assert_eq!(sc.step_of_message(2), Some(3));
+    assert_eq!(sc.step_of_message(4), Some(sc.steps.len()));
+    assert_eq!(sc.step_of_message(5), None);
+}
+
+/// The range is SIPp's `0 <= N <= messages`: N == messages jumps past the
+/// last message (the call ends), and labels do not widen it.
+#[test]
+fn jump_value_range_is_the_message_count() {
+    let scenario = |dest: usize| {
+        wrap(&format!(
+            r#"{invite}
+               <label id="a"/>
+               <nop><action><jump value="{dest}"/></action></nop>
+               <label id="b"/>
+               <recv response="200"/>"#,
+            invite = send_invite()
+        ))
+    };
+    // 3 messages (send, nop, recv) in 5 steps.
+    let end = compile("test", &scenario(3))
+        .scenario
+        .expect("jump to the end");
+    assert_eq!(jump_value_step(&end, 2), end.steps.len());
+    for dest in [4, 5] {
+        let errs = errors(&scenario(dest));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains(&format!("jump to message index {dest} is out of range"))),
+            "{dest}: {errs:?}"
+        );
+    }
+}
+
 #[test]
 fn undefined_label_is_an_error() {
     let xml = wrap(&format!(

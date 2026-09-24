@@ -306,6 +306,7 @@ mod tests {
             steps: vec![
                 StepRow {
                     label: "send INVITE".into(),
+                    message: Some(0),
                     hidden: false,
                     stats: StepStats {
                         sent: 1000,
@@ -315,6 +316,7 @@ mod tests {
                 },
                 StepRow {
                     label: "recv 200".into(),
+                    message: Some(1),
                     hidden: false,
                     stats: StepStats {
                         recv: 950,
@@ -371,6 +373,7 @@ mod tests {
         let mut s = snap();
         s.steps.push(StepRow {
             label: "nop (branch)".into(),
+            message: Some(2),
             hidden: true,
             stats: StepStats::default(),
         });

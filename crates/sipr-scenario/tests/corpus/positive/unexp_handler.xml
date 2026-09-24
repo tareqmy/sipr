@@ -15,6 +15,9 @@
 
   ]]></send>
   <recv request="ACK"/>
+  <!-- _unexp.retaddr holds a SIPp message index, and labels are not
+       messages: this one must not shift the return to the pause. -->
+  <label id="hold"/>
   <pause milliseconds="3000"/>
   <send retrans="500"><![CDATA[
     BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0

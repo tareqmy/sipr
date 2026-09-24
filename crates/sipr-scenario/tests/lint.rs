@@ -259,6 +259,22 @@ fn jump_actions_count_and_computed_jumps_disable_the_analysis() {
     assert_eq!(findings(&retaddr), [(Lint::Unreachable, 4)]);
 }
 
+#[test]
+fn a_jump_value_counts_messages_not_labels() {
+    // Message 3 is the <send> on line 6: the label before the nop is not a
+    // message. The <send> on line 5 (message 2) is what the jump skips,
+    // and the nop's own `next` goes elsewhere.
+    let xml = scenario(&[
+        SEND,
+        r#"<label id="start"/>"#,
+        r#"<nop next="end"><action><jump value="3"/></action></nop>"#,
+        SEND,
+        SEND,
+        r#"<label id="end"/>"#,
+    ]);
+    assert_eq!(findings(&xml), [(Lint::Unreachable, 5)]);
+}
+
 // ---- body-separator ---------------------------------------------------
 
 #[test]

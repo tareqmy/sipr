@@ -81,8 +81,12 @@ pub enum ActionOutcome {
     Warn(String),
     /// Fail this call (`<error>`, `ereg check_it` miss, `exec stop_call`).
     FailCall(String),
-    /// Jump to a message index (`<jump>`).
+    /// `<jump value=>`: continue at this step (the compiler resolved the
+    /// message index).
     Jump(usize),
+    /// `<jump variable=>`: continue at this SIPp message index, which the
+    /// engine maps to a step — labels are not messages.
+    JumpToMessage(usize),
     /// Stop the whole run gracefully (`exec stop_gracefully`).
     StopGracefully,
     /// Stop the whole run immediately (`exec stop_now`).
@@ -356,12 +360,14 @@ fn run_one(
             store.set(*assign_to, Value::Num(number));
             ActionOutcome::Continue
         }
-        Action::Jump { dest } => ActionOutcome::Jump(match dest {
-            JumpTarget::Index(i) => *i,
+        Action::Jump { dest } => match dest {
+            JumpTarget::Index(step) => ActionOutcome::Jump(*step),
             // SIPp: `(int)operand`; a negative index is nonsense → 0.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            JumpTarget::Var(v) => store.get(*v).as_num().max(0.0) as usize,
-        }),
+            JumpTarget::Var(v) => {
+                ActionOutcome::JumpToMessage(store.get(*v).as_num().max(0.0) as usize)
+            }
+        },
         Action::PauseRestore(op) => ActionOutcome::PauseRestore(match op {
             Operand::Value(v) => *v,
             Operand::Var(id) => store.get(*id).as_num(),

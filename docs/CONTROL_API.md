@@ -132,6 +132,10 @@ sipr_rtd_seconds{rtd="1",stat="p99"} 0.020000
 sipr_step_messages_total{step="0",label="send INVITE",kind="sent"} 20000
 ```
 
+`step` is SIPp's message index: the number `[msg_index]` renders,
+`<jump value=>` takes and the `/scenario` dump shows. A `<label>` is not a
+message, so it has no series and does not shift the numbers after it.
+
 `/metrics` needs the token like every path but `/health`. Prometheus sends
 it with `authorization: { credentials: TOKEN }` in the scrape config.
 

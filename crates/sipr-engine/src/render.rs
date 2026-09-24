@@ -162,7 +162,8 @@ pub struct RenderCtx<'a> {
     pub pid: u32,
     /// Current CSeq counter value.
     pub cseq: u32,
-    /// Step index (message index) being sent.
+    /// SIPp's message index of the step being rendered (labels are not
+    /// messages: `Scenario::message_index`), for `[msg_index]`/`[branch]`.
     pub msg_index: usize,
     /// Remote tag, once learned (renders `[peer_tag_param]`).
     pub peer_tag: Option<&'a str>,

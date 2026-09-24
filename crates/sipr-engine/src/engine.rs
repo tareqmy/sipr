@@ -657,7 +657,7 @@ struct RetransCtx {
     buf: Vec<u8>,
     lost_pct: Option<f64>,
     /// Step index of the send, for per-step retrans counters.
-    msg_index: usize,
+    step: usize,
     attempt: u32,
     schedule: RetransSchedule,
     timer: TimerId,
@@ -2601,7 +2601,10 @@ impl<'s> Engine<'s> {
                 let mut lines: Vec<String> = self
                     .calls
                     .iter()
-                    .map(|(id, c)| format!("call {id}: number {} at step {}", c.number, c.index))
+                    .map(|(id, c)| {
+                        let index = self.call_message_index(c);
+                        format!("call {id}: number {} at index {index}", c.number)
+                    })
                     .collect();
                 lines.sort();
                 self.log_err(&format!("---- {} Active Tasks ----", lines.len()));
@@ -2765,6 +2768,16 @@ impl<'s> Engine<'s> {
         }
     }
 
+    /// SIPp's message index of the step a call is at — what its traces and
+    /// logs print. Works on a call already taken out of the table.
+    fn call_message_index(&self, call: &CallState) -> usize {
+        let scenario = match self.secondary.as_ref() {
+            Some(o) if call.secondary => o.scenario,
+            _ => self.scenario,
+        };
+        scenario.message_index(call.index)
+    }
+
     /// The stat set of the scenario a call runs (see [`stats_for`]).
     fn stats_of(&mut self, secondary: bool) -> &mut sipr_stats::StatSet {
         stats_for(&mut self.stats, self.secondary.as_mut(), secondary)
@@ -2819,7 +2832,7 @@ impl<'s> Engine<'s> {
             users_total: self.config.users.map_or(0, |n| n as u64),
             pid: self.pid,
             cseq: call.cseq,
-            msg_index: index,
+            msg_index: scenario.message_index(index),
             peer_tag: call.peer_tag.as_deref(),
             routes: &call.routes,
             last: call.last_recv.as_ref(),
@@ -3230,7 +3243,7 @@ impl<'s> Engine<'s> {
                             call.retrans = Some(RetransCtx {
                                 buf,
                                 lost_pct,
-                                msg_index: index,
+                                step: index,
                                 attempt: 1,
                                 schedule,
                                 timer,
@@ -3393,6 +3406,15 @@ impl<'s> Engine<'s> {
                 }
             }
         }
+    }
+
+    /// A `<jump>`: continue the call at `step` (one past the last step ends
+    /// it, as SIPp's jump to the message count does).
+    fn jump_to_step(&mut self, call_id: &str, step: usize) {
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.index = step;
+        }
+        self.advance(call_id);
     }
 
     /// Where execution goes after `index` finishes: `next` (with `chance`),
@@ -3664,10 +3686,11 @@ impl<'s> Engine<'s> {
                     return;
                 }
                 let transport = self.transport_token;
+                let index = self.scenario_of(&call_id).message_index(window_start);
                 self.call_debug(
                     &call_id,
                     format!(
-                        "Unexpected {transport} message received (index {window_start}, hash {}):\n\n{}\n",
+                        "Unexpected {transport} message received (index {index}, hash {}):\n\n{}\n",
                         msg_hash,
                         String::from_utf8_lossy(&packet.raw)
                     ),
@@ -3933,7 +3956,7 @@ impl<'s> Engine<'s> {
                 users_total: self.config.users.map_or(0, |n| n as u64),
                 pid: self.pid,
                 cseq: call.cseq,
-                msg_index: index,
+                msg_index: scenario.message_index(index),
                 peer_tag: call.peer_tag.as_deref(),
                 routes: &call.routes,
                 last: last.as_ref(),
@@ -3973,23 +3996,25 @@ impl<'s> Engine<'s> {
                 crate::actions::ActionOutcome::Continue => {}
                 crate::actions::ActionOutcome::Log(line) => self.log_action(&line),
                 crate::actions::ActionOutcome::Warn(line) => self.log_err(&line),
-                crate::actions::ActionOutcome::Jump(dest) => {
-                    // SIPp: "Jump statement out of range" is fatal; sipr
-                    // fails the call instead of the run.
-                    if dest >= scenario.steps.len() {
+                // Compile-time checked; one past the last step ends the call.
+                crate::actions::ActionOutcome::Jump(step) => {
+                    self.jump_to_step(call_id, step);
+                    return true;
+                }
+                crate::actions::ActionOutcome::JumpToMessage(index) => {
+                    let Some(step) = scenario.step_of_message(index) else {
+                        // SIPp: "Jump statement out of range" is fatal; sipr
+                        // fails the call instead of the run.
                         self.call_stats(call_id).failed_other += 1;
                         self.log_err(&format!(
-                            "call {call_id} failed: jump to message index {dest} is out of \
-                             range (0..{})",
-                            scenario.steps.len()
+                            "call {call_id} failed: jump to message index {index} is out of \
+                             range (0..={})",
+                            scenario.message_count()
                         ));
                         self.remove_call(call_id);
                         return true;
-                    }
-                    if let Some(call) = self.calls.get_mut(call_id) {
-                        call.index = dest;
-                    }
-                    self.advance(call_id);
+                    };
+                    self.jump_to_step(call_id, step);
                     return true;
                 }
                 crate::actions::ActionOutcome::PauseRestore(ms) => {
@@ -4638,7 +4663,7 @@ impl<'s> Engine<'s> {
             users_total: self.config.users.map_or(0, |n| n as u64),
             pid: self.pid,
             cseq: call.cseq,
-            msg_index: index,
+            msg_index: self.scenario.message_index(index),
             peer_tag: call.peer_tag.as_deref(),
             routes: &call.routes,
             last: call.last_recv.as_ref(),
@@ -4867,7 +4892,7 @@ impl<'s> Engine<'s> {
     /// `-aa`: answer in-dialog OPTIONS/INFO/UPDATE/NOTIFY with 200 without
     /// disturbing the scenario. Returns true when handled.
     /// SIPp's `_unexp.main` label (`call.cpp` ~l.5449): an unexpected message
-    /// jumps there, saving the interrupted step index in `_unexp.retaddr`
+    /// jumps there, saving the interrupted message index in `_unexp.retaddr`
     /// and a running pause's deadline (ms since start, 0 = none) in
     /// `_unexp.pausedaddr`, then the message is offered to the handler
     /// (SIPp `queue_up`). Not re-entered while `_unexp.retaddr` is non-zero
@@ -4881,8 +4906,10 @@ impl<'s> Engine<'s> {
         let Some(call) = self.calls.get_mut(call_id) else {
             return false;
         };
-        // The step being interrupted: the running pause, else the recv.
-        let interrupted = call.pause_deadline.map_or(call.index, |(i, _)| i);
+        // The step being interrupted: the running pause, else the recv —
+        // as SIPp's message index, which `jump variable=` maps back.
+        let interrupted =
+            scenario.message_index(call.pause_deadline.map_or(call.index, |(i, _)| i));
         if let Some(v) = scenario.unexp_retaddr {
             if call.store.get(v).as_num() != 0.0 {
                 return false;
@@ -5317,7 +5344,10 @@ impl<'s> Engine<'s> {
         if self.trace_calldebug.is_some()
             && let Some(call_id) = sipr_stats::message_call_id(buf)
         {
-            let index = self.calls.get(&call_id).map_or(0, |c| c.index);
+            let index = self
+                .calls
+                .get(&call_id)
+                .map_or(0, |c| self.call_message_index(c));
             self.call_debug(
                 &call_id,
                 format!(
@@ -5479,19 +5509,19 @@ impl<'s> Engine<'s> {
     }
 
     fn on_retrans_timer(&mut self, call_id: &str, generation: u64) {
-        let Some((buf, lost, next, msg_index)) = self.calls.get_mut(call_id).and_then(|call| {
+        let Some((buf, lost, next, step)) = self.calls.get_mut(call_id).and_then(|call| {
             let r = call.retrans.as_mut()?;
             r.attempt += 1;
             Some((
                 r.buf.clone(),
                 r.lost_pct,
                 r.schedule.interval(r.attempt),
-                r.msg_index,
+                r.step,
             ))
         }) else {
             return; // call gone or retransmission already cancelled
         };
-        if let Some(s) = self.call_stats(call_id).step_mut(msg_index) {
+        if let Some(s) = self.call_stats(call_id).step_mut(step) {
             s.retrans += 1;
         }
         let Some(remote) = self.calls.get(call_id).map(|c| c.remote) else {
@@ -5568,17 +5598,18 @@ impl<'s> Engine<'s> {
             self.return_user(&call);
             // SIPp `call::abort`: the call's debug buffer goes to
             // -trace_calldebug, then the Call-ID lives on as a dead call.
+            let index = self.call_message_index(&call);
             if let Some(f) = self.trace_calldebug.as_mut() {
                 let mut debug = call.debug.take().unwrap_or_default();
                 debug.push_str(&sipr_stats::calldebug_line(
-                    &format!("Aborting call {call_id} (index {}).\n", call.index),
+                    &format!("Aborting call {call_id} (index {index}).\n"),
                     self.config.rfc3339,
                 ));
                 f.write(&format!(
                     "-------------------------------------------------------------------------------\nCall debugging information for call {call_id}:\n{debug}"
                 ));
             }
-            self.remember_dead(call_id, format!("aborted at index {}", call.index));
+            self.remember_dead(call_id, format!("aborted at index {index}"));
         }
     }
 
@@ -5863,7 +5894,8 @@ fn step_kind(step: &Step) -> sipr_stats::StepKind {
         Step::Pause { .. } | Step::Timewait { .. } => sipr_stats::StepKind::Pause,
         Step::SendCmd { .. } => sipr_stats::StepKind::SendCmd,
         Step::RecvCmd { .. } => sipr_stats::StepKind::RecvCmd,
-        Step::Nop { .. } | Step::Label { .. } => sipr_stats::StepKind::Other,
+        Step::Nop { .. } => sipr_stats::StepKind::Other,
+        Step::Label { .. } => sipr_stats::StepKind::Label,
     }
 }
 

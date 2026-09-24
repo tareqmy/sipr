@@ -151,8 +151,11 @@ pub enum StepKind {
     SendCmd,
     /// A 3PCC `recvCmd`: `RecvCmd` and `RecvCmd_Timeout`.
     RecvCmd,
-    /// Anything else (nop, label): no columns.
+    /// A nop: no columns.
     Other,
+    /// A label: no columns, and not a SIPp message, so it takes no index —
+    /// the columns after it keep SIPp's message numbering.
+    Label,
 }
 
 /// How the statistics files are written.
@@ -586,18 +589,41 @@ impl StatSet {
         out
     }
 
+    /// SIPp's message index of each step, by step: SIPp numbers messages,
+    /// and a label is not one (`None`).
+    pub(crate) fn message_indices(&self) -> impl Iterator<Item = Option<usize>> + '_ {
+        let mut next = 0;
+        self.step_kinds.iter().map(move |kind| {
+            if matches!(kind, StepKind::Label) {
+                return None;
+            }
+            let index = next;
+            next += 1;
+            Some(index)
+        })
+    }
+
+    /// The steps `-trace_counts` has columns for, as `(step, message
+    /// index, kind)`: labels have none, and a hidden step keeps its message
+    /// index but has no columns.
+    fn counted_steps(&self) -> impl Iterator<Item = (usize, usize, &StepKind)> {
+        self.step_kinds
+            .iter()
+            .zip(self.message_indices())
+            .enumerate()
+            .filter_map(|(step, (kind, index))| Some((step, index?, kind)))
+            .filter(|(step, _, _)| !self.step_hidden.get(*step).copied().unwrap_or(false))
+    }
+
     /// The `-trace_counts` header (SIPp `print_count_file(header)`): time,
-    /// elapsed, then per visible step `<index>_<name>_Sent`/`_Retrans`
+    /// elapsed, then per visible message `<index>_<name>_Sent`/`_Retrans`
     /// (+ `_Timeout` when the send has `retrans=`) for sends and
     /// `_Recv`/`_Retrans`/`_Timeout`/`_Unexp` for recvs.
     #[must_use]
     pub fn counts_header(&self) -> String {
         let d = self.dump.delimiter.as_str();
         let mut out = format!("CurrentTime{d}ElapsedTime{d}");
-        for (i, kind) in self.step_kinds.iter().enumerate() {
-            if self.step_hidden.get(i).copied().unwrap_or(false) {
-                continue;
-            }
+        for (_, i, kind) in self.counted_steps() {
             match kind {
                 StepKind::Send { name, retrans } => {
                     let _ = write!(out, "{i}_{name}_Sent{d}{i}_{name}_Retrans{d}");
@@ -620,7 +646,7 @@ impl StatSet {
                 StepKind::RecvCmd => {
                     let _ = write!(out, "{i}_RecvCmd{d}{i}_RecvCmd_Timeout{d}");
                 }
-                StepKind::Other => {}
+                StepKind::Other | StepKind::Label => {}
             }
         }
         out.push('\n');
@@ -636,11 +662,8 @@ impl StatSet {
             clock::sipp_timestamp(SystemTime::now(), self.dump.rfc3339),
             hhmmss_us(self.started.elapsed().as_secs_f64() * 1000.0)
         );
-        for (i, kind) in self.step_kinds.iter().enumerate() {
-            if self.step_hidden.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            let st = self.steps.get(i).cloned().unwrap_or_default();
+        for (step, _, kind) in self.counted_steps() {
+            let st = self.steps.get(step).cloned().unwrap_or_default();
             match kind {
                 StepKind::Send { retrans, .. } => {
                     let _ = write!(out, "{}{d}{}{d}", st.sent, st.retrans);
@@ -664,7 +687,7 @@ impl StatSet {
                 StepKind::RecvCmd => {
                     let _ = write!(out, "{}{d}{}{d}", st.recv, st.timeouts);
                 }
-                StepKind::Other => {}
+                StepKind::Other | StepKind::Label => {}
             }
         }
         out.push('\n');
@@ -1271,6 +1294,26 @@ mod tests {
         let row = s.counts_row();
         assert!(row.ends_with(";3;1;0;2;0;0;1;3;0;2;2;0;\n"), "{row}");
         assert_eq!(row.split(';').count(), s.counts_header().split(';').count());
+    }
+
+    #[test]
+    fn counts_columns_number_messages_so_labels_take_no_index() {
+        let mut s = StatSet::new(&[], &[]);
+        s.init_steps((0..5).map(|i| format!("s{i}")).collect());
+        s.set_step_kinds(vec![
+            StepKind::Label,
+            StepKind::SendCmd,
+            StepKind::Label,
+            StepKind::Other,
+            StepKind::SendCmd,
+        ]);
+        s.steps[4].sent = 7;
+        // Steps 1 and 4 are SIPp messages 0 and 2 (the nop is message 1).
+        assert_eq!(
+            s.counts_header(),
+            "CurrentTime;ElapsedTime;0_SendCmd;2_SendCmd;\n"
+        );
+        assert!(s.counts_row().ends_with(";0;7;\n"));
     }
 
     #[test]

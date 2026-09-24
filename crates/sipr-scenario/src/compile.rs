@@ -12,9 +12,9 @@ use crate::diag::{Diagnostic, Diagnostics};
 use crate::distribution::Distribution;
 use crate::lint::{self, Lint, LintInput};
 use crate::model::{
-    Action, ArithOp, CompareOp, Expect, IntCmd, JumpTarget, MediaKind, Operand, PauseSpec,
-    RecvStep, Role, RtpEchoCmd, RtpEchoVerb, RtpSource, RtpStreamCmd, Scenario, SearchIn, SendStep,
-    Step, StepCommon, StepIndex, Transaction, TxnId, VarId, VarScope, VarTable,
+    Action, ArithOp, CompareOp, Expect, IntCmd, JumpTarget, MediaKind, MessageNumbering, Operand,
+    PauseSpec, RecvStep, Role, RtpEchoCmd, RtpEchoVerb, RtpSource, RtpStreamCmd, Scenario,
+    SearchIn, SendStep, Step, StepCommon, StepIndex, Transaction, TxnId, VarId, VarScope, VarTable,
 };
 use crate::template::{self, Keyword, MsgTemplate};
 use crate::xml::{self, Element, Node};
@@ -1327,6 +1327,7 @@ impl Compiler {
             "jump" => {
                 self.warn_unknown_attrs(el, &["value", "variable"]);
                 match (el.attr("value"), el.attr("variable")) {
+                    // A message index until `finish` resolves it to a step.
                     (Some(raw), None) => match raw.parse::<usize>() {
                         Ok(dest) => Some(Action::Jump {
                             dest: JumpTarget::Index(dest),
@@ -1801,6 +1802,43 @@ impl Compiler {
         }
     }
 
+    /// `<jump value="N"/>` names SIPp message N, and labels are not
+    /// messages ([`MessageNumbering`]): resolve each N to the step that runs
+    /// it. SIPp's range is `0 <= N <= messages` (`call.cpp` `E_AT_JUMP`):
+    /// N == messages jumps past the last one, and the call ends.
+    fn resolve_jump_values(&mut self, numbering: &MessageNumbering) {
+        let mut bad_jumps = Vec::new();
+        for step in &mut self.steps {
+            let (actions, line) = match step {
+                Step::Send(s) => (&mut s.actions, s.common.line),
+                Step::Recv(r) => (&mut r.actions, r.common.line),
+                Step::Nop { actions, common }
+                | Step::RecvCmd {
+                    actions, common, ..
+                } => (actions, common.line),
+                _ => continue,
+            };
+            for action in actions {
+                if let Action::Jump {
+                    dest: JumpTarget::Index(dest),
+                } = action
+                {
+                    match numbering.step(*dest) {
+                        Some(step) => *dest = step,
+                        None => bad_jumps.push((*dest, line)),
+                    }
+                }
+            }
+        }
+        let max = numbering.count();
+        for (dest, line) in bad_jumps {
+            self.diags.error(
+                Some(line),
+                format!("jump to message index {dest} is out of range (0..={max})"),
+            );
+        }
+    }
+
     fn finish(mut self) -> CompileOutcome {
         // Resolve label references.
         for p in std::mem::take(&mut self.pending) {
@@ -1830,32 +1868,8 @@ impl Compiler {
                 ),
             }
         }
-        // Bounds-check jump actions.
-        let max = self.steps.len();
-        let mut bad_jumps = Vec::new();
-        for step in &self.steps {
-            let actions = match step {
-                Step::Send(s) => &s.actions,
-                Step::Recv(r) => &r.actions,
-                Step::Nop { actions, .. } | Step::RecvCmd { actions, .. } => actions,
-                _ => continue,
-            };
-            for a in actions {
-                if let Action::Jump {
-                    dest: JumpTarget::Index(dest),
-                } = a
-                    && *dest >= max
-                {
-                    bad_jumps.push(*dest);
-                }
-            }
-        }
-        for dest in bad_jumps {
-            self.diags.error(
-                None,
-                format!("jump to message index {dest} is out of range (0..{max})"),
-            );
-        }
+        let numbering = MessageNumbering::new(&self.steps);
+        self.resolve_jump_values(&numbering);
         self.validate_txn_usage();
         // Role detection.
         let role = self.steps.iter().find_map(|s| match s {
@@ -1908,6 +1922,7 @@ impl Compiler {
                 unexpected_jump: self.labels.get("_unexp.main").copied(),
                 unexp_retaddr: self.vars.find("_unexp.retaddr"),
                 unexp_pausedaddr: self.vars.find("_unexp.pausedaddr"),
+                numbering,
                 vars: self.vars,
                 transactions: self
                     .txns

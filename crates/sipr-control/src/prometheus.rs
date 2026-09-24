@@ -282,9 +282,10 @@ fn rtd_metrics(out: &mut String, s: &Snapshot) {
     let _ = writeln!(out, "sipr_call_length_samples_total {count}");
 }
 
-/// Per-step counters, labelled by index and the screen's own label. The
-/// index keeps the series stable when a label is edited; the label keeps a
-/// dashboard readable.
+/// Per-step counters, labelled by SIPp message index (what `[msg_index]`
+/// renders; a `<label>` is no message and has no series) and the screen's
+/// own label. The index keeps the series stable when a label is edited; the
+/// label keeps a dashboard readable.
 fn step_metrics(out: &mut String, s: &Snapshot) {
     if s.steps.is_empty() {
         return;
@@ -295,7 +296,10 @@ fn step_metrics(out: &mut String, s: &Snapshot) {
         "counter",
         "Per-scenario-step message counters.",
     );
-    for (index, row) in s.steps.iter().enumerate() {
+    for row in &s.steps {
+        let Some(index) = row.message else {
+            continue;
+        };
         let label = escape(&row.label);
         for (kind, value) in [
             ("sent", row.stats.sent),
@@ -352,6 +356,7 @@ mod tests {
             rate_target: 10.0,
             steps: vec![StepRow {
                 label: "send INVITE".into(),
+                message: Some(0),
                 hidden: false,
                 stats: StepStats {
                     sent: 7,
@@ -440,6 +445,27 @@ mod tests {
         assert!(text.contains("sipr_calls_successful_total 5"));
         assert!(text.contains("sipr_calls_failed_total{reason=\"recv_timeout\"} 2"));
         assert!(text.contains("sipr_calls_active 3"));
+        assert!(text.contains(
+            "sipr_step_messages_total{step=\"0\",label=\"send INVITE\",kind=\"sent\"} 7"
+        ));
+    }
+
+    /// `step` is SIPp's message index, the number `[msg_index]` renders: a
+    /// `<label>` row is no message, has no series, and shifts nothing.
+    #[test]
+    fn step_series_number_messages_and_skip_labels() {
+        let mut s = snap();
+        s.steps.insert(
+            0,
+            StepRow {
+                label: "label start".into(),
+                message: None,
+                hidden: false,
+                stats: StepStats::default(),
+            },
+        );
+        let text = render(&s);
+        assert!(!text.contains("label start"), "{text}");
         assert!(text.contains(
             "sipr_step_messages_total{step=\"0\",label=\"send INVITE\",kind=\"sent\"} 7"
         ));

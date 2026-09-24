@@ -28,6 +28,9 @@ pub struct StepStats {
 pub struct StepRow {
     /// Short human description ("send INVITE", "recv 200", "pause 3000ms").
     pub label: String,
+    /// SIPp's message index of the step (what `[msg_index]` renders);
+    /// `None` for a label, which is not a message.
+    pub message: Option<usize>,
     /// `hide="true"` on the step: skipped while [`Snapshot::hide`] holds.
     pub hidden: bool,
     /// The counters.
@@ -236,6 +239,7 @@ impl crate::StatSet {
     /// The per-step rows of the scenario screen.
     #[must_use]
     pub fn step_rows(&self) -> Vec<StepRow> {
+        let messages: Vec<Option<usize>> = self.message_indices().collect();
         self.steps
             .iter()
             .enumerate()
@@ -245,6 +249,8 @@ impl crate::StatSet {
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("step {i}")),
+                // Without step kinds (a bare stat set) every step counts.
+                message: messages.get(i).copied().unwrap_or(Some(i)),
                 hidden: self.step_hidden.get(i).copied().unwrap_or(false),
                 stats: s.clone(),
             })

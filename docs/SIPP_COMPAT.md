@@ -350,7 +350,7 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   lints (docs/LINTS.md). SIPp does not look at the end of the scenario:
   a trailing optional recv loads, and without a timeout it holds the call
   forever in both tools, which `optional-window` also flags. Two
-  divergences found on the way are **open**. (1) SIPp arms the waiting
+  divergences found on the way were **open**. (1) SIPp arms the waiting
   recv's *own* timeout (`call.cpp` ~l.2195, `curmsg->timeout`, else
   `-recv_timeout`), optional or not. sipr's engine
   (`window_mandatory`) arms only the window's mandatory recv's, so an
@@ -358,8 +358,9 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `optional timeout="1000" ontimeout="end"` recv ends the call after 1 s
   in SIPp but hangs in sipr. (2) `<jump value="N"/>` is a SIPp *message*
   index, and a `<label>` is not a message (`labelMap[id] =
-  messages.size()`), but sipr counts labels as steps, so N lands
-  elsewhere when a label precedes it.
+  messages.size()`), but sipr counted labels as steps, so N landed
+  elsewhere when a label preceded it — fixed since, see "Message
+  indices" below.
 - Template CDATA normalization (M1, `template::normalize_cdata`): every line
   left-trimmed, line endings → CRLF, leading/trailing blank lines dropped,
   single trailing CRLF appended; internal blank line (header/body separator)
@@ -940,7 +941,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `next()`s past it — so jumping back to an interrupted `<pause>` waits
   out the original deadline and skips the pause; jumping back to a
   `<recv>` (pausedaddr 0) simply re-arms it. `<jump>` itself is `handle_rhs`
-  (`value=` or `variable=`, `msg_index = (int)operand - 1`); an
+  (`value=` or `variable=`, `msg_index = (int)operand - 1`, a message
+  index — labels do not count, see "Message indices" below); an
   out-of-range target is a fatal ERROR. sipr matches all of this (deadlines
   are ms since the run started, like SIPp's clock tick), with two
   divergences: an out-of-range jump fails the call rather than the run,
@@ -1428,8 +1430,12 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `<index>_Pause_Sessions` (times entered) and `_Pause_Unexp`; for a
   3PCC `sendCmd` `<index>_SendCmd`, for a `recvCmd` `<index>_RecvCmd` and
   `_RecvCmd_Timeout`; nothing for a nop or label — `<name>` the method or
-  status code, `<index>` the step's position counting every step (SIPp's
-  message index counts pauses and nops too). SIPp's `_Lost` columns
+  status code, `<index>` SIPp's message index, which counts pauses and
+  nops but not labels (see "Message indices" below). **Open:** real
+  SIPp's `print_count_file` gives a nop, `sendCmd` and `recvCmd` the
+  `Pause` columns instead — its `else if (pause_distribution ||
+  pause_variable)` test is always true there, because `pause_variable`
+  defaults to -1 — so its NOP, RecvCmd and SendCmd arms never run. SIPp's `_Lost` columns
   appear only with `-lost` (M42). `-trace_error_codes` writes
   `<scenario>_<pid>_error_codes.csv`: per dump the time, the elapsed
   time and the status codes of the responses that failed a call as
@@ -1537,3 +1543,45 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   the keyboard watcher. `-send_timeout` and `-timer_resol` are accepted
   with a warning: sipr has no send queue that could time out and its
   timers are exact, not polled.
+- Message indices: labels are not messages (verified in `scenario.cpp`
+  ~l.803-839 and `call.cpp` ~l.1930-1945, ~l.3892-3902, ~l.5449-5458,
+  ~l.5991-6002, `logger.cpp` `print_count_file`; confirmed against real
+  sipp). SIPp's scenario is a vector of *messages* — `send`, `recv`,
+  `pause`, `timewait`, `nop`, `sendCmd`, `recvCmd` — and a `<label>` is
+  not one of them: it only records `labelMap[id] = messages.size()`, the
+  index of the message after it. Every index a scenario or SIPp's output
+  speaks is a message index. `<jump value="N"/>` (and `variable=`) sets
+  `msg_index = N - 1` and lets `next()` step to N, with the range
+  `0 <= N <= messages`: N equal to the message count runs past the last
+  message, and the call ends successfully. `[msg_index]` renders the
+  index of the message being sent, and `[branch]` ends in it
+  (`z9hG4bK-<pid>-<call>-<index>`). `_unexp.retaddr` receives the
+  interrupted message's index. The `-trace_counts` columns are prefixed
+  with it, and the call-debug lines ("Sending … (index N", "Unexpected …
+  (index N", "Aborting call … (index N)") print it. sipr keeps a label
+  as a step of its own (the scenario screen and the lints place it), so
+  it used to count labels in all of these. A `<label>` before the target
+  sent a jump elsewhere, and a label anywhere earlier shifted
+  `[msg_index]`, `[branch]` and the counts columns. Now the compiler
+  numbers messages as SIPp does (`Scenario::message_index` and
+  `step_of_message`). `jump value=` resolves to the message's step at
+  compile time, and `jump variable=` maps its message index at run time,
+  so `_unexp.retaddr`, written as a message index, round-trips. The
+  range check follows SIPp, including the jump past the end. sipr's own
+  outputs number the same way: the `--check` dump and `/scenario`
+  (labels unnumbered, `next->`/`ontimeout->` as message indices),
+  `dump tasks`, and `/metrics` `step=` (no series for a label).
+  Verified against real sipp, which sends the same messages with the
+  same `[msg_index]`, `[branch]` and counts prefixes for a UAC whose
+  jumps cross labels. It also round-trips `_unexp.retaddr` with a label
+  before the interrupted pause. **Open**, found on the way: (1) SIPp
+  evaluates `next()` *at message N-1* after a jump, so if message N-1
+  has a `next=` (its `test` set, its `chance` won), SIPp follows that
+  instead of running N. sipr runs N. (2) A `<jump>` in a mandatory
+  `<recv>`'s actions does nothing in SIPp: `process_incoming` then sets
+  `msg_index = search_index` and calls `next()`. sipr takes the jump.
+  (3) Where SIPp renders with no message index (`P_index` -1: actions
+  such as `<log>` and `<assignstr>`, `<sendCmd>`, the `-default_behaviors`
+  abort messages), `[msg_index]` prints `-1`, and `[branch]` ends in the
+  current message index minus one. sipr renders the current message's
+  index in both.
