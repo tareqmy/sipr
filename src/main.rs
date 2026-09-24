@@ -453,12 +453,13 @@ fn resolve_http_addr(raw: &str) -> Result<std::net::SocketAddr, String> {
 /// resolved (SIPp's `remote_host`).
 /// `-trace_screen`: the scenario, statistics and repartition screens as
 /// text, in SIPp's `print_screens` order, to `-screen_file` or
-/// `<scenario>_<pid>_screens.log`.
+/// `<scenario>_<pid>_screen.log` — SIPp's `screen` log file, whatever its
+/// help text says (`_screens.log`).
 fn write_screens(cli: &cli::Cli, base: &str, pid: u32, snap: &sipr_stats::Snapshot) {
     let path = cli
         .screen_file
         .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_screens.log")));
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_screen.log")));
     let mut text = String::new();
     for screen in [
         sipr_tui::Screen::Scenario,

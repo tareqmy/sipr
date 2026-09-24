@@ -5779,8 +5779,9 @@ fn generic_counters_match_real_sipps_statistics() {
     assert_eq!(final_counter_values(&theirs), expected, "sipp:\n{theirs}");
     assert_eq!(final_counter_values(&ours), expected, "sipr:\n{ours}");
     for (dir, who) in [(&sipp_dir, "sipp"), (&sipr_dir, "sipr")] {
-        // The screen dump, the only log file either run writes.
-        let screens = read_file_ending(dir, ".log");
+        // `<scenario>_<pid>_screen.log` on both sides: SIPp's `screen` log
+        // file, whatever its help text says (`_screens.log`).
+        let screens = read_file_ending(dir, "_screen.log");
         for name in ["invites", "1234567", "7", "acks", "jumper", "skipped"] {
             assert!(
                 screens.contains(&format!("Counter {name} ")),

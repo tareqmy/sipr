@@ -157,6 +157,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `-trace_screen` writes `<scenario>_<pid>_screen.log`, the name real
+  sipp uses, instead of `_screens.log`. That name came from sipp's help
+  text, which does not match the file sipp writes.
 - The scenario screen no longer panics on a step label longer than its
   22-character column when the cut falls inside a multi-byte character
   (a non-ASCII `display=` text). Labels are cut by character, not byte.

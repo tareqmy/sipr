@@ -7426,7 +7426,7 @@ fn statistics_files_have_sipps_shape() {
     assert!(codes.lines().count() >= 1, "{codes}");
     assert!(codes.lines().all(|l| l.ends_with(',')), "{codes}");
     // -trace_screen: the three screens as text at exit.
-    let screens = read("_screens.log");
+    let screens = read("_screen.log");
     for want in [
         "send INVITE",
         "3 created",
@@ -9043,7 +9043,7 @@ fn generic_counters_reach_the_statistics_file_screen_and_api() {
     let cumulative: Vec<&str> = (0..6).map(|i| last[at + 2 * i + 1]).collect();
     assert_eq!(cumulative, ["3", "3", "6", "3", "3", "0"], "{stat}");
 
-    let screens = read("_screens.log");
+    let screens = read("_screen.log");
     for (name, total) in [
         ("invites", 3),
         ("1234567", 3),

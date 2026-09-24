@@ -1438,9 +1438,13 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `<scenario>_<pid>_error_codes.csv`: per dump the time, the elapsed
   time and the status codes of the responses that failed a call as
   unexpected since the last dump, comma-terminated, newest first (SIPp
-  pops them off the back). `-trace_screen` (or `-screen_file`) writes the
+  pops them off the back). `-trace_screen` writes the
   scenario, statistics and repartition screens as text at exit, SIPp's
-  `print_screens` order; sipr's screens are its own layout, not a copy of
+  `print_screens` order, to `<scenario>_<pid>_screen.log` (or
+  `-screen_file`) — SIPp's `screen` log file (`logger.hpp`
+  `LOGFILE(screen_lfi, "screen", …)`), not the `_screens.log` its help
+  text promises, which sipr copied until the generic-counters interop
+  test read real sipp's directory; sipr's screens are its own layout, not a copy of
   SIPp's curses text. `-periodic_rtd` zeroes every repartition table
   (per RTD and call length) at each dump. `-stat_delimiter` applies to
   all four CSV files. Found on the way: an `rtd=` with no matching

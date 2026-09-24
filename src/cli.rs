@@ -969,7 +969,7 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "trace_screen",
         false,
         "",
-        "Dump the statistics screens to <scenario>_<pid>_screens.log when quitting",
+        "Dump the statistics screens to <scenario>_<pid>_screen.log when quitting",
     ),
     (
         "screen_file",

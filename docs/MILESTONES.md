@@ -1634,7 +1634,8 @@ file dump period).
       `-screen_file` (main renders the TUI's three screens from the run
       report's final snapshot), `-f` (the snapshot/`-bg` line period).
       File names `<scenario>_<pid>_{,rtt,counts,error_codes}.csv` and
-      `_screens.log` as SIPp's. Rows are built off the per-message path,
+      `_screen.log` as SIPp's (shipped as `_screens.log`, from SIPp's
+      help text; corrected after M48). Rows are built off the per-message path,
       in the `-fd` dump and the once-a-second tick.
 - [x] Tests: stats unit tests (header column set and positions, period
       roll-over, periodic RTD, counts columns, error-code and RTT rows,
