@@ -18,6 +18,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   body). Findings print as `warning[NAME]`, and
   `<!-- sipr-lint: allow NAME -->` right before a step silences one for
   that step. See `docs/LINTS.md`.
+- Structured statistics (M46): `--sipr-stats-json FILE` appends one JSON
+  object per snapshot tick (the `/stats` document), flushed every second
+  so it can be tailed live. The file is truncated at start-up, an
+  unwritable path fails start-up, and the last line is the run's final
+  state. `GET /metrics` on the HTTP API serves the same snapshot as
+  Prometheus text exposition: names prefixed `sipr_`, counters ending in
+  `_total`, durations in seconds, and labels for failure reason, message
+  kind and step. It is guarded by the bearer token like every path but
+  `/health`. See `docs/CONTROL_API.md` §3.
+- Performance measurement (M45): `make bench-vs-sipp` runs sipr and real
+  sipp against themselves on loopback at 500, 2000 and 5000 calls/s and
+  compares CPU, peak RSS, retransmissions and concurrency. Criterion
+  benches cover the hot path (template fill, inbound parse and route,
+  timer churn) with baselines in `benches/BASELINES.md`, and a nightly
+  Linux workflow runs both. The results, including where sipp is still
+  faster, are in `docs/PERFORMANCE.md`.
+- `PRINTF=` injection files (M44): a `PRINTF=<n>` header, with optional
+  `PRINTFOFFSET=` and `PRINTFMULTIPLE=`, turns the data rows into
+  templates over n virtual lines, so one row can stand in for thousands
+  of users. `-infindex` and `-users` range over the virtual lines;
+  `insert`/`replace` are refused on such a file, as in SIPp.
+- `<rtp_echo variable="v">` switches echoing from a variable (M44). SIPp
+  parses this form but reads the wrong slot, so it always switches echoing
+  off there; sipr reads the variable (SIPP_COMPAT §6).
+- Socket options (M44): `-bind_local` (listen on the `-i` address only),
+  `-buff_size` (send and receive buffers), `-sendbuffer_warn` (a default,
+  non-scenario message that cannot be sent ends the run; without the flag
+  it warns), and `-bind_to_device` on Linux (`SO_BINDTODEVICE`, needs
+  root; a usage error on other systems).
+- `play_pcap_audio`/`_video`/`_image` read pcapng captures as well as
+  classic pcap (M44). tcpdump and Wireshark write pcapng by default, and
+  SIPp rejects it.
 - Extended 3PCC (M43): `-master NAME`/`-slave NAME` with `-slave_cfg FILE`
   (`name;host:port` lines), `sendCmd dest=` routed to the named peer and
   `recvCmd src=` checked against the command's `From:` line, on SIPp's
@@ -78,6 +110,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `--check` fails on the new lint findings like any other warning, so a
   scenario that passed it before may now exit 1. Normal runs do not lint.
+- SIPp's `-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`,
+  `-rtp_threadtasks`, `-skip_rlimit`, `-plugin` and its six SCTP socket
+  options are accepted with a "has no effect in sipr" warning each,
+  instead of being rejected (the SCTP ones were a hard error), so wrapper
+  scripts written for sipp keep running (M44, SIPP_COMPAT §3.1).
+- A default (non-scenario) message that cannot be sent now warns, where
+  it used to be dropped silently; `-sendbuffer_warn` makes it end the run
+  (M44).
 - A 3PCC twin command must carry the call's `Call-ID:` (SIPp routes by
   it); sipr used to hand a command to whichever call was waiting. Classic
   controller B no longer paces its calls with `-r`: as in SIPp they open
@@ -103,6 +143,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Without `-i`, `[local_ip]` rendered `0.0.0.0`. It now renders the
+  address the remote is reached from, found as SIPp does by connecting a
+  UDP socket and reading it back (no packet is sent). Sockets still bind
+  every interface unless `-i` or `-bind_local` names one (M44).
 - On Windows an ICMP port-unreachable for a peer that is down no longer
   kills the UDP socket: the receive loop rides out `ConnectionReset`
   (the `WSAECONNRESET` quirk on unconnected sockets) instead of ending
