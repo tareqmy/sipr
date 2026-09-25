@@ -1452,7 +1452,7 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   used to write nothing for a nop and SIPp's dead `SendCmd` and
   `RecvCmd` columns for the 3PCC commands. **Open:** SIPp adds a
   `_Lost` column to every send and recv once packet loss is on (`-lost`
-  or any `lost=`); sipr writes none. `-trace_error_codes` writes
+  or any `lost=`); sipr writes none (`docs/FOLLOWUPS.md` 13). `-trace_error_codes` writes
   `<scenario>_<pid>_error_codes.csv`: per dump the time, the elapsed
   time and the status codes of the responses that failed a call as
   unexpected since the last dump, comma-terminated, newest first (SIPp
