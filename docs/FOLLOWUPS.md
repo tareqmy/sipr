@@ -16,6 +16,8 @@ agent as is. Delete an entry when its fix lands.
   against sipp 3.7.7.
 - **11** breaks the rule that sipr never ignores scenario input silently.
   It was found while fixing jump semantics (commit `5b29b65`).
+- **12** is a gap in SIPp's documented keywords, found while adding
+  `[branch±N]` (commit `bffa0e8`).
 
 The SIPp C++ source is at `../../cprojects/sipp/src` (relative to the
 repo root). Read it to confirm the behavior, and never copy it (GPL).
@@ -279,3 +281,34 @@ Scope: `fix(scenario)`, then `fix(engine)`. SIPP_COMPAT §6, "Where a
 - **Test:** an interop UAC whose pause logs through `-trace_logs` and
   jumps, compared with real sipp. Add a compile test that an unknown
   child of `<pause>` is an error.
+
+## 12. Take SIPp's `+N`/`-N` offset on every keyword
+
+Scope: `fix(scenario)`, and `fix(engine)` for the rendering.
+
+- **SIPp:** `SendingMessage` (`message.cpp` ~l.242-250) strips a `+N`
+  or `-N` (a sign, then a digit) from any keyword but `authentication`
+  and `tdmmap`, and keeps it as the component's `offset`. These
+  keywords add it: `[remote_port]` (`call.cpp` ~l.2748),
+  `[local_port]` (~l.2760), `[media_port]` (~l.2791), the
+  `[rtpstream_*_port]`s (~l.2832-2856), the crypto keywords, `[cseq]`
+  (~l.3884), `[branch]` (~l.3892), `[len]` (~l.3915) and
+  `[last_cseq_number]` (~l.4083). Every other keyword drops it:
+  `[call_number+1]` renders the call number. SIPp's
+  `docs/scenarios/keywords.rst` documents `[remote_port+3]`,
+  `[local_port+3]`, `[len+3]` and `[cseq+1]`.
+- **sipr:** `classify` in `crates/sipr-scenario/src/template.rs` takes
+  offsets only on the media and rtpstream ports, the crypto keywords,
+  `[last_cseq_number]` and `[branch]`. `[cseq+1]`, `[len+3]`,
+  `[remote_port+3]` and `[local_port+3]` warn "unknown keyword … passed
+  through verbatim", so the brackets go out in the message. So does an
+  offset on any other keyword.
+- **Fix:** give `Cseq`, `Len`, `RemotePort` and `LocalPort` an `offset`
+  like `Branch { offset }`, parsed with `parse_offset`, and add it where
+  `render.rs` writes them. `[len]` fills a width-5 placeholder after
+  the body is known, so check that the offset reaches that
+  computation. For the keywords SIPp parses an offset on and drops it,
+  decide between matching SIPp and a specific warning. Dropping it
+  silently is what AGENTS.md forbids.
+- **Test:** an interop UAC rendering each offset form into an OPTIONS
+  to a UDP sink, compared with real sipp.
