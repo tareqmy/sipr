@@ -5,12 +5,15 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod common;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::Command;
 use std::time::Duration;
 
+use common::{SpawnOutsideProbes, free_port, free_port_block};
 use sipr_net::{EscFramer, Inbound, TcpFramer};
 
 /// Minimal scripted UAS. Answers until the socket is idle for `idle`.
@@ -98,7 +101,7 @@ fn mirror_response(msg: &Inbound, status: &str, add_to_tag: bool) -> Vec<u8> {
 fn run_sipr(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_sipr"))
         .args(args)
-        .output()
+        .output_outside_probes()
         .expect("spawn sipr")
 }
 
@@ -289,7 +292,7 @@ fn a_jump_to_itself_fails_the_call() {
         .current_dir(dir.path())
         .args(["-sf", xml.to_str().expect("utf8")])
         .args(["-m", "1", "-timeout", "5", "-trace_err", &addr])
-        .output()
+        .output_outside_probes()
         .expect("run sipr");
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr:\n{err}");
@@ -303,62 +306,6 @@ fn a_jump_to_itself_fails_the_call() {
         log.contains("Jump statement at index 1 jumps to itself and causes an infinite loop"),
         "errors log:\n{log}"
     );
-}
-
-/// A base port such that `base..base+span` are all free right now, for
-/// scenarios that spread calls over `[auto_media_port]` blocks.
-fn free_port_block(span: u16) -> u16 {
-    for _ in 0..100 {
-        let base = media_port_candidate();
-        let held: Vec<_> = (0..span)
-            .map(|i| UdpSocket::bind(("127.0.0.1", base + i)))
-            .collect();
-        if held.iter().all(Result::is_ok) {
-            return base;
-        }
-    }
-    panic!("no free port block of {span}");
-}
-/// A random even port in 20000..45000 — below the OS ephemeral range
-/// (49152+ on macOS), so a media port probed-then-released here is not
-/// handed to some other test's socket a moment later.
-fn media_port_candidate() -> u16 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEED: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    let n = SEED.fetch_add(1, Ordering::Relaxed);
-    let mut x =
-        nanos ^ (u64::from(std::process::id()) << 32) ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    x ^= x >> 29;
-    #[allow(clippy::cast_possible_truncation)]
-    let port = 20_000 + (x % 25_000) as u16;
-    port & !1
-}
-
-/// A free loopback port that binds on *both* TCP and UDP, drawn from the
-/// same below-ephemeral range as media ports. Tests hand this number to a
-/// spawned sipr (`-p`, `-cp`, `--sipr-http`, `-3pcc`, ...) whose transport
-/// may be TCP or TLS, so a UDP-only probe is not enough: on Windows the
-/// Hyper-V/WinNAT excluded port ranges are per protocol, and a port the OS
-/// happily allocated for UDP can fail a later TCP bind with error 10013.
-fn free_port() -> u16 {
-    for _ in 0..100 {
-        let port = media_port_candidate();
-        if port_binds_on_tcp_and_udp(port) {
-            return port;
-        }
-    }
-    panic!("no free TCP+UDP port");
-}
-
-/// Whether `port` can be bound on loopback for both TCP and UDP right now.
-fn port_binds_on_tcp_and_udp(port: u16) -> bool {
-    let addr = ("127.0.0.1", port);
-    TcpListener::bind(addr).is_ok() && UdpSocket::bind(addr).is_ok()
 }
 
 #[test]
@@ -378,7 +325,7 @@ fn sipr_uas_answers_sipr_uac_self_test() {
             "20",
         ])
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .spawn_outside_probes()
         .expect("spawn uas");
     std::thread::sleep(Duration::from_millis(300)); // let it bind
     let uac = run_sipr(&[
@@ -427,7 +374,7 @@ fn uas_auto_answers_in_dialog_options_with_aa() {
             "15",
         ])
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .spawn_outside_probes()
         .expect("spawn uas");
     std::thread::sleep(Duration::from_millis(300));
     // UAC flow with an in-dialog OPTIONS the UAS scenario does not expect.
@@ -523,7 +470,7 @@ fn trace_files_are_written() {
             "-trace_stat",
             &addr.to_string(),
         ])
-        .output()
+        .output_outside_probes()
         .expect("run sipr");
     assert_eq!(
         out.status.code(),
@@ -1164,7 +1111,7 @@ fn tcp_uas_answers_over_stream() {
             "10",
             "-bg",
         ])
-        .spawn()
+        .spawn_outside_probes()
         .expect("spawn sipr uas");
 
     // Connect once sipr has bound its listener.
@@ -1453,7 +1400,7 @@ fn tls_uas_answers_over_stream() {
             "10",
             "-bg",
         ])
-        .spawn()
+        .spawn_outside_probes()
         .expect("spawn sipr uas");
 
     // Connect once sipr has bound its listener.
@@ -2743,7 +2690,7 @@ fn spawn_sipr_bg(args: &[&str]) -> (std::process::Child, std::thread::JoinHandle
     let mut child = Command::new(env!("CARGO_BIN_EXE_sipr"))
         .args(args)
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .spawn_outside_probes()
         .expect("spawn sipr");
     let mut stderr = child.stderr.take().expect("stderr");
     let reader = std::thread::spawn(move || {
@@ -5614,7 +5561,7 @@ fn run_sipr_in(dir: &std::path::Path, args: &[&str]) -> (std::process::Output, S
     let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
         .current_dir(dir)
         .args(args)
-        .output()
+        .output_outside_probes()
         .expect("spawn sipr");
     let errors = std::fs::read_dir(dir)
         .expect("readdir")
@@ -6336,7 +6283,7 @@ fn set_users_retires_and_reuses_ids_like_sipp() {
             &addr.to_string(),
         ])
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .spawn_outside_probes()
         .expect("spawn sipr");
     let mut stderr = child.stderr.take().expect("stderr");
     let reader = std::thread::spawn(move || {
@@ -6684,7 +6631,7 @@ fn late_final_response_to_a_named_invite_transaction_is_acked_again() {
             "-bg",
             &addr.to_string(),
         ])
-        .output()
+        .output_outside_probes()
         .expect("run sipr");
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
@@ -6749,7 +6696,7 @@ fn exec_uas_scenario() -> String {
 fn zombie_children_of(pid: u32) -> usize {
     let out = Command::new("ps")
         .args(["-A", "-o", "ppid=,stat="])
-        .output()
+        .output_outside_probes()
         .expect("ps");
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -6789,7 +6736,7 @@ fn exec_command_runs_a_shell_per_matching_message() {
             "-bg",
         ])
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .spawn_outside_probes()
         .expect("spawn uas");
     let uas_pid = uas.id();
     std::thread::sleep(Duration::from_millis(300));
@@ -6811,7 +6758,7 @@ fn exec_command_runs_a_shell_per_matching_message() {
             &format!("127.0.0.1:{port}"),
         ])
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .spawn_outside_probes()
         .expect("spawn uac");
     let uac_code = wait_exit(&mut uac, Duration::from_secs(20));
     assert_eq!(uac_code, Some(0), "uac");
@@ -6904,7 +6851,7 @@ fn run_sipr_traced(tag: &str, scenario: &str, args: &[&str]) -> (std::process::O
         .arg(&sc_path)
         .arg("-trace_err")
         .args(args)
-        .output()
+        .output_outside_probes()
         .expect("run sipr");
     let errors_log = std::fs::read_dir(&dir)
         .expect("readdir")
@@ -7124,7 +7071,7 @@ fn setdest_is_refused_where_sipp_refuses_it() {
             "-bg",
             &addr.to_string(),
         ])
-        .output()
+        .output_outside_probes()
         .expect("run sipr");
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "one failed call: {err}");
@@ -7474,7 +7421,7 @@ fn statistics_files_have_sipps_shape() {
             "-bg",
             &addr.to_string(),
         ])
-        .output()
+        .output_outside_probes()
         .expect("run sipr");
     assert_eq!(
         out.status.code(),
@@ -7677,7 +7624,7 @@ Content-Length: 0
             "-bg",
             &addr.to_string(),
         ])
-        .output()
+        .output_outside_probes()
         .expect("run sipr");
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
@@ -7786,7 +7733,7 @@ fn calldebug_dumps_aborted_calls() {
             "-bg",
             &addr.to_string(),
         ])
-        .output()
+        .output_outside_probes()
         .expect("run sipr");
     assert_ne!(out.status.code(), Some(0));
     let name = std::fs::read_dir(&dir)
@@ -9144,7 +9091,7 @@ fn generic_counters_reach_the_statistics_file_screen_and_api() {
         .arg("--sipr-stats-json")
         .arg(&json)
         .arg(addr.to_string())
-        .output()
+        .output_outside_probes()
         .expect("run sipr");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");

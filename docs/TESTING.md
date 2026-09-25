@@ -82,9 +82,10 @@ created: there is no `SOCK_CLOEXEC`, so std sets `FD_CLOEXEC` a moment
 after `socket()`. A `free_port()` probe socket inherited that way keeps
 the probed port bound for as long as the child lives, and the sipp or sipr
 the port is handed to exits with "Address already in use". `tests/interop.rs`
-therefore starts every child through `spawn_outside_probes()` /
-`output_outside_probes()`, which never overlap a probe; use them for any
-new one.
+and `tests/e2e.rs` therefore probe ports only through `tests/common/mod.rs`
+(`free_port()`, `free_port_block()`, `free_even_port()`) and start every
+child through its `spawn_outside_probes()` / `output_outside_probes()`,
+which never overlap a probe; use them for any new one.
 
 SCTP cannot be tested on this development host: macOS has no SCTP stack and
 the Homebrew sipp is built without `USE_SCTP` (its banner lacks `-SCTP`).

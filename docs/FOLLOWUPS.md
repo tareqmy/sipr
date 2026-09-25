@@ -4,8 +4,8 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **5-6** are test-harness problems found while fixing the interop
-  port-probe race (commit `4ff94ca`). They change only tests, so each one
+- **6** is a test-harness problem found while fixing the interop
+  port-probe race (commit `4ff94ca`). It changes only tests, so it
   replaces steps 1 and 2 below with the check it describes.
 - **7-8** are SIPp divergences that `docs/SIPP_COMPAT.md` §6 already
   listed as open, with no fix picked up yet.
@@ -39,33 +39,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 5. Stop e2e children inheriting port-probe sockets
-
-Scope: `test(e2e)`.
-
-- **The race:** macOS has no `SOCK_CLOEXEC`, so std sets `FD_CLOEXEC` on
-  a new socket a moment after `socket()`. A child spawned from another
-  test thread in that gap inherits a `free_port()` probe socket. It then
-  keeps the probed port bound for as long as it lives, and the sipr the
-  port is handed to exits with "Address already in use".
-  `docs/TESTING.md` §4 has the details.
-- **Fixed in interop** (commit `4ff94ca`): in `tests/interop.rs`, probes
-  hold `PORT_PROBES` exclusively through `probing()`. Every child starts
-  through `spawn_outside_probes()` or `output_outside_probes()`, which
-  hold it shared. That took `recv_timeouts_arm_like_real_sipp` from 5/35
-  failed runs to 0/55.
-- **Still open in e2e:** `tests/e2e.rs` has its own `free_port()` and
-  `free_port_block()` and 19 unguarded spawn sites (8 `.spawn()`, 11
-  `.output()`). cargo runs its tests in parallel threads, and each one
-  probes and spawns, so any of them can inherit another's probe socket.
-- **Fix:** port the interop guard, or move both copies into a shared
-  `tests/common/mod.rs`. Keep `output_outside_probes()`'s shape: it
-  spawns under the lock and waits outside it. Most e2e `.output()` calls
-  run sipr to completion, so holding the lock across the wait would
-  stall every other test's probes.
-- **Verify:** loop the e2e suite about 10 times before and after the
-  fix. The tests need sockets, so run them outside the sandbox.
 
 ## 6. Pass `-nostdin` to every sipp the interop suite starts
 
