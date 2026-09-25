@@ -313,6 +313,38 @@ fn threepcc_send_and_recv_cmd_compile() {
     assert!(matches!(sc.steps[3], Step::RecvCmd { .. }));
 }
 
+/// SIPp reads `<action>` on a `<sendCmd>` as on any message; any other
+/// child element is still refused.
+#[test]
+fn a_send_cmd_takes_actions() {
+    let xml = wrap(&format!(
+        r#"{invite}
+           <sendCmd><![CDATA[
+             Call-ID: [call_id]
+           ]]><action><log message="sent"/></action></sendCmd>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    assert_eq!(sc.steps[1].actions().len(), 1);
+
+    let bogus = wrap(&format!(
+        r#"{invite}
+           <sendCmd><![CDATA[
+             Call-ID: [call_id]
+           ]]><bogus/></sendCmd>"#,
+        invite = send_invite()
+    ));
+    assert!(
+        errors(&bogus)
+            .iter()
+            .any(|e| e.contains("unexpected <bogus> inside <sendCmd>")),
+        "{:?}",
+        errors(&bogus)
+    );
+}
+
 #[test]
 fn extended_3pcc_attrs_compile_to_peer_names() {
     let xml = wrap(&format!(

@@ -273,6 +273,8 @@ pub enum Step {
     SendCmd {
         /// The command body, rendered with keywords/variables at send time.
         template: MsgTemplate,
+        /// Actions run once the command is sent.
+        actions: Vec<Action>,
         /// Shared attributes.
         common: StepCommon,
         /// Extended 3PCC: the peer to send to (`dest=`), a name from the
@@ -339,8 +341,8 @@ impl Step {
         }
     }
 
-    /// The step's actions: every message command but a `<sendCmd>` takes
-    /// them (SIPp's `getCommonAttributes`); a label has none.
+    /// The step's actions: every message command takes them (SIPp's
+    /// `getCommonAttributes`); a label has none.
     #[must_use]
     pub fn actions(&self) -> &[Action] {
         match self {
@@ -348,9 +350,10 @@ impl Step {
             Self::Recv(r) => &r.actions,
             Self::Pause { actions, .. }
             | Self::Nop { actions, .. }
+            | Self::SendCmd { actions, .. }
             | Self::RecvCmd { actions, .. }
             | Self::Timewait { actions, .. } => actions,
-            Self::SendCmd { .. } | Self::Label { .. } => &[],
+            Self::Label { .. } => &[],
         }
     }
 
@@ -361,9 +364,10 @@ impl Step {
             Self::Recv(r) => Some(&mut r.actions),
             Self::Pause { actions, .. }
             | Self::Nop { actions, .. }
+            | Self::SendCmd { actions, .. }
             | Self::RecvCmd { actions, .. }
             | Self::Timewait { actions, .. } => Some(actions),
-            Self::SendCmd { .. } | Self::Label { .. } => None,
+            Self::Label { .. } => None,
         }
     }
 

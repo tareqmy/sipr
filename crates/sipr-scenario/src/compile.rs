@@ -843,6 +843,7 @@ impl Compiler {
         let common = self.parse_common(el, &["dest"]);
         let mut body = String::new();
         let mut cdata_line = el.line;
+        let mut actions = Vec::new();
         for node in &el.children {
             match node {
                 Node::CData { text, line } => {
@@ -855,6 +856,9 @@ impl Compiler {
                     if !t.trim().is_empty() {
                         body.push_str(t);
                     }
+                }
+                Node::Element(a) if a.name == "action" => {
+                    actions.extend(self.parse_actions(a));
                 }
                 Node::Element(a) => self.diags.error(
                     Some(a.line),
@@ -871,6 +875,7 @@ impl Compiler {
         let template = self.templ(&normalized, cdata_line);
         self.steps.push(Step::SendCmd {
             template,
+            actions,
             common,
             dest,
         });

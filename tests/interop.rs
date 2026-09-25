@@ -5976,6 +5976,110 @@ fn variables_read_and_render_like_real_sipp() {
     );
 }
 
+// ---- a <sendCmd>'s actions ---------------------------------------------------
+
+/// A 3PCC controller whose `<sendCmd>` runs actions once the command is
+/// out: a `<log>`, then a `<jump>` over message 2. Messages: 0 an OPTIONS,
+/// 1 the sendCmd, 2 skipped, 3 `landed`.
+fn send_cmd_actions_xml() -> String {
+    format!(
+        r#"<scenario name="cmd-actions">
+{first}  <sendCmd><![CDATA[
+    Call-ID: [call_id]
+    X-Offer: hello
+  ]]><action><log message="command sent"/><jump value="3"/></action></sendCmd>
+{skipped}{landed}</scenario>
+"#,
+        first = step_options("first", ""),
+        skipped = step_options("skipped", ""),
+        landed = step_options("landed", ""),
+    )
+}
+
+/// Run `bin` on [`send_cmd_actions_xml`] as a 3PCC controller against a
+/// silent twin and a UDP sink, with `-trace_logs`. Returns the exit code,
+/// the `X-Step`s the sink got and the log lines.
+fn run_send_cmd_actions(bin: &std::path::Path) -> (Option<i32>, Vec<String>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("cmd_actions.xml");
+    std::fs::write(&xml, send_cmd_actions_xml()).expect("write controller");
+    let twin = TcpListener::bind("127.0.0.1:0").expect("bind twin");
+    let twin_addr = twin.local_addr().expect("twin addr").to_string();
+    let held = silent_twin(twin);
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut controller = Reaper(
+        tool_command(bin)
+            .current_dir(dir.path())
+            .args(["-sf", xml.to_str().expect("utf8"), "-3pcc", &twin_addr])
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-m",
+                "1",
+                "-timeout",
+                "10",
+                "-trace_logs",
+            ])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn controller"),
+    );
+    let code = wait_with_timeout(&mut controller.0, Duration::from_secs(12));
+    held.join().expect("twin thread");
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut steps = Vec::new();
+    let mut buf = [0u8; 65_535];
+    while let Ok(n) = sink.recv(&mut buf) {
+        if let Some(step) = String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .find_map(|l| l.strip_prefix("X-Step:"))
+        {
+            steps.push(step.trim().to_owned());
+        }
+    }
+    let logs = std::fs::read_dir(dir.path())
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_logs.log"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("read logs"))
+        .unwrap_or_default()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+    (code, steps, logs)
+}
+
+/// SIPp reads `<action>` on a `<sendCmd>` too and runs it once the command
+/// is sent; a `<jump>` there lands as a nop's does (docs/SIPP_COMPAT.md
+/// §6).
+#[test]
+fn a_send_cmds_actions_run_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::a_send_cmds_actions_run_like_real_sipp — no sipp.");
+        return;
+    };
+    let theirs = run_send_cmd_actions(&sipp);
+    assert_eq!(
+        theirs,
+        (
+            Some(0),
+            vec!["first".to_owned(), "landed".to_owned()],
+            vec!["command sent".to_owned()]
+        ),
+        "real sipp"
+    );
+    let ours = run_send_cmd_actions(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(
+        ours, theirs,
+        "sipr ran the sendCmd differently than real sipp"
+    );
+}
+
 // ---- -trace_counts _Lost columns --------------------------------------------
 
 /// A UAC whose first OPTIONS is always lost (`lost="100"`), which turns on

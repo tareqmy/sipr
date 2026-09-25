@@ -1697,7 +1697,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   action only sets `msg_index = N - 1`. The actions after it still run,
   and the last jump wins. What happens next depends on the message the
   actions belong to:
-  - A nop, and a send (whose actions run *after* it is sent), then call
+  - A nop, a send (whose actions run *after* it is sent) and a
+    `<sendCmd>` (whose actions run after the command is out) then call
     `next()`, which reads message N-1: its `next=` (its `test` set, its
     `chance` won) wins over N. A pause and a timewait run their actions
     when they start, and call `next()` the same way when they end, so a
@@ -1719,8 +1720,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   overflowed its stack. **Divergences:** a jump to itself fails the call
   with SIPp's text instead of the run, as an out-of-range jump does. A
   stayed optional recv's jump to message 0 waits at message 0, where SIPp
-  indexes message -1. SIPp also runs the actions of a `<sendCmd>`;
-  sipr refuses them there.
+  indexes message -1. sipr used to refuse a `<sendCmd>`'s actions, so a
+  SIPp scenario with one did not load.
 - Actions on a `<pause>` and a `<timewait>` (verified in `scenario.cpp`
   ~l.961 and ~l.1829 `getCommonAttributes`, `call.cpp` ~l.1956-1990;
   confirmed against real sipp, the `a_pauses_actions_run_like_real_sipp`

@@ -7,8 +7,8 @@ agent as is. Delete an entry when its fix lands.
 - **14** is a flaky interop test, seen again while running the gates for
   the fixes above. It changes only tests, so it replaces steps 1 and 2
   below with the check it describes.
-- **15-16** are SIPp divergences found while fixing the `_Lost` columns
-  (commit `79c22ee`) and pause actions (commit `69319d6`).
+- **15** is a SIPp divergence found while fixing the `_Lost` columns
+  (commit `79c22ee`). It needs a decision before a fix.
 
 The SIPp C++ source is at `../../cprojects/sipp/src` (relative to the
 repo root). Read it to confirm the behavior, and never copy it (GPL).
@@ -94,27 +94,3 @@ point): matching SIPp exactly makes sipr end calls it copes with today.
 - **Test:** the UAS above as an interop test with `-trace_counts`,
   compared with real sipp. Add a one-send variant (BYE, 200) to cover
   the resend, and a `lost="100"` variant for the loss.
-
-## 16. Run a `<sendCmd>`'s actions
-
-Scope: `fix(scenario)`, then `fix(engine)`.
-
-- **SIPp:** a `<sendCmd>` takes `<action>` like any message
-  (`getCommonAttributes`). Its branch of `executeMessage` (`call.cpp`
-  ~l.1989-2006) sends the command, books `M_nbCmdSent` and
-  `do_bookkeeping`, runs the actions, then calls `next()`. A `<jump>`
-  among them lands as a nop's does (SIPP_COMPAT §6, "Where a `<jump>`
-  lands").
-- **sipr:** `compile_send_cmd` (`crates/sipr-scenario/src/compile.rs`)
-  refuses any child but the CDATA: "unexpected <action> inside
-  <sendCmd>". A SIPp scenario with one does not load. `Step::SendCmd`
-  has no `actions`.
-- **Fix:** give `Step::SendCmd` actions, parsed as a nop's are, and add
-  them to `Step::actions()`/`actions_mut()`. Run them in the engine's
-  `Step::SendCmd` arm after the command is sent and booked, landing a
-  jump through `step_after_jump` as the `Step::Nop` arm does. The lint
-  then follows those jumps without change.
-- **Test:** a 3PCC interop controller, as in
-  `msg_index_and_branch_in_a_send_cmd_render_like_real_sipp`, whose
-  `<sendCmd>` logs through `-trace_logs` and jumps, compared with real
-  sipp.

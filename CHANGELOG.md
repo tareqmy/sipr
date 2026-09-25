@@ -157,6 +157,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A `<sendCmd>` takes `<action>`, as in SIPp, and runs it once the
+  command is sent. A `<jump>` there lands as a nop's does. sipr refused
+  the scenario ("unexpected <action> inside <sendCmd>").
 - With packet loss on (`-lost`, or any `lost=`), each simulated loss
   counts on its step, and `-trace_counts` gives every send and recv
   SIPp's `_Lost` column. The scenario screen shows a `lost` column. sipr

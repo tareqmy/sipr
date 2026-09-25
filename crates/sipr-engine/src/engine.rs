@@ -3395,6 +3395,7 @@ impl<'s> Engine<'s> {
                 }
                 Step::SendCmd {
                     template,
+                    actions,
                     common,
                     dest,
                 } => {
@@ -3427,9 +3428,19 @@ impl<'s> Engine<'s> {
                         s.sent += 1;
                     }
                     self.book_counter(call_id, index);
-                    let jump = self.next_step(common, index, call_id);
+                    // SIPp runs a sendCmd's actions once the command is out
+                    // (`call.cpp` ~l.2004), then `next()` as after a nop.
+                    let AfterActions::Proceed { jump } =
+                        self.run_step_actions(call_id, actions, index)
+                    else {
+                        return;
+                    };
+                    let next = match jump {
+                        Some(target) => self.step_after_jump(call_id, target),
+                        None => self.next_step(common, index, call_id),
+                    };
                     if let Some(call) = self.calls.get_mut(call_id) {
-                        call.index = jump;
+                        call.index = next;
                     }
                 }
                 Step::RecvCmd { optional, .. } => {
