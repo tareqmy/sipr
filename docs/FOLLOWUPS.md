@@ -11,6 +11,9 @@ agent as is. Delete an entry when its fix lands.
   replaces steps 1 and 2 below with the check it describes.
 - **7-8** are SIPp divergences that `docs/SIPP_COMPAT.md` §6 already
   listed as open, with no fix picked up yet.
+- **9-10** are SIPp divergences in how variables read and render, found
+  while fixing `<assign value=>` (commit `86b9505`). Both were confirmed
+  against sipp 3.7.7.
 
 The SIPp C++ source is at `../../cprojects/sipp/src` (relative to the
 repo root). Read it to confirm the behavior, and never copy it (GPL).
@@ -231,3 +234,65 @@ Scope: `fix(engine)`. SIPP_COMPAT §6, the 3PCC note, says "Still open:
   both sides and compare the entries' shapes with real sipp's, as
   `short_message_log_matches_real_sipps` does for SIP. The classic and
   extended 3PCC tests in `tests/interop.rs` show how to start the pair.
+
+## 9. Read a variable's number the way SIPp's `getDouble()` does
+
+Scope: `fix(engine)`. SIPP_COMPAT §6, the `<assign>` note, lists it as
+open.
+
+- **SIPp:** `CCallVariable::getDouble` (`variables.cpp` ~l.94) returns
+  the double of a double variable and 0 for anything else: a string, a
+  regexp capture, a bool (true included) or an unset variable. Every
+  numeric read goes through it:
+  - `get_rhs` (`call.cpp` ~l.5692): `variable=` on `assign`, `add`,
+    `subtract`, `multiply`, `divide`, `jump` and `pauserestore`
+  - the arithmetic actions' own left-hand side (~l.6006-6025)
+  - `CAction::compare` (`actions.cpp` ~l.69), for `<test>`
+  - `<pause variable=>` (~l.1970), `[fill variable=]` (~l.3989) and the
+    `_unexp.retaddr` check (~l.5452)
+
+  Only `<todouble>` converts: `CCallVariable::toDouble` (~l.121) parses
+  a string or capture with `strtod` and requires all of it to parse,
+  reads a bool as 0 or 1, and otherwise leaves the target alone with a
+  "Invalid double conversion" warning (`call.cpp` ~l.6117-6124).
+- **Confirmed against sipp 3.7.7**, in a UAC nop rendering into an
+  OPTIONS: `<assignstr assign_to="t" value="5"/><add assign_to="t"
+  value="1"/>` makes `[$t]` `1.000000`. `<assign variable=>` naming the
+  string `"5"`, or a true `<test>` result, renders empty (a zero double).
+- **sipr:** `Value::as_num` (`crates/sipr-engine/src/actions.rs`)
+  parses a numeric string and reads a true bool as 1. It serves all the
+  reads above (see its callers in `actions.rs`, `render.rs` and
+  `engine.rs`), so the same scenario sends `6.000000`, `5.000000` and
+  `1.000000`. `ToDouble` uses it too, so an unparsable string writes 0
+  with no warning.
+- **Fix:** give `Value` SIPp's strict number and use it for every read
+  above, and move `as_num`'s parsing into `ToDouble` with SIPp's
+  whole-string check and warning. Check each caller against SIPp before
+  switching it: `[fieldN line=[$v]]` is not in the list above. The
+  `value_coercions` unit test pins the current coercions.
+- **Test:** extend `assign_takes_a_value_or_a_variable_like_real_sipp`
+  in `tests/interop.rs` with string and bool sources and an `<add>` on
+  a string, or write a sibling test that also covers `<todouble>`.
+
+## 10. Render a false bool as `false`
+
+Scope: `fix(engine)`. The "Variable value semantics" note in
+SIPP_COMPAT §6 says the opposite and needs correcting.
+
+- **SIPp:** `E_Message_Variable` (`call.cpp` ~l.3966-3981) writes
+  `true` for a set (true) bool, and its `else if (var->isBool())` branch
+  writes `false` for an unset (false) one. Confirmed against sipp 3.7.7:
+  `[$no]` after `<test assign_to="no" variable="seven" compare="equal"
+  value="8"/>` renders `false`.
+- **sipr:** `Value::as_str` (`crates/sipr-engine/src/actions.rs`)
+  renders `Bool(false)` as nothing. The `value_coercions` unit test pins
+  that, and the §6 note says "a false `<test>` result render[s] empty"
+  and that sipr "used to print … `false`". So an earlier change moved
+  sipr away from SIPp here.
+- **Fix:** render `Bool(false)` as `false` in the message template path.
+  Keep `is_set` false for it, since `test=` and `condexec` ask `isSet`.
+  Check the other users of `as_str` (`strcmp`, `trim`, `urlencode`,
+  `ereg search_in="var"`), where SIPp calls `getString()`, which is `""`
+  for a bool.
+- **Test:** an interop test rendering `[$yes]` and `[$no]` from two
+  `<test>` results, compared with real sipp.

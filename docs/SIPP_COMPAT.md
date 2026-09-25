@@ -1175,7 +1175,7 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   **Open:** SIPp's number of a variable (`CCallVariable::getDouble`) is 0
   for anything but a double, so `variable=` naming a string or a bool
   stores 0. sipr's parses a numeric string and reads a true bool as 1, as
-  in all its `value=`/`variable=` actions.
+  in all its `value=`/`variable=` actions (`docs/FOLLOWUPS.md` 9).
 - Manual transactions (M36; verified in `scenario.cpp` ~l.343-400
   `get_txn`, ~l.878-931, ~l.588-602 `validate_txn_usage`; `call.cpp`
   ~l.1128, ~l.2110-2116, ~l.4431-4450 `extract_transaction`,
