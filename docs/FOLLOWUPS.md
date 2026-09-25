@@ -45,14 +45,13 @@ Scope: `test(interop)`.
   type" or "Unable to send UDP message"). These hangs log neither, and
   the assertion prints nothing about what sipp did, so it is unknown
   whether this is the same bug.
-- **Fix:** when the UAC has not exited, put its stderr (the pair already
-  reads it) and its `-trace_err` log into the failure message. Loop the
-  test under load until it fails, and read what sipp logged. If it is
+- **Done so far:** a failure now prints sipp's stderr and `-trace_err`
+  log. Fifteen full interop runs after that, some beside four CPU-bound
+  processes, did not reproduce the hang, so there is no evidence yet.
+- **Next:** when the test fails again, read what sipp logged. If it is
   sipp's reset-connection bug in another form, widen the skip. Match
   something specific, not a bare "did not exit", which would hide a real
   sipr regression. If sipr is at fault, it becomes a `fix(net)` task.
-- **Verify:** loop the full interop suite, or run the test beside a
-  CPU-heavy job, and check that a failure now explains itself.
 
 ## 15. Handle a received retransmission as SIPp's `process_incoming` does
 

@@ -2166,7 +2166,8 @@ fn real_sipp_tcp_uac_reconnects_to_sipr() {
     };
     let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
     let dir = tempfile::tempdir().expect("tempdir");
-    let (code, _) = tcp_reconnect_pair(&sipr, &["-bg"], &sipp, &["-trace_err"], None, dir.path());
+    let (code, stderr) =
+        tcp_reconnect_pair(&sipr, &["-bg"], &sipp, &["-trace_err"], None, dir.path());
     if code != Some(0) && sipp_stream_client_cannot_bind(dir.path()) {
         eprintln!("SKIPPED interop::real_sipp_tcp_uac_reconnects_to_sipr — sipp bind limitation.");
         return;
@@ -2182,7 +2183,9 @@ fn real_sipp_tcp_uac_reconnects_to_sipr() {
     assert_eq!(
         code,
         Some(1),
-        "sipp uac: one call dies on the dead socket, the rest complete"
+        "sipp uac: one call dies on the dead socket, the rest complete\n\
+         --- sipp stderr ---\n{stderr}\n--- sipp -trace_err ---\n{}",
+        sipp_error_log(dir.path())
     );
 }
 
