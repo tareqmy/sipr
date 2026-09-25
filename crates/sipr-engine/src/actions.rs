@@ -7,7 +7,7 @@
 
 use sipr_net::Inbound;
 use sipr_net::rng::Rng;
-use sipr_scenario::model::{Action, ArithOp, CompareOp, JumpTarget, Operand, SearchIn};
+use sipr_scenario::model::{Action, ArithOp, CompareOp, JumpTarget, Operand, SearchIn, VarId};
 use sipr_scenario::template::MsgTemplate;
 
 use crate::render::{RenderCtx, render_to_string};
@@ -41,14 +41,36 @@ impl Value {
         }
     }
 
-    /// Numeric view, coercing strings and bools like SIPp.
+    /// SIPp `CCallVariable::getDouble`, the number every numeric read
+    /// takes (`value=`/`variable=` actions, `<test>`, `<pause variable=>`,
+    /// `[fill]`): a double's value, and 0 for anything else — a string, a
+    /// capture, a bool or an unset variable. Only `<todouble>` converts.
     #[must_use]
-    pub fn as_num(&self) -> f64 {
+    pub fn as_double(&self) -> f64 {
         match self {
             Self::Num(n) => *n,
-            Self::Bool(true) => 1.0,
-            Self::Str(s) => s.trim().parse().unwrap_or(0.0),
-            Self::Unset | Self::Bool(false) => 0.0,
+            Self::Str(_) | Self::Bool(_) | Self::Unset => 0.0,
+        }
+    }
+
+    /// SIPp `CCallVariable::toDouble`, for `<todouble>`: a double as is, a
+    /// bool as 0 or 1, a string (or capture) when `strtod` takes all of it
+    /// — leading blanks allowed, and "" is 0 — and `None` otherwise, or
+    /// when the variable is unset.
+    #[must_use]
+    pub fn to_double(&self) -> Option<f64> {
+        match self {
+            Self::Num(n) => Some(*n),
+            Self::Bool(b) => Some(f64::from(u8::from(*b))),
+            Self::Str(s) => {
+                let s = s.trim_start();
+                if s.is_empty() {
+                    Some(0.0)
+                } else {
+                    s.parse().ok()
+                }
+            }
+            Self::Unset => None,
         }
     }
 
@@ -195,7 +217,7 @@ fn run_actions_impl(
 fn operand_value(operand: &Operand, store: &VarStore) -> f64 {
     match operand {
         Operand::Value(v) => *v,
-        Operand::Var(id) => store.get(*id).as_num(),
+        Operand::Var(id) => store.get(*id).as_double(),
     }
 }
 
@@ -324,7 +346,7 @@ fn run_one(
             compare,
             value,
         } => {
-            let lhs = store.get(*variable).as_num();
+            let lhs = store.get(*variable).as_double();
             let result = match compare {
                 CompareOp::Equal => (lhs - *value).abs() < f64::EPSILON,
                 CompareOp::NotEqual => (lhs - *value).abs() >= f64::EPSILON,
@@ -341,7 +363,7 @@ fn run_one(
             assign_to,
             operand,
         } => {
-            let lhs = store.get(*assign_to).as_num();
+            let lhs = store.get(*assign_to).as_double();
             let rhs = operand_value(operand, store);
             let result = match op {
                 ArithOp::Add => lhs + rhs,
@@ -362,16 +384,31 @@ fn run_one(
             assign_to,
             variable,
         } => {
-            let number = store.get(*variable).as_num();
-            store.set(*assign_to, Value::Num(number));
-            ActionOutcome::Continue
+            let converted = store.get(*variable).to_double();
+            match converted {
+                Some(number) => {
+                    store.set(*assign_to, Value::Num(number));
+                    ActionOutcome::Continue
+                }
+                // SIPp's WARNING names its internal variable ids; sipr names
+                // the variables.
+                None => {
+                    let name =
+                        |id: VarId| base_ctx.var_ctx.as_ref().map_or("?", |vc| vc.vars.name(id));
+                    ActionOutcome::Warn(format!(
+                        "Invalid double conversion from ${} to ${}",
+                        name(*variable),
+                        name(*assign_to)
+                    ))
+                }
+            }
         }
         Action::Jump { dest } => match dest {
             JumpTarget::Index(step) => ActionOutcome::Jump(*step),
             // SIPp: `(int)operand`; a negative index is nonsense → 0.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             JumpTarget::Var(v) => {
-                ActionOutcome::JumpToMessage(store.get(*v).as_num().max(0.0) as usize)
+                ActionOutcome::JumpToMessage(store.get(*v).as_double().max(0.0) as usize)
             }
         },
         Action::PauseRestore(op) => ActionOutcome::PauseRestore(operand_value(op, store)),
@@ -593,7 +630,19 @@ mod tests {
 
     #[test]
     fn value_coercions() {
-        assert_eq!(Value::Str("42".into()).as_num(), 42.0);
+        // SIPp's getDouble: only a double has a number.
+        assert_eq!(Value::Num(42.0).as_double(), 42.0);
+        assert_eq!(Value::Str("42".into()).as_double(), 0.0);
+        assert_eq!(Value::Bool(true).as_double(), 0.0);
+        assert_eq!(Value::Unset.as_double(), 0.0);
+        // SIPp's toDouble: all of the string, leading blanks allowed.
+        assert_eq!(Value::Str(" 12.5".into()).to_double(), Some(12.5));
+        assert_eq!(Value::Str(String::new()).to_double(), Some(0.0));
+        assert_eq!(Value::Str("12abc".into()).to_double(), None);
+        assert_eq!(Value::Str("5 ".into()).to_double(), None);
+        assert_eq!(Value::Bool(true).to_double(), Some(1.0));
+        assert_eq!(Value::Num(-2.0).to_double(), Some(-2.0));
+        assert_eq!(Value::Unset.to_double(), None);
         assert_eq!(Value::Num(3.0).as_str(), "3.000000", "SIPp %lf");
         assert_eq!(Value::Num(3.5).as_str(), "3.500000");
         assert_eq!(Value::Num(-2.0).as_str(), "-2.000000");
@@ -604,7 +653,6 @@ mod tests {
         );
         assert_eq!(Value::Bool(true).as_str(), "true");
         assert_eq!(Value::Bool(false).as_str(), "");
-        assert_eq!(Value::Bool(true).as_num(), 1.0);
         assert_eq!(Value::Unset.as_str(), "");
         assert!(!Value::Unset.is_set());
         assert!(!Value::Num(0.0).is_set());

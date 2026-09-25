@@ -5850,6 +5850,124 @@ fn a_recv_cmds_ontimeout_takes_the_receive_timeout_like_real_sipp() {
     assert_eq!(ours, theirs, "sipr differs from real sipp");
 }
 
+// ---- a variable's number: SIPp's getDouble() and toDouble() ---------------
+
+/// A UAC reading variables as numbers every way SIPp does. `getDouble` is
+/// 0 for anything but a double: an `<add>` on the string "5" gives 1, an
+/// `<assign variable=>` from a string or a bool gives 0 (rendered empty),
+/// and a `<test>` of the string "5" against 5 is false, so the `condexec`
+/// send is skipped. `<todouble>` parses a whole string (leading blanks
+/// allowed, "" is 0) and leaves its target alone, with a warning, when it
+/// cannot.
+const NUMBERS_UAC_XML: &str = r#"<scenario name="numbers">
+  <nop>
+    <action>
+      <assignstr assign_to="t" value="5"/>
+      <add assign_to="t" value="1"/>
+      <assignstr assign_to="s5" value="5"/>
+      <assign assign_to="fromstr" variable="s5"/>
+      <assign assign_to="seven" value="7"/>
+      <test assign_to="b" variable="seven" compare="equal" value="7"/>
+      <assign assign_to="frombool" variable="b"/>
+      <assignstr assign_to="s" value=" 12.5"/>
+      <todouble assign_to="d" variable="s"/>
+      <assignstr assign_to="bad" value="12abc"/>
+      <assign assign_to="kept" value="3"/>
+      <todouble assign_to="kept" variable="bad"/>
+      <assignstr assign_to="empty" value=""/>
+      <assign assign_to="e" value="3"/>
+      <todouble assign_to="e" variable="empty"/>
+      <test assign_to="cmp" variable="s5" compare="equal" value="5"/>
+    </action>
+  </nop>
+  <send><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:num@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 OPTIONS
+    Max-Forwards: 70
+    X-Values: [$t]|[$fromstr]|[$frombool]|[$d]|[$kept]|[$e]
+    Content-Length: 0
+
+  ]]></send>
+  <send condexec="cmp"><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:num@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 2 OPTIONS
+    Max-Forwards: 70
+    X-Values: compared-equal
+    Content-Length: 0
+
+  ]]></send>
+</scenario>
+"#;
+
+/// Run `uac_bin` on [`NUMBERS_UAC_XML`] against a UDP sink with
+/// `-trace_err`. Returns the exit code, every `X-Values` the sink got, and
+/// whether the error log has the failed `<todouble>`'s warning (SIPp names
+/// the variables by internal ids, sipr by name, so only its start counts).
+fn run_numbers_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>, bool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("numbers.xml");
+    std::fs::write(&xml, NUMBERS_UAC_XML).expect("write uac");
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut uac = Reaper(
+        tool_command(uac_bin)
+            .current_dir(dir.path())
+            .args(["-sf", xml.to_str().expect("utf8")])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20", "-trace_err"])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uac"),
+    );
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut values = Vec::new();
+    let mut buf = [0u8; 65_535];
+    while let Ok(n) = sink.recv(&mut buf) {
+        if let Some(v) = String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .find_map(|l| l.strip_prefix("X-Values:"))
+        {
+            values.push(v.trim().to_owned());
+        }
+    }
+    let warned = sipp_error_log(dir.path()).contains("Invalid double conversion from $");
+    (code, values, warned)
+}
+
+/// Variables read as numbers the way SIPp reads them (docs/SIPP_COMPAT.md
+/// §6): `getDouble` everywhere, `toDouble` in `<todouble>` only.
+#[test]
+fn variables_read_as_numbers_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::variables_read_as_numbers_like_real_sipp — no sipp.");
+        return;
+    };
+    let theirs = run_numbers_uac(&sipp);
+    assert_eq!(
+        theirs,
+        (
+            Some(0),
+            vec!["1.000000|||12.500000|3.000000|".to_owned()],
+            true
+        ),
+        "real sipp"
+    );
+    let ours = run_numbers_uac(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(ours, theirs, "sipr read numbers differently than real sipp");
+}
+
 // ---- twin commands in -trace_msg and -trace_shortmsg ----------------------
 
 /// Accept the one twin link `listener` gets, answer its first command with

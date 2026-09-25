@@ -630,7 +630,9 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
             let length = ctx
                 .var_ctx
                 .as_ref()
-                .and_then(|vc| table_lookup(vc.vars, variable).map(|id| vc.store.get(id).as_num()))
+                .and_then(|vc| {
+                    table_lookup(vc.vars, variable).map(|id| vc.store.get(id).as_double())
+                })
                 .unwrap_or(0.0);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let length = if length.is_nan() || length < 0.0 {
@@ -797,7 +799,9 @@ fn resolve_line_expr(expr: &LineExpr, ctx: &RenderCtx<'_>) -> Option<usize> {
         LineExpr::Var(name) => {
             let vc = ctx.var_ctx.as_ref()?;
             let id = table_lookup(vc.vars, name)?;
-            let n = vc.store.get(id).as_num();
+            // SIPp renders `line=` and parses the text (`strtod`), so a
+            // numeric string works here, unlike in `getDouble`.
+            let n = vc.store.get(id).to_double().unwrap_or(0.0);
             if n < 0.0 {
                 None
             } else {

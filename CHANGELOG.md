@@ -157,6 +157,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A variable reads as a number the way SIPp's `getDouble` reads it: a
+  double's value, and 0 for a string, a capture, a bool or an unset
+  variable. That covers every `value=`/`variable=` action, the
+  arithmetic actions, `<test>`, `<pause variable=>` and `[fill]`. sipr
+  parsed numeric strings and read a true bool as 1, so for one,
+  `<assignstr value="5"/><add value="1"/>` gave 6 where sipp gives 1.
+  Behavior change: a string or an `<ereg>` capture used as a number now
+  needs a `<todouble>` first, as in SIPp. `<todouble>` takes a string
+  only when all of it parses, and otherwise leaves its target alone with
+  SIPp's "Invalid double conversion" warning, where sipr wrote 0.
 - 3PCC twin commands show up in `-trace_msg` and `-trace_shortmsg` as in
   SIPp: `TCP control message sent|received [<n>] bytes:` frames, with
   SIPp's handling of the closing ESC, and `S`/`R` short lines. The

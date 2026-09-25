@@ -4,9 +4,9 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **9-10** are SIPp divergences in how variables read and render, found
-  while fixing `<assign value=>` (commit `86b9505`). Both were confirmed
-  against sipp 3.7.7.
+- **10** is a SIPp divergence in how variables render, found while
+  fixing `<assign value=>` (commit `86b9505`). It was confirmed against
+  sipp 3.7.7.
 - **11** breaks the rule that sipr never ignores scenario input silently.
   It was found while fixing jump semantics (commit `5b29b65`).
 - **12** is a gap in SIPp's documented keywords, found while adding
@@ -34,45 +34,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 9. Read a variable's number the way SIPp's `getDouble()` does
-
-Scope: `fix(engine)`. SIPP_COMPAT §6, the `<assign>` note, lists it as
-open.
-
-- **SIPp:** `CCallVariable::getDouble` (`variables.cpp` ~l.94) returns
-  the double of a double variable and 0 for anything else: a string, a
-  regexp capture, a bool (true included) or an unset variable. Every
-  numeric read goes through it:
-  - `get_rhs` (`call.cpp` ~l.5692): `variable=` on `assign`, `add`,
-    `subtract`, `multiply`, `divide`, `jump` and `pauserestore`
-  - the arithmetic actions' own left-hand side (~l.6006-6025)
-  - `CAction::compare` (`actions.cpp` ~l.69), for `<test>`
-  - `<pause variable=>` (~l.1970), `[fill variable=]` (~l.3989) and the
-    `_unexp.retaddr` check (~l.5452)
-
-  Only `<todouble>` converts: `CCallVariable::toDouble` (~l.121) parses
-  a string or capture with `strtod` and requires all of it to parse,
-  reads a bool as 0 or 1, and otherwise leaves the target alone with a
-  "Invalid double conversion" warning (`call.cpp` ~l.6117-6124).
-- **Confirmed against sipp 3.7.7**, in a UAC nop rendering into an
-  OPTIONS: `<assignstr assign_to="t" value="5"/><add assign_to="t"
-  value="1"/>` makes `[$t]` `1.000000`. `<assign variable=>` naming the
-  string `"5"`, or a true `<test>` result, renders empty (a zero double).
-- **sipr:** `Value::as_num` (`crates/sipr-engine/src/actions.rs`)
-  parses a numeric string and reads a true bool as 1. It serves all the
-  reads above (see its callers in `actions.rs`, `render.rs` and
-  `engine.rs`), so the same scenario sends `6.000000`, `5.000000` and
-  `1.000000`. `ToDouble` uses it too, so an unparsable string writes 0
-  with no warning.
-- **Fix:** give `Value` SIPp's strict number and use it for every read
-  above, and move `as_num`'s parsing into `ToDouble` with SIPp's
-  whole-string check and warning. Check each caller against SIPp before
-  switching it: `[fieldN line=[$v]]` is not in the list above. The
-  `value_coercions` unit test pins the current coercions.
-- **Test:** extend `assign_takes_a_value_or_a_variable_like_real_sipp`
-  in `tests/interop.rs` with string and bool sources and an `<add>` on
-  a string, or write a sibling test that also covers `<todouble>`.
 
 ## 10. Render a false bool as `false`
 

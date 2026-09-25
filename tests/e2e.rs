@@ -7150,7 +7150,9 @@ fn statistical_pauses_scenario_runs_against_scripted_uas() {
 /// The M39 keywords end to end: the OPTIONS a scripted responder receives
 /// carries the `-key` value, `[remote_host]`, `[dynamic_id]`, `[date]`,
 /// `[sipp_version]`, and on the second request `[fill]` sized by a
-/// captured variable and `[last_cseq_number+1]` from the previous 200.
+/// captured variable (through `<todouble>`: `[fill]` reads a double, as
+/// SIPp's `getDouble` does) and `[last_cseq_number+1]` from the previous
+/// 200.
 #[test]
 fn m39_keywords_render_in_sent_messages() {
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -7204,6 +7206,7 @@ Content-Length: 0
   <recv response="200">
     <action>
       <ereg regexp="([0-9]+)" search_in="hdr" header="X-Len:" check_it="true" assign_to="whole,n"/>
+      <todouble assign_to="len" variable="n"/>
     </action>
   </recv>
   <send retrans="500"><![CDATA[
@@ -7214,7 +7217,7 @@ To: <sip:[service]@[remote_ip]:[remote_port]>
 Call-ID: [call_id]
 CSeq: [last_cseq_number+1] OPTIONS
 Max-Forwards: 70
-X-Fill: [fill variable=n text="ab"]
+X-Fill: [fill variable=len text="ab"]
 X-Last: [last_cseq_number]
 Content-Length: 0
 

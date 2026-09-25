@@ -260,7 +260,7 @@ mod tests {
     }
 
     fn num(store: &VarStore, id: VarId) -> f64 {
-        store.get(id).as_num()
+        store.get(id).as_double()
     }
 
     #[test]

@@ -3553,7 +3553,7 @@ impl<'s> Engine<'s> {
                 let ms = self
                     .calls
                     .get(call_id)
-                    .map_or(0.0, |c| c.store.get(*v).as_num());
+                    .map_or(0.0, |c| c.store.get(*v).as_double());
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 Duration::from_millis(ms.max(0.0) as u64)
             }
@@ -5084,7 +5084,7 @@ impl<'s> Engine<'s> {
         let interrupted =
             scenario.message_index(call.pause_deadline.map_or(call.index, |(i, _)| i));
         if let Some(v) = scenario.unexp_retaddr {
-            if call.store.get(v).as_num() != 0.0 {
+            if call.store.get(v).as_double() != 0.0 {
                 return false;
             }
             #[allow(clippy::cast_precision_loss)]

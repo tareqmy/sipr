@@ -1190,10 +1190,30 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   of its value. sipr refused `value=` and copied the value as is, until
   it matched both. Verified against real sipp 3.7.7 by the
   `assign_takes_a_value_or_a_variable_like_real_sipp` interop test.
-  **Open:** SIPp's number of a variable (`CCallVariable::getDouble`) is 0
-  for anything but a double, so `variable=` naming a string or a bool
-  stores 0. sipr's parses a numeric string and reads a true bool as 1, as
-  in all its `value=`/`variable=` actions (`docs/FOLLOWUPS.md` 9).
+  What "the other variable's number" means is the next note.
+- A variable's number (verified in `variables.cpp` ~l.94 `getDouble` and
+  ~l.121 `toDouble`, `call.cpp` ~l.5692 `get_rhs`, ~l.1970, ~l.3989,
+  ~l.5452, ~l.6006-6025, ~l.6117-6124, ~l.6646-6657, `actions.cpp` ~l.69
+  `compare`; confirmed against real sipp, the
+  `variables_read_as_numbers_like_real_sipp` interop test). SIPp reads a
+  variable as a number through `getDouble`, which gives a double's value
+  and **0 for anything else**: a string, a regexp capture, a bool (true
+  included), an unset variable. Every numeric read goes through it:
+  `variable=` on `assign`, `add`, `subtract`, `multiply`, `divide`,
+  `jump` and `pauserestore`, the arithmetic actions' own left-hand side,
+  `<test>`, `<pause variable=>`, `[fill variable=]` and the
+  `_unexp.retaddr` check. So `<assignstr value="5"/>` then `<add
+  value="1"/>` gives 1, and a `<test>` of that string against 5 is false.
+  A string or a capture needs a `<todouble>` first. Only `<todouble>`
+  converts, through `toDouble`: a double as is, a bool as 0 or 1, a
+  string or capture when `strtod` takes all of it (leading blanks
+  allowed, `""` is 0). Otherwise it leaves its target alone and warns
+  "Invalid double conversion from $<a> to $<b>". SIPp prints its internal
+  variable ids there, and sipr prints the names. `[fieldN line=[$v]]`
+  renders the variable and parses the text, so a numeric string works
+  there. sipr used to parse a numeric string and read a true bool as 1
+  in every numeric read. Its `<todouble>` wrote 0 for a string it could
+  not parse, with no warning.
 - Manual transactions (M36; verified in `scenario.cpp` ~l.343-400
   `get_txn`, ~l.878-931, ~l.588-602 `validate_txn_usage`; `call.cpp`
   ~l.1128, ~l.2110-2116, ~l.4431-4450 `extract_transaction`,
