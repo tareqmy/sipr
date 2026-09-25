@@ -653,6 +653,24 @@ enum Event {
     Control(ControlRequest),
 }
 
+/// What tells a received message's copies apart: its top Via branch, its
+/// CSeq, and its method or status.
+type RecvKey = (String, String, String);
+
+/// The send that answered a received message: the first one after it, as
+/// SIPp's `recv_retrans_*` record it (`call.cpp` ~l.2118). A copy of that
+/// message gets this send again.
+struct Answer {
+    /// The message answered.
+    key: RecvKey,
+    /// The recv step that took it.
+    recv_step: usize,
+    /// The send step that answered it.
+    send_step: usize,
+    /// What that send put on the wire.
+    buf: Vec<u8>,
+}
+
 struct RetransCtx {
     buf: Vec<u8>,
     lost_pct: Option<f64>,
@@ -778,8 +796,12 @@ struct CallState {
     crypto: crate::render::CallCrypto,
     /// Next `play_dtmf` sequence number (SIPp: from 1200, advanced per burst).
     dtmf_seq: u16,
-    /// (branch, cseq-line, start-line-ish) key for inbound retrans dedupe.
-    last_recv_key: Option<(String, String, String)>,
+    /// The last received message's key, to spot its copies.
+    last_recv_key: Option<RecvKey>,
+    /// The recv step that took the last received message.
+    last_recv_step: Option<usize>,
+    /// The send that answered a received message, for its copies.
+    answer: Option<Answer>,
     retrans: Option<RetransCtx>,
     timer: Option<(TimerId, TimerKind)>,
     /// Bumped whenever timers are (re)armed; stale fires are ignored.
@@ -3288,6 +3310,19 @@ impl<'s> Engine<'s> {
                         slot.ack_index = Some(index);
                     }
                     call.last_sent = Some(buf.clone());
+                    // The first send after a received message answers it.
+                    let unanswered = call
+                        .last_recv_key
+                        .as_ref()
+                        .filter(|key| call.answer.as_ref().is_none_or(|a| &a.key != *key));
+                    if let (Some(key), Some(recv_step)) = (unanswered, call.last_recv_step) {
+                        call.answer = Some(Answer {
+                            key: key.clone(),
+                            recv_step,
+                            send_step: index,
+                            buf: buf.clone(),
+                        });
+                    }
                     // Replace any pending retransmission with this send's.
                     if let Some(old) = call.retrans.take() {
                         self.timers.cancel(old.timer);
@@ -3761,18 +3796,7 @@ impl<'s> Engine<'s> {
             None => return,
         };
         if is_dup {
-            self.stats_of(secondary).retrans_recv += 1;
-            // Re-send our last message (SIPp: retransmitted request → last
-            // response again; harmless for a duplicated response).
-            let resend = self
-                .calls
-                .get(&call_id)
-                .and_then(|c| c.last_sent.clone().map(|b| (b, c.remote)));
-            if let Some((buf, remote)) = resend {
-                let _ = self.send_for_call(&call_id, &buf, remote, None);
-                self.stats_of(secondary).retrans_sent += 1;
-                self.trace_send(&buf, remote);
-            }
+            self.on_received_retransmission(&call_id, secondary, hash_bytes(&packet.raw));
             return;
         }
         if completing {
@@ -3815,11 +3839,12 @@ impl<'s> Engine<'s> {
                 }
                 self.on_matched(&call_id, si, msg, msg_hash, key);
             }
-            Scan::Old => {
+            Scan::Old(si) => {
                 // Late/repeated optional (e.g. another 180): absorbed.
                 self.stats_of(secondary).messages_matched += 1;
                 if let Some(call) = self.calls.get_mut(&call_id) {
                     call.last_recv_key = Some(key);
+                    call.last_recv_step = Some(si);
                 }
             }
             Scan::NoMatch | Scan::OldTxn(_) => {
@@ -3932,6 +3957,60 @@ impl<'s> Engine<'s> {
         self.secondary_live += 1;
     }
 
+    /// A copy of the last message the call received (SIPp `process_incoming`
+    /// ~l.4659-4705). Once a send has answered it, the recv's loss is rolled,
+    /// the copy counts on the recv's `_Retrans` column, and that send goes
+    /// out again, counting on its own. A copy of a message nothing answered
+    /// yet only counts, and is dropped. SIPp forgets the answer at the call's
+    /// next send and then takes a copy as a new message (often unexpected,
+    /// failing the call); sipr keeps answering it (docs/SIPP_COMPAT.md §6).
+    fn on_received_retransmission(&mut self, call_id: &str, secondary: bool, msg_hash: u64) {
+        let Some(call) = self.calls.get(call_id) else {
+            return;
+        };
+        let remote = call.remote;
+        let answer = call
+            .answer
+            .as_ref()
+            .filter(|a| call.last_recv_key.as_ref() == Some(&a.key))
+            .map(|a| (a.recv_step, a.send_step, a.buf.clone()));
+        let Some(recv_step) = answer.as_ref().map(|a| a.0).or(call.last_recv_step) else {
+            return;
+        };
+        if answer.is_some() {
+            let lost = match self.scenario_of(call_id).steps.get(recv_step) {
+                Some(Step::Recv(r)) => r.lost_pct.or(self.config.lost),
+                _ => self.config.lost,
+            };
+            if lost.is_some_and(|p| self.rng.chance_pct(p)) {
+                if let Some(s) = self.stats_of(secondary).step_mut(recv_step) {
+                    s.lost += 1;
+                }
+                let transport = self.transport_token;
+                self.call_debug(
+                    call_id,
+                    format!("{transport} message (retrans) lost (recv) (hash {msg_hash})\n"),
+                );
+                return;
+            }
+        }
+        let stats = self.stats_of(secondary);
+        stats.retrans_recv += 1;
+        if let Some(s) = stats.step_mut(recv_step) {
+            s.retrans += 1;
+        }
+        let Some((_, send_step, buf)) = answer else {
+            return;
+        };
+        let _ = self.send_for_call(call_id, &buf, remote, None);
+        let stats = self.stats_of(secondary);
+        stats.retrans_sent += 1;
+        if let Some(s) = stats.step_mut(send_step) {
+            s.retrans += 1;
+        }
+        self.trace_send(&buf, remote);
+    }
+
     /// Common handling for a message matched at step `si`.
     fn on_matched(
         &mut self,
@@ -4013,6 +4092,7 @@ impl<'s> Engine<'s> {
         apply_rtds(call, stats, &common, now);
         stats.tick_counter(si);
         call.last_recv_key = Some(key);
+        call.last_recv_step = Some(si);
         if has_media && !ignore_sdp {
             learn_remote_media(call, msg);
         }
@@ -6468,6 +6548,8 @@ fn new_call(
         crypto: crate::render::CallCrypto::default(),
         dtmf_seq: DTMF_FIRST_SEQ,
         last_recv_key: None,
+        last_recv_step: None,
+        answer: None,
         retrans: None,
         timer: None,
         generation: 0,
@@ -6573,8 +6655,9 @@ fn apply_rtds(
 enum Scan {
     /// Matched at this forward step index.
     Forward(usize),
-    /// Matched an already-passed optional (contiguous block behind us).
-    Old,
+    /// Matched an already-passed optional (contiguous block behind us) at
+    /// this step index.
+    Old(usize),
     /// A response for a named transaction behind the contiguous block —
     /// SIPp's "reply to an old transaction" (call.cpp ~l.5395).
     OldTxn(TxnId),
@@ -6657,7 +6740,7 @@ fn scan_for_match_guarded(
                 }
                 if contig {
                     if recv_matches(r, expected_cseq_method.get(i), txns, i, msg) {
-                        return Scan::Old;
+                        return Scan::Old(i);
                     }
                 } else if let Some(txn) = r.response_txn
                     && recv_matches(r, expected_cseq_method.get(i), txns, i, msg)
@@ -7224,7 +7307,7 @@ mod tests {
         // optional block behind the window.
         assert!(matches!(
             scan_for_match(&sc, &methods, &[], 4, true, &response(180, "INVITE", false)),
-            Scan::Old
+            Scan::Old(_)
         ));
         // Once past the mandatory 200 (ACK sent, window start 5), contig is
         // broken by the mandatory step: a late 180 is unexpected — verified

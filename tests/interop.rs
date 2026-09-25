@@ -5976,6 +5976,158 @@ fn variables_read_and_render_like_real_sipp() {
     );
 }
 
+// ---- received retransmissions ----------------------------------------------
+
+/// A UAS that pauses before answering its INVITE, then takes an ACK and a
+/// BYE and lingers in a timewait. Messages: 0 INVITE, 1 pause, 2 its 200,
+/// 3 ACK, 4 BYE, 5 its 200, 6 timewait.
+const RETRANS_UAS_XML: &str = r#"<scenario name="retrans-uas">
+  <recv request="INVITE"/>
+  <pause milliseconds="400"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+  <recv request="BYE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <timewait milliseconds="1000"/>
+</scenario>
+"#;
+
+/// Run `uas_bin` on [`RETRANS_UAS_XML`] with `-trace_counts`, driven by a
+/// raw UDP UAC that sends each of the INVITE and the BYE twice: the
+/// INVITE's copy while the UAS still pauses (nothing answered it yet), the
+/// BYE's once its 200 is back. Returns the exit code, each response as
+/// `<status> <CSeq method>`, and the last counts row without its two time
+/// columns.
+fn run_retrans_uas(uas_bin: &std::path::Path) -> (Option<i32>, Vec<String>, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("retrans_uas.xml");
+    std::fs::write(&path, RETRANS_UAS_XML).expect("write uas");
+    // The first run of a freshly built binary takes ~0.5 s on macOS while
+    // the system checks it. The INVITE below goes out once, so warm the
+    // binary up first.
+    let _ = Command::new(uas_bin).arg("-v").output_outside_probes();
+    let port = free_port();
+    let mut uas = Reaper(
+        tool_command(uas_bin)
+            .current_dir(dir.path())
+            .args(["-sf", path.to_str().expect("utf8")])
+            .args(["-i", "127.0.0.1", "-p", &port.to_string()])
+            .args(["-m", "1", "-timeout", "10", "-trace_counts"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uas"),
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let uas_addr = format!("127.0.0.1:{port}");
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uac");
+    let local = sock.local_addr().expect("uac addr");
+    let request = |method: &str, cseq: u32, to_tag: &str| {
+        format!(
+            "{method} sip:svc@{uas_addr} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {local};branch=z9hG4bK-rr-{method}-{cseq}\r\n\
+             From: <sip:uac@{local}>;tag=rr-uac\r\n\
+             To: <sip:svc@{uas_addr}>{to_tag}\r\n\
+             Call-ID: retrans-{}@127.0.0.1\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
+            local.port()
+        )
+    };
+    let mut responses = Vec::new();
+    let mut buf = [0u8; 65_535];
+    let mut listen = |limit: Duration, responses: &mut Vec<String>| {
+        let start = Instant::now();
+        while let Some(left) = limit.checked_sub(start.elapsed()) {
+            sock.set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .expect("timeout");
+            let Ok(n) = sock.recv(&mut buf) else {
+                break;
+            };
+            let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let status = text.split(' ').nth(1).unwrap_or_default();
+            let method = text
+                .lines()
+                .find_map(|l| l.strip_prefix("CSeq:"))
+                .and_then(|v| v.split_whitespace().nth(1))
+                .unwrap_or_default();
+            responses.push(format!("{status} {method}"));
+        }
+    };
+    let send = |text: String| {
+        sock.send_to(text.as_bytes(), &uas_addr)
+            .expect("send request");
+    };
+    send(request("INVITE", 1, ""));
+    std::thread::sleep(Duration::from_millis(100));
+    send(request("INVITE", 1, ""));
+    listen(Duration::from_millis(800), &mut responses);
+    send(request("ACK", 1, ";tag=x"));
+    send(request("BYE", 2, ";tag=x"));
+    listen(Duration::from_millis(300), &mut responses);
+    send(request("BYE", 2, ";tag=x"));
+    listen(Duration::from_millis(300), &mut responses);
+    let code = wait_with_timeout(&mut uas.0, Duration::from_secs(12));
+    let last = std::fs::read_dir(dir.path())
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_counts.csv"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("read counts"))
+        .unwrap_or_default()
+        .lines()
+        .last()
+        .and_then(|row| row.splitn(3, ';').nth(2))
+        .unwrap_or_default()
+        .to_owned();
+    (code, responses, last)
+}
+
+/// A retransmitted message, where sipr and SIPp agree (docs/SIPP_COMPAT.md
+/// §6): a copy that nothing answered yet is booked on its recv's
+/// `_Retrans` column and dropped; a copy of one a send answered gets that
+/// send again, booked on both steps.
+#[test]
+fn received_retransmissions_are_booked_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::received_retransmissions_are_booked_like_real_sipp — no sipp.");
+        return;
+    };
+    let theirs = run_retrans_uas(&sipp);
+    assert_eq!(
+        theirs,
+        (
+            Some(0),
+            vec!["200 INVITE".into(), "200 BYE".into(), "200 BYE".into()],
+            "1;1;0;0;1;0;1;0;1;0;0;0;1;1;0;0;1;1;1;0;".into()
+        ),
+        "real sipp"
+    );
+    let ours = run_retrans_uas(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(
+        ours, theirs,
+        "sipr handled the copies differently than real sipp"
+    );
+}
+
 // ---- a <sendCmd>'s actions ---------------------------------------------------
 
 /// A 3PCC controller whose `<sendCmd>` runs actions once the command is

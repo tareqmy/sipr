@@ -9167,3 +9167,235 @@ fn generic_counters_reach_the_statistics_file_screen_and_api() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- received retransmissions: where sipr keeps answering -----------------
+
+/// A raw UDP UAC for one call against a UAS on `uas`: requests share one
+/// Call-ID, and every response is read as `<status> <CSeq method>`.
+struct RawUac {
+    sock: UdpSocket,
+    uas: SocketAddr,
+    local: SocketAddr,
+}
+
+impl RawUac {
+    fn new(uas: SocketAddr) -> Self {
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uac");
+        let local = sock.local_addr().expect("uac addr");
+        Self { sock, uas, local }
+    }
+
+    /// Send `method` with `cseq`; the same arguments send the same bytes,
+    /// so a repeat is a retransmission.
+    fn send(&self, method: &str, cseq: u32) {
+        let (uas, local) = (self.uas, self.local);
+        let to_tag = if method == "INVITE" { "" } else { ";tag=x" };
+        let text = format!(
+            "{method} sip:svc@{uas} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {local};branch=z9hG4bK-e2e-{method}-{cseq}\r\n\
+             From: <sip:uac@{local}>;tag=e2e-uac\r\n\
+             To: <sip:svc@{uas}>{to_tag}\r\n\
+             Call-ID: e2e-retrans-{}@127.0.0.1\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
+            local.port()
+        );
+        self.sock
+            .send_to(text.as_bytes(), uas)
+            .expect("send request");
+    }
+
+    /// Every response that arrives within `limit`.
+    fn responses(&self, limit: Duration) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 65_535];
+        let start = std::time::Instant::now();
+        while let Some(left) = limit.checked_sub(start.elapsed()) {
+            self.sock
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .expect("timeout");
+            let Ok(n) = self.sock.recv(&mut buf) else {
+                break;
+            };
+            let Ok(msg) = Inbound::parse(&buf[..n]) else {
+                continue;
+            };
+            let method = msg.cseq().map(|(_, m)| m.to_owned()).unwrap_or_default();
+            out.push(format!("{} {method}", msg.status_code().unwrap_or(0)));
+        }
+        out
+    }
+}
+
+/// Start sipr as a UAS on `xml` with `-trace_counts` in `dir`, and wait
+/// until it has bound its port.
+fn spawn_counting_uas(dir: &std::path::Path, xml: &str) -> (std::process::Child, SocketAddr) {
+    let path = dir.join("uas.xml");
+    std::fs::write(&path, xml).expect("write uas");
+    let port = free_port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(dir)
+        .args(["-sf", path.to_str().expect("utf8")])
+        .args(["-i", "127.0.0.1", "-p", &port.to_string()])
+        .args(["-m", "1", "-timeout", "10", "-trace_counts", "-nostdin"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn_outside_probes()
+        .expect("spawn sipr");
+    let stderr = child.stderr.take().expect("stderr");
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stderr));
+    while let Some(Ok(line)) = lines.next() {
+        if line.contains("bound to") {
+            break;
+        }
+    }
+    std::thread::spawn(move || for _ in lines {});
+    let addr = format!("127.0.0.1:{port}").parse().expect("addr");
+    (child, addr)
+}
+
+/// The last `-trace_counts` row in `dir`, without its two time columns.
+fn last_counts_row(dir: &std::path::Path) -> String {
+    std::fs::read_dir(dir)
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_counts.csv"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("read counts"))
+        .unwrap_or_default()
+        .lines()
+        .last()
+        .and_then(|row| row.splitn(3, ';').nth(2))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// A copy of an INVITE that a 180 and then a 200 answered gets the 180
+/// again: the send that answered it, booked with the copy on both steps.
+/// Real sipp takes that copy as a new, unexpected message and aborts the
+/// call; sipr keeps answering (docs/SIPP_COMPAT.md §6).
+#[test]
+fn a_copy_gets_the_send_that_answered_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let answer = |status: &str, to_tag: &str| {
+        format!(
+            r"  <send><![CDATA[
+    SIP/2.0 {status}
+    [last_Via:]
+    [last_From:]
+    [last_To:]{to_tag}
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+"
+        )
+    };
+    let xml = format!(
+        r#"<scenario name="answered-copy">
+  <recv request="INVITE"/>
+{ringing}{ok}  <recv request="ACK"/>
+  <recv request="BYE"/>
+{bye_ok}  <timewait milliseconds="300"/>
+</scenario>
+"#,
+        ringing = answer("180 Ringing", ";tag=[pid]SIPpTag01[call_number]"),
+        ok = answer("200 OK", ";tag=[pid]SIPpTag01[call_number]"),
+        bye_ok = answer("200 OK", ""),
+    );
+    let (mut uas, addr) = spawn_counting_uas(dir.path(), &xml);
+    let uac = RawUac::new(addr);
+    uac.send("INVITE", 1);
+    let first = uac.responses(Duration::from_millis(400));
+    uac.send("INVITE", 1);
+    let copy = uac.responses(Duration::from_millis(400));
+    uac.send("ACK", 1);
+    uac.send("BYE", 2);
+    let bye = uac.responses(Duration::from_millis(400));
+    let code = wait_exit(&mut uas, Duration::from_secs(8));
+    assert_eq!(first, ["180 INVITE", "200 INVITE"]);
+    assert_eq!(copy, ["180 INVITE"], "the send that answered the INVITE");
+    assert_eq!(bye, ["200 BYE"]);
+    assert_eq!(code, Some(0), "the call completes");
+    // 0 INVITE, 1 180, 2 200, 3 ACK, 4 BYE, 5 200, 6 timewait.
+    assert_eq!(
+        last_counts_row(dir.path()),
+        "1;1;0;0;1;1;1;0;1;0;0;0;1;0;0;0;1;0;1;0;"
+    );
+}
+
+/// A recv's `lost=` is rolled on each copy of its message once a send
+/// answered it, as SIPp does: a lost copy counts on the recv's `_Lost`
+/// column and gets nothing back; the others count on `_Retrans` and get
+/// the answer again.
+#[test]
+fn a_copy_of_an_answered_message_can_be_lost() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = r#"<scenario name="lost-copies">
+  <recv request="INVITE"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="ACK"/>
+  <recv request="BYE" lost="50"/>
+  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:]
+    [last_Call-ID:]
+    [last_CSeq:]
+    Content-Length: 0
+
+  ]]></send>
+  <timewait milliseconds="2000"/>
+</scenario>
+"#;
+    let (mut uas, addr) = spawn_counting_uas(dir.path(), xml);
+    let uac = RawUac::new(addr);
+    uac.send("INVITE", 1);
+    assert_eq!(uac.responses(Duration::from_millis(300)), ["200 INVITE"]);
+    uac.send("ACK", 1);
+    // The BYE itself may be lost too: resend it until the 200 comes.
+    let mut tries = 0u64;
+    loop {
+        tries += 1;
+        uac.send("BYE", 2);
+        if !uac.responses(Duration::from_millis(100)).is_empty() {
+            break;
+        }
+        assert!(tries < 40, "the BYE never got its 200");
+    }
+    const COPIES: u64 = 20;
+    for _ in 0..COPIES {
+        uac.send("BYE", 2);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let answered = uac.responses(Duration::from_millis(300)).len() as u64;
+    let code = wait_exit(&mut uas, Duration::from_secs(8));
+    assert_eq!(code, Some(0));
+    // Columns: 0 INVITE (0-4), 1 200 (5-7), 2 ACK (8-12), 3 BYE (13-17),
+    // 4 200 (18-20), 5 timewait (21-22). Loss is on, so every send and
+    // recv ends in a Lost column.
+    let row = last_counts_row(dir.path());
+    let n: Vec<u64> = row
+        .split(';')
+        .filter(|c| !c.is_empty())
+        .map(|c| c.parse().expect("numeric"))
+        .collect();
+    let (bye_recv, bye_retrans, bye_lost) = (n[13], n[14], n[17]);
+    let ok_retrans = n[19];
+    assert_eq!(bye_recv, 1, "{row}");
+    assert_eq!(bye_retrans, answered, "{row}");
+    assert_eq!(ok_retrans, answered, "{row}");
+    assert_eq!(bye_lost, tries - 1 + COPIES - answered, "{row}");
+    // Half of 20 copies are lost on average; all or none is 2^-20.
+    assert!(answered > 0 && answered < COPIES, "{answered} of {COPIES}");
+}

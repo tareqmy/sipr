@@ -313,9 +313,10 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
 - Pacing: SIPp smooths call starts within the rate period rather than
   bursting `-r` calls at once; sipr ticks every ≤20 ms and accumulates
   fractional starts.
-- UAS behaviors (M4): an inbound retransmission (same branch/CSeq/start
-  line) is answered by re-sending our last message; during `timewait` the
-  call absorbs traffic without failing (SIPp deadcall). `-aa` answers
+- UAS behaviors (M4): an inbound retransmission of the last received
+  message (same top Via branch, CSeq and method or status) is handled as
+  the "Received retransmissions" note below describes; during `timewait`
+  the call absorbs traffic without failing (SIPp deadcall). `-aa` answers
   in-dialog OPTIONS/INFO/UPDATE/NOTIFY with a 200 mirroring
   Via/From/To/Call-ID/CSeq. UAS calls reply to the request's source
   address — as SIPp does: it keeps the source as `call_peer` and never
@@ -1500,9 +1501,27 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   the recv matched (confirmed against real sipp, the
   `lost_messages_are_counted_like_real_sipp` interop test). The scenario
   screen gets a `lost` column too. sipr counted no losses and wrote no
-  `_Lost` column. **Open:** SIPp also rolls the loss on a retransmission
-  it receives of the message a recv matched (`call.cpp` ~l.4668), and
-  sipr applies no loss to incoming retransmissions. `-trace_error_codes` writes
+  `_Lost` column. A received retransmission rolls the loss too (the
+  next note).
+- Received retransmissions (verified in `call.cpp` ~l.2118-2130 and
+  ~l.4659-4705; confirmed against real sipp, the
+  `received_retransmissions_are_booked_like_real_sipp` interop test).
+  SIPp records the first send after a received message as its answer.
+  A copy of that message rolls the recv's loss: a lost one counts on the
+  recv's `_Lost` column and gets nothing. Otherwise the copy counts on
+  the recv's `_Retrans` column, and SIPp sends the answer again and
+  counts it on that send's `_Retrans`. A copy of a message nothing has
+  answered yet counts on the recv's `_Retrans` and is dropped. sipr does
+  all of this. **Divergence, on purpose:** SIPp overwrites its record at
+  the call's next send, so it only answers a copy that arrives before
+  then. Later it takes the copy as a new message, and an INVITE
+  retransmitted after a 180 and a 200 aborts the call as unexpected.
+  sipr keeps the answer until the next received message is answered, so
+  that INVITE gets its 180 again and the call goes on. SIPp also does
+  this only over UDP without `-nr`; sipr treats a copy the same way on
+  any transport. sipr used to resend its last message for any copy, the
+  one answering a message the copy never asked for included, and counted
+  nothing per step. `-trace_error_codes` writes
   `<scenario>_<pid>_error_codes.csv`: per dump the time, the elapsed
   time and the status codes of the responses that failed a call as
   unexpected since the last dump, comma-terminated, newest first (SIPp

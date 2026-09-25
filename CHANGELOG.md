@@ -157,6 +157,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A retransmitted message gets the send that answered it (the first send
+  after it), not simply the last one sent. For one, a retransmitted 200
+  gets its ACK again even after a BYE has gone out. It counts on the
+  recv's `-trace_counts` `_Retrans` column, and the resend on the send's.
+  A recv's `lost=` (or `-lost`) is rolled on it, as in SIPp. A copy of a
+  message nothing answered yet is counted and dropped. sipr used to
+  resend whatever it sent last, and counted retransmissions only in
+  total. Unlike SIPp, sipr keeps answering a copy after later sends
+  instead of failing the call on it.
 - A `<sendCmd>` takes `<action>`, as in SIPp, and runs it once the
   command is sent. A `<jump>` there lands as a nop's does. sipr refused
   the scenario ("unexpected <action> inside <sendCmd>").
