@@ -4,8 +4,6 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **12** is a gap in SIPp's documented keywords, found while adding
-  `[branch±N]` (commit `bffa0e8`).
 - **13** is a SIPp divergence in the `-trace_counts` columns, found while
   fixing the nop and 3PCC columns (commit `532133a`).
 - **14** is a flaky interop test, seen again while running the gates for
@@ -32,37 +30,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 12. Take SIPp's `+N`/`-N` offset on every keyword
-
-Scope: `fix(scenario)`, and `fix(engine)` for the rendering.
-
-- **SIPp:** `SendingMessage` (`message.cpp` ~l.242-250) strips a `+N`
-  or `-N` (a sign, then a digit) from any keyword but `authentication`
-  and `tdmmap`, and keeps it as the component's `offset`. These
-  keywords add it: `[remote_port]` (`call.cpp` ~l.2748),
-  `[local_port]` (~l.2760), `[media_port]` (~l.2791), the
-  `[rtpstream_*_port]`s (~l.2832-2856), the crypto keywords, `[cseq]`
-  (~l.3884), `[branch]` (~l.3892), `[len]` (~l.3915) and
-  `[last_cseq_number]` (~l.4083). Every other keyword drops it:
-  `[call_number+1]` renders the call number. SIPp's
-  `docs/scenarios/keywords.rst` documents `[remote_port+3]`,
-  `[local_port+3]`, `[len+3]` and `[cseq+1]`.
-- **sipr:** `classify` in `crates/sipr-scenario/src/template.rs` takes
-  offsets only on the media and rtpstream ports, the crypto keywords,
-  `[last_cseq_number]` and `[branch]`. `[cseq+1]`, `[len+3]`,
-  `[remote_port+3]` and `[local_port+3]` warn "unknown keyword … passed
-  through verbatim", so the brackets go out in the message. So does an
-  offset on any other keyword.
-- **Fix:** give `Cseq`, `Len`, `RemotePort` and `LocalPort` an `offset`
-  like `Branch { offset }`, parsed with `parse_offset`, and add it where
-  `render.rs` writes them. `[len]` fills a width-5 placeholder after
-  the body is known, so check that the offset reaches that
-  computation. For the keywords SIPp parses an offset on and drops it,
-  decide between matching SIPp and a specific warning. Dropping it
-  silently is what AGENTS.md forbids.
-- **Test:** an interop UAC rendering each offset form into an OPTIONS
-  to a UDP sink, compared with real sipp.
 
 ## 13. Count and report simulated losses per message
 

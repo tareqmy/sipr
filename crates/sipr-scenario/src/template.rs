@@ -29,8 +29,11 @@ pub enum Keyword {
     Service,
     /// `[remote_ip]`
     RemoteIp,
-    /// `[remote_port]`
-    RemotePort,
+    /// `[remote_port]`, with an optional `+N`/`-N` added to it.
+    RemotePort {
+        /// The `+N`/`-N` suffix (0 without one).
+        offset: i64,
+    },
     /// `[local_ip]`
     LocalIp,
     /// `[server_ip]`: the IP of the socket this call's messages leave on
@@ -38,8 +41,11 @@ pub enum Keyword {
     ServerIp,
     /// `[local_ip_type]` — `4` or `6`.
     LocalIpType,
-    /// `[local_port]`
-    LocalPort,
+    /// `[local_port]`, with an optional `+N`/`-N` added to it.
+    LocalPort {
+        /// The `+N`/`-N` suffix (0 without one).
+        offset: i64,
+    },
     /// `[transport]` — `UDP` / `TCP` / `TLS`.
     Transport,
     /// `[call_id]`
@@ -50,8 +56,11 @@ pub enum Keyword {
     UserId,
     /// `[users]` — the configured `-users` count (0 when not in users mode).
     Users,
-    /// `[cseq]` — current CSeq value.
-    Cseq,
+    /// `[cseq]` — current CSeq value, with an optional `+N`/`-N` added.
+    Cseq {
+        /// The `+N`/`-N` suffix (0 without one).
+        offset: i64,
+    },
     /// `[branch]`, with an optional `+N`/`-N` — per-transaction Via branch,
     /// ending in the message index plus the offset (`[branch-2]` repeats
     /// the branch of the message two before).
@@ -69,8 +78,12 @@ pub enum Keyword {
     NextUrl,
     /// `[peer_tag_param]` — `;tag=X` of the peer, or empty.
     PeerTagParam,
-    /// `[len]` — computed Content-Length (body bytes after substitution).
-    Len,
+    /// `[len]` — computed Content-Length (body bytes after substitution),
+    /// with an optional `+N`/`-N` added.
+    Len {
+        /// The `+N`/`-N` suffix (0 without one).
+        offset: i64,
+    },
     /// `[media_ip]` — the `-mi` media address (defaults to the local IP).
     MediaIp,
     /// `[media_port]` / `[auto_media_port]`, optionally with a `+N` offset
@@ -279,6 +292,20 @@ pub fn tokenize_with(
                 }
                 spans.push(Span::Kw(kw));
             }
+            Classified::OffsetIgnored(kw) => {
+                diags.warn(
+                    Some(line),
+                    format!(
+                        "offset in '[{body}]' has no effect: SIPp drops it, and adds one only to \
+                         [cseq], [len], [branch], [remote_port], [local_port], \
+                         [last_cseq_number] and the media port and crypto keywords"
+                    ),
+                );
+                if !lit.is_empty() {
+                    spans.push(Span::Lit(std::mem::take(&mut lit)));
+                }
+                spans.push(Span::Kw(kw));
+            }
             Classified::File(name) => {
                 // SIPp compiles the file name as a sub-message.
                 let sub = tokenize_with(&name, line, diags, generic);
@@ -330,6 +357,8 @@ fn matching_close(after: &str) -> Option<usize> {
 
 enum Classified {
     Keyword(Keyword),
+    /// A keyword with a `+N`/`-N` SIPp parses and then drops.
+    OffsetIgnored(Keyword),
     /// `[file name=…]`: the name text, tokenized by the caller.
     File(String),
     Unknown,
@@ -379,36 +408,30 @@ fn classify(body: &str, generic: &[String]) -> Classified {
             Classified::Unknown
         }
     };
+    if let Some(kw) = simple_keyword(name) {
+        return simple(kw);
+    }
+    // SIPp strips a `+N`/`-N` from any keyword but `[authentication]` and
+    // `[tdmmap]`; only some keywords then add it.
+    if let Some((base, offset)) = split_offset(name).filter(|(base, _)| *base != "tdmmap") {
+        let known = simple_keyword(base).or_else(|| {
+            generic
+                .iter()
+                .any(|g| g == base)
+                .then(|| Keyword::Generic(base.to_owned()))
+        });
+        if let Some(kw) = known {
+            if !params.is_empty() {
+                return Classified::Unknown;
+            }
+            return match with_offset(&kw, offset) {
+                Some(kw) => Classified::Keyword(kw),
+                None => Classified::OffsetIgnored(kw),
+            };
+        }
+    }
     match name {
-        "service" => simple(Keyword::Service),
-        "remote_ip" => simple(Keyword::RemoteIp),
-        "remote_port" => simple(Keyword::RemotePort),
-        "local_ip" => simple(Keyword::LocalIp),
-        "server_ip" => simple(Keyword::ServerIp),
-        "local_ip_type" => simple(Keyword::LocalIpType),
-        "local_port" => simple(Keyword::LocalPort),
-        "transport" => simple(Keyword::Transport),
-        "call_id" => simple(Keyword::CallId),
-        "call_number" => simple(Keyword::CallNumber),
-        "userid" => simple(Keyword::UserId),
-        "users" => simple(Keyword::Users),
-        "cseq" => simple(Keyword::Cseq),
-        "msg_index" => simple(Keyword::MsgIndex),
-        "pid" => simple(Keyword::Pid),
-        "routes" => simple(Keyword::Routes),
-        "next_url" => simple(Keyword::NextUrl),
-        "peer_tag_param" => simple(Keyword::PeerTagParam),
-        "len" => simple(Keyword::Len),
-        "media_ip" => simple(Keyword::MediaIp),
-        "media_ip_type" => simple(Keyword::MediaIpType),
         "authentication" => Classified::Keyword(Keyword::Authentication(parse_params(params))),
-        "clock_tick" => simple(Keyword::ClockTick),
-        "timestamp" => simple(Keyword::Timestamp),
-        "date" => simple(Keyword::Date),
-        "sipp_version" => simple(Keyword::SippVersion),
-        "dynamic_id" => simple(Keyword::DynamicId),
-        "remote_host" => simple(Keyword::RemoteHost),
-        "tdmmap" => simple(Keyword::TdmMap),
         "fill" => {
             let variable = param_value(params, "variable=");
             if variable.is_empty() {
@@ -442,6 +465,64 @@ fn classify(body: &str, generic: &[String]) -> Classified {
             },
         },
     }
+}
+
+/// The keywords named by their name alone, without parameters.
+fn simple_keyword(name: &str) -> Option<Keyword> {
+    Some(match name {
+        "service" => Keyword::Service,
+        "remote_ip" => Keyword::RemoteIp,
+        "remote_port" => Keyword::RemotePort { offset: 0 },
+        "local_ip" => Keyword::LocalIp,
+        "server_ip" => Keyword::ServerIp,
+        "local_ip_type" => Keyword::LocalIpType,
+        "local_port" => Keyword::LocalPort { offset: 0 },
+        "transport" => Keyword::Transport,
+        "call_id" => Keyword::CallId,
+        "call_number" => Keyword::CallNumber,
+        "userid" => Keyword::UserId,
+        "users" => Keyword::Users,
+        "cseq" => Keyword::Cseq { offset: 0 },
+        "msg_index" => Keyword::MsgIndex,
+        "pid" => Keyword::Pid,
+        "routes" => Keyword::Routes,
+        "next_url" => Keyword::NextUrl,
+        "peer_tag_param" => Keyword::PeerTagParam,
+        "len" => Keyword::Len { offset: 0 },
+        "media_ip" => Keyword::MediaIp,
+        "media_ip_type" => Keyword::MediaIpType,
+        "clock_tick" => Keyword::ClockTick,
+        "timestamp" => Keyword::Timestamp,
+        "date" => Keyword::Date,
+        "sipp_version" => Keyword::SippVersion,
+        "dynamic_id" => Keyword::DynamicId,
+        "remote_host" => Keyword::RemoteHost,
+        "tdmmap" => Keyword::TdmMap,
+        _ => return None,
+    })
+}
+
+/// `keyword` with SIPp's `+N`/`-N`, for the simple keywords that add it
+/// (`call.cpp` `comp->offset`); `None` for one that drops it.
+fn with_offset(keyword: &Keyword, offset: i64) -> Option<Keyword> {
+    match keyword {
+        Keyword::RemotePort { .. } => Some(Keyword::RemotePort { offset }),
+        Keyword::LocalPort { .. } => Some(Keyword::LocalPort { offset }),
+        Keyword::Cseq { .. } => Some(Keyword::Cseq { offset }),
+        Keyword::Len { .. } => Some(Keyword::Len { offset }),
+        _ => None,
+    }
+}
+
+/// A keyword name and its SIPp offset (`message.cpp` ~l.242): the first
+/// `+` or `-` followed by a digit starts it. `None` without one, or when
+/// what follows is not a plain integer.
+fn split_offset(name: &str) -> Option<(&str, i64)> {
+    let at = name.char_indices().find_map(|(i, c)| {
+        let digit_next = name[i + c.len_utf8()..].starts_with(|d: char| d.is_ascii_digit());
+        ((c == '+' || c == '-') && digit_next).then_some(i)
+    })?;
+    Some((&name[..at], parse_offset(&name[at..])?))
 }
 
 /// A keyword's `+N`/`-N` numeric suffix: `""` is 0, anything else that is
@@ -652,6 +733,37 @@ mod tests {
         assert_eq!(text, "INVITE sip:x SIP/2.0\r\nVia: y\r\n\r\nv=0\r\n");
     }
 
+    /// SIPp strips a `+N`/`-N` from any keyword (`message.cpp` ~l.242):
+    /// some add it, the rest drop it — rendered as the keyword, with a
+    /// warning here.
+    #[test]
+    fn keyword_offsets_are_kept_or_dropped_as_in_sipp() {
+        let (t, msgs) = tok("[cseq+1][len-2][remote_port+3][local_port-4][branch-5]");
+        let kws: Vec<&Keyword> = t.keywords().collect();
+        assert_eq!(
+            kws,
+            [
+                &Keyword::Cseq { offset: 1 },
+                &Keyword::Len { offset: -2 },
+                &Keyword::RemotePort { offset: 3 },
+                &Keyword::LocalPort { offset: -4 },
+                &Keyword::Branch { offset: -5 },
+            ]
+        );
+        assert!(msgs.is_empty(), "{msgs:?}");
+
+        let (t, msgs) = tok("[call_number+1] [pid-1]");
+        let kws: Vec<&Keyword> = t.keywords().collect();
+        assert_eq!(kws, [&Keyword::CallNumber, &Keyword::Pid]);
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert!(msgs[0].contains("offset in '[call_number+1]' has no effect"));
+
+        // Not an offset: no digit after the sign, or not a keyword.
+        let (t, msgs) = tok("[cseq+] [2001:db8::1-2]");
+        assert_eq!(t.keywords().count(), 0);
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+    }
+
     #[test]
     fn normalize_empty_is_empty() {
         assert_eq!(normalize_cdata("  \n \n"), "");
@@ -685,7 +797,7 @@ mod tests {
                 Span::Lit("@".into()),
                 Span::Kw(Keyword::RemoteIp),
                 Span::Lit(":".into()),
-                Span::Kw(Keyword::RemotePort),
+                Span::Kw(Keyword::RemotePort { offset: 0 }),
                 Span::Lit(" SIP/2.0\r\n".into()),
             ]
         );

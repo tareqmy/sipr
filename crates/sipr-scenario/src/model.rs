@@ -1174,23 +1174,27 @@ fn keyword_name(k: &Keyword) -> String {
         Keyword::LastRequestUri => "last_Request_URI",
         Keyword::Service => "service",
         Keyword::RemoteIp => "remote_ip",
-        Keyword::RemotePort => "remote_port",
+        Keyword::RemotePort { offset } => {
+            return format!("[remote_port{}]", offset_suffix(*offset));
+        }
         Keyword::LocalIp => "local_ip",
         Keyword::ServerIp => "server_ip",
         Keyword::LocalIpType => "local_ip_type",
-        Keyword::LocalPort => "local_port",
+        Keyword::LocalPort { offset } => {
+            return format!("[local_port{}]", offset_suffix(*offset));
+        }
         Keyword::Transport => "transport",
         Keyword::CallId => "call_id",
         Keyword::CallNumber => "call_number",
         Keyword::UserId => "userid",
         Keyword::Users => "users",
-        Keyword::Cseq => "cseq",
+        Keyword::Cseq { offset } => return format!("[cseq{}]", offset_suffix(*offset)),
         Keyword::MsgIndex => "msg_index",
         Keyword::Pid => "pid",
         Keyword::Routes => "routes",
         Keyword::NextUrl => "next_url",
         Keyword::PeerTagParam => "peer_tag_param",
-        Keyword::Len => "len",
+        Keyword::Len { offset } => return format!("[len{}]", offset_suffix(*offset)),
         Keyword::MediaIp => "media_ip",
         Keyword::MediaIpType => "media_ip_type",
     };

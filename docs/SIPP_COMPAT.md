@@ -64,7 +64,9 @@ Shipped: `exec play_pcap_audio|video|image=` and `<recv ignoresdp>` (M14),
 
 `[service]` `[remote_ip]` `[remote_port]` `[server_ip]` (the IP this call sends from; `-t ui`) `[local_ip]` `[local_ip_type]`
 `[local_port]` `[transport]` `[call_id]` `[call_number]` `[userid]` `[users]`
-`[cseq]` `[branch]` (with `+N`/`-N`) `[msg_index]` `[pid]` `[routes]` `[next_url]` `[peer_tag_param]`
+`[cseq]` `[branch]` `[msg_index]` `[pid]` `[routes]` `[next_url]` `[peer_tag_param]`
+(`[remote_port]`, `[local_port]`, `[cseq]`, `[len]` and `[branch]` take a
+`+N`/`-N` offset; see §6 "Keyword offsets")
 `[last_*]` (verbatim copy of header(s) from last received message, e.g.
 `[last_Via:]`, `[last_From:]`) `[$var]` `[authentication]` (+ `username=`/
 `password=` params) `[len]` (Content-Length auto-compute) `[field0..N]` (v1.x,
@@ -1643,6 +1645,22 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   jumps cross labels. It also round-trips `_unexp.retaddr` with a label
   before the interrupted pause. Where the jump then lands is in "Where a
   `<jump>` lands" below.
+- Keyword offsets (verified in `message.cpp` ~l.242-250, `call.cpp`
+  ~l.2748, ~l.2760, ~l.3884, ~l.3892, ~l.3915, ~l.4083, ~l.4112-4124;
+  confirmed against real sipp, the `keyword_offsets_render_like_real_sipp`
+  interop test). SIPp strips a `+N` or `-N` (a sign, then a digit) from
+  any keyword but `[authentication]` and `[tdmmap]`. `[remote_port]` and
+  `[local_port]` add it (`%d`), `[cseq]` adds it as an unsigned sum
+  (`[cseq-2]` at 1 prints 4294967295), and so do `[branch]`,
+  `[last_cseq_number]` and the media port and crypto keywords. Every
+  other keyword drops it, so `[call_number+1]` is the call number. sipr
+  renders a dropped offset the same way, with a warning that it has no
+  effect. `[len]` is `%5u`, the body length plus the offset
+  right-aligned in five columns (`Content-Length:    34`); with no body
+  it is `    0` and the offset is dropped. sipr took offsets on the media,
+  crypto, `[last_cseq_number]` and `[branch]` keywords only, and passed
+  the rest through verbatim with an unknown-keyword warning. It wrote
+  `[len]` without the padding.
 - `[msg_index]` and `[branch]` with no message index (verified in
   `call.cpp` ~l.3892-3902 `E_Message_Branch`/`E_Message_Index`, the
   `createSendingMessage` default `P_index = -1` in `call.hpp`, and its

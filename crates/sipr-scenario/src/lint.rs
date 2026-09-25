@@ -436,7 +436,7 @@ fn shape(template: &MsgTemplate) -> String {
     for span in &template.spans {
         match span {
             Span::Lit(text) => out.push_str(text),
-            Span::Kw(Keyword::Len) => out.push(LEN),
+            Span::Kw(Keyword::Len { .. }) => out.push(LEN),
             Span::Kw(_) => out.push(KEYWORD),
         }
     }

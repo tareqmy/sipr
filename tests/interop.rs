@@ -5973,6 +5973,109 @@ fn variables_read_and_render_like_real_sipp() {
     );
 }
 
+// ---- +N/-N keyword offsets --------------------------------------------------
+
+/// A UAC rendering SIPp's keyword offsets: kept on `[cseq]`, the ports and
+/// `[len]` (`%5u`, 0 with no body), dropped on `[call_number]`.
+const OFFSETS_UAC_XML: &str = r#"<scenario name="offsets">
+  <send><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:o@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: [cseq] OPTIONS
+    X-Off: [cseq+1]|[cseq-1]|[remote_port+1]|[local_port-1]|[call_number+1]
+    Content-Type: application/sdp
+    Content-Length: [len+3]
+
+    v=0
+    o=- 1 1 IN IP4 [local_ip]
+
+  ]]></send>
+  <send><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:o@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: [cseq] OPTIONS
+    Content-Length: [len]
+
+  ]]></send>
+</scenario>
+"#;
+
+/// Run `uac_bin` on [`OFFSETS_UAC_XML`] from local `port` to `sink`.
+/// Returns its exit code and the `X-Off` and `Content-Length` lines the
+/// sink got.
+fn run_offsets_uac(
+    uac_bin: &std::path::Path,
+    sink: &UdpSocket,
+    port: u16,
+) -> (Option<i32>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("offsets.xml");
+    std::fs::write(&xml, OFFSETS_UAC_XML).expect("write uac");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut uac = Reaper(
+        tool_command(uac_bin)
+            .current_dir(dir.path())
+            .args(["-sf", xml.to_str().expect("utf8")])
+            .args(["-i", "127.0.0.1", "-p", &port.to_string()])
+            .args(["-m", "1", "-timeout", "20"])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uac"),
+    );
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut lines = Vec::new();
+    let mut buf = [0u8; 65_535];
+    while let Ok(n) = sink.recv(&mut buf) {
+        lines.extend(
+            String::from_utf8_lossy(&buf[..n])
+                .split("\r\n")
+                .filter(|l| l.starts_with("X-Off:") || l.starts_with("Content-Length:"))
+                .map(ToOwned::to_owned),
+        );
+    }
+    (code, lines)
+}
+
+/// SIPp's `+N`/`-N` keyword offsets (docs/SIPP_COMPAT.md §2): the same
+/// UAC, same local port and same sink, sends the same header values under
+/// sipr and real sipp.
+#[test]
+fn keyword_offsets_render_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::keyword_offsets_render_like_real_sipp — no sipp.");
+        return;
+    };
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let sink_port = sink.local_addr().expect("sink addr").port();
+    let port = free_port();
+    let theirs = run_offsets_uac(&sipp, &sink, port);
+    assert_eq!(
+        theirs,
+        (
+            Some(0),
+            vec![
+                format!("X-Off: 2|0|{}|{}|1", sink_port + 1, port - 1),
+                "Content-Length:    34".to_owned(),
+                "Content-Length:     0".to_owned(),
+            ]
+        ),
+        "real sipp"
+    );
+    let ours = run_offsets_uac(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")), &sink, port);
+    assert_eq!(ours, theirs, "sipr rendered differently than real sipp");
+}
+
 // ---- a <pause>'s and a <timewait>'s actions --------------------------------
 
 /// A UAC whose pause runs actions when it starts: a `<log>` (before the

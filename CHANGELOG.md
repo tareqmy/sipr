@@ -157,6 +157,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The `+N`/`-N` keyword offsets SIPp documents work: `[cseq+1]`,
+  `[len+3]`, `[remote_port+3]` and `[local_port-1]` add theirs. An offset
+  on a keyword SIPp ignores it on, such as `[call_number+1]`, renders the
+  keyword as SIPp does, with a warning that it has no effect. sipr sent
+  all of these through verbatim with an unknown-keyword warning.
+  Behavior change: `[len]` renders as SIPp's `%5u`, right-aligned in five
+  columns (`Content-Length:    34`), and a message without a body gets
+  `    0`.
 - A `<pause>`'s and a `<timewait>`'s actions run, as in SIPp: when the
   pause starts, with a `<jump>` taking effect once it is over. A jump
   from a timewait sends the call on instead of ending it. sipr dropped

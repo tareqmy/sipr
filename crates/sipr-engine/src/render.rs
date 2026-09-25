@@ -119,8 +119,11 @@ impl CallCrypto {
     }
 }
 
-/// Marker interpolated for `[len]`, patched after body length is known.
-const LEN_MARKER: &str = "\u{7}SIPR_LEN\u{7}";
+/// Marker interpolated for `[len]` (`LEN_MARKER`, the offset, then
+/// `LEN_MARKER_END`), patched after body length is known.
+const LEN_MARKER: &str = "\u{7}SIPR_LEN";
+/// See [`LEN_MARKER`].
+const LEN_MARKER_END: char = '\u{7}';
 /// Marker appended when a line must be deleted (empty `[last_*]`/`[routes]`).
 const KILL_MARKER: &str = "\u{7}SIPR_KILL\u{7}";
 
@@ -400,9 +403,38 @@ fn render_string(template: &MsgTemplate, ctx: &RenderCtx<'_>) -> Result<String, 
     // Patch [len] with the body length (bytes after the header separator).
     if out.contains(LEN_MARKER) {
         let body_len = out.find("\r\n\r\n").map_or(0, |i| out.len() - (i + 4));
-        out = out.replace(LEN_MARKER, &body_len.to_string());
+        out = patch_len(&out, body_len);
     }
     Ok(out)
+}
+
+/// Replace each `[len]` marker as SIPp fixes its length up (`call.cpp`
+/// ~l.4112-4124): `%5u`, right-aligned in five columns, of the body length
+/// plus the marker's offset. With no body (or one of 100000 bytes or
+/// more) SIPp writes 0 and drops the offset.
+fn patch_len(text: &str, body_len: usize) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(LEN_MARKER) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + LEN_MARKER.len()..];
+        let (offset, tail) = after.split_once(LEN_MARKER_END).unwrap_or((after, ""));
+        let length = if (1..100_000).contains(&body_len) {
+            wrap_unsigned(signed(body_len) + offset.parse::<i64>().unwrap_or(0))
+        } else {
+            0
+        };
+        let _ = write!(out, "{length:>5}");
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// SIPp's `(unsigned)` of an `int` sum: a negative one wraps.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn wrap_unsigned(n: i64) -> u32 {
+    n as u32
 }
 
 #[allow(clippy::too_many_lines)] // one arm per keyword; splitting hurts
@@ -410,14 +442,14 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
     match kw {
         Keyword::Service => out.push_str(ctx.service),
         Keyword::RemoteIp => push_ip_for_uri(out, ctx.remote_ip),
-        Keyword::RemotePort => {
-            let _ = write!(out, "{}", ctx.remote_port);
+        Keyword::RemotePort { offset } => {
+            let _ = write!(out, "{}", i64::from(ctx.remote_port) + offset);
         }
         Keyword::LocalIp => push_ip_for_uri(out, ctx.local_ip),
         Keyword::ServerIp => push_ip_for_uri(out, ctx.server_ip),
         Keyword::LocalIpType => out.push_str(ip_type(ctx.local_ip)),
-        Keyword::LocalPort => {
-            let _ = write!(out, "{}", ctx.local_port);
+        Keyword::LocalPort { offset } => {
+            let _ = write!(out, "{}", i64::from(ctx.local_port) + offset);
         }
         Keyword::Transport => out.push_str(ctx.transport),
         Keyword::CallId => out.push_str(ctx.call_id),
@@ -430,8 +462,9 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
         Keyword::Users => {
             let _ = write!(out, "{}", ctx.users_total);
         }
-        Keyword::Cseq => {
-            let _ = write!(out, "{}", ctx.cseq);
+        Keyword::Cseq { offset } => {
+            // SIPp `%u` of an unsigned sum, so `[cseq-2]` at 1 wraps.
+            let _ = write!(out, "{}", wrap_unsigned(i64::from(ctx.cseq) + offset));
         }
         Keyword::Branch { offset } => {
             // SIPp `E_Message_Branch` (`call.cpp` ~l.3892): magic cookie +
@@ -499,7 +532,9 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
                 }
             }
         }
-        Keyword::Len => out.push_str(LEN_MARKER),
+        Keyword::Len { offset } => {
+            let _ = write!(out, "{LEN_MARKER}{offset}{LEN_MARKER_END}");
+        }
         Keyword::MediaIp => out.push_str(ctx.media_ip),
         Keyword::MediaPort { auto, offset } => {
             let port = media_port_value(ctx.media_port, *auto, *offset, ctx.call_number);
@@ -999,12 +1034,12 @@ mod tests {
         assert!(text.contains("Via: SIP/2.0/UDP 10.0.0.1:5061;branch=z9hG4bK-99-1-0\r\n"));
         assert!(text.contains("Call-ID: 1-99@10.0.0.1\r\n"));
         let (head, body) = text.split_once("\r\n\r\n").expect("separator");
-        let len: usize = head
+        let value = head
             .lines()
             .find_map(|l| l.strip_prefix("Content-Length: "))
-            .expect("length header")
-            .parse()
-            .expect("numeric");
+            .expect("length header");
+        assert_eq!(value.len(), 5, "SIPp's %5u: {value:?}");
+        let len: usize = value.trim_start().parse().expect("numeric");
         assert_eq!(len, body.len(), "[len] must equal body bytes:\n{text}");
         assert!(body.starts_with("v=0\r\n"));
         assert!(
@@ -1139,6 +1174,29 @@ mod tests {
         let rb = String::from_utf8(render(&t, &b).unwrap()).unwrap();
         assert!(ra.contains("branch=z9hG4bK-99-1-0"));
         assert!(rb.contains("branch=z9hG4bK-99-1-7"));
+    }
+
+    /// SIPp's `+N`/`-N` on the keywords that take one (`call.cpp`
+    /// `comp->offset`): the ports as `%d`, `[cseq]` as an unsigned sum,
+    /// `[len]` as `%5u` of the body length — and 0, offset dropped, with
+    /// no body.
+    #[test]
+    fn keyword_offsets_follow_sipp() {
+        let mut c = ctx(None);
+        c.cseq = 1;
+        assert_eq!(
+            render_kw("[cseq+1]|[cseq-1]|[cseq-2]", &c),
+            "2|0|4294967295"
+        );
+        assert_eq!(render_kw("[remote_port+1]|[local_port-1]", &c), "5061|5060");
+        assert_eq!(
+            render_kw("Content-Length: [len+3]\r\n\r\nv=0\r\n", &c),
+            "Content-Length:     8\r\n\r\nv=0\r\n"
+        );
+        assert_eq!(
+            render_kw("Content-Length: [len+3]\r\n\r\n", &c),
+            "Content-Length:     0\r\n\r\n"
+        );
     }
 
     /// SIPp's `P_index`: a send renders its own message index; without one
