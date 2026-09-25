@@ -56,36 +56,44 @@ Scope: `test(interop)`.
 ## 15. Handle a received retransmission as SIPp's `process_incoming` does
 
 Scope: `fix(engine)`. SIPP_COMPAT §6, the M40 statistics-files note,
-lists the loss half as open.
+lists the loss half as open. **Needs a decision first** (see the last
+point): matching SIPp exactly makes sipr end calls it copes with today.
 
-- **SIPp** (`call.cpp` ~l.4659-4705, and ~l.2118-2124 where a send
-  records the pair): over UDP with retransmission enabled, a send that
-  follows a received message remembers that recv
-  (`recv_retrans_recv_index`, `recv_retrans_hash`) and itself
-  (`recv_retrans_send_index`). When the received message comes again,
-  SIPp:
-  - rolls the recv's loss (`lost(recv_retrans_recv_index)`). On a loss
-    it books `nb_lost` on the recv and stops there.
-  - Otherwise it books `nb_recv_retrans` on the recv (its `_Retrans`
-    column), sends that send again (`send_scene`), and books
-    `nb_sent_retrans` on it.
-
-  A copy of the last received message that nothing answered yet
-  (`last_recv_hash`) only books `nb_recv_retrans` on its recv.
+- **SIPp** (`call.cpp` ~l.2118-2130 on every send, ~l.4659-4705 on
+  receipt; UDP with retransmission enabled only). Every send made after
+  something was received records `recv_retrans_hash = last_recv_hash`,
+  the last recv's index and its own index, then zeroes
+  `last_recv_hash`. So only the *first* send after a recv carries that
+  recv's hash, and a second send (180, then 200) overwrites the record
+  with hash 0. A received message that equals `recv_retrans_hash` rolls
+  the recv's loss (`nb_lost` on a loss, then nothing). Otherwise it books
+  `nb_recv_retrans` on the recv, re-renders and resends the recorded
+  send (`send_scene`), and books `nb_sent_retrans` on that send. One
+  that equals `last_recv_hash` (received, nothing sent since) books
+  `nb_recv_retrans` and is dropped. Anything else goes through normal
+  matching.
+- **Confirmed against sipp 3.7.7** with a UAS scenario of INVITE, 180,
+  200, ACK, BYE, 200, driven by a raw UAC that sent the INVITE again after
+  the 200. sipp sent nothing back, counted the INVITE as unexpected at
+  the ACK recv (`3_ACK_Unexp` = 1) and aborted the call. The counts row
+  was `1;0;0;0;1;0;1;0;0;0;0;1;0;0;0;0;0;0;`.
 - **sipr:** the `is_dup` branch of the inbound path
-  (`crates/sipr-engine/src/engine.rs`, the one keyed on
-  `last_recv_key`) counts the global `retrans_recv` and `retrans_sent`,
-  and resends `last_sent`, whatever the transport. It books nothing per
-  step, so a recv's `-trace_counts` `_Retrans` column stays 0 and the
-  resent send's does not grow. It rolls no loss. Which message it
-  resends can differ too: SIPp resends the send that answered the
-  retransmitted message, sipr its last send.
-- **Fix:** remember the recv step and the answering send per call, as
-  SIPp does, then book, roll the loss and resend by them. Check the
-  transport and `-nr` conditions, and what sipr's TCP paths should do.
-- **Test:** an interop UAS whose peer (the test) retransmits its INVITE
-  after the 200, with `-trace_counts`, comparing the `_Retrans` columns
-  with real sipp. Add a `lost="100"` variant for the loss.
+  (`crates/sipr-engine/src/engine.rs`, keyed on `last_recv_key`: top Via
+  branch, CSeq, method or status) answers any copy of the last received
+  message by resending `last_sent`, whatever the transport, and counts
+  only the global `retrans_recv` and `retrans_sent`. The same scenario
+  under sipr resent the 200 and completed the call, with the counts row
+  `1;0;0;0;1;0;1;0;1;0;0;0;1;0;0;0;1;0;`. SIPP_COMPAT §6 ("UAS behaviors
+  (M4)") describes sipr's behavior as if it were SIPp's; it was never
+  checked.
+- **Decide:** mirror SIPp exactly, keeping its hash-per-send
+  bookkeeping and the call it aborts, or keep sipr's more forgiving
+  resend and adopt only the parts that do not end calls: the per-step
+  `_Retrans` bookkeeping, resending the send that answered rather than
+  the last one, and the loss roll. Then correct the M4 note.
+- **Test:** the UAS above as an interop test with `-trace_counts`,
+  compared with real sipp. Add a one-send variant (BYE, 200) to cover
+  the resend, and a `lost="100"` variant for the loss.
 
 ## 16. Run a `<sendCmd>`'s actions
 
