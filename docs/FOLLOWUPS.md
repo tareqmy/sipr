@@ -9,6 +9,8 @@ agent as is. Delete an entry when its fix lands.
 - **5-6** are test-harness problems found while fixing the interop
   port-probe race (commit `4ff94ca`). They change only tests, so each one
   replaces steps 1 and 2 below with the check it describes.
+- **7-8** are SIPp divergences that `docs/SIPP_COMPAT.md` §6 already
+  listed as open, with no fix picked up yet.
 
 The SIPp C++ source is at `../../cprojects/sipp/src` (relative to the
 repo root). Read it to confirm the behavior, and never copy it (GPL).
@@ -172,3 +174,77 @@ Scope: `test(interop)`.
   It failed once in 13 full runs after `4ff94ca`: sipp hit its known
   freed-socket bug and hung past `-timeout`, without logging the text
   the test's skip looks for.
+
+## 7. Take `ontimeout=` on `<send>` and `<recvCmd>`
+
+Scope: `fix(engine)`. SIPP_COMPAT §6, the receive-timeouts note lists
+the `<recvCmd>` half as open. The `<send>` half is not recorded yet.
+
+- **SIPp:** `ontimeout` is a common attribute, parsed for every message
+  by `getCommonAttributes` (`scenario.cpp` ~l.1878; only `<timewait>`
+  refuses it). Two places use it:
+  - A `<recv>` or `<recvCmd>` whose receive timeout expires
+    (`call.cpp` ~l.2150-2190). `<recvCmd>` has no `timeout=` of its own
+    (its branch in `scenario.cpp` ~l.997 reads none), so only
+    `-recv_timeout` arms it.
+  - A `<send>` whose UDP retransmissions run out (`call.cpp`
+    ~l.2262-2285). SIPp warns "timeout on max UDP retrans for message
+    <n>, jumping to label <m>" and jumps. A label past the last message
+    fails the call as `E_FAILED_MAX_UDP_RETRANS`. Without `ontimeout`
+    the call fails as before.
+
+  `<pause>`, `<nop>` and `<sendCmd>` also accept `ontimeout`, and
+  nothing reads it there.
+- **sipr:** `<send>` and `<recvCmd>` warn `ontimeout` away ("unknown
+  attribute 'ontimeout' … — ignored", confirmed on `master`). Only
+  `RecvStep` has an `ontimeout` field (`crates/sipr-scenario/src/model.rs`).
+  So a send whose retransmissions run out always fails the call
+  (`fail_call(…, "retransmissions exhausted")` in `on_retrans_timer`,
+  `crates/sipr-engine/src/engine.rs`), and so does a timed-out recvCmd
+  (`on_recv_timeout`).
+- **Fix:** resolve `ontimeout` for `<send>` and `<recvCmd>` the way
+  `<recv>`'s is resolved (a pending label in `compile.rs`, checked in
+  `finish()`). Then follow it on retransmission exhaustion and on a
+  recvCmd timeout, with SIPp's warnings and failure counters. Decide
+  what `ontimeout` on `<pause>`, `<nop>` and `<sendCmd>` should do.
+  SIPp accepts it and ignores it, and AGENTS.md says sipr must not
+  ignore scenario input silently, so a specific warning is likely
+  right.
+- **Also update:** the `unreachable` lint's `successors`
+  (`crates/sipr-scenario/src/lint.rs`), which follows only a recv's
+  `ontimeout`, and the `--check` dump, which prints `ontimeout->` for
+  recvs only.
+- **Test:** an interop test with a UAC whose `<send retrans=…
+  ontimeout=…>` goes to a silent sink, and a 3PCC pair where a
+  `<recvCmd ontimeout=…>` waits out `-recv_timeout`. Compare the
+  messages sent, the exit code and the warning with real sipp.
+
+## 8. Log 3PCC twin commands in `-trace_msg` and `-trace_shortmsg`
+
+Scope: `fix(engine)`. SIPP_COMPAT §6, the 3PCC note, says "Still open:
+`-trace_msg` does not log twin commands".
+
+- **SIPp:** its socket layer logs every write and read, twin sockets
+  included, and marks the twin ones `control`:
+  - `-trace_msg` frames read `<transport> control message sent [<n>]
+    bytes:` and `… received …` (`socket.cpp` ~l.1132-1138 and
+    ~l.2211-2217).
+  - `-trace_shortmsg` gets its `S`/`R` lines from the same paths
+    (~l.1127 and ~l.2219-2224).
+  - A twin command for no call, or one the call did not expect, logs
+    "Unexpected control message received …" in `-trace_msg` and the
+    call debug (`call.cpp` ~l.4274 and ~l.4318).
+
+  Check whether the logged text and byte count include the ESC delimiter
+  SIPp appends to a command on the wire.
+- **sipr:** `trace_send`/`trace_recv` (`crates/sipr-engine/src/engine.rs`)
+  are called for SIP messages only. The `Step::SendCmd` arm's twin send,
+  `send_twin_abort` and `on_twin_cmd` log nothing. `sipp_message_frame`
+  (`crates/sipr-stats/src/lib.rs`) has no `control` tag.
+- **Fix:** give the frame a control flag and log twin commands from the
+  send and receive paths, the unexpected-command lines included. Add
+  short-message lines if real sipp writes them.
+- **Test:** run a 3PCC pair under `-trace_msg` and `-trace_shortmsg` on
+  both sides and compare the entries' shapes with real sipp's, as
+  `short_message_log_matches_real_sipps` does for SIP. The classic and
+  extended 3PCC tests in `tests/interop.rs` show how to start the pair.
