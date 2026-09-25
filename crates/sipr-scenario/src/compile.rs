@@ -801,12 +801,24 @@ impl Compiler {
                 PauseSpec::Default
             }
         };
-        self.steps.push(Step::Pause { spec, common });
+        let actions = self.parse_step_actions(el);
+        self.steps.push(Step::Pause {
+            spec,
+            actions,
+            common,
+        });
     }
 
     fn compile_nop(&mut self, el: &Element) {
         const ATTRS: &[&str] = &["display"];
         let common = self.parse_common(el, ATTRS);
+        let actions = self.parse_step_actions(el);
+        self.steps.push(Step::Nop { actions, common });
+    }
+
+    /// The `<action>` children of a message element that has no other
+    /// children (a nop, a pause, a timewait); anything else is an error.
+    fn parse_step_actions(&mut self, el: &Element) -> Vec<Action> {
         let mut actions = Vec::new();
         for a in el.child_elements() {
             if a.name == "action" {
@@ -814,11 +826,11 @@ impl Compiler {
             } else {
                 self.diags.error(
                     Some(a.line),
-                    format!("unexpected <{}> inside <nop>", a.name),
+                    format!("unexpected <{}> inside <{}>", a.name, el.name),
                 );
             }
         }
-        self.steps.push(Step::Nop { actions, common });
+        actions
     }
 
     /// `<sendCmd>` — a 3PCC control command whose CDATA is the message body
@@ -932,7 +944,12 @@ impl Compiler {
                 .error(Some(el.line), "<timewait> needs 'milliseconds'");
             return;
         };
-        self.steps.push(Step::Timewait { ms, line: el.line });
+        let actions = self.parse_step_actions(el);
+        self.steps.push(Step::Timewait {
+            ms,
+            actions,
+            line: el.line,
+        });
     }
 
     // ---- shared attribute parsing --------------------------------------
@@ -1842,14 +1859,12 @@ impl Compiler {
     fn resolve_jump_values(&mut self, numbering: &MessageNumbering) {
         let mut bad_jumps = Vec::new();
         for step in &mut self.steps {
-            let (actions, line) = match step {
-                Step::Send(s) => (&mut s.actions, s.common.line),
-                Step::Recv(r) => (&mut r.actions, r.common.line),
-                Step::Nop { actions, common }
-                | Step::RecvCmd {
-                    actions, common, ..
-                } => (actions, common.line),
-                _ => continue,
+            let line = match step {
+                Step::Timewait { line, .. } | Step::Label { line, .. } => *line,
+                _ => step.common().map_or(0, |c| c.line),
+            };
+            let Some(actions) = step.actions_mut() else {
+                continue;
             };
             for action in actions {
                 if let Action::Jump {

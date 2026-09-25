@@ -257,6 +257,8 @@ pub enum Step {
     Pause {
         /// Duration specification.
         spec: PauseSpec,
+        /// Actions run when the pause starts.
+        actions: Vec<Action>,
         /// Shared attributes.
         common: StepCommon,
     },
@@ -301,6 +303,8 @@ pub enum Step {
     Timewait {
         /// Duration in ms.
         ms: u64,
+        /// Actions run when the linger starts.
+        actions: Vec<Action>,
         /// Source line.
         line: u32,
     },
@@ -332,6 +336,34 @@ impl Step {
             | Self::SendCmd { common, .. }
             | Self::RecvCmd { common, .. } => Some(common),
             Self::Label { .. } | Self::Timewait { .. } => None,
+        }
+    }
+
+    /// The step's actions: every message command but a `<sendCmd>` takes
+    /// them (SIPp's `getCommonAttributes`); a label has none.
+    #[must_use]
+    pub fn actions(&self) -> &[Action] {
+        match self {
+            Self::Send(s) => &s.actions,
+            Self::Recv(r) => &r.actions,
+            Self::Pause { actions, .. }
+            | Self::Nop { actions, .. }
+            | Self::RecvCmd { actions, .. }
+            | Self::Timewait { actions, .. } => actions,
+            Self::SendCmd { .. } | Self::Label { .. } => &[],
+        }
+    }
+
+    /// [`Step::actions`], mutably; `None` where there can be none.
+    pub fn actions_mut(&mut self) -> Option<&mut Vec<Action>> {
+        match self {
+            Self::Send(s) => Some(&mut s.actions),
+            Self::Recv(r) => Some(&mut r.actions),
+            Self::Pause { actions, .. }
+            | Self::Nop { actions, .. }
+            | Self::RecvCmd { actions, .. }
+            | Self::Timewait { actions, .. } => Some(actions),
+            Self::SendCmd { .. } | Self::Label { .. } => None,
         }
     }
 
@@ -823,12 +855,7 @@ impl Scenario {
 
     /// Every action of every step, in step order.
     pub fn all_actions(&self) -> impl Iterator<Item = &Action> {
-        self.steps.iter().flat_map(|step| match step {
-            Step::Send(s) => s.actions.iter(),
-            Step::Recv(r) => r.actions.iter(),
-            Step::Nop { actions, .. } | Step::RecvCmd { actions, .. } => actions.iter(),
-            _ => [].iter(),
-        })
+        self.steps.iter().flat_map(|step| step.actions().iter())
     }
 
     /// The `(kind, file)` of every `play_pcap_*` action.
@@ -973,7 +1000,7 @@ impl Scenario {
                     }
                     format!("recv {what}{extra}{}", self.common_suffix(&r.common))
                 }
-                Step::Pause { spec, common } => {
+                Step::Pause { spec, common, .. } => {
                     let what = match spec {
                         PauseSpec::Default => "default (-d)".to_owned(),
                         PauseSpec::Fixed(ms) => format!("{ms}ms"),

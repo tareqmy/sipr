@@ -5973,6 +5973,109 @@ fn variables_read_and_render_like_real_sipp() {
     );
 }
 
+// ---- a <pause>'s and a <timewait>'s actions --------------------------------
+
+/// A UAC whose pause runs actions when it starts: a `<log>` (before the
+/// `<assignstr>` after it), an `<assignstr>`, and a `<jump>` to message 3
+/// that takes effect once the pause is over. Its closing timewait logs.
+/// Messages: 0 the pause, 1-2 skipped, 3 `landed`, 4 the timewait.
+fn pause_actions_uac_xml() -> String {
+    format!(
+        r#"<scenario name="pause-actions">
+  <pause milliseconds="300"><action><log message="paused [$x]"/><assignstr assign_to="x" value="set"/><jump value="3"/></action></pause>
+{s1}{s2}{landed}  <timewait milliseconds="100"><action><log message="timewait [$x]"/></action></timewait>
+</scenario>
+"#,
+        s1 = step_options("skipped-1 [$x]", ""),
+        s2 = step_options("skipped-2 [$x]", ""),
+        landed = step_options("landed [$x]", ""),
+    )
+}
+
+/// Run `uac_bin` on [`pause_actions_uac_xml`] against a UDP sink with
+/// `-trace_logs` and `-trace_counts`. Returns the exit code, the
+/// `X-Step`s the sink got, the log lines, and the last counts row without
+/// its two time columns.
+fn run_pause_actions_uac(
+    uac_bin: &std::path::Path,
+) -> (Option<i32>, Vec<String>, Vec<String>, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("pause_actions.xml");
+    std::fs::write(&xml, pause_actions_uac_xml()).expect("write uac");
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut uac = Reaper(
+        tool_command(uac_bin)
+            .current_dir(dir.path())
+            .args(["-sf", xml.to_str().expect("utf8")])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20"])
+            .args(["-trace_logs", "-trace_counts"])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uac"),
+    );
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut steps = Vec::new();
+    let mut buf = [0u8; 65_535];
+    while let Ok(n) = sink.recv(&mut buf) {
+        if let Some(step) = String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .find_map(|l| l.strip_prefix("X-Step:"))
+        {
+            steps.push(step.trim().to_owned());
+        }
+    }
+    let read = |suffix: &str| {
+        std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().ends_with(suffix))
+            .map(|e| std::fs::read_to_string(e.path()).expect("read"))
+            .unwrap_or_default()
+    };
+    let logs = read("_logs.log").lines().map(ToOwned::to_owned).collect();
+    let counts = read("_counts.csv")
+        .lines()
+        .last()
+        .and_then(|row| row.splitn(3, ';').nth(2))
+        .unwrap_or_default()
+        .to_owned();
+    (code, steps, logs, counts)
+}
+
+/// SIPp reads `<action>` on every message (`getCommonAttributes`) and runs
+/// a pause's, and a timewait's, when it starts (docs/SIPP_COMPAT.md §6): a
+/// `<jump>` there lands once the pause is over. A timewait counts a Pause
+/// session as a pause does.
+#[test]
+fn a_pauses_actions_run_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::a_pauses_actions_run_like_real_sipp — no sipp.");
+        return;
+    };
+    let theirs = run_pause_actions_uac(&sipp);
+    assert_eq!(
+        theirs,
+        (
+            Some(0),
+            vec!["landed set".to_owned()],
+            vec!["paused ".to_owned(), "timewait set".to_owned()],
+            "1;0;0;0;0;0;1;0;1;0;".to_owned()
+        ),
+        "real sipp"
+    );
+    let ours = run_pause_actions_uac(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(
+        ours, theirs,
+        "sipr ran the pause differently than real sipp"
+    );
+}
+
 // ---- twin commands in -trace_msg and -trace_shortmsg ----------------------
 
 /// Accept the one twin link `listener` gets, answer its first command with

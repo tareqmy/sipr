@@ -1480,7 +1480,7 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `hh:mm:ss:uuuuuu`) then per visible step `<index>_<name>_Sent`,
   `_Retrans` and, for a send with `retrans=`, `_Timeout`; for a recv
   `_Recv`, `_Retrans`, `_Timeout`, `_Unexp`; for every other message
-  `<index>_Pause_Sessions` (times a pause was entered) and
+  `<index>_Pause_Sessions` (times a pause or timewait was entered) and
   `_Pause_Unexp`; nothing for a label — `<name>` the method or status
   code, `<index>` SIPp's message index, which counts pauses and nops but
   not labels (see "Message indices" below). The Pause columns go to a
@@ -1674,7 +1674,9 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   actions belong to:
   - A nop, and a send (whose actions run *after* it is sent), then call
     `next()`, which reads message N-1: its `next=` (its `test` set, its
-    `chance` won) wins over N.
+    `chance` won) wins over N. A pause and a timewait run their actions
+    when they start, and call `next()` the same way when they end, so a
+    jump from a timewait sends the call on instead of ending it.
   - A recv then sets `msg_index = search_index` and calls `next()` from
     there, which overwrites the jump, unless it is an optional recv that
     stays where the call waited (its `next=`'s `test=` unset, see
@@ -1692,9 +1694,18 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   overflowed its stack. **Divergences:** a jump to itself fails the call
   with SIPp's text instead of the run, as an out-of-range jump does. A
   stayed optional recv's jump to message 0 waits at message 0, where SIPp
-  indexes message -1. SIPp also runs the actions of a `<pause>` and a
-  `<sendCmd>`. sipr refuses them on a `<sendCmd>`. **Open:** sipr drops
-  them on a `<pause>` without a word (`docs/FOLLOWUPS.md` 11).
+  indexes message -1. SIPp also runs the actions of a `<sendCmd>`;
+  sipr refuses them there.
+- Actions on a `<pause>` and a `<timewait>` (verified in `scenario.cpp`
+  ~l.961 and ~l.1829 `getCommonAttributes`, `call.cpp` ~l.1956-1990;
+  confirmed against real sipp, the `a_pauses_actions_run_like_real_sipp`
+  interop test). SIPp reads `<action>` on both, and runs them when the
+  pause starts: after `sessions++` and its bookkeeping, before the wait.
+  A `<pauserestore>` among them sets the deadline that pause waits for.
+  A timewait is a pause in that branch, so it also counts a session in
+  `-trace_counts`. sipr ignored every child of both elements, with no
+  diagnostic, so their actions never ran. Any child but `<action>` is now
+  an error, as on a nop. It also counted no session for a timewait.
 - Receive timeouts (verified in `call.cpp` ~l.2150-2205 `call::run`,
   ~l.5653-5687 `process_incoming`, ~l.1920-1945 `next()`, `task.cpp`
   `add_paused_task`, and `scenario.cpp` ~l.33-39 the `message` defaults,

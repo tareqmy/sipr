@@ -207,6 +207,36 @@ fn ontimeout_is_taken_on_a_send_and_a_recv_cmd() {
     }
 }
 
+/// SIPp reads `<action>` on a pause and a timewait too; any other child
+/// is refused, as on a nop.
+#[test]
+fn a_pause_and_a_timewait_take_actions() {
+    let xml = wrap(&format!(
+        r#"{invite}
+           <pause milliseconds="10"><action><assignstr assign_to="x" value="1"/></action></pause>
+           <timewait milliseconds="10"><action><log message="[$x]"/></action></timewait>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    assert_eq!(sc.steps[1].actions().len(), 1);
+    assert_eq!(sc.steps[2].actions().len(), 1);
+    assert_eq!(sc.all_actions().count(), 2);
+
+    for element in [
+        r#"<pause milliseconds="10"><bogus/></pause>"#,
+        r#"<timewait milliseconds="10"><bogus/></timewait>"#,
+    ] {
+        let xml = wrap(&format!("{}{element}", send_invite()));
+        let errs = errors(&xml);
+        assert!(
+            errs.iter().any(|e| e.contains("unexpected <bogus> inside")),
+            "{element}: {errs:?}"
+        );
+    }
+}
+
 #[test]
 fn duplicate_label_is_an_error() {
     let xml = wrap(&format!(

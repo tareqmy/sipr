@@ -157,6 +157,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A `<pause>`'s and a `<timewait>`'s actions run, as in SIPp: when the
+  pause starts, with a `<jump>` taking effect once it is over. A jump
+  from a timewait sends the call on instead of ending it. sipr dropped
+  every child of both elements without a word. A child other than
+  `<action>` is now an error, as on a `<nop>`. A timewait now counts a
+  `Pause_Sessions` entry in `-trace_counts`, as a pause does.
 - A false bool, such as a failed `<test>` result, renders as `false` in
   `[$var]`, as real sipp writes it. sipr rendered it empty, having
   misread SIPp's rendering code for a true-or-nothing rule.

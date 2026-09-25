@@ -216,25 +216,27 @@ fn successors(steps: &[Step], i: StepIndex, retaddr: Option<VarId>) -> Option<Ve
     let Some(step) = steps.get(i) else {
         return Some(Vec::new());
     };
-    if matches!(step, Step::Timewait { .. }) {
-        return Some(Vec::new());
-    }
-    let Some(common) = step.common() else {
-        return Some(vec![i + 1]); // a label
-    };
     let mut out = Vec::new();
-    // An optional recv is a window: a message for a later step can match
-    // while the call waits here, so the next step stays reachable even when
-    // this one jumps away on its own match.
-    if !always_jumps(common) || is_optional_recv(step) {
-        out.push(i + 1);
+    match step.common() {
+        // The call ends after a <timewait> (SIPp refuses any step after
+        // one), unless a jump among its actions sends it elsewhere.
+        None if matches!(step, Step::Timewait { .. }) => {}
+        None => return Some(vec![i + 1]), // a label
+        Some(common) => {
+            // An optional recv is a window: a message for a later step can
+            // match while the call waits here, so the next step stays
+            // reachable even when this one jumps away on its own match.
+            if !always_jumps(common) || is_optional_recv(step) {
+                out.push(i + 1);
+            }
+            out.extend(common.next);
+            out.extend(step.ontimeout());
+        }
     }
-    out.extend(common.next);
-    out.extend(step.ontimeout());
     if !jump_takes_effect(step) {
         return Some(out);
     }
-    for action in step_actions(step) {
+    for action in step.actions() {
         match action {
             Action::Jump {
                 dest: JumpTarget::Index(dest),
@@ -447,15 +449,6 @@ fn readable(line: &str) -> String {
 }
 
 // ---- describing steps ---------------------------------------------------
-
-fn step_actions(step: &Step) -> &[Action] {
-    match step {
-        Step::Send(s) => &s.actions,
-        Step::Recv(r) => &r.actions,
-        Step::Nop { actions, .. } | Step::RecvCmd { actions, .. } => actions,
-        _ => &[],
-    }
-}
 
 fn line_of(step: &Step) -> u32 {
     match step {

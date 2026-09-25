@@ -4,8 +4,6 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **11** breaks the rule that sipr never ignores scenario input silently.
-  It was found while fixing jump semantics (commit `5b29b65`).
 - **12** is a gap in SIPp's documented keywords, found while adding
   `[branch±N]` (commit `bffa0e8`).
 - **13** is a SIPp divergence in the `-trace_counts` columns, found while
@@ -34,37 +32,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 11. Run a `<pause>`'s and a `<timewait>`'s actions
-
-Scope: `fix(scenario)`, then `fix(engine)`. SIPP_COMPAT §6, "Where a
-`<jump>` lands", lists it as open.
-
-- **SIPp:** `<pause>` and `<timewait>` are messages like any other, so
-  `getCommonAttributes` (`scenario.cpp` ~l.1829) reads their `<action>`
-  (~l.1783 `getActionForThisMessage`). `executeMessage`'s pause branch
-  (`call.cpp` ~l.1956-1990) runs them with `executeAction` when the
-  pause starts, right after `do_bookkeeping`. A `<jump>` among them sets
-  `msg_index = N - 1`. When the pause ends, `run()` serves
-  `paused_until` and calls `next()` from there, so the call goes on at
-  N, or at message N-1's `next=`.
-- **sipr:** `compile_pause` and `compile_timewait`
-  (`crates/sipr-scenario/src/compile.rs`) never look at the element's
-  children. `<pause milliseconds="10"><action><log message="x"/></action>
-  </pause>` compiles clean under `--check`, and the log never runs. Any
-  other child element vanishes the same way, which the "unknown elements
-  are hard errors" rule in AGENTS.md forbids. `Step::Pause` and
-  `Step::Timewait` have no `actions` field.
-- **Fix:** compile `<action>` on both, and refuse other children as
-  `compile_nop` does ("unexpected <x> inside <pause>"). Run the actions
-  in the engine's `Step::Pause` arm when the pause starts, after
-  `book_counter`. Apply a jump as `step_after_jump` does when the pause
-  ends, and add the actions to `Scenario::all_actions`. Check whether
-  SIPp's `<timewait>` runs them the same way. It shares the pause branch,
-  with `timewait` set.
-- **Test:** an interop UAC whose pause logs through `-trace_logs` and
-  jumps, compared with real sipp. Add a compile test that an unknown
-  child of `<pause>` is an error.
 
 ## 12. Take SIPp's `+N`/`-N` offset on every keyword
 

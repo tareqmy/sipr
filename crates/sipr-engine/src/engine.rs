@@ -3324,19 +3324,38 @@ impl<'s> Engine<'s> {
                     self.arm_recv_timeout(call_id, index);
                     return;
                 }
-                Step::Pause { spec, common } => {
-                    let dur = self.sample_pause(spec, call_id);
-                    self.book_counter(call_id, index);
-                    let jump = self.next_step(common, index, call_id);
-                    // SIPp `curmsg->sessions++` on entering the pause.
+                Step::Pause {
+                    spec,
+                    actions,
+                    common,
+                } => {
+                    let mut dur = self.sample_pause(spec, call_id);
+                    // SIPp `curmsg->sessions++` on entering the pause, then
+                    // its bookkeeping and actions (`call.cpp` ~l.1982).
                     if let Some(s) = self.call_stats(call_id).step_mut(index) {
                         s.sessions += 1;
                     }
+                    self.book_counter(call_id, index);
+                    let AfterActions::Proceed { jump } =
+                        self.run_step_actions(call_id, actions, index)
+                    else {
+                        return;
+                    };
+                    // SIPp's `next()` once the pause is over.
+                    let next = match jump {
+                        Some(target) => self.step_after_jump(call_id, target),
+                        None => self.next_step(common, index, call_id),
+                    };
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
+                    // A <pauserestore> among the actions sets SIPp's
+                    // `paused_until`, the deadline this pause waits for.
+                    if let Some(deadline) = call.paused_until.take() {
+                        dur = deadline.saturating_duration_since(Instant::now());
+                    }
                     call.generation += 1;
-                    call.index = jump; // applied when the timer fires
+                    call.index = next; // applied when the timer fires
                     call.pause_deadline = Some((index, Instant::now() + dur));
                     let timer = self.timers.arm(
                         dur,
@@ -3424,22 +3443,44 @@ impl<'s> Engine<'s> {
                         call.index = index + 1;
                     }
                 }
-                Step::Timewait { ms, .. } => {
+                Step::Timewait { ms, actions, .. } => {
+                    // SIPp's timewait is a pause (`call.cpp` ~l.1956): it
+                    // counts a session and runs its actions on entry.
+                    if let Some(s) = self.call_stats(call_id).step_mut(index) {
+                        s.sessions += 1;
+                    }
+                    let AfterActions::Proceed { jump } =
+                        self.run_step_actions(call_id, actions, index)
+                    else {
+                        return;
+                    };
+                    // A jump sends the call on when the linger is over,
+                    // through SIPp's `next()`, instead of ending it.
+                    let resume = jump.map(|target| self.step_after_jump(call_id, target));
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
                     call.generation += 1;
-                    call.completing = true;
-                    call.index = index + 1;
+                    let kind = match resume {
+                        Some(step) => {
+                            call.index = step;
+                            TimerKind::Pause
+                        }
+                        None => {
+                            call.completing = true;
+                            call.index = index + 1;
+                            TimerKind::Timewait
+                        }
+                    };
                     let timer = self.timers.arm(
                         Duration::from_millis(*ms),
                         Event::CallTimer {
                             call_id: call_id.to_owned(),
                             generation: call.generation,
-                            kind: TimerKind::Timewait,
+                            kind,
                         },
                     );
-                    call.timer = Some((timer, TimerKind::Timewait));
+                    call.timer = Some((timer, kind));
                     return;
                 }
             }
