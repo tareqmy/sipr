@@ -682,6 +682,37 @@ impl Wait {
             deadline: call.recv_deadline,
         }
     }
+
+    /// The same wait, deadline kept, moved to step `index`: what a
+    /// `<jump>` does to an optional recv that stays (SIPp keeps the
+    /// `msg_index = N - 1` the jump set, and the call waits there). A
+    /// mandatory recvCmd there waits for a command only, as `advance`
+    /// leaves it.
+    fn moved_to(self, index: usize, step: Option<&Step>) -> Self {
+        Self {
+            index,
+            waiting: !matches!(
+                step,
+                Some(Step::RecvCmd {
+                    optional: false,
+                    ..
+                })
+            ),
+            awaiting_cmd: matches!(step, Some(Step::RecvCmd { .. })),
+            deadline: self.deadline,
+        }
+    }
+}
+
+/// What a step's actions leave the step to do.
+enum AfterActions {
+    /// A fail or stop outcome removed the call or ended the run: the
+    /// caller must stop touching this call.
+    Ended,
+    /// The step carries on. `jump` is the SIPp message index the last
+    /// `<jump>` named, if any. SIPp's jump only sets `msg_index = N - 1`;
+    /// the step decides whether that survives (see `step_after_jump`).
+    Proceed { jump: Option<usize> },
 }
 
 /// A call's view of one manual transaction (SIPp `txnInstanceInfo`).
@@ -3180,11 +3211,13 @@ impl<'s> Engine<'s> {
                         None => return,
                     };
                     // Run this send's actions (rare, but SIPp allows them).
-                    if !send.actions.is_empty()
-                        && self.run_step_actions(call_id, &send.actions, index)
-                    {
+                    // SIPp runs them after the send, so a <jump> among them
+                    // only picks where the call goes next.
+                    let AfterActions::Proceed { jump: action_jump } =
+                        self.run_step_actions(call_id, &send.actions, index, index)
+                    else {
                         return;
-                    }
+                    };
                     // SIPp `send_raw`: a send that fails ends the call
                     // (E_FAILED_CANNOT_SEND_MSG); a dead connection is then
                     // reset for the calls that follow (-max_reconnect).
@@ -3206,7 +3239,10 @@ impl<'s> Engine<'s> {
                     self.trace_send(&buf, remote);
                     let retrans_ms = send.retrans_ms;
                     let lost_pct = send.lost_pct.or(self.config.lost);
-                    let jump = self.next_step(&send.common, index, call_id);
+                    let next = match action_jump {
+                        Some(target) => self.step_after_jump(call_id, target),
+                        None => self.next_step(&send.common, index, call_id),
+                    };
                     let now = Instant::now();
                     let common = send.common.clone();
                     let Some(call) = self.calls.get_mut(call_id) else {
@@ -3278,7 +3314,7 @@ impl<'s> Engine<'s> {
                             });
                         }
                     }
-                    call.index = jump;
+                    call.index = next;
                 }
                 Step::Recv(_) => {
                     if let Some(call) = self.calls.get_mut(call_id) {
@@ -3314,16 +3350,17 @@ impl<'s> Engine<'s> {
                 }
                 Step::Nop { common, actions } => {
                     self.book_counter(call_id, index);
-                    if !actions.is_empty() && self.run_step_actions(call_id, actions, index) {
+                    let AfterActions::Proceed { jump } =
+                        self.run_step_actions(call_id, actions, index, index)
+                    else {
                         return;
-                    }
-                    // A jump action may have moved us; only advance if not.
-                    let moved = self.calls.get(call_id).is_some_and(|c| c.index != index);
-                    if !moved {
-                        let jump = self.next_step(common, index, call_id);
-                        if let Some(call) = self.calls.get_mut(call_id) {
-                            call.index = jump;
-                        }
+                    };
+                    let next = match jump {
+                        Some(target) => self.step_after_jump(call_id, target),
+                        None => self.next_step(common, index, call_id),
+                    };
+                    if let Some(call) = self.calls.get_mut(call_id) {
+                        call.index = next;
                     }
                 }
                 Step::SendCmd {
@@ -3407,13 +3444,22 @@ impl<'s> Engine<'s> {
         }
     }
 
-    /// A `<jump>`: continue the call at `step` (one past the last step ends
-    /// it, as SIPp's jump to the message count does).
-    fn jump_to_step(&mut self, call_id: &str, step: usize) {
-        if let Some(call) = self.calls.get_mut(call_id) {
-            call.index = step;
+    /// Where a step whose actions `<jump>`ed to message `target` sends the
+    /// call. SIPp's jump sets `msg_index = target - 1`, and the step's
+    /// `next()` then reads *that* message's `next=` (its test set, its
+    /// chance won) before it steps to `target` (`call.cpp` ~l.1930). The
+    /// message count ends the call, as SIPp's jump past the last message
+    /// does.
+    fn step_after_jump(&mut self, call_id: &str, target: usize) -> usize {
+        let scenario = self.scenario_of(call_id);
+        let landing = scenario
+            .step_of_message(target)
+            .unwrap_or(scenario.steps.len());
+        let before = message_before(scenario, target).and_then(|i| step_common(&scenario.steps[i]));
+        match before {
+            Some(common) => self.branch(common, call_id).unwrap_or(landing),
+            None => landing,
         }
-        self.advance(call_id);
     }
 
     /// SIPp `do_bookkeeping`'s counter: step `index` ran for this call, so
@@ -3432,20 +3478,22 @@ impl<'s> Engine<'s> {
     /// variable, if any, is set and its `chance` draw, if any, is won; else
     /// the following step.
     fn next_step(&mut self, common: &StepCommon, index: usize, call_id: &str) -> usize {
-        if let Some(dest) = common.next {
-            let test_ok = match common.test {
-                Some(v) => self
-                    .calls
-                    .get(call_id)
-                    .is_some_and(|c| test_truthy(&c.store.get(v))),
-                None => true,
-            };
-            let chance_ok = common.chance.is_none_or(|c| self.rng.next_f64() < c);
-            if test_ok && chance_ok {
-                return dest;
-            }
-        }
-        index + 1
+        self.branch(common, call_id).unwrap_or(index + 1)
+    }
+
+    /// The branch of SIPp's `next()`: the step's `next`, when its `test`
+    /// variable, if any, is set and its `chance` draw, if any, is won.
+    fn branch(&mut self, common: &StepCommon, call_id: &str) -> Option<usize> {
+        let dest = common.next?;
+        let test_ok = match common.test {
+            Some(v) => self
+                .calls
+                .get(call_id)
+                .is_some_and(|c| test_truthy(&c.store.get(v))),
+            None => true,
+        };
+        let chance_ok = common.chance.is_none_or(|c| self.rng.next_f64() < c);
+        (test_ok && chance_ok).then_some(dest)
     }
 
     /// Arm the receive timeout of the recv (or recvCmd) the call now waits
@@ -3924,15 +3972,26 @@ impl<'s> Engine<'s> {
             Step::Recv(r) => r.actions.clone(),
             _ => Vec::new(),
         };
-        if !recv_actions.is_empty() && self.run_step_actions(call_id, &recv_actions, si) {
+        let AfterActions::Proceed { jump } =
+            self.run_step_actions(call_id, &recv_actions, si, waited.index)
+        else {
             return;
-        }
+        };
         // SIPp `process_incoming` ~l.5653, after the actions (which may set
         // the `test` variable): an optional recv whose `test` variable is
-        // unset leaves the call waiting where it was; any other match moves
-        // it on through `next()`.
+        // unset leaves the call waiting where it was — or where a <jump>
+        // put `msg_index`, message N - 1. Any other match moves it on
+        // through `msg_index = search_index; next()`, which overwrites a
+        // jump.
         if optional && self.test_unset(&common, call_id) {
-            self.resume_wait(call_id, waited);
+            let wait = match jump {
+                Some(target) => {
+                    let at = message_before(scenario, target).unwrap_or(0);
+                    waited.moved_to(at, scenario.steps.get(at))
+                }
+                None => waited,
+            };
+            self.resume_wait(call_id, wait);
             return;
         }
         let next = self.next_step(&common, si, call_id);
@@ -3967,11 +4026,17 @@ impl<'s> Engine<'s> {
         self.arm_recv_deadline(call_id, wait.deadline);
     }
 
-    /// Execute a step's actions against the call's store. Returns true when a
-    /// terminal outcome (fail/stop) removed the call or ended the run — the
-    /// caller must stop touching this call.
-    fn run_step_actions(&mut self, call_id: &str, actions: &[Action], index: usize) -> bool {
-        self.run_step_actions_inner(call_id, actions, index, None)
+    /// Execute step `index`'s actions against the call's store. `position`
+    /// is the step the call is at, SIPp's `msg_index` while the actions run
+    /// (for a recv, the one it waited at), which a `<jump>` must not name.
+    fn run_step_actions(
+        &mut self,
+        call_id: &str,
+        actions: &[Action],
+        index: usize,
+        position: usize,
+    ) -> AfterActions {
+        self.run_step_actions_inner(call_id, actions, index, position, None)
     }
 
     /// Shared body for step actions. `cmd_text` is set only for `<recvCmd>`,
@@ -3981,10 +4046,14 @@ impl<'s> Engine<'s> {
         call_id: &str,
         actions: &[Action],
         index: usize,
+        position: usize,
         cmd_text: Option<&str>,
-    ) -> bool {
+    ) -> AfterActions {
+        if actions.is_empty() {
+            return AfterActions::Proceed { jump: None };
+        }
         let Some(call) = self.calls.get(call_id) else {
-            return true;
+            return AfterActions::Ended;
         };
         let remote_ip = call.render_remote.ip().to_string();
         let digest_uri = self.digest_uri(call.render_remote);
@@ -4059,31 +4128,25 @@ impl<'s> Engine<'s> {
         if let Some(call) = self.calls.get_mut(call_id) {
             call.store = store;
         }
+        let at_message = scenario.message_index(position);
+        let mut jump = None;
         for outcome in outcomes {
             match outcome {
                 crate::actions::ActionOutcome::Continue => {}
                 crate::actions::ActionOutcome::Log(line) => self.log_action(&line),
                 crate::actions::ActionOutcome::Warn(line) => self.log_err(&line),
-                // Compile-time checked; one past the last step ends the call.
                 crate::actions::ActionOutcome::Jump(step) => {
-                    self.jump_to_step(call_id, step);
-                    return true;
-                }
-                crate::actions::ActionOutcome::JumpToMessage(index) => {
-                    let Some(step) = scenario.step_of_message(index) else {
-                        // SIPp: "Jump statement out of range" is fatal; sipr
-                        // fails the call instead of the run.
-                        self.call_stats(call_id).failed_other += 1;
-                        self.log_err(&format!(
-                            "call {call_id} failed: jump to message index {index} is out of \
-                             range (0..={})",
-                            scenario.message_count()
-                        ));
-                        self.remove_call(call_id);
-                        return true;
+                    let target = scenario.message_index(step);
+                    let Some(target) = self.checked_jump(call_id, target, at_message) else {
+                        return AfterActions::Ended;
                     };
-                    self.jump_to_step(call_id, step);
-                    return true;
+                    jump = Some(target);
+                }
+                crate::actions::ActionOutcome::JumpToMessage(target) => {
+                    let Some(target) = self.checked_jump(call_id, target, at_message) else {
+                        return AfterActions::Ended;
+                    };
+                    jump = Some(target);
                 }
                 crate::actions::ActionOutcome::PauseRestore(ms) => {
                     let started = self.stats.started;
@@ -4103,10 +4166,8 @@ impl<'s> Engine<'s> {
                     }
                 }
                 crate::actions::ActionOutcome::FailCall(why) => {
-                    self.call_stats(call_id).failed_other += 1;
-                    self.log_err(&format!("call {call_id} failed: {why}"));
-                    self.remove_call(call_id);
-                    return true;
+                    self.fail_from_action(call_id, &why);
+                    return AfterActions::Ended;
                 }
                 crate::actions::ActionOutcome::StopGracefully => {
                     self.soft_stopping = true;
@@ -4115,7 +4176,7 @@ impl<'s> Engine<'s> {
                 crate::actions::ActionOutcome::StopNow => {
                     self.fail_all("exec stop_now");
                     self.hard_stop = true;
-                    return true;
+                    return AfterActions::Ended;
                 }
                 crate::actions::ActionOutcome::PlayPcap { kind, file } => {
                     self.start_pcap(call_id, kind, &file);
@@ -4145,15 +4206,42 @@ impl<'s> Engine<'s> {
                     protocol,
                 } => {
                     if let Err(why) = self.apply_setdest(call_id, &host, &port, &protocol) {
-                        self.call_stats(call_id).failed_other += 1;
-                        self.log_err(&format!("call {call_id} failed: setdest: {why}"));
-                        self.remove_call(call_id);
-                        return true;
+                        self.fail_from_action(call_id, &format!("setdest: {why}"));
+                        return AfterActions::Ended;
                     }
                 }
             }
         }
-        false
+        AfterActions::Proceed { jump }
+    }
+
+    /// An action failed the call (`<error>`, a `check_it` miss, a bad
+    /// `<jump>` or `<setdest>`): it counts as failed for another reason.
+    fn fail_from_action(&mut self, call_id: &str, why: &str) {
+        self.call_stats(call_id).failed_other += 1;
+        self.log_err(&format!("call {call_id} failed: {why}"));
+        self.remove_call(call_id);
+    }
+
+    /// SIPp's `E_AT_JUMP` checks (`call.cpp` ~l.5991): a jump to the
+    /// message the call is at would loop for ever, and one past the
+    /// message count is out of range (a `value=` was range-checked at
+    /// compile time). Both are fatal ERRORs in SIPp; sipr fails the call
+    /// instead of the run. `Some(target)` when the jump stands.
+    fn checked_jump(&mut self, call_id: &str, target: usize, at_message: usize) -> Option<usize> {
+        let scenario = self.scenario_of(call_id);
+        let why = if target == at_message {
+            format!("Jump statement at index {target} jumps to itself and causes an infinite loop")
+        } else if scenario.step_of_message(target).is_none() {
+            format!(
+                "jump to message index {target} is out of range (0..={})",
+                scenario.message_count()
+            )
+        } else {
+            return Some(target);
+        };
+        self.fail_from_action(call_id, &why);
+        None
     }
 
     /// `<setdest>` (SIPp `E_AT_SET_DEST`, `call.cpp` ~l.5841-5935): move the
@@ -4751,12 +4839,14 @@ impl<'s> Engine<'s> {
         Some(crate::render::render_to_string(template, &ctx, None))
     }
 
-    /// Run a `<recvCmd>`'s actions against `cmd`, then advance the call. Returns
-    /// true when a control-flow outcome (jump/fail/stop) already handled it.
+    /// Run a `<recvCmd>`'s actions against `cmd`, then move the call on.
+    /// `position` is the step the call waited at. Returns true when a
+    /// fail or stop outcome already ended the call.
     fn deliver_recv_cmd(
         &mut self,
         call_id: &str,
         index: usize,
+        position: usize,
         actions: &[Action],
         common: &StepCommon,
         cmd: &str,
@@ -4766,15 +4856,15 @@ impl<'s> Engine<'s> {
             s.recv += 1;
         }
         self.book_counter(call_id, index);
-        if !actions.is_empty() && self.run_step_actions_inner(call_id, actions, index, Some(cmd)) {
-            return true; // actions jumped/failed/stopped
+        let after = self.run_step_actions_inner(call_id, actions, index, position, Some(cmd));
+        if matches!(after, AfterActions::Ended) {
+            return true;
         }
-        let moved = self.calls.get(call_id).is_some_and(|c| c.index != index);
-        if !moved {
-            let jump = self.next_step(common, index, call_id);
-            if let Some(call) = self.calls.get_mut(call_id) {
-                call.index = jump;
-            }
+        // SIPp `process_twinSippCom` then sets `msg_index = search_index`
+        // and runs `next()`, which overwrites a <jump> among the actions.
+        let next = self.next_step(common, index, call_id);
+        if let Some(call) = self.calls.get_mut(call_id) {
+            call.index = next;
         }
         false
     }
@@ -4927,7 +5017,7 @@ impl<'s> Engine<'s> {
         // SIPp strips the trailing CRLFs the transport added before the
         // actions see the command.
         let text = cmd.trim_end_matches("\r\n");
-        if !self.deliver_recv_cmd(call_id, si, actions, common, text) {
+        if !self.deliver_recv_cmd(call_id, si, index, actions, common, text) {
             self.advance(call_id);
         }
     }
@@ -5562,10 +5652,25 @@ impl<'s> Engine<'s> {
     /// message: SIPp ends the call there as failed
     /// (`E_FAILED_TIMEOUT_ON_RECV`), not as a jump to the end.
     fn on_recv_timeout(&mut self, call_id: &str, index: usize) {
+        let scenario = self.scenario_of(call_id);
+        // A <jump> from an optional recv that stayed can leave the wait on
+        // a message that is no recv (SIPp's `msg_index = N - 1`): its
+        // deadline only wakes the call, and SIPp's `run()` executes that
+        // message.
+        if !matches!(
+            scenario.steps.get(index),
+            Some(Step::Recv(_) | Step::RecvCmd { .. })
+        ) {
+            if let Some(call) = self.calls.get_mut(call_id) {
+                call.waiting = false;
+                call.awaiting_cmd = false;
+            }
+            self.advance(call_id);
+            return;
+        }
         if let Some(s) = self.call_stats(call_id).step_mut(index) {
             s.timeouts += 1;
         }
-        let scenario = self.scenario_of(call_id);
         let at = format!("{}:{}", scenario.name, scenario.message_index(index));
         let ontimeout = match scenario.steps.get(index) {
             Some(Step::Recv(RecvStep { ontimeout, .. })) => *ontimeout,
@@ -5910,6 +6015,12 @@ impl<'s> Engine<'s> {
 }
 
 /// The shared attributes of a step, when it has any.
+/// The step of message `target - 1`, where SIPp's `<jump>` to message
+/// `target` leaves `msg_index` (`None` for a jump to message 0: SIPp's -1).
+fn message_before(scenario: &Scenario, target: usize) -> Option<usize> {
+    scenario.step_of_message(target.checked_sub(1)?)
+}
+
 fn step_common(step: &Step) -> Option<&StepCommon> {
     match step {
         Step::Send(s) => Some(&s.common),

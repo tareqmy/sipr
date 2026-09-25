@@ -82,10 +82,11 @@ pub enum ActionOutcome {
     /// Fail this call (`<error>`, `ereg check_it` miss, `exec stop_call`).
     FailCall(String),
     /// `<jump value=>`: continue at this step (the compiler resolved the
-    /// message index).
+    /// message index). Not terminal: as in SIPp, the actions after it run,
+    /// and the last jump wins.
     Jump(usize),
     /// `<jump variable=>`: continue at this SIPp message index, which the
-    /// engine maps to a step — labels are not messages.
+    /// engine maps to a step — labels are not messages. Not terminal.
     JumpToMessage(usize),
     /// Stop the whole run gracefully (`exec stop_gracefully`).
     StopGracefully,
@@ -128,7 +129,8 @@ pub enum ActionOutcome {
 }
 
 /// Run every action in order, mutating the store and collecting outcomes.
-/// Control-flow outcomes (jump/fail/stop) short-circuit the rest.
+/// A fail or stop outcome short-circuits the rest; a jump does not (SIPp's
+/// `executeAction` only records it in `msg_index`).
 pub fn run_actions(
     actions: &[Action],
     store: &mut VarStore,
@@ -167,6 +169,8 @@ fn run_actions_impl(
         let terminal = !matches!(
             outcome,
             ActionOutcome::Continue
+                | ActionOutcome::Jump(_)
+                | ActionOutcome::JumpToMessage(_)
                 | ActionOutcome::Log(_)
                 | ActionOutcome::Warn(_)
                 | ActionOutcome::PlayPcap { .. }

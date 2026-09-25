@@ -53,6 +53,14 @@ optional recv. A `jump variable=` could land anywhere, so a scenario that
 has one is not checked. The exception is the `_unexp.retaddr` return, which
 goes back to a step that already ran.
 
+A jump counts where SIPp lands it. SIPp sets `msg_index = N - 1` and runs
+`next()`, so a jump to message N lands on the `next=` of message N-1 when
+it has one, and on N only when that `next=` has a `test` or `chance`, or
+when there is none. A jump in a recv's actions counts only when the recv
+is optional and has a `next=` with a `test=`, which can make it stay where
+the call waited. The call then waits at message N-1. Any other recv, and
+every `<recvCmd>`, moves on through `next()`, which overwrites the jump.
+
 ### `body-separator`
 
 A line that looks like SDP (`v=0`, `o=…`, `m=audio …`) sits among the

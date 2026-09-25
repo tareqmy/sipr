@@ -943,8 +943,10 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   index — labels do not count, see "Message indices" below); an
   out-of-range target is a fatal ERROR. sipr matches all of this (deadlines
   are ms since the run started, like SIPp's clock tick), with two
-  divergences: an out-of-range jump fails the call rather than the run,
-  and the `_unexp.main` jump is tried before `-aa` auto-answering.
+  divergences: an out-of-range jump, and one to the message the call is
+  at, fail the call rather than the run (see "Where a `<jump>` lands"
+  below), and the `_unexp.main` jump is tried before `-aa`
+  auto-answering.
   Verified both ways against real sipp with an INFO during a 3 s pause: the
   BYE after the pause lands ~2.5 s after the INFO, not ~3 s.
 - `<closecon/>` (M27; verified in `call.cpp` ~l.5836 `E_AT_CLOSE_CON`,
@@ -1588,17 +1590,44 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   Verified against real sipp, which sends the same messages with the
   same `[msg_index]`, `[branch]` and counts prefixes for a UAC whose
   jumps cross labels. It also round-trips `_unexp.retaddr` with a label
-  before the interrupted pause. **Open**, found on the way: (1) SIPp
-  evaluates `next()` *at message N-1* after a jump, so if message N-1
-  has a `next=` (its `test` set, its `chance` won), SIPp follows that
-  instead of running N. sipr runs N. (2) A `<jump>` in a mandatory
-  `<recv>`'s actions does nothing in SIPp: `process_incoming` then sets
-  `msg_index = search_index` and calls `next()`. sipr takes the jump.
-  (3) Where SIPp renders with no message index (`P_index` -1: actions
-  such as `<log>` and `<assignstr>`, `<sendCmd>`, the `-default_behaviors`
-  abort messages), `[msg_index]` prints `-1`, and `[branch]` ends in the
-  current message index minus one. sipr renders the current message's
-  index in both.
+  before the interrupted pause. Where the jump then lands is the next
+  note. **Open**, found on the way: where SIPp renders with no message
+  index (`P_index` -1: actions such as `<log>` and `<assignstr>`,
+  `<sendCmd>`, the `-default_behaviors` abort messages), `[msg_index]`
+  prints `-1`, and `[branch]` ends in the current message index minus
+  one. sipr renders the current message's index in both.
+- Where a `<jump>` lands (verified in `call.cpp` ~l.5991-6002 `E_AT_JUMP`,
+  ~l.1920-1945 `next()`, the `executeMessage` branches ~l.1985-2144,
+  `process_incoming` ~l.5517 and ~l.5629-5687, `process_twinSippCom`
+  ~l.4304-4320; confirmed against real sipp, the
+  `jumps_resume_through_next_like_real_sipp` and
+  `jumps_in_a_recvs_actions_follow_real_sipp` interop tests). The jump
+  action only sets `msg_index = N - 1`. The actions after it still run,
+  and the last jump wins. What happens next depends on the message the
+  actions belong to:
+  - A nop, and a send (whose actions run *after* it is sent), then call
+    `next()`, which reads message N-1: its `next=` (its `test` set, its
+    `chance` won) wins over N.
+  - A recv then sets `msg_index = search_index` and calls `next()` from
+    there, which overwrites the jump, unless it is an optional recv that
+    stays where the call waited (its `next=`'s `test=` unset, see
+    "Branching on a matched `<recv>`"). That one keeps `msg_index = N - 1`,
+    so the call waits at message N-1 with the deadline it had. If message
+    N-1 is not a recv, the deadline wakes the call and it runs that
+    message, as `run()` would.
+  - A recvCmd always overwrites the jump the same way.
+
+  Before any of that, SIPp stops the run with "Jump statement at index N
+  jumps to itself and causes an infinite loop" when N is the message the
+  call is at (for a recv, the one it waited at). sipr used to go straight
+  to message N, ending the actions there. So it skipped a send whose
+  actions jumped, and took a jump from a mandatory recv. A jump to itself
+  overflowed its stack. **Divergences:** a jump to itself fails the call
+  with SIPp's text instead of the run, as an out-of-range jump does. A
+  stayed optional recv's jump to message 0 waits at message 0, where SIPp
+  indexes message -1. SIPp also runs the actions of a `<pause>` and a
+  `<sendCmd>`. sipr refuses them on a `<sendCmd>`. **Open:** sipr drops
+  them on a `<pause>` without a word.
 - Receive timeouts (verified in `call.cpp` ~l.2150-2205 `call::run`,
   ~l.5653-5687 `process_incoming`, ~l.1920-1945 `next()`, `task.cpp`
   `add_paused_task`, and `scenario.cpp` ~l.33-39 the `message` defaults,

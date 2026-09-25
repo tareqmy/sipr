@@ -4,7 +4,7 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **2-4** are SIPp divergences found while fixing message indices (commit
+- **3-4** are SIPp divergences found while fixing message indices (commit
   `5d28c1c`, "count messages, not labels, in jumps and indices").
 - **5-6** are test-harness problems found while fixing the interop
   port-probe race (commit `4ff94ca`). They change only tests, so each one
@@ -35,30 +35,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 2. Match SIPp's jump semantics after the jump
-
-Scope: `fix(engine)`. SIPP_COMPAT §6, "Message indices", open items (1)
-and (2).
-
-- **Resuming after a jump.** SIPp's `E_AT_JUMP` (`call.cpp`
-  ~l.5991-6002) sets `msg_index = N - 1`. The caller's `next()`
-  (~l.1930-1945) then reads `messages[N-1]->next`/`test`/`chance`. So if
-  message N-1 has a `next=` (its test set, its chance won), SIPp
-  continues at that label instead of running message N. sipr's
-  `jump_to_step` in `crates/sipr-engine/src/engine.rs` goes straight
-  to N.
-- **A jump inside a mandatory `<recv>`.** It does nothing in SIPp. After
-  `executeAction`, `process_incoming` sets `msg_index = search_index`
-  and calls `next()` (~l.5650-5660), which overwrites the jump. Read
-  that branch for optional recvs too, which behave differently. sipr
-  takes the jump: see the `ActionOutcome::Jump`/`JumpToMessage` arms in
-  the engine's action-outcome loop.
-- **Also check:** SIPp's fatal "jumps to itself" check
-  (`msg_index == operand`), which sipr lacks.
-- **Also update:** the `unreachable` lint's `successors` in
-  `crates/sipr-scenario/src/lint.rs`, which models jumps and may need
-  the same semantics.
 
 ## 3. Render `[msg_index]` and `[branch]` like SIPp when there is no message index
 

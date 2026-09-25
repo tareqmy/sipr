@@ -223,16 +223,17 @@ fn a_step_after_timewait_is_unreachable() {
 
 #[test]
 fn jump_actions_count_and_computed_jumps_disable_the_analysis() {
-    // `jump value=` reaches its index; the step it skips is still reached
-    // through the fall-through the lint keeps open for actions.
+    // `jump value=` reaches its index when the message before it has no
+    // `next=`: only the send on line 4 is dead.
     let by_index = scenario(&[
         SEND,
         r#"<recv response="200" next="end"/>"#,
         SEND,
+        SEND,
         r#"<label id="end"/>"#,
-        "<nop><action><jump value=\"2\"/></action></nop>",
+        "<nop><action><jump value=\"3\"/></action></nop>",
     ]);
-    assert_eq!(findings(&by_index), []);
+    assert_eq!(findings(&by_index), [(Lint::Unreachable, 4)]);
 
     // `jump variable=` could go anywhere: no verdict at all.
     let computed = scenario(&[
@@ -273,6 +274,56 @@ fn a_jump_value_counts_messages_not_labels() {
         r#"<label id="end"/>"#,
     ]);
     assert_eq!(findings(&xml), [(Lint::Unreachable, 5)]);
+}
+
+#[test]
+fn a_jump_lands_on_the_next_of_the_message_before_its_target() {
+    // SIPp's jump to message 2 sets `msg_index = 1`, and `next()` there
+    // takes the recv's `next="end"`: the send the jump names never runs.
+    let certain = scenario(&[
+        SEND,
+        r#"<recv response="200" next="end"/>"#,
+        SEND,
+        r#"<label id="end"/>"#,
+        "<nop><action><jump value=\"2\"/></action></nop>",
+    ]);
+    assert_eq!(findings(&certain), [(Lint::Unreachable, 4)]);
+
+    // A `test=` on that `next=` keeps the target open.
+    let conditional = scenario(&[
+        SEND,
+        r#"<recv response="200" next="end" test="t"/>"#,
+        r#"<label id="end"/>"#,
+        "<nop><action><jump value=\"2\"/></action></nop>",
+        SEND,
+        "<nop><action><assignstr assign_to=\"t\" value=\"x\"/></action></nop>",
+    ]);
+    assert_eq!(findings(&conditional), []);
+}
+
+#[test]
+fn a_recvs_jump_counts_only_when_the_recv_stays() {
+    // A mandatory recv moves on through `next()`, which overwrites the
+    // jump: the send on line 4 stays dead.
+    let mandatory = scenario(&[
+        SEND,
+        r#"<recv response="200" next="end"><action><jump value="2"/></action></recv>"#,
+        SEND,
+        r#"<label id="end"/>"#,
+    ]);
+    assert_eq!(findings(&mandatory), [(Lint::Unreachable, 4)]);
+
+    // An optional recv whose `test=` is unset stays, and the jump to
+    // message 4 leaves the call waiting at message 3 (line 5).
+    let stays = scenario(&[
+        SEND,
+        r#"<recv response="180" optional="true" next="end" test="t"><action><ereg regexp="x" search_in="msg" assign_to="t"/><jump value="4"/></action></recv>"#,
+        r#"<recv response="200" next="end"/>"#,
+        r#"<recv response="200"/>"#,
+        SEND,
+        r#"<label id="end"/>"#,
+    ]);
+    assert_eq!(findings(&stays), []);
 }
 
 // ---- body-separator ---------------------------------------------------

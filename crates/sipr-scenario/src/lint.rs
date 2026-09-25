@@ -210,7 +210,7 @@ fn reachable(input: &LintInput<'_>) -> Option<Vec<bool>> {
 
 /// Where execution can go after step `i` — conservatively: a condition
 /// (`test`, `chance`, `condexec`) keeps both ways open, and a `jump` action
-/// adds its target without closing the fall-through. `None` for a jump
+/// adds where it lands without closing the fall-through. `None` for a jump
 /// whose target is only known at run time.
 fn successors(steps: &[Step], i: StepIndex, retaddr: Option<VarId>) -> Option<Vec<StepIndex>> {
     let Some(step) = steps.get(i) else {
@@ -233,11 +233,14 @@ fn successors(steps: &[Step], i: StepIndex, retaddr: Option<VarId>) -> Option<Ve
     if let Step::Recv(recv) = step {
         out.extend(recv.ontimeout);
     }
+    if !jump_takes_effect(step) {
+        return Some(out);
+    }
     for action in step_actions(step) {
         match action {
             Action::Jump {
                 dest: JumpTarget::Index(dest),
-            } => out.push(*dest),
+            } => out.extend(jump_landing(steps, step, *dest)),
             Action::Jump {
                 dest: JumpTarget::Var(var),
             } if Some(*var) != retaddr => return None,
@@ -245,6 +248,40 @@ fn successors(steps: &[Step], i: StepIndex, retaddr: Option<VarId>) -> Option<Ve
         }
     }
     Some(out)
+}
+
+/// Whether a `<jump>` among the step's actions moves the call. After a
+/// recv's actions SIPp sets `msg_index = search_index` and runs `next()`,
+/// which overwrites the jump — unless the recv is optional and stays where
+/// the call waited, which only a `next=` beside a `test=` can make it do.
+/// A recvCmd always overwrites it.
+fn jump_takes_effect(step: &Step) -> bool {
+    match step {
+        Step::Recv(r) => r.optional && r.common.next.is_some() && r.common.test.is_some(),
+        Step::RecvCmd { .. } => false,
+        _ => true,
+    }
+}
+
+/// Where `step`'s jump to step `dest` (message N) goes. SIPp sets
+/// `msg_index = N - 1`: an optional recv that stays then waits at message
+/// N-1, and any other step runs `next()` there, which takes message N-1's
+/// `next=` (when its test and chance allow) before N.
+fn jump_landing(steps: &[Step], step: &Step, dest: StepIndex) -> Vec<StepIndex> {
+    let before = steps[..dest.min(steps.len())]
+        .iter()
+        .rposition(|s| !matches!(s, Step::Label { .. }));
+    if matches!(step, Step::Recv(_)) {
+        return vec![before.unwrap_or(0)];
+    }
+    let Some(common) = before.and_then(|i| step_common(&steps[i])) else {
+        return vec![dest];
+    };
+    let mut landing: Vec<StepIndex> = common.next.into_iter().collect();
+    if common.next.is_none() || common.test.is_some() || common.chance.is_some() {
+        landing.push(dest);
+    }
+    landing
 }
 
 /// `next` with nothing that can make the step skip it.

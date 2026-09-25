@@ -262,6 +262,49 @@ fn silence_leads_to_failed_calls_and_exit_1() {
     assert!(err.contains("failed 1"), "{err}");
 }
 
+/// A `<jump>` to the message the call is at would loop for ever. SIPp stops
+/// the run with "Jump statement at index N jumps to itself…"; sipr fails the
+/// call with that text, as it does an out-of-range jump, instead of
+/// overflowing its stack.
+#[test]
+fn a_jump_to_itself_fails_the_call() {
+    let dead = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = dead.local_addr().expect("addr").to_string();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("self_jump.xml");
+    std::fs::write(
+        &xml,
+        r#"<scenario name="self-jump">
+  <send><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Call-ID: [call_id]
+
+  ]]></send>
+  <nop><action><jump value="1"/></action></nop>
+</scenario>
+"#,
+    )
+    .expect("write scenario");
+    let out = Command::new(env!("CARGO_BIN_EXE_sipr"))
+        .current_dir(dir.path())
+        .args(["-sf", xml.to_str().expect("utf8")])
+        .args(["-m", "1", "-timeout", "5", "-trace_err", &addr])
+        .output()
+        .expect("run sipr");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{err}");
+    let log = std::fs::read_dir(dir.path())
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_errors.log"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("read errors log"))
+        .unwrap_or_default();
+    assert!(
+        log.contains("Jump statement at index 1 jumps to itself and causes an infinite loop"),
+        "errors log:\n{log}"
+    );
+}
+
 /// A base port such that `base..base+span` are all free right now, for
 /// scenarios that spread calls over `[auto_media_port]` blocks.
 fn free_port_block(span: u16) -> u16 {
@@ -1658,6 +1701,106 @@ fn threepcc_controller_a_round_trips_a_command() {
         Some("WORLD"),
         "twin answer must reach the ACK's X-Answer header"
     );
+}
+
+/// A `<recvCmd>` behind an optional recv takes the command while the call
+/// waits at the optional one, then moves the call on past itself, as SIPp's
+/// `msg_index = search_index; next()` does. The test plays the twin peer
+/// and a UDP sink that records the `X-Step` of each send.
+#[test]
+fn a_recv_cmd_behind_an_optional_recv_moves_the_call_on() {
+    let twin = TcpListener::bind("127.0.0.1:0").expect("bind twin");
+    let twin_addr = twin.local_addr().expect("twin addr");
+    let twin_thread = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = twin.accept() else {
+            return;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("twin timeout");
+        let mut framer = EscFramer::new();
+        let mut buf = [0u8; 8192];
+        let mut answered = false;
+        // Answer the first command, then hold the link until sipr closes it.
+        while let Ok(n) = stream.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            framer.push(&buf[..n]);
+            if let Some(cmd) = framer.next_command().filter(|_| !answered) {
+                let call_id = cmd
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Call-ID:"))
+                    .map(str::trim)
+                    .expect("command names its call");
+                let reply = format!("Call-ID: {call_id}\r\nX-Answer: back");
+                stream.write_all(reply.as_bytes()).expect("twin reply");
+                stream.write_all(&[0x1b]).expect("twin esc");
+                answered = true;
+            }
+        }
+    });
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let sink_addr = sink.local_addr().expect("sink addr").to_string();
+    let send = |step: &str| {
+        format!(
+            r"  <send><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:a@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 OPTIONS
+    X-Step: {step}
+    Content-Length: 0
+
+  ]]></send>
+"
+        )
+    };
+    let scenario = format!(
+        r#"<scenario name="cmd-behind-optional">
+{first}  <sendCmd><![CDATA[
+    Call-ID: [call_id]
+    X-Offer: hello
+  ]]></sendCmd>
+  <recv request="INFO" optional="true"/>
+  <recvCmd/>
+{after}</scenario>
+"#,
+        first = send("first"),
+        after = send("after-cmd"),
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sc_path = dir.path().join("cmd_behind_optional.xml");
+    std::fs::write(&sc_path, scenario).expect("write scenario");
+    let out = run_sipr(&[
+        "-sf",
+        sc_path.to_str().expect("utf8"),
+        "-3pcc",
+        &twin_addr.to_string(),
+        "-m",
+        "1",
+        "-nr",
+        "-timeout",
+        "5",
+        "-bg",
+        &sink_addr,
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    twin_thread.join().expect("twin thread");
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut steps: Vec<String> = Vec::new();
+    let mut buf = [0u8; 65_535];
+    while let Ok(n) = sink.recv(&mut buf) {
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        if let Some(step) = text.lines().find_map(|l| l.strip_prefix("X-Step:")) {
+            steps.push(step.trim().to_owned());
+        }
+    }
+    assert_eq!(steps, ["first", "after-cmd"]);
 }
 
 #[test]

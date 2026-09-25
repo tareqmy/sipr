@@ -157,6 +157,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A `<jump>` lands where SIPp's does. SIPp's jump to message N sets its
+  message index to N-1 and lets the step carry on, and sipr now does the
+  same. The actions after a jump still run, and the last jump wins. A
+  nop or send then follows message N-1's `next=` when it has one (its
+  `test` set, its `chance` won) instead of running N. A send whose
+  actions jump is sent first. A jump in a mandatory recv's actions, or in
+  a recvCmd's, is overwritten by the step's own `next()`. An optional
+  recv that stays where the call waited leaves the call waiting at
+  message N-1. A jump to the message the call is at fails the call with
+  SIPp's "jumps to itself" error, where sipr used to overflow its stack
+  and crash. A recvCmd reached past an optional recv now moves the call
+  on after its command. The `unreachable` lint follows the same rules.
 - `<assign assign_to="x" value="7"/>`, the form SIPp documents, compiles
   and stores the double 7. sipr took only `variable=` and refused the
   scenario ("`<assign>` needs a 'variable' attribute"). As in SIPp,

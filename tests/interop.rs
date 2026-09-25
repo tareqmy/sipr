@@ -5120,6 +5120,290 @@ fn jumps_and_message_indices_skip_labels_like_real_sipp() {
     );
 }
 
+// ---- where a <jump> lands: SIPp's next() after msg_index = N - 1 ---------
+
+/// A UAC whose jumps land where SIPp's `next()` puts them. Messages: 0 a
+/// nop jumping to 4 then setting `late` (the actions after a jump run),
+/// 1-4 sends, of which 3 has `next="tail"`, so the jump to 4 follows it
+/// (`msg_index = 3`); 5 a nop jumping to 7 then 8 (the last jump wins),
+/// 6-8 sends, 8 with a jump to 10 that runs after it is sent; 9, 10 sends.
+fn jump_resume_uac_xml() -> String {
+    let send = |step: &str, attrs: &str, actions: &str| {
+        format!(
+            r"  <send{attrs}><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:jump@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 OPTIONS
+    Max-Forwards: 70
+    X-Step: {step} [$late]
+    Content-Length: 0
+
+  ]]>{actions}</send>
+"
+        )
+    };
+    format!(
+        r#"<scenario name="jump-resume">
+  <nop><action><jump value="4"/><assignstr assign_to="late" value="ran"/></action></nop>
+{s1}{s2}{s3}{s4}  <label id="tail"/>
+  <nop><action><jump value="7"/><jump value="8"/></action></nop>
+{s6}{s7}{s8}{s9}{s10}</scenario>
+"#,
+        s1 = send("skipped-1", "", ""),
+        s2 = send("skipped-2", "", ""),
+        s3 = send("skipped-3", r#" next="tail""#, ""),
+        s4 = send("target-4", "", ""),
+        s6 = send("skipped-6", "", ""),
+        s7 = send("skipped-7", "", ""),
+        s8 = send("landed-8", "", r#"<action><jump value="10"/></action>"#),
+        s9 = send("skipped-9", "", ""),
+        s10 = send("final-10", "", ""),
+    )
+}
+
+/// Run `uac_bin` on [`jump_resume_uac_xml`] against a UDP sink. Returns its
+/// exit code and the `X-Step`s the sink got, retransmissions collapsed.
+fn run_jump_resume_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("jump_resume.xml");
+    std::fs::write(&xml, jump_resume_uac_xml()).expect("write uac");
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut uac = Reaper(
+        Command::new(uac_bin)
+            .current_dir(dir.path())
+            .args(["-sf", xml.to_str().expect("utf8")])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20", "-nostdin"])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uac"),
+    );
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut seen: Vec<String> = Vec::new();
+    let mut buf = [0u8; 65_535];
+    while let Ok(n) = sink.recv(&mut buf) {
+        let step = String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .find_map(|l| l.strip_prefix("X-Step:"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if seen.last() != Some(&step) {
+            seen.push(step);
+        }
+    }
+    (code, seen)
+}
+
+/// A `<jump>` to message N sets SIPp's `msg_index` to N - 1 and leaves the
+/// rest to `next()` (docs/SIPP_COMPAT.md §6): message N-1's `next=` wins
+/// over N, the actions after a jump still run, the last jump wins, and a
+/// send's jump runs after the send.
+#[test]
+fn jumps_resume_through_next_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::jumps_resume_through_next_like_real_sipp — no sipp.");
+        return;
+    };
+    let (code, theirs) = run_jump_resume_uac(&sipp);
+    assert_eq!(code, Some(0), "real sipp uac");
+    assert_eq!(theirs, ["landed-8 ran", "final-10 ran"], "real sipp");
+    let (code, ours) = run_jump_resume_uac(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(code, Some(0), "sipr uac");
+    assert_eq!(ours, theirs, "sipr sent different messages than real sipp");
+}
+
+/// The 200 a recv-jump UAS answers with, its `X-Step` naming where the call
+/// has got to.
+fn step_200(step: &str) -> String {
+    format!(
+        r"  <send><![CDATA[
+    SIP/2.0 200 OK
+    [last_Via:]
+    [last_From:]
+    [last_To:];tag=[pid]SIPpTag01[call_number]
+    [last_Call-ID:]
+    [last_CSeq:]
+    X-Step: {step}
+    Content-Length: 0
+
+  ]]></send>
+"
+    )
+}
+
+/// An optional INFO that stays where the call waited (its `next=`'s `test=`
+/// variable is left unset) and jumps to message `target` from its actions.
+fn staying_info(attrs: &str, target: usize) -> String {
+    format!(
+        r#"  <recv request="INFO" optional="true" next="never" test="miss"{attrs}>
+    <action>
+      <ereg regexp="no-such-text" search_in="msg" assign_to="miss"/>
+      <jump value="{target}"/>
+    </action>
+  </recv>
+"#
+    )
+}
+
+/// Run `uas_bin` on `xml` and drive it from a raw UDP UAC: each request of
+/// `script` in turn (the first resent until the UAS answers), listening its
+/// duration for the `X-Step`s the UAS sends back. Returns the exit code and
+/// one `METHOD: steps` line per request.
+fn run_scripted_uas(
+    uas_bin: &std::path::Path,
+    xml: &str,
+    script: &[(&str, Duration)],
+) -> (Option<i32>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("scripted_uas.xml");
+    std::fs::write(&path, xml).expect("write uas");
+    let port = free_port();
+    let mut uas = Reaper(
+        Command::new(uas_bin)
+            .current_dir(dir.path())
+            .args(["-sf", path.to_str().expect("utf8")])
+            .args(["-i", "127.0.0.1", "-p", &port.to_string()])
+            .args(["-m", "1", "-timeout", "10", "-nostdin"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uas"),
+    );
+    let uas_addr = format!("127.0.0.1:{port}");
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind uac");
+    let local = sock.local_addr().expect("uac addr");
+    let request = |method: &str, cseq: usize| {
+        format!(
+            "{method} sip:svc@{uas_addr} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {local};branch=z9hG4bK-scripted-{cseq}\r\n\
+             From: <sip:uac@{local}>;tag=scripted-uac\r\n\
+             To: <sip:svc@{uas_addr}>\r\n\
+             Call-ID: scripted-{}@127.0.0.1\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
+            local.port()
+        )
+    };
+    let mut buf = [0u8; 65_535];
+    let mut listen = |limit: Duration| {
+        let mut steps: Vec<String> = Vec::new();
+        let start = Instant::now();
+        while let Some(left) = limit.checked_sub(start.elapsed()) {
+            sock.set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .expect("timeout");
+            let Ok(n) = sock.recv(&mut buf) else {
+                break;
+            };
+            let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+            if let Some(step) = text.lines().find_map(|l| l.strip_prefix("X-Step:")) {
+                let step = step.trim().to_owned();
+                if steps.last() != Some(&step) {
+                    steps.push(step);
+                }
+            }
+        }
+        steps
+    };
+    let mut transcript = Vec::new();
+    for (cseq, &(method, limit)) in script.iter().enumerate() {
+        let tries = if cseq == 0 { 10 } else { 1 };
+        let mut steps = Vec::new();
+        for _ in 0..tries {
+            sock.send_to(request(method, cseq + 1).as_bytes(), &uas_addr)
+                .expect("send request");
+            steps = listen(limit);
+            if !steps.is_empty() {
+                break;
+            }
+        }
+        transcript.push(format!("{method}: {}", steps.join(" ")));
+    }
+    let code = wait_with_timeout(&mut uas.0, Duration::from_secs(12));
+    (code, transcript)
+}
+
+/// A `<jump>` among a recv's actions, as SIPp's `process_incoming` treats
+/// it (docs/SIPP_COMPAT.md §6): a mandatory recv's `next()` overwrites it,
+/// and an optional recv that stays keeps it, so the call waits at message
+/// N-1. Two UASes: one where that message is a recv, which then takes the
+/// next request; one where it is a send, which the stayed recv's
+/// `timeout=` deadline wakes the call to run.
+#[test]
+fn jumps_in_a_recvs_actions_follow_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::jumps_in_a_recvs_actions_follow_real_sipp — no sipp.");
+        return;
+    };
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let short = Duration::from_millis(400);
+    // 0 OPTIONS, 1 its 200, 2 INFO (stays; jump to 5 waits at 4),
+    // 3 BYE, 4 MESSAGE, 5 its 200.
+    let waits_at_a_recv = format!(
+        r#"<scenario name="recv-jump-to-recv">
+  <recv request="OPTIONS"><action><jump value="3"/></action></recv>
+{answered}{info}  <recv request="BYE"/>
+  <recv request="MESSAGE"/>
+{messaged}  <label id="never"/>
+</scenario>
+"#,
+        answered = step_200("after-options"),
+        info = staying_info("", 5),
+        messaged = step_200("after-message"),
+    );
+    let script = [("OPTIONS", short), ("INFO", short), ("MESSAGE", short)];
+    let (code, theirs) = run_scripted_uas(&sipp, &waits_at_a_recv, &script);
+    assert_eq!(code, Some(0), "real sipp uas");
+    assert_eq!(
+        theirs,
+        ["OPTIONS: after-options", "INFO: ", "MESSAGE: after-message"],
+        "real sipp"
+    );
+    let (code, ours) = run_scripted_uas(&sipr, &waits_at_a_recv, &script);
+    assert_eq!(code, Some(0), "sipr uas");
+    assert_eq!(ours, theirs, "sipr answered differently than real sipp");
+
+    // 0 OPTIONS, 1 its 200, 2 INFO (stays, timeout 1 s; jump to 5 waits at
+    // 4), 3 BYE, 4 the 200 the deadline sends, 5 BYE, 6 its 200.
+    let waits_at_a_send = format!(
+        r#"<scenario name="recv-jump-to-send">
+  <recv request="OPTIONS"/>
+{answered}{info}  <recv request="BYE"/>
+{woken}  <recv request="BYE"/>
+{byed}  <label id="never"/>
+</scenario>
+"#,
+        answered = step_200("after-options"),
+        info = staying_info(r#" timeout="1000""#, 5),
+        woken = step_200("woken"),
+        byed = step_200("after-bye"),
+    );
+    let script = [
+        ("OPTIONS", short),
+        ("INFO", Duration::from_millis(1600)),
+        ("BYE", short),
+    ];
+    let (code, theirs) = run_scripted_uas(&sipp, &waits_at_a_send, &script);
+    assert_eq!(code, Some(0), "real sipp uas");
+    assert_eq!(
+        theirs,
+        ["OPTIONS: after-options", "INFO: woken", "BYE: after-bye"],
+        "real sipp"
+    );
+    let (code, ours) = run_scripted_uas(&sipr, &waits_at_a_send, &script);
+    assert_eq!(code, Some(0), "sipr uas");
+    assert_eq!(ours, theirs, "sipr answered differently than real sipp");
+}
+
 // ---- <assign>: SIPp's value= and variable= forms --------------------------
 
 /// A UAC whose nop assigns doubles both ways SIPp's `handle_rhs` allows and
