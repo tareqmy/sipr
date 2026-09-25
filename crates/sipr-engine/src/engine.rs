@@ -3175,7 +3175,7 @@ impl<'s> Engine<'s> {
                 return;
             }
             // condexec: run this step only if the variable's set-ness matches.
-            if let Some(common) = step_common(step) {
+            if let Some(common) = step.common() {
                 if let Some(v) = common.condexec {
                     let set = self.calls.get(call_id).is_some_and(|c| c.store.is_set(v));
                     if set == common.condexec_inverse {
@@ -3295,7 +3295,7 @@ impl<'s> Engine<'s> {
                             },
                             self.config.no_retrans,
                         );
-                        if let Some(interval) = schedule.interval(1) {
+                        if let Some(interval) = schedule.wait(1) {
                             call.generation += 1;
                             let timer = self.timers.arm(
                                 interval,
@@ -3456,7 +3456,7 @@ impl<'s> Engine<'s> {
         let landing = scenario
             .step_of_message(target)
             .unwrap_or(scenario.steps.len());
-        let before = message_before(scenario, target).and_then(|i| step_common(&scenario.steps[i]));
+        let before = message_before(scenario, target).and_then(|i| scenario.steps[i].common());
         match before {
             Some(common) => self.branch(common, call_id).unwrap_or(landing),
             None => landing,
@@ -5676,10 +5676,7 @@ impl<'s> Engine<'s> {
             s.timeouts += 1;
         }
         let at = format!("{}:{}", scenario.name, scenario.message_index(index));
-        let ontimeout = match scenario.steps.get(index) {
-            Some(Step::Recv(RecvStep { ontimeout, .. })) => *ontimeout,
-            _ => None,
-        };
+        let ontimeout = scenario.steps.get(index).and_then(Step::ontimeout);
         let Some(dest) = ontimeout else {
             self.log_err(&format!(
                 "Call-Id: {call_id}, receive timeout on message {at} without label to jump to \
@@ -5705,17 +5702,27 @@ impl<'s> Engine<'s> {
     }
 
     fn on_retrans_timer(&mut self, call_id: &str, generation: u64) {
-        let Some((buf, lost, next, step)) = self.calls.get_mut(call_id).and_then(|call| {
-            let r = call.retrans.as_mut()?;
-            r.attempt += 1;
-            Some((
-                r.buf.clone(),
-                r.lost_pct,
-                r.schedule.interval(r.attempt),
-                r.step,
-            ))
-        }) else {
+        let Some((attempt, schedule, step)) = self
+            .calls
+            .get(call_id)
+            .and_then(|call| call.retrans.as_ref())
+            .map(|r| (r.attempt, r.schedule, r.step))
+        else {
             return; // call gone or retransmission already cancelled
+        };
+        // SIPp counts an attempt when its timer fires and gives up there,
+        // one interval after the last retransmission (`call.cpp` ~l.2253).
+        if !schedule.allows(attempt) {
+            self.on_retrans_exhausted(call_id, step);
+            return;
+        }
+        let Some((buf, lost)) = self
+            .calls
+            .get(call_id)
+            .and_then(|call| call.retrans.as_ref())
+            .map(|r| (r.buf.clone(), r.lost_pct))
+        else {
+            return;
         };
         if let Some(s) = self.call_stats(call_id).step_mut(step) {
             s.retrans += 1;
@@ -5729,22 +5736,63 @@ impl<'s> Engine<'s> {
         }
         self.call_stats(call_id).retrans_sent += 1;
         self.trace_send(&buf, remote);
-        match next {
-            Some(interval) => {
-                let timer = self.timers.arm(
-                    interval,
-                    Event::CallTimer {
-                        call_id: call_id.to_owned(),
-                        generation,
-                        kind: TimerKind::Retrans,
-                    },
-                );
-                if let Some(r) = self.calls.get_mut(call_id).and_then(|c| c.retrans.as_mut()) {
-                    r.timer = timer;
-                }
+        let next = attempt + 1;
+        if let Some(wait) = schedule.wait(next) {
+            let timer = self.timers.arm(
+                wait,
+                Event::CallTimer {
+                    call_id: call_id.to_owned(),
+                    generation,
+                    kind: TimerKind::Retrans,
+                },
+            );
+            if let Some(r) = self.calls.get_mut(call_id).and_then(|c| c.retrans.as_mut()) {
+                r.attempt = next;
+                r.timer = timer;
             }
-            None => self.fail_call(call_id, "retransmissions exhausted"),
         }
+    }
+
+    /// A send's UDP retransmissions ran out (SIPp `call::run` ~l.2264): the
+    /// send counts a timeout, and the call goes to the send's `ontimeout`
+    /// with SIPp's warning, from wherever it waits. Without one — or with
+    /// a label past the last message — the call fails.
+    fn on_retrans_exhausted(&mut self, call_id: &str, send_step: usize) {
+        if let Some(s) = self.call_stats(call_id).step_mut(send_step) {
+            s.timeouts += 1;
+        }
+        let scenario = self.scenario_of(call_id);
+        let Some(dest) = scenario.steps.get(send_step).and_then(Step::ontimeout) else {
+            self.fail_call(call_id, "retransmissions exhausted");
+            return;
+        };
+        let at = self
+            .calls
+            .get(call_id)
+            .map_or(0, |c| scenario.message_index(c.index));
+        let label = scenario.message_index(dest);
+        self.log_err(&format!(
+            "Call-Id: {call_id}, timeout on max UDP retrans for message {at}, jumping to label \
+             {label} "
+        ));
+        if label >= scenario.message_count() {
+            self.fail_call(call_id, "retransmissions exhausted");
+            return;
+        }
+        let Some(call) = self.calls.get_mut(call_id) else {
+            return;
+        };
+        call.retrans = None;
+        if let Some((timer, _)) = call.timer.take() {
+            self.timers.cancel(timer);
+        }
+        call.generation += 1;
+        call.waiting = false;
+        call.awaiting_cmd = false;
+        call.recv_deadline = None;
+        call.pause_deadline = None;
+        call.index = dest;
+        self.advance(call_id);
     }
 
     // ---- lifecycle -----------------------------------------------------
@@ -6025,18 +6073,6 @@ fn message_before(scenario: &Scenario, target: usize) -> Option<usize> {
     scenario.step_of_message(target.checked_sub(1)?)
 }
 
-fn step_common(step: &Step) -> Option<&StepCommon> {
-    match step {
-        Step::Send(s) => Some(&s.common),
-        Step::Recv(r) => Some(&r.common),
-        Step::Pause { common, .. }
-        | Step::Nop { common, .. }
-        | Step::SendCmd { common, .. }
-        | Step::RecvCmd { common, .. } => Some(common),
-        Step::Label { .. } | Step::Timewait { .. } => None,
-    }
-}
-
 /// SIPp `test`/`condexec` truthiness: a variable counts as true when it is
 /// set and not numerically zero / boolean false.
 /// `test="var"` on a message (SIPp `call::next`): the branch is taken when
@@ -6052,7 +6088,7 @@ fn test_truthy(v: &crate::actions::Value) -> bool {
 fn rtd_names(scenario: &Scenario) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for step in &scenario.steps {
-        if let Some(c) = step_common(step) {
+        if let Some(c) = step.common() {
             for n in [c.start_rtd.as_ref(), c.rtd.as_ref()].into_iter().flatten() {
                 if !names.contains(n) {
                     names.push(n.clone());
@@ -6106,7 +6142,7 @@ fn step_kind(step: &Step) -> sipr_stats::StepKind {
 
 fn step_label(step: &Step) -> String {
     // `display="…"` replaces the derived label (SIPp shows it verbatim).
-    if let Some(d) = step_common(step).and_then(|c| c.display.as_deref()) {
+    if let Some(d) = step.common().and_then(|c| c.display.as_deref()) {
         return d.to_owned();
     }
     match step {
@@ -6325,14 +6361,14 @@ fn new_stat_set(scenario: &Scenario) -> sipr_stats::StatSet {
         scenario
             .steps
             .iter()
-            .map(|s| step_common(s).and_then(|c| c.counter.clone()))
+            .map(|s| s.common().and_then(|c| c.counter.clone()))
             .collect(),
     );
     stats.set_step_hidden(
         scenario
             .steps
             .iter()
-            .map(|s| step_common(s).is_some_and(|c| c.hide))
+            .map(|s| s.common().is_some_and(|c| c.hide))
             .collect(),
     );
     stats

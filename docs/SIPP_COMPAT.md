@@ -1531,7 +1531,13 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   a ceiling on both; the interval doubles from the send's `retrans=` and
   is capped at T2 (4 s) only for non-INVITE transactions — an INVITE keeps
   doubling (500, 1000, 2000, 4000, 8000 ms). sipr used one cap of 5 and
-  capped everything at T2; both now match. `-recv_timeout` (default unit
+  capped everything at T2; both now match. SIPp counts a retransmission
+  when its timer fires and gives up only there, so a send times out one
+  interval after its last retransmission (with `retrans="200"` and
+  `-max_retrans 2`: retransmissions at 0.2 s and 0.6 s, the timeout at
+  1.4 s). sipr gave up right after the last one, until the `ontimeout`
+  fix below. The timed-out send counts it in its `_Timeout` column, which
+  sipr left at 0. `-recv_timeout` (default unit
   ms) is the timeout of every recv without its own `timeout=`; the
   timeout fires the same way (`ontimeout` label or a failed call).
   `-timeout_error` makes reaching `-timeout` an error — SIPp's
@@ -1684,11 +1690,28 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   counted as a success; and a `<recvCmd>` never timed out. So a
   `timeout=` on the 200 of `100 optional`, `180 optional`, `200` arms
   only once a provisional has moved the call onto the 200. Until then it
-  waits for the 100, as it always did in SIPp. **Open:** SIPp takes
-  `ontimeout=` on a `<recvCmd>` (a common attribute); sipr warns it away
-  as unknown, so a recvCmd that times out always fails the call. (The
-  other item once open here, a matched recv's `next=`/`test=`/`chance=`,
-  is fixed since: see the next note.)
+  waits for the 100, as it always did in SIPp. A `<recvCmd>`'s own
+  `ontimeout=` is taken the same way (see "`ontimeout=` on any message"
+  below). (The items once open here, that one and a matched recv's
+  `next=`/`test=`/`chance=`, are fixed since: see the next note.)
+- `ontimeout=` on any message (verified in `scenario.cpp` ~l.1878
+  `getCommonAttributes`, `call.cpp` ~l.2159-2194 the receive timeout and
+  ~l.2253-2298 exhausted retransmissions; confirmed against real sipp,
+  the `a_sends_ontimeout_*` and `a_recv_cmds_ontimeout_*` interop tests).
+  It is a common attribute, read on every message but a `<timewait>`,
+  and two places use it. A recv or recvCmd whose receive timeout
+  expires goes there, as the note above describes. A `<recvCmd>` has
+  no `timeout=`, so only `-recv_timeout` arms it. A send whose UDP
+  retransmissions run out goes there from wherever the call waits,
+  with the warning `Call-Id: <id>, timeout on max UDP retrans for
+  message <the call's message index>, jumping to label <index> ` (the
+  trailing space is SIPp's). A label past the last message fails the
+  call as `FailedMaxUDPRetrans`. Without `ontimeout` the call fails as
+  before. On `<pause>`, `<nop>` and `<sendCmd>` SIPp reads it and never
+  looks at it, so sipr compiles it there with a warning that it has no
+  effect. sipr used to warn `ontimeout` away as an unknown attribute on
+  everything but a recv, so an exhausted send and a timed-out recvCmd
+  always failed the call.
 - Branching on a matched `<recv>` (verified in `call.cpp` ~l.5653-5687
   `process_incoming`, ~l.1920-1945 `next()`, ~l.1777 `do_bookkeeping`,
   and `scenario.cpp` ~l.1860-1876, which reads `test=` and `chance=` only

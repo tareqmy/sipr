@@ -157,6 +157,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `ontimeout=` works on a `<send>` and a `<recvCmd>`, as in SIPp, which
+  reads it on every message. A send whose UDP retransmissions run out
+  sends the call to its `ontimeout` label with SIPp's "timeout on max UDP
+  retrans … jumping to label" warning, where the call used to fail. A
+  recvCmd that `-recv_timeout` times out follows it the way a recv does.
+  On `<pause>`, `<nop>` and `<sendCmd>` it compiles with a warning that it
+  has no effect there, as SIPp ignores it. sipr warned it away as an
+  unknown attribute. A send now times out one interval after its last
+  retransmission, when SIPp's timer fires, not right after it, and it
+  counts in the send's `-trace_counts` `_Timeout` column.
 - `-trace_counts` gives a nop, a `<sendCmd>` and a `<recvCmd>` the
   `<index>_Pause_Sessions` and `<index>_Pause_Unexp` columns, as real
   sipp does. SIPp's count file tests for a pause in a way that is true

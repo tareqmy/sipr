@@ -86,7 +86,22 @@ impl RetransSchedule {
     /// message should not be retransmitted (again).
     #[must_use]
     pub fn interval(&self, attempt: u32) -> Option<Duration> {
-        if !self.enabled || attempt == 0 || attempt > self.max_retrans {
+        self.wait(attempt).filter(|_| self.allows(attempt))
+    }
+
+    /// Whether retransmission `attempt` (1-based) may be sent.
+    #[must_use]
+    pub fn allows(&self, attempt: u32) -> bool {
+        self.enabled && (1..=self.max_retrans).contains(&attempt)
+    }
+
+    /// The wait before retransmission `attempt` (1-based), allowed or not:
+    /// SIPp counts an attempt when its timer fires and gives up there, so
+    /// the message times out one interval after its last retransmission
+    /// (`call.cpp` ~l.2253-2264). `None` when it is not retransmitted.
+    #[must_use]
+    pub fn wait(&self, attempt: u32) -> Option<Duration> {
+        if !self.enabled || attempt == 0 {
             return None;
         }
         // attempt 1 → base, 2 → base*2, ...; non-INVITE capped at T2, an
@@ -146,6 +161,32 @@ mod tests {
             vec![ms(500), ms(1000), ms(2000), ms(4000), ms(8000)]
         );
         assert_eq!(s.interval(6), None, "SIPp's INVITE cap is 5");
+    }
+
+    #[test]
+    fn the_message_times_out_one_interval_after_its_last_retransmission() {
+        let caps = RetransCaps {
+            global: Some(2),
+            ..RetransCaps::default()
+        };
+        let s = RetransSchedule::new(Some(200), false, caps, false);
+        assert!(s.allows(1) && s.allows(2) && !s.allows(3));
+        assert_eq!(s.interval(3), None);
+        assert_eq!(s.wait(3), Some(ms(800)), "the wait before giving up");
+        // No retransmission at all: still one interval, then the timeout.
+        let none = RetransSchedule::new(
+            Some(200),
+            false,
+            RetransCaps {
+                global: Some(0),
+                ..RetransCaps::default()
+            },
+            false,
+        );
+        assert!(!none.allows(1));
+        assert_eq!(none.wait(1), Some(ms(200)));
+        let off = RetransSchedule::new(Some(200), false, caps, true);
+        assert_eq!(off.wait(1), None);
     }
 
     #[test]

@@ -158,7 +158,53 @@ fn ontimeout_resolves() {
         panic!("step 1 not recv")
     };
     assert_eq!(r.timeout_ms, Some(5000));
-    assert_eq!(r.ontimeout, Some(2));
+    assert_eq!(r.common.ontimeout, Some(2));
+}
+
+/// SIPp reads `ontimeout=` on every message (`getCommonAttributes`), and
+/// acts on it for a recv's or recvCmd's receive timeout and a send's
+/// exhausted retransmissions. Elsewhere it compiles, with a warning that
+/// it does nothing.
+#[test]
+fn ontimeout_is_taken_on_a_send_and_a_recv_cmd() {
+    let xml = wrap(
+        r#"<send retrans="500" ontimeout="bail"><![CDATA[
+             OPTIONS sip:[service]@[remote_ip] SIP/2.0
+             Call-ID: [call_id]
+
+           ]]></send>
+           <recvCmd ontimeout="bail"/>
+           <label id="bail"/>
+           <recv response="200"/>"#,
+    );
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    assert_eq!(sc.steps[0].ontimeout(), Some(2));
+    assert_eq!(sc.steps[1].ontimeout(), Some(2));
+
+    for element in [
+        r#"<pause milliseconds="10" ontimeout="bail"/>"#,
+        r#"<nop ontimeout="bail"/>"#,
+    ] {
+        let xml = wrap(&format!(
+            r#"{invite}
+               {element}
+               <label id="bail"/>
+               <recv response="200"/>"#,
+            invite = send_invite()
+        ));
+        let out = compile("test", &xml);
+        let sc = out.scenario.as_ref().expect("compiles");
+        assert_eq!(sc.steps[1].ontimeout(), None, "{element}");
+        assert!(
+            warnings(&xml)
+                .iter()
+                .any(|w| w.contains("'ontimeout'") && w.contains("has no effect")),
+            "{element}: {:?}",
+            out.diagnostics
+        );
+    }
 }
 
 #[test]

@@ -152,6 +152,10 @@ pub struct StepCommon {
     pub test: Option<VarId>,
     /// `chance`: probability (0..=1) of taking `next`.
     pub chance: Option<f64>,
+    /// `ontimeout`: where a timeout sends the call (resolved from a label
+    /// id). SIPp reads it on a recv or recvCmd whose receive timeout
+    /// expires, and on a send whose UDP retransmissions run out.
+    pub ontimeout: Option<StepIndex>,
     /// `condexec`: execute this step only if the variable is set.
     pub condexec: Option<VarId>,
     /// `condexec_inverse`: invert the `condexec` test.
@@ -210,8 +214,6 @@ pub struct RecvStep {
     pub expect_regex: Option<crate::regex::Regex>,
     /// `timeout`: ms to wait before `ontimeout` (or call failure).
     pub timeout_ms: Option<u64>,
-    /// `ontimeout`: jump target on timeout (resolved from a label id).
-    pub ontimeout: Option<StepIndex>,
     /// `rrs`: capture the Record-Route set for `[routes]`.
     pub record_route_set: bool,
     /// `auth`: capture a 401/407 challenge for `[authentication]`.
@@ -302,6 +304,46 @@ pub enum Step {
         /// Source line.
         line: u32,
     },
+}
+
+impl Step {
+    /// The attributes every message command shares; a label and a
+    /// timewait have none.
+    #[must_use]
+    pub fn common(&self) -> Option<&StepCommon> {
+        match self {
+            Self::Send(s) => Some(&s.common),
+            Self::Recv(r) => Some(&r.common),
+            Self::Pause { common, .. }
+            | Self::Nop { common, .. }
+            | Self::SendCmd { common, .. }
+            | Self::RecvCmd { common, .. } => Some(common),
+            Self::Label { .. } | Self::Timewait { .. } => None,
+        }
+    }
+
+    /// [`Step::common`], mutably.
+    pub fn common_mut(&mut self) -> Option<&mut StepCommon> {
+        match self {
+            Self::Send(s) => Some(&mut s.common),
+            Self::Recv(r) => Some(&mut r.common),
+            Self::Pause { common, .. }
+            | Self::Nop { common, .. }
+            | Self::SendCmd { common, .. }
+            | Self::RecvCmd { common, .. } => Some(common),
+            Self::Label { .. } | Self::Timewait { .. } => None,
+        }
+    }
+
+    /// The step's `ontimeout`, where SIPp reads one: a recv's or recvCmd's
+    /// receive timeout, or a send's exhausted retransmissions.
+    #[must_use]
+    pub fn ontimeout(&self) -> Option<StepIndex> {
+        match self {
+            Self::Send(_) | Self::Recv(_) | Self::RecvCmd { .. } => self.common()?.ontimeout,
+            _ => None,
+        }
+    }
 }
 
 /// `search_in` of `ereg`.
@@ -926,9 +968,6 @@ impl Scenario {
                     if let Some(t) = r.timeout_ms {
                         let _ = write!(extra, " timeout={t}ms");
                     }
-                    if let Some(d) = r.ontimeout {
-                        let _ = write!(extra, " ontimeout->{}", self.message_index(d));
-                    }
                     if !r.actions.is_empty() {
                         let _ = write!(extra, " actions={}", r.actions.len());
                     }
@@ -996,6 +1035,9 @@ impl Scenario {
         }
         if c.chance.is_some() {
             s.push_str(" (chance)");
+        }
+        if let Some(d) = c.ontimeout {
+            s.push_str(&format!(" ontimeout->{}", self.message_index(d)));
         }
         if c.condexec.is_some() {
             s.push_str(" (condexec)");

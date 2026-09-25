@@ -219,7 +219,7 @@ fn successors(steps: &[Step], i: StepIndex, retaddr: Option<VarId>) -> Option<Ve
     if matches!(step, Step::Timewait { .. }) {
         return Some(Vec::new());
     }
-    let Some(common) = step_common(step) else {
+    let Some(common) = step.common() else {
         return Some(vec![i + 1]); // a label
     };
     let mut out = Vec::new();
@@ -230,9 +230,7 @@ fn successors(steps: &[Step], i: StepIndex, retaddr: Option<VarId>) -> Option<Ve
         out.push(i + 1);
     }
     out.extend(common.next);
-    if let Step::Recv(recv) = step {
-        out.extend(recv.ontimeout);
-    }
+    out.extend(step.ontimeout());
     if !jump_takes_effect(step) {
         return Some(out);
     }
@@ -274,7 +272,7 @@ fn jump_landing(steps: &[Step], step: &Step, dest: StepIndex) -> Vec<StepIndex> 
     if matches!(step, Step::Recv(_)) {
         return vec![before.unwrap_or(0)];
     }
-    let Some(common) = before.and_then(|i| step_common(&steps[i])) else {
+    let Some(common) = before.and_then(|i| steps[i].common()) else {
         return vec![dest];
     };
     let mut landing: Vec<StepIndex> = common.next.into_iter().collect();
@@ -308,7 +306,7 @@ fn unreachable_finding(steps: &[Step], start: StepIndex, len: usize) -> Finding 
              <timewait>"
                 .to_owned()
         }
-        Some(prev) => match step_common(prev).and_then(|c| c.next) {
+        Some(prev) => match prev.common().and_then(|c| c.next) {
             Some(dest) => format!(
                 "the {} at line {} before it always jumps to label '{}', and no next, ontimeout \
                  or jump leads here",
@@ -450,18 +448,6 @@ fn readable(line: &str) -> String {
 
 // ---- describing steps ---------------------------------------------------
 
-fn step_common(step: &Step) -> Option<&StepCommon> {
-    match step {
-        Step::Send(s) => Some(&s.common),
-        Step::Recv(r) => Some(&r.common),
-        Step::Pause { common, .. }
-        | Step::Nop { common, .. }
-        | Step::SendCmd { common, .. }
-        | Step::RecvCmd { common, .. } => Some(common),
-        Step::Label { .. } | Step::Timewait { .. } => None,
-    }
-}
-
 fn step_actions(step: &Step) -> &[Action] {
     match step {
         Step::Send(s) => &s.actions,
@@ -474,7 +460,7 @@ fn step_actions(step: &Step) -> &[Action] {
 fn line_of(step: &Step) -> u32 {
     match step {
         Step::Label { line, .. } | Step::Timewait { line, .. } => *line,
-        _ => step_common(step).map_or(0, |c| c.line),
+        _ => step.common().map_or(0, |c| c.line),
     }
 }
 

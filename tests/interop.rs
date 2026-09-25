@@ -5644,6 +5644,212 @@ fn branch_in_an_abort_bye_renders_like_real_sipp() {
     assert_eq!(ours, theirs, "sipr sent different branches than real sipp");
 }
 
+// ---- ontimeout= on a <send> and a <recvCmd> -------------------------------
+
+/// An OPTIONS naming its step in `X-Step`, with `attrs` on the `<send>`.
+fn step_options(step: &str, attrs: &str) -> String {
+    format!(
+        r"  <send{attrs}><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:ot@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 OPTIONS
+    Max-Forwards: 70
+    X-Step: {step}
+    Content-Length: 0
+
+  ]]></send>
+"
+    )
+}
+
+/// What a UAC run against a silent UDP sink did: its exit code, each
+/// `X-Step` the sink got with its arrival after the first rounded to 0.2 s,
+/// and the rest of the first `-trace_err` line naming a timeout, after
+/// `Call-Id: <id>, `.
+#[derive(Debug, PartialEq)]
+struct TimedRun {
+    code: Option<i32>,
+    steps: Vec<String>,
+    warning: Option<String>,
+}
+
+/// Run `bin` on `xml` (plus `extra`) against a silent UDP sink with
+/// `-trace_err`, listening to the sink while it runs.
+fn run_timed_uac(bin: &std::path::Path, xml: &str, extra: &[&str]) -> TimedRun {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("timed.xml");
+    std::fs::write(&path, xml).expect("write uac");
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut uac = Reaper(
+        tool_command(bin)
+            .current_dir(dir.path())
+            .args(["-sf", path.to_str().expect("utf8")])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "10", "-trace_err"])
+            .args(extra)
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uac"),
+    );
+    sink.set_read_timeout(Some(Duration::from_millis(2500)))
+        .expect("timeout");
+    let mut steps = Vec::new();
+    let mut first = None;
+    let mut buf = [0u8; 65_535];
+    while let Ok(n) = sink.recv(&mut buf) {
+        let at = *first.get_or_insert_with(Instant::now);
+        let step = String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .find_map(|l| l.strip_prefix("X-Step:"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let fifths = (at.elapsed().as_millis() + 100) / 200;
+        steps.push(format!("{step} {}.{}", fifths / 5, fifths % 5 * 2));
+    }
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(12));
+    let warning = sipp_error_log(dir.path()).lines().find_map(|l| {
+        l.split_once("Call-Id: ")
+            .and_then(|(_, rest)| rest.split_once(", "))
+            .map(|(_, rest)| rest.to_owned())
+    });
+    TimedRun {
+        code,
+        steps,
+        warning,
+    }
+}
+
+/// SIPp takes `ontimeout=` on any message (`getCommonAttributes`). On a
+/// `<send>` it is where the call goes once the send's UDP retransmissions
+/// run out: one retransmission interval after the last one, with SIPp's
+/// warning, instead of the call failing. Messages: 0 the retransmitted
+/// OPTIONS, 1 the 200 it never gets, 2 skipped, 3 `late`.
+#[test]
+fn a_sends_ontimeout_follows_exhausted_retransmissions_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::a_sends_ontimeout_follows_exhausted_retransmissions_like_real_sipp \
+             — no sipp."
+        );
+        return;
+    };
+    let xml = format!(
+        r#"<scenario name="send-ontimeout">
+{first}  <recv response="200"/>
+{skipped}  <label id="late"/>
+{late}</scenario>
+"#,
+        first = step_options("first", r#" retrans="200" ontimeout="late""#),
+        skipped = step_options("skipped", ""),
+        late = step_options("late", ""),
+    );
+    let theirs = run_timed_uac(&sipp, &xml, &["-max_retrans", "2"]);
+    assert_eq!(
+        theirs,
+        TimedRun {
+            code: Some(0),
+            steps: vec![
+                "first 0.0".into(),
+                "first 0.2".into(),
+                "first 0.6".into(),
+                "late 1.4".into()
+            ],
+            warning: Some("timeout on max UDP retrans for message 1, jumping to label 3 ".into()),
+        },
+        "real sipp"
+    );
+    let ours = run_timed_uac(
+        &PathBuf::from(env!("CARGO_BIN_EXE_sipr")),
+        &xml,
+        &["-max_retrans", "2"],
+    );
+    assert_eq!(ours, theirs, "sipr differs from real sipp");
+}
+
+/// Accept the one twin link `listener` gets and hold it, reading until the
+/// peer closes it or 10 s pass: a 3PCC twin that never answers.
+fn silent_twin(listener: TcpListener) -> std::thread::JoinHandle<()> {
+    use std::io::Read;
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking twin");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break None,
+            }
+        };
+        let Some(mut stream) = stream else {
+            return;
+        };
+        stream.set_nonblocking(false).expect("blocking twin");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("twin timeout");
+        let mut buf = [0u8; 4096];
+        while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+    })
+}
+
+/// A `<recvCmd>`'s `ontimeout=` is where `-recv_timeout` sends the call when
+/// no command comes, as on a `<recv>`. Messages: 0 an OPTIONS, 1 the
+/// `<sendCmd>` that dials the (silent) twin, 2 the `<recvCmd>`, 3 skipped,
+/// 4 `late`.
+#[test]
+fn a_recv_cmds_ontimeout_takes_the_receive_timeout_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::a_recv_cmds_ontimeout_takes_the_receive_timeout_like_real_sipp \
+             — no sipp."
+        );
+        return;
+    };
+    let xml = format!(
+        r#"<scenario name="cmd-ontimeout">
+{first}  <sendCmd><![CDATA[
+    Call-ID: [call_id]
+    X-Offer: hello
+  ]]></sendCmd>
+  <recvCmd ontimeout="late"/>
+{skipped}  <label id="late"/>
+{late}</scenario>
+"#,
+        first = step_options("first", ""),
+        skipped = step_options("skipped", ""),
+        late = step_options("late", ""),
+    );
+    let run = |bin: &std::path::Path| {
+        let twin = TcpListener::bind("127.0.0.1:0").expect("bind twin");
+        let twin_addr = twin.local_addr().expect("twin addr").to_string();
+        let held = silent_twin(twin);
+        let run = run_timed_uac(bin, &xml, &["-3pcc", &twin_addr, "-recv_timeout", "600"]);
+        held.join().expect("twin thread");
+        run
+    };
+    let theirs = run(&sipp);
+    assert_eq!(
+        theirs,
+        TimedRun {
+            code: Some(0),
+            steps: vec!["first 0.0".into(), "late 0.6".into()],
+            warning: Some("receive timeout on message cmd-ontimeout:2, jumping to label 4".into()),
+        },
+        "real sipp"
+    );
+    let ours = run(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(ours, theirs, "sipr differs from real sipp");
+}
+
 // ---- <assign>: SIPp's value= and variable= forms --------------------------
 
 /// A UAC whose nop assigns doubles both ways SIPp's `handle_rhs` allows and

@@ -4,7 +4,7 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **7-8** are SIPp divergences that `docs/SIPP_COMPAT.md` §6 already
+- **8** is a SIPp divergence that `docs/SIPP_COMPAT.md` §6 already
   listed as open, with no fix picked up yet.
 - **9-10** are SIPp divergences in how variables read and render, found
   while fixing `<assign value=>` (commit `86b9505`). Both were confirmed
@@ -36,50 +36,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 7. Take `ontimeout=` on `<send>` and `<recvCmd>`
-
-Scope: `fix(engine)`. SIPP_COMPAT §6, the receive-timeouts note lists
-the `<recvCmd>` half as open. The `<send>` half is not recorded yet.
-
-- **SIPp:** `ontimeout` is a common attribute, parsed for every message
-  by `getCommonAttributes` (`scenario.cpp` ~l.1878; only `<timewait>`
-  refuses it). Two places use it:
-  - A `<recv>` or `<recvCmd>` whose receive timeout expires
-    (`call.cpp` ~l.2150-2190). `<recvCmd>` has no `timeout=` of its own
-    (its branch in `scenario.cpp` ~l.997 reads none), so only
-    `-recv_timeout` arms it.
-  - A `<send>` whose UDP retransmissions run out (`call.cpp`
-    ~l.2262-2285). SIPp warns "timeout on max UDP retrans for message
-    <n>, jumping to label <m>" and jumps. A label past the last message
-    fails the call as `E_FAILED_MAX_UDP_RETRANS`. Without `ontimeout`
-    the call fails as before.
-
-  `<pause>`, `<nop>` and `<sendCmd>` also accept `ontimeout`, and
-  nothing reads it there.
-- **sipr:** `<send>` and `<recvCmd>` warn `ontimeout` away ("unknown
-  attribute 'ontimeout' … — ignored", confirmed on `master`). Only
-  `RecvStep` has an `ontimeout` field (`crates/sipr-scenario/src/model.rs`).
-  So a send whose retransmissions run out always fails the call
-  (`fail_call(…, "retransmissions exhausted")` in `on_retrans_timer`,
-  `crates/sipr-engine/src/engine.rs`), and so does a timed-out recvCmd
-  (`on_recv_timeout`).
-- **Fix:** resolve `ontimeout` for `<send>` and `<recvCmd>` the way
-  `<recv>`'s is resolved (a pending label in `compile.rs`, checked in
-  `finish()`). Then follow it on retransmission exhaustion and on a
-  recvCmd timeout, with SIPp's warnings and failure counters. Decide
-  what `ontimeout` on `<pause>`, `<nop>` and `<sendCmd>` should do.
-  SIPp accepts it and ignores it, and AGENTS.md says sipr must not
-  ignore scenario input silently, so a specific warning is likely
-  right.
-- **Also update:** the `unreachable` lint's `successors`
-  (`crates/sipr-scenario/src/lint.rs`), which follows only a recv's
-  `ontimeout`, and the `--check` dump, which prints `ontimeout->` for
-  recvs only.
-- **Test:** an interop test with a UAC whose `<send retrans=…
-  ontimeout=…>` goes to a silent sink, and a 3PCC pair where a
-  `<recvCmd ontimeout=…>` waits out `-recv_timeout`. Compare the
-  messages sent, the exit code and the warning with real sipp.
 
 ## 8. Log 3PCC twin commands in `-trace_msg` and `-trace_shortmsg`
 

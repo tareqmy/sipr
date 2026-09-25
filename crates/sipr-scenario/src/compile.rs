@@ -680,7 +680,6 @@ impl Compiler {
             "auth",
             "lost",
             "timeout",
-            "ontimeout",
             "regexp_match",
             "response_txn",
             "ignoresdp",
@@ -722,15 +721,6 @@ impl Compiler {
                 None
             }
         };
-        let ontimeout_label = el.attr("ontimeout").map(ToOwned::to_owned);
-        if let Some(label) = ontimeout_label {
-            self.pending.push(Pending {
-                step: self.steps.len(),
-                slot: Slot::Ontimeout,
-                label,
-                line: el.line,
-            });
-        }
         let mut actions = Vec::new();
         for a in el.child_elements() {
             if a.name == "action" {
@@ -765,7 +755,6 @@ impl Compiler {
             regexp_match,
             expect_regex,
             timeout_ms: self.parse_num_attr(el, "timeout"),
-            ontimeout: None, // resolved in finish()
             record_route_set: self.parse_bool_attr(el, "rrs"),
             auth: self.parse_bool_attr(el, "auth"),
             lost_pct: self.parse_num_attr(el, "lost"),
@@ -956,6 +945,7 @@ impl Compiler {
             "repeat_rtd",
             "crlf",
             "next",
+            "ontimeout",
             "test",
             "chance",
             "condexec",
@@ -973,6 +963,26 @@ impl Compiler {
                 label: label.to_owned(),
                 line: el.line,
             });
+        }
+        if let Some(label) = el.attr("ontimeout") {
+            self.pending.push(Pending {
+                step: self.steps.len(),
+                slot: Slot::Ontimeout,
+                label: label.to_owned(),
+                line: el.line,
+            });
+            // SIPp reads it on any message (`getCommonAttributes`) but acts
+            // on it only for a receive timeout or exhausted retransmissions.
+            if !matches!(el.name.as_str(), "send" | "recv" | "recvCmd") {
+                self.diags.warn(
+                    Some(el.line),
+                    format!(
+                        "'ontimeout' on <{}> has no effect: SIPp takes it only on <send>, \
+                         <recv> and <recvCmd>",
+                        el.name
+                    ),
+                );
+            }
         }
         let chance = el.attr("chance").and_then(|raw| {
             let parsed: Option<f64> = raw.parse().ok();
@@ -1004,7 +1014,8 @@ impl Compiler {
             rtd: el.attr("rtd").map(norm_rtd),
             repeat_rtd: self.parse_bool_attr(el, "repeat_rtd"),
             crlf: self.parse_bool_attr(el, "crlf"),
-            next: None, // resolved in finish()
+            next: None,      // resolved in finish()
+            ontimeout: None, // resolved in finish()
             test: el
                 .attr("test")
                 .map(ToOwned::to_owned)
@@ -1866,21 +1877,11 @@ impl Compiler {
         for p in std::mem::take(&mut self.pending) {
             match self.labels.get(&p.label) {
                 Some(&dest) => {
-                    let slot = match self.steps.get_mut(p.step) {
-                        Some(Step::Send(s)) => Some(&mut s.common.next),
-                        Some(Step::Recv(r)) => match p.slot {
-                            Slot::Next => Some(&mut r.common.next),
-                            Slot::Ontimeout => Some(&mut r.ontimeout),
-                        },
-                        Some(
-                            Step::Pause { common, .. }
-                            | Step::Nop { common, .. }
-                            | Step::SendCmd { common, .. }
-                            | Step::RecvCmd { common, .. },
-                        ) => Some(&mut common.next),
-                        _ => None,
-                    };
-                    if let Some(slot) = slot {
+                    if let Some(common) = self.steps.get_mut(p.step).and_then(Step::common_mut) {
+                        let slot = match p.slot {
+                            Slot::Next => &mut common.next,
+                            Slot::Ontimeout => &mut common.ontimeout,
+                        };
                         *slot = Some(dest);
                     }
                 }

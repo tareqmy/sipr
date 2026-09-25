@@ -215,6 +215,20 @@ fn ontimeout_and_the_unexpected_handler_make_steps_reachable() {
 }
 
 #[test]
+fn a_sends_ontimeout_makes_its_label_reachable() {
+    // Exhausted retransmissions send the call to `late`: the send on line 5
+    // is reached that way only.
+    let xml = scenario(&[
+        r#"<send retrans="500" ontimeout="late"><![CDATA[OPTIONS sip:[service]@[remote_ip] SIP/2.0]]></send>"#,
+        r#"<recv response="200" next="end"/>"#,
+        r#"<label id="late"/>"#,
+        SEND,
+        r#"<label id="end"/>"#,
+    ]);
+    assert_eq!(findings(&xml), []);
+}
+
+#[test]
 fn a_step_after_timewait_is_unreachable() {
     let xml = scenario(&[SEND, "<timewait milliseconds=\"10\"/>", "<nop/>"]);
     assert_eq!(findings(&xml), [(Lint::Unreachable, 4)]);
