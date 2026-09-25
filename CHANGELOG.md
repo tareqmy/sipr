@@ -157,6 +157,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A false bool, such as a failed `<test>` result, renders as `false` in
+  `[$var]`, as real sipp writes it. sipr rendered it empty, having
+  misread SIPp's rendering code for a true-or-nothing rule.
 - A variable reads as a number the way SIPp's `getDouble` reads it: a
   double's value, and 0 for a string, a capture, a bool or an unset
   variable. That covers every `value=`/`variable=` action, the

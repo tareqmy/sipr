@@ -4,9 +4,6 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **10** is a SIPp divergence in how variables render, found while
-  fixing `<assign value=>` (commit `86b9505`). It was confirmed against
-  sipp 3.7.7.
 - **11** breaks the rule that sipr never ignores scenario input silently.
   It was found while fixing jump semantics (commit `5b29b65`).
 - **12** is a gap in SIPp's documented keywords, found while adding
@@ -34,29 +31,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 10. Render a false bool as `false`
-
-Scope: `fix(engine)`. The "Variable value semantics" note in
-SIPP_COMPAT §6 says the opposite and needs correcting.
-
-- **SIPp:** `E_Message_Variable` (`call.cpp` ~l.3966-3981) writes
-  `true` for a set (true) bool, and its `else if (var->isBool())` branch
-  writes `false` for an unset (false) one. Confirmed against sipp 3.7.7:
-  `[$no]` after `<test assign_to="no" variable="seven" compare="equal"
-  value="8"/>` renders `false`.
-- **sipr:** `Value::as_str` (`crates/sipr-engine/src/actions.rs`)
-  renders `Bool(false)` as nothing. The `value_coercions` unit test pins
-  that, and the §6 note says "a false `<test>` result render[s] empty"
-  and that sipr "used to print … `false`". So an earlier change moved
-  sipr away from SIPp here.
-- **Fix:** render `Bool(false)` as `false` in the message template path.
-  Keep `is_set` false for it, since `test=` and `condexec` ask `isSet`.
-  Check the other users of `as_str` (`strcmp`, `trim`, `urlencode`,
-  `ereg search_in="var"`), where SIPp calls `getString()`, which is `""`
-  for a bool.
-- **Test:** an interop test rendering `[$yes]` and `[$no]` from two
-  `<test>` results, compared with real sipp.
 
 ## 11. Run a `<pause>`'s and a `<timewait>`'s actions
 

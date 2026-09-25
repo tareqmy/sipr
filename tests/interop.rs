@@ -5858,7 +5858,7 @@ fn a_recv_cmds_ontimeout_takes_the_receive_timeout_like_real_sipp() {
 /// and a `<test>` of the string "5" against 5 is false, so the `condexec`
 /// send is skipped. `<todouble>` parses a whole string (leading blanks
 /// allowed, "" is 0) and leaves its target alone, with a warning, when it
-/// cannot.
+/// cannot. The two `<test>` results render as `true` and `false`.
 const NUMBERS_UAC_XML: &str = r#"<scenario name="numbers">
   <nop>
     <action>
@@ -5888,7 +5888,7 @@ const NUMBERS_UAC_XML: &str = r#"<scenario name="numbers">
     Call-ID: [call_id]
     CSeq: 1 OPTIONS
     Max-Forwards: 70
-    X-Values: [$t]|[$fromstr]|[$frombool]|[$d]|[$kept]|[$e]
+    X-Values: [$t]|[$fromstr]|[$frombool]|[$d]|[$kept]|[$e]|[$b]|[$cmp]
     Content-Length: 0
 
   ]]></send>
@@ -5947,11 +5947,13 @@ fn run_numbers_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>, bool
 }
 
 /// Variables read as numbers the way SIPp reads them (docs/SIPP_COMPAT.md
-/// §6): `getDouble` everywhere, `toDouble` in `<todouble>` only.
+/// §6): `getDouble` everywhere, `toDouble` in `<todouble>` only. Bools
+/// render as SIPp's `E_Message_Variable` writes them, a false one as
+/// `false`.
 #[test]
-fn variables_read_as_numbers_like_real_sipp() {
+fn variables_read_and_render_like_real_sipp() {
     let Some(sipp) = sipp_bin() else {
-        eprintln!("SKIPPED interop::variables_read_as_numbers_like_real_sipp — no sipp.");
+        eprintln!("SKIPPED interop::variables_read_and_render_like_real_sipp — no sipp.");
         return;
     };
     let theirs = run_numbers_uac(&sipp);
@@ -5959,13 +5961,16 @@ fn variables_read_as_numbers_like_real_sipp() {
         theirs,
         (
             Some(0),
-            vec!["1.000000|||12.500000|3.000000|".to_owned()],
+            vec!["1.000000|||12.500000|3.000000||true|false".to_owned()],
             true
         ),
         "real sipp"
     );
     let ours = run_numbers_uac(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
-    assert_eq!(ours, theirs, "sipr read numbers differently than real sipp");
+    assert_eq!(
+        ours, theirs,
+        "sipr read or rendered differently than real sipp"
+    );
 }
 
 // ---- twin commands in -trace_msg and -trace_shortmsg ----------------------

@@ -1170,18 +1170,23 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   SIPp), which only shows through shared (global) variables. Settled as a
   permanent divergence in M44 below; the M35 interop test normalises it.
 - Variable value semantics (v0.24.0; verified in `variables.cpp` ~l.33-46
-  `CCallVariable::isSet`, `call.cpp` ~l.3968-3978 `E_Message_Variable`,
-  ~l.1933 `call::next`, ~l.2241 `condexec`): a variable "is set" when it
-  is a string or regexp capture (even empty), a **non-zero** double, or a
-  **true** bool. `[$var]` writes nothing for an unset variable, a double
-  as `%lf` (`3.000000`, `-2.000000`), a true bool as `true`; so a zero
-  counter and a false `<test>` result render empty. `test="var"` on a
-  message and `condexec` ask the same `isSet`. sipr now matches all of
-  it (it used to print `3`, `false` and `0`, and treated a `"0"`/`"false"`
-  string as not set). Not matched on purpose: SIPp's `getString()` of a
-  double is `""` (the source calls it a bug), so `strcmp`/`trim`/
-  `urlencode` on a numeric variable see nothing there; sipr gives them
-  the `%lf` text.
+  `CCallVariable::isSet`, `call.cpp` ~l.3966-3981 `E_Message_Variable`,
+  ~l.1933 `call::next`, ~l.2241 `condexec`; confirmed against real sipp,
+  the `variables_read_and_render_like_real_sipp` interop test): a
+  variable "is set" when it is a string or regexp capture (even empty), a
+  **non-zero** double, or a **true** bool. `[$var]` writes nothing for an
+  unset variable or a zero double, a double as `%lf` (`3.000000`,
+  `-2.000000`), and a bool as `true` or `false`: a true one from the
+  set-variable branch, a false one from its `else if (isBool())` branch.
+  So a zero counter renders empty and a false `<test>` result `false`.
+  `test="var"` on a message and `condexec` ask the same `isSet`. sipr
+  matches all of it. It used to print `3` and `0`, and treated a
+  `"0"`/`"false"` string as not set. The v0.24.0 fix of that read only
+  the set-variable branch, so for a while sipr rendered a false bool
+  empty too. Not matched on purpose: SIPp's `getString()` of a double or
+  a bool is `""` (the source calls it a bug), so `strcmp`/`trim`/
+  `urlencode` on such a variable see nothing there; sipr gives them the
+  text `[$var]` renders.
 - `<assign>` (verified in `scenario.cpp` ~l.1344-1365 `handle_rhs`,
   ~l.1469; `call.cpp` ~l.5692 `get_rhs`, ~l.5778
   `E_AT_ASSIGN_FROM_VALUE`): it takes `value=` (a double, the form SIPp's

@@ -76,16 +76,16 @@ impl Value {
 
     /// Text view, as SIPp writes a variable into a message
     /// (`call.cpp` `E_Message_Variable`): a string as is, a double with
-    /// `%lf` (`3.000000`), a true bool as `true`, and nothing at all when
-    /// the variable is not set — so a zero double and a false bool render
-    /// empty.
+    /// `%lf` (`3.000000`), a bool as `true` or `false`, and nothing when
+    /// the variable is unset or a zero double. SIPp's set-variable branch
+    /// writes `true`, and its `else if (isBool())` branch `false`.
     #[must_use]
     pub fn as_str(&self) -> String {
         match self {
             Self::Str(s) => s.clone(),
             Self::Num(n) if *n != 0.0 => format!("{n:.6}"),
-            Self::Bool(true) => "true".to_owned(),
-            Self::Num(_) | Self::Bool(false) | Self::Unset => String::new(),
+            Self::Bool(b) => b.to_string(),
+            Self::Num(_) | Self::Unset => String::new(),
         }
     }
 }
@@ -652,7 +652,7 @@ mod tests {
             "a zero double is unset in SIPp"
         );
         assert_eq!(Value::Bool(true).as_str(), "true");
-        assert_eq!(Value::Bool(false).as_str(), "");
+        assert_eq!(Value::Bool(false).as_str(), "false");
         assert_eq!(Value::Unset.as_str(), "");
         assert!(!Value::Unset.is_set());
         assert!(!Value::Num(0.0).is_set());
