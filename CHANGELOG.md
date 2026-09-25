@@ -157,6 +157,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The HTTP control API's reply to `POST /quit` arrives in full. A soft
+  quit with little to drain could end sipr between the reply's head and
+  body, so a client read a `202` with an empty body. Each reply now goes
+  out in one write, and sipr waits up to a second, as it exits, for
+  replies still being written.
 - A retransmitted message gets the send that answered it (the first send
   after it), not simply the last one sent. For one, a retransmitted 200
   gets its ACK again even after a BYE has gone out. It counts on the

@@ -7,7 +7,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// A parsed request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,11 +96,19 @@ pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 /// Largest accepted request (head + body).
 const MAX_REQUEST: usize = 1 << 20;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long dropping the server waits for requests it is still answering.
+const DRAIN_LIMIT: Duration = Duration::from_secs(1);
 
 /// The listening server; dropping it does not stop the accept thread (the
 /// thread ends when the process does), which is fine for a control plane.
+/// Dropping it does wait, briefly, for the requests it is answering: the
+/// engine drops it as the run ends, and `POST /quit` is answered only once
+/// the engine has taken the quit, so without the wait the process could
+/// end in the middle of that reply.
 pub struct HttpServer {
     local_addr: SocketAddr,
+    /// Requests read and not yet answered in full.
+    answering: Arc<AtomicUsize>,
 }
 
 impl HttpServer {
@@ -111,18 +120,24 @@ impl HttpServer {
     pub fn start(addr: SocketAddr, handler: Handler) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
+        let answering = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&answering);
         std::thread::Builder::new()
             .name("sipr-http".into())
             .spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
                     let handler = Arc::clone(&handler);
+                    let counter = Arc::clone(&counter);
                     let _ = std::thread::Builder::new()
                         .name("sipr-http-conn".into())
-                        .spawn(move || serve_connection(stream, &handler));
+                        .spawn(move || serve_connection(stream, &handler, &counter));
                 }
             })?;
-        Ok(Self { local_addr })
+        Ok(Self {
+            local_addr,
+            answering,
+        })
     }
 
     /// The bound address.
@@ -132,10 +147,39 @@ impl HttpServer {
     }
 }
 
-fn serve_connection(mut stream: TcpStream, handler: &Handler) {
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        let deadline = Instant::now() + DRAIN_LIMIT;
+        while self.answering.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// Counts a request as being answered for as long as it lives.
+struct Answering<'a>(&'a AtomicUsize);
+
+impl<'a> Answering<'a> {
+    fn begin(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for Answering<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn serve_connection(mut stream: TcpStream, handler: &Handler, answering: &AtomicUsize) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let response = match read_request(&mut stream) {
+    let request = read_request(&mut stream);
+    // From here the request is owed a reply, which dropping the server
+    // waits for.
+    let _answering = Answering::begin(answering);
+    let response = match request {
         Ok(req) => handler(&req),
         Err(status) => Response::text(status, "bad request\n"),
     };
@@ -147,8 +191,10 @@ fn serve_connection(mut stream: TcpStream, handler: &Handler) {
         response.content_type,
         response.body.len()
     );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&response.body);
+    // One write, so a reader never sees the head without its body.
+    let mut reply = head.into_bytes();
+    reply.extend_from_slice(&response.body);
+    let _ = stream.write_all(&reply);
     let _ = stream.flush();
 }
 
@@ -277,5 +323,42 @@ mod tests {
         assert!(out.ends_with("body={\"rate\":10}"), "{out}");
         let out = roundtrip(addr, "garbage\r\n\r\n");
         assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    }
+
+    /// Dropping the server waits for a request it is answering (the engine
+    /// drops it as the run ends, right after it took a `POST /quit`), but
+    /// not for a connection that sent nothing.
+    #[test]
+    fn dropping_the_server_lets_a_reply_in_progress_finish() {
+        let handler: Handler = Arc::new(|_: &Request| {
+            std::thread::sleep(Duration::from_millis(300));
+            Response::text(202, "done")
+        });
+        let server = HttpServer::start("127.0.0.1:0".parse().unwrap(), handler).unwrap();
+        let addr = server.local_addr();
+        let _idle = TcpStream::connect(addr).unwrap();
+        let client = std::thread::spawn(move || roundtrip(addr, "POST /quit HTTP/1.1\r\n\r\n"));
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        drop(server);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(100) && waited < DRAIN_LIMIT,
+            "{waited:?}"
+        );
+        let out = client.join().unwrap();
+        assert!(out.starts_with("HTTP/1.1 202"), "{out}");
+        assert!(out.ends_with("done"), "{out}");
+
+        // Nothing being answered: no wait, idle connections or not.
+        let quiet = HttpServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(|_: &Request| Response::text(200, "")),
+        )
+        .unwrap();
+        let _idle = TcpStream::connect(quiet.local_addr()).unwrap();
+        let started = Instant::now();
+        drop(quiet);
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 }
