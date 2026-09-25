@@ -29,7 +29,7 @@ pub enum TwinEvent {
 }
 
 /// The ESC (0x1B) byte that terminates each twin command on the wire.
-const ESC: u8 = 0x1b;
+pub const ESC: u8 = 0x1b;
 
 /// One read chunk from the twin socket.
 const READ_CHUNK: usize = 16 * 1024;

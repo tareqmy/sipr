@@ -1177,11 +1177,26 @@ pub const ERROR_LOG_HEADER: &str = "The following events occurred:\n";
 /// `<TRANSPORT> message sent|received [<len>] bytes:` and the message.
 #[must_use]
 pub fn sipp_message_frame(transport: &str, direction: &str, payload: &[u8]) -> String {
+    message_frame(transport, direction, payload, payload.len())
+}
+
+/// One `-trace_msg` entry for a 3PCC twin command. SIPp's socket layer
+/// traces the twin link like any other, always TCP, and tags it
+/// `control`: `TCP control message sent|received [<bytes>] bytes:`.
+/// `bytes` is what crossed the link, the ESC that ends a command
+/// included. `text` is what SIPp prints: a sent command still carries its
+/// ESC; a received one does not (its reader turns the ESC into the end of
+/// the string).
+#[must_use]
+pub fn sipp_control_frame(direction: &str, text: &[u8], bytes: usize) -> String {
+    message_frame("TCP control", direction, text, bytes)
+}
+
+fn message_frame(what: &str, direction: &str, text: &[u8], bytes: usize) -> String {
     format!(
-        "----------------------------------------------- {}\n{transport} message {direction} [{}] bytes:\n\n{}\n",
+        "----------------------------------------------- {}\n{what} message {direction} [{bytes}] bytes:\n\n{}\n",
         clock::sipp_timestamp(SystemTime::now(), true),
-        payload.len(),
-        String::from_utf8_lossy(payload)
+        String::from_utf8_lossy(text)
     )
 }
 
@@ -1240,9 +1255,11 @@ pub fn message_call_id(message: &[u8]) -> Option<String> {
 }
 
 /// A header's value in a SIP message text (case-insensitive name, the first
-/// occurrence), trimmed.
+/// occurrence), trimmed. The scan starts at the first line, as SIPp's
+/// `internal_find_header` does: a twin command has no start line, and
+/// often begins with its `Call-ID:`.
 fn header_value(text: &str, name: &str) -> Option<String> {
-    text.lines().skip(1).find_map(|line| {
+    text.lines().find_map(|line| {
         let (n, v) = line.split_once(':')?;
         n.trim()
             .eq_ignore_ascii_case(name)
@@ -1591,8 +1608,21 @@ mod tests {
             content.contains("UDP message sent [22] bytes:\n\nINVITE sip:x SIP/2.0\r\n\n"),
             "{content}"
         );
+        assert!(
+            sipp_control_frame("received", b"Call-ID: a\r\nX: y", 18)
+                .ends_with("\nTCP control message received [18] bytes:\n\nCall-ID: a\r\nX: y\n"),
+        );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn a_twin_commands_short_line_takes_its_first_line_call_id() {
+        let line = short_message_line('R', b"Call-ID: 1-2@h\r\nX-Answer: back", false);
+        assert!(
+            line.ends_with("\tR\t1-2@h\tCSeq:\tCall-ID: 1-2@h\n"),
+            "{line}"
+        );
     }
 
     #[test]

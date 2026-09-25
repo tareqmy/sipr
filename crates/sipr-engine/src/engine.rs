@@ -3392,6 +3392,7 @@ impl<'s> Engine<'s> {
                         self.fail_call(call_id, &format!("3PCC <sendCmd> failed: {e}"));
                         return;
                     }
+                    self.trace_twin_sent(&rendered);
                     // SIPp `M_nbCmdSent` (the `-trace_counts` SendCmd column).
                     if let Some(s) = self.call_stats(call_id).step_mut(index) {
                         s.sent += 1;
@@ -4933,11 +4934,14 @@ impl<'s> Engine<'s> {
     /// Call-ID it carries, opening the call when this side's calls are
     /// command-driven (controller B, slaves) and discarding it otherwise.
     fn on_twin_cmd(&mut self, cmd: String) {
+        // SIPp `process_message`: a command without a Call-ID is dropped
+        // before it is traced, with the SIP message's warning.
         let Some(call_id) = command_call_id(&cmd, self.config.callid_slash_ign) else {
             self.stats.out_of_call_msgs += 1;
-            self.log_err("twin command without Call-ID discarded");
+            self.log_err("SIP message without Call-ID discarded");
             return;
         };
+        self.trace_twin_received(&cmd);
         if !self.calls.contains_key(&call_id) {
             if !self.twin_creates_calls {
                 self.stats.out_of_call_msgs += 1;
@@ -4948,7 +4952,7 @@ impl<'s> Engine<'s> {
             }
             if self.done_creating() {
                 self.stats.out_of_call_msgs += 1;
-                self.log_err("Discarded message for new calls while quitting");
+                self.trace_msg_text("Discarded message for new calls while quitting\n");
                 return;
             }
             self.start_commanded_call(&call_id);
@@ -4967,6 +4971,10 @@ impl<'s> Engine<'s> {
     /// mandatory step of another kind means the command was unexpected and
     /// the call is rejected.
     fn process_twin_cmd(&mut self, call_id: &str, cmd: &str) {
+        self.call_debug(
+            call_id,
+            format!("Processing incoming command for call-ID {call_id}:\n{cmd}\n\n"),
+        );
         let index = self.calls.get(call_id).map_or(0, |c| c.index);
         let scenario = self.scenario_of(call_id);
         let mut found = None;
@@ -4986,9 +4994,10 @@ impl<'s> Engine<'s> {
             }
         }
         let Some((si, src)) = found else {
-            self.log_err(&format!(
-                "Unexpected control message received ({why}):\n{cmd}"
-            ));
+            // SIPp's TRACE_MSG and callDebug, not a warning.
+            let line = format!("Unexpected control message received ({why}):\n{cmd}\n");
+            self.trace_msg_text(&line);
+            self.call_debug(call_id, format!("{line}\n"));
             self.reject_call(call_id);
             return;
         };
@@ -5047,8 +5056,9 @@ impl<'s> Engine<'s> {
             return;
         }
         let cmd = format!("call-id: {call_id}\ninternal-cmd: abort_call\n\n");
-        if let Err(e) = ch.send(&cmd) {
-            self.log_err(&format!("sendCmdBuffer returned an error: {e}"));
+        match ch.send(&cmd) {
+            Ok(()) => self.trace_twin_sent(&cmd),
+            Err(e) => self.log_err(&format!("sendCmdBuffer returned an error: {e}")),
         }
     }
 
@@ -5495,6 +5505,56 @@ impl<'s> Engine<'s> {
     /// A message went out: the `-trace_msg` frame, the `-trace_shortmsg`
     /// line and the call's `-trace_calldebug` entry (SIPp `send_raw` /
     /// `SIPpSocket::write_primitive`).
+    /// Trace a twin command we sent, as SIPp's `SIPpSocket::write` does for
+    /// its `control` socket: the frame and the short line both see the
+    /// command with the ESC that ends it on the wire.
+    fn trace_twin_sent(&mut self, cmd: &str) {
+        let wire = format!("{cmd}{}", char::from(sipr_net::twin::ESC));
+        let rfc3339 = self.config.rfc3339;
+        if let Some(f) = self.trace_msg.as_mut() {
+            f.write(&sipr_stats::sipp_control_frame(
+                "sent",
+                wire.as_bytes(),
+                wire.len(),
+            ));
+        }
+        if let Some(f) = self.trace_shortmsg.as_mut() {
+            f.write(&sipr_stats::short_message_line(
+                'S',
+                wire.as_bytes(),
+                rfc3339,
+            ));
+        }
+    }
+
+    /// Trace a twin command we received (SIPp `process_message`). The
+    /// frame counts the ESC that ended it, but SIPp's reader turns the ESC
+    /// into the end of the string, so the text goes without it.
+    fn trace_twin_received(&mut self, cmd: &str) {
+        let rfc3339 = self.config.rfc3339;
+        if let Some(f) = self.trace_msg.as_mut() {
+            f.write(&sipr_stats::sipp_control_frame(
+                "received",
+                cmd.as_bytes(),
+                cmd.len() + 1,
+            ));
+        }
+        if let Some(f) = self.trace_shortmsg.as_mut() {
+            f.write(&sipr_stats::short_message_line(
+                'R',
+                cmd.as_bytes(),
+                rfc3339,
+            ));
+        }
+    }
+
+    /// A line of SIPp's `TRACE_MSG` that is no message frame.
+    fn trace_msg_text(&mut self, text: &str) {
+        if let Some(f) = self.trace_msg.as_mut() {
+            f.write(text);
+        }
+    }
+
     fn trace_send(&mut self, buf: &[u8], _remote: SocketAddr) {
         let transport = self.transport_token;
         let rfc3339 = self.config.rfc3339;

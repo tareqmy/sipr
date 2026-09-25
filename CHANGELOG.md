@@ -157,6 +157,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- 3PCC twin commands show up in `-trace_msg` and `-trace_shortmsg` as in
+  SIPp: `TCP control message sent|received [<n>] bytes:` frames, with
+  SIPp's handling of the closing ESC, and `S`/`R` short lines. The
+  "Unexpected control message received" lines go to `-trace_msg` and
+  the call debug, where SIPp writes them, not to `-trace_err`. A command
+  without a Call-ID is refused with SIPp's wording. `-trace_shortmsg`
+  now finds a Call-ID on a message's first line, where a twin command
+  has it.
 - `ontimeout=` works on a `<send>` and a `<recvCmd>`, as in SIPp, which
   reads it on every message. A send whose UDP retransmissions run out
   sends the call to its `ontimeout` label with SIPp's "timeout on max UDP

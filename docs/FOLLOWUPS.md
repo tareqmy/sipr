@@ -4,8 +4,6 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **8** is a SIPp divergence that `docs/SIPP_COMPAT.md` §6 already
-  listed as open, with no fix picked up yet.
 - **9-10** are SIPp divergences in how variables read and render, found
   while fixing `<assign value=>` (commit `86b9505`). Both were confirmed
   against sipp 3.7.7.
@@ -36,36 +34,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 8. Log 3PCC twin commands in `-trace_msg` and `-trace_shortmsg`
-
-Scope: `fix(engine)`. SIPP_COMPAT §6, the 3PCC note, says "Still open:
-`-trace_msg` does not log twin commands".
-
-- **SIPp:** its socket layer logs every write and read, twin sockets
-  included, and marks the twin ones `control`:
-  - `-trace_msg` frames read `<transport> control message sent [<n>]
-    bytes:` and `… received …` (`socket.cpp` ~l.1132-1138 and
-    ~l.2211-2217).
-  - `-trace_shortmsg` gets its `S`/`R` lines from the same paths
-    (~l.1127 and ~l.2219-2224).
-  - A twin command for no call, or one the call did not expect, logs
-    "Unexpected control message received …" in `-trace_msg` and the
-    call debug (`call.cpp` ~l.4274 and ~l.4318).
-
-  Check whether the logged text and byte count include the ESC delimiter
-  SIPp appends to a command on the wire.
-- **sipr:** `trace_send`/`trace_recv` (`crates/sipr-engine/src/engine.rs`)
-  are called for SIP messages only. The `Step::SendCmd` arm's twin send,
-  `send_twin_abort` and `on_twin_cmd` log nothing. `sipp_message_frame`
-  (`crates/sipr-stats/src/lib.rs`) has no `control` tag.
-- **Fix:** give the frame a control flag and log twin commands from the
-  send and receive paths, the unexpected-command lines included. Add
-  short-message lines if real sipp writes them.
-- **Test:** run a 3PCC pair under `-trace_msg` and `-trace_shortmsg` on
-  both sides and compare the entries' shapes with real sipp's, as
-  `short_message_log_matches_real_sipps` does for SIP. The classic and
-  extended 3PCC tests in `tests/interop.rs` show how to start the pair.
 
 ## 9. Read a variable's number the way SIPp's `getDouble()` does
 

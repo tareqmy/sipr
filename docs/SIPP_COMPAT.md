@@ -532,8 +532,24 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
     `recvCmd` and queued early ones, so a peer's reply did not need the
     Call-ID; it must carry it now, as with SIPp. Controller B used to pace
     its calls with `-r`; they now open on the commands that name them.
-    Still open: `-trace_msg` does not log twin commands (SIPp logs them
-    tagged "control").
+  - The twin link in the traces (verified in `socket.cpp` ~l.1117-1138
+    `process_message` and ~l.2208-2224 `SIPpSocket::write`, `call.cpp`
+    ~l.2612-2674 and ~l.4253-4320; confirmed against real sipp, the
+    `twin_commands_are_traced_like_real_sipps` interop test). SIPp's
+    socket layer traces the twin sockets, always TCP, like any other,
+    tagged `control`. `-trace_msg` gets `TCP control message sent [<n>]
+    bytes:` with the command as written, its closing ESC included in the
+    text and the count. A received command's count includes its ESC too,
+    but its text does not: the reader turns the ESC into the end of the
+    string. `-trace_shortmsg` gets the usual `S`/`R` lines, with an empty
+    `CSeq:` and the command's first line as the start line. A command
+    the call does not expect ("I was expecting a different type of
+    message", "no such message found") and a command for a new call
+    while quitting are `TRACE_MSG` lines in `-trace_msg`, the first two
+    also in the call debug; they are not warnings. A command without a
+    Call-ID is dropped untraced, with the SIP message's warning. sipr
+    logged none of the twin traffic, and wrote those lines to
+    `-trace_err`.
 - `-users N` closed loop (M11, verified in `call_generation_task.cpp`
   `run`/`free_user`/`set_users`, `call.cpp` `init` line assignment and
   `[userid]`/`[users]` keywords, `sipp.cpp` `SIPP_OPTION_USERS`): instead of

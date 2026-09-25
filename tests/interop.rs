@@ -5850,6 +5850,221 @@ fn a_recv_cmds_ontimeout_takes_the_receive_timeout_like_real_sipp() {
     assert_eq!(ours, theirs, "sipr differs from real sipp");
 }
 
+// ---- twin commands in -trace_msg and -trace_shortmsg ----------------------
+
+/// Accept the one twin link `listener` gets, answer its first command with
+/// `Call-ID: <its call>` and `X-Answer: back`, and hold the link until the
+/// peer closes it or 10 s pass.
+fn answering_twin(listener: TcpListener) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking twin");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break None,
+            }
+        };
+        let Some(mut stream) = stream else {
+            return;
+        };
+        stream.set_nonblocking(false).expect("blocking twin");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("twin timeout");
+        let mut command = Vec::new();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = stream.read(&mut byte) {
+            if byte[0] == 0x1b {
+                break;
+            }
+            command.push(byte[0]);
+        }
+        let text = String::from_utf8_lossy(&command).into_owned();
+        if let Some(call_id) = text.lines().find_map(|l| l.strip_prefix("Call-ID:")) {
+            let reply = format!("Call-ID: {}\r\nX-Answer: back\u{1b}", call_id.trim());
+            let _ = stream.write_all(reply.as_bytes());
+        }
+        let mut buf = [0u8; 4096];
+        while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+    })
+}
+
+/// What a 3PCC controller traced of its twin link: its exit code, each
+/// `-trace_msg` control frame as `<direction> [text±<n>] <text>` (the byte
+/// count against the length of the text printed), each `-trace_shortmsg`
+/// line of a command without its timestamp, and the `Unexpected control
+/// message` lines. The call's Call-ID reads `CID`.
+#[derive(Debug, PartialEq)]
+struct TwinTrace {
+    code: Option<i32>,
+    frames: Vec<String>,
+    short: Vec<String>,
+    unexpected: Vec<String>,
+}
+
+/// Run `bin` on `xml` as a 3PCC controller with `-trace_msg` and
+/// `-trace_shortmsg`, against an answering twin and a silent UDP sink.
+fn run_twin_trace(bin: &std::path::Path, xml: &str) -> TwinTrace {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("twin_trace.xml");
+    std::fs::write(&path, xml).expect("write controller");
+    let twin = TcpListener::bind("127.0.0.1:0").expect("bind twin");
+    let twin_addr = twin.local_addr().expect("twin addr").to_string();
+    let held = answering_twin(twin);
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut controller = Reaper(
+        tool_command(bin)
+            .current_dir(dir.path())
+            .args(["-sf", path.to_str().expect("utf8"), "-3pcc", &twin_addr])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "10"])
+            .args(["-trace_msg", "-trace_shortmsg"])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn controller"),
+    );
+    let code = wait_with_timeout(&mut controller.0, Duration::from_secs(12));
+    held.join().expect("twin thread");
+    let read = |suffix: &str| {
+        std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().ends_with(suffix))
+            .map(|e| std::fs::read_to_string(e.path()).expect("read trace"))
+            .unwrap_or_default()
+    };
+    // SIPp also writes two lines of debris about the twin socket closing
+    // ("Problem EAGAIN on socket …", "Exit problem event on socket …").
+    let messages: String = read("_messages.log")
+        .split_inclusive('\n')
+        .filter(|l| !l.starts_with("Problem EAGAIN") && !l.starts_with("Exit problem event"))
+        .collect();
+    let call_id = messages
+        .lines()
+        .find_map(|l| l.strip_prefix("Call-ID: "))
+        .map(|v| v.trim_end_matches('\r').to_owned())
+        .unwrap_or_default();
+    let mask = |text: &str| {
+        if call_id.is_empty() {
+            text.to_owned()
+        } else {
+            text.replace(&call_id, "CID")
+        }
+    };
+    let frames = messages
+        .split("----------------------------------------------- ")
+        .filter_map(|frame| {
+            let (_, rest) = frame.split_once('\n')?;
+            let (head, text) = rest.split_once(" bytes:\n\n")?;
+            let (what, bytes) = head.rsplit_once(" [")?;
+            let direction = what.strip_prefix("TCP control message ")?;
+            let bytes: i64 = bytes.trim_end_matches(']').parse().ok()?;
+            let text = text.strip_suffix('\n').unwrap_or(text);
+            let text = text.split("\nUnexpected control message").next()?;
+            let extra = bytes - i64::try_from(text.len()).ok()?;
+            Some(format!("{direction} [text{extra:+}] {}", mask(text)))
+        })
+        .collect();
+    let short = read("_shortmessages.log")
+        .lines()
+        .filter(|l| l.contains("\tCall-ID:"))
+        .map(|l| {
+            let fields: Vec<&str> = l.split('\t').collect();
+            mask(&fields[3..].join("\t"))
+        })
+        .collect();
+    let unexpected = messages
+        .split("Unexpected control message")
+        .skip(1)
+        .map(|rest| {
+            let entry = rest
+                .split("-----------------------------------------------")
+                .next();
+            mask(&format!(
+                "Unexpected control message{}",
+                entry.unwrap_or_default()
+            ))
+        })
+        .collect();
+    TwinTrace {
+        code,
+        frames,
+        short,
+        unexpected,
+    }
+}
+
+/// SIPp's socket layer traces the twin link like any other, tagged
+/// `control` (docs/SIPP_COMPAT.md §6): a sent command with its ESC, a
+/// received one without it but counted, `S` and `R` short lines with an
+/// empty CSeq, and a command the call did not expect as an `Unexpected
+/// control message` entry.
+#[test]
+fn twin_commands_are_traced_like_real_sipps() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::twin_commands_are_traced_like_real_sipps — no sipp.");
+        return;
+    };
+    let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
+    let controller = |tail: &str| {
+        format!(
+            r#"<scenario name="twin-trace">
+{first}  <sendCmd><![CDATA[
+    Call-ID: [call_id]
+    X-Offer: hello
+  ]]></sendCmd>
+{tail}</scenario>
+"#,
+            first = step_options("first", ""),
+        )
+    };
+    let expected = controller("  <recvCmd/>\n");
+    let theirs = run_twin_trace(&sipp, &expected);
+    assert_eq!(
+        theirs,
+        TwinTrace {
+            code: Some(0),
+            frames: vec![
+                "sent [text+0] Call-ID: CID\r\nX-Offer: hello\r\n\r\n\u{1b}".into(),
+                "received [text+1] Call-ID: CID\r\nX-Answer: back".into(),
+            ],
+            short: vec![
+                "S\tCID\tCSeq:\tCall-ID: CID".into(),
+                "R\tCID\tCSeq:\tCall-ID: CID".into(),
+            ],
+            unexpected: vec![],
+        },
+        "real sipp"
+    );
+    assert_eq!(run_twin_trace(&sipr, &expected), theirs, "sipr, expected");
+
+    // The call waits for a SIP 200 when the command arrives.
+    let unexpected = controller("  <recv response=\"200\"/>\n");
+    let theirs = run_twin_trace(&sipp, &unexpected);
+    assert_eq!(theirs.code, Some(1), "real sipp: the call is rejected");
+    assert_eq!(
+        theirs.unexpected,
+        [
+            "Unexpected control message received (I was expecting a different type of \
+          message):\nCall-ID: CID\r\nX-Answer: back\n"
+        ],
+        "real sipp"
+    );
+    assert_eq!(
+        run_twin_trace(&sipr, &unexpected),
+        theirs,
+        "sipr, unexpected"
+    );
+}
+
 // ---- <assign>: SIPp's value= and variable= forms --------------------------
 
 /// A UAC whose nop assigns doubles both ways SIPp's `handle_rhs` allows and
