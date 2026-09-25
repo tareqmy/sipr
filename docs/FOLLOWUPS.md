@@ -10,6 +10,9 @@ agent as is. Delete an entry when its fix lands.
   `[branch±N]` (commit `bffa0e8`).
 - **13** is a SIPp divergence in the `-trace_counts` columns, found while
   fixing the nop and 3PCC columns (commit `532133a`).
+- **14** is a flaky interop test, seen again while running the gates for
+  the fixes above. It changes only tests, so it replaces steps 1 and 2
+  below with the check it describes.
 
 The SIPp C++ source is at `../../cprojects/sipp/src` (relative to the
 repo root). Read it to confirm the behavior, and never copy it (GPL).
@@ -120,3 +123,26 @@ lists it as open.
 - **Test:** widen `statistics_file_headers_match_real_sipps` in
   `tests/interop.rs`, or add a sibling that runs with `-lost 50` and
   compares the counts header with real sipp's.
+
+## 14. Let `real_sipp_tcp_uac_reconnects_to_sipr` see sipp's hang
+
+Scope: `test(interop)`.
+
+- **The flake:** real sipp's TCP UAC now and then never exits. The test
+  waits 20 s, past the UAC's `-timeout 15`, then fails with
+  `left: None, right: Some(1)`. It happened in 2 of about 20 full
+  interop runs on 2026-09-25, once before `badc816` and once after
+  `42ac306`, and never in 15 runs of the test alone. The test skips when
+  sipp's `-trace_err` log shows its freed-socket bug
+  (`sipp_freed_socket_on_reset` in `tests/interop.rs`: "unknown transport
+  type" or "Unable to send UDP message"). These hangs log neither, and
+  the assertion prints nothing about what sipp did, so it is unknown
+  whether this is the same bug.
+- **Fix:** when the UAC has not exited, put its stderr (the pair already
+  reads it) and its `-trace_err` log into the failure message. Loop the
+  test under load until it fails, and read what sipp logged. If it is
+  sipp's reset-connection bug in another form, widen the skip. Match
+  something specific, not a bare "did not exit", which would hide a real
+  sipr regression. If sipr is at fault, it becomes a `fix(net)` task.
+- **Verify:** loop the full interop suite, or run the test beside a
+  CPU-heavy job, and check that a failure now explains itself.
