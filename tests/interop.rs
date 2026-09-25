@@ -30,6 +30,19 @@ fn sipp_bin() -> Option<PathBuf> {
         .find(|c| c.is_file())
 }
 
+/// Write a scenario file that every sipp can load. SIPp 3.7.7's own XML
+/// parser, the version CI builds, refuses a file that does not start with
+/// `<?xml`; later sipp versions parse with pugixml and do not care.
+fn write_scenario(path: &std::path::Path, xml: impl AsRef<str>) {
+    let xml = xml.as_ref();
+    let prolog = if xml.starts_with("<?xml") {
+        ""
+    } else {
+        "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
+    };
+    std::fs::write(path, format!("{prolog}{xml}")).expect("write scenario");
+}
+
 /// A command for `program`, real sipp or sipr, with `-nostdin`. A sipp whose
 /// stdin is /dev/null busy-polls it at a full core, mostly kernel time
 /// (`-bg` does not help: its forked child points stdin at /dev/null too),
@@ -816,7 +829,7 @@ fn rtpcheck_against_real_sipp_echo() {
     let dir = std::env::temp_dir();
     let pid = std::process::id();
     let scenario_path = dir.join(format!("sipr-interop-check-{pid}.xml"));
-    std::fs::write(
+    write_scenario(
         &scenario_path,
         r#"<scenario name="uac-rtpcheck-interop">
   <send retrans="500"><![CDATA[
@@ -872,8 +885,7 @@ fn rtpcheck_against_real_sipp_echo() {
   <recv response="200"/>
 </scenario>
 "#,
-    )
-    .expect("write scenario");
+    );
     let mut sipp_proc = Reaper(
         tool_command(&sipp)
             .args([
@@ -978,7 +990,7 @@ fn srtp_against_real_sipp_echo() {
     let dir = std::env::temp_dir();
     let pid = std::process::id();
     let scenario_path = dir.join(format!("sipr-interop-srtp-{pid}.xml"));
-    std::fs::write(
+    write_scenario(
         &scenario_path,
         r#"<scenario name="uac-srtp-interop">
   <send retrans="500"><![CDATA[
@@ -1047,8 +1059,7 @@ fn srtp_against_real_sipp_echo() {
   <recv response="200"/>
 </scenario>
 "#,
-    )
-    .expect("write scenario");
+    );
     // sipp's -srtpcheck_debug files land in its working directory.
     let sipp_dir = dir.join(format!("sipr-interop-srtp-{pid}-sipp"));
     let _ = std::fs::remove_dir_all(&sipp_dir);
@@ -1367,8 +1378,8 @@ fn run_verifyauth_pair(
     let pid = std::process::id();
     let uas_path = dir.join(format!("sipr-interop-verifyauth-uas-{tag}-{pid}.xml"));
     let uac_path = dir.join(format!("sipr-interop-verifyauth-uac-{tag}-{pid}.xml"));
-    std::fs::write(&uas_path, VERIFYAUTH_UAS).expect("write uas");
-    std::fs::write(&uac_path, verifyauth_uac_scenario(password, expect)).expect("write uac");
+    write_scenario(&uas_path, VERIFYAUTH_UAS);
+    write_scenario(&uac_path, verifyauth_uac_scenario(password, expect));
     let port = free_port();
     let mut uas = Reaper(
         tool_command(uas_bin)
@@ -1545,8 +1556,8 @@ fn run_unexp_pair(
     let pid = std::process::id();
     let uas_path = dir.join(format!("sipr-interop-unexp-uas-{tag}-{pid}.xml"));
     let uac_path = dir.join(format!("sipr-interop-unexp-uac-{tag}-{pid}.xml"));
-    std::fs::write(&uas_path, unexp_handler_uas_xml()).expect("write uas");
-    std::fs::write(&uac_path, info_during_pause_uac_xml(2800)).expect("write uac");
+    write_scenario(&uas_path, unexp_handler_uas_xml());
+    write_scenario(&uac_path, info_during_pause_uac_xml(2800));
     let port = free_port();
     let mut uas = Reaper(
         tool_command(uas_bin)
@@ -2541,7 +2552,7 @@ fn real_sipp_ooc_scenario_answers_siprs_out_of_call_options() {
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let uas_path = dir.path().join("uas-ooc-probe.xml");
-    std::fs::write(&uas_path, ooc_probing_uas_xml()).expect("write uas");
+    write_scenario(&uas_path, ooc_probing_uas_xml());
     let port = free_port();
     let mut sipr_uas = Reaper(
         tool_command(env!("CARGO_BIN_EXE_sipr"))
@@ -2661,7 +2672,7 @@ fn sipr_ooc_scenario_answers_real_sipps_out_of_call_options() {
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let uas_path = dir.path().join("uas-ooc-probe.xml");
-    std::fs::write(&uas_path, ooc_probing_uas_xml()).expect("write uas");
+    write_scenario(&uas_path, ooc_probing_uas_xml());
     let port = free_port();
     let sipp_uas = Reaper(
         tool_command(&sipp)
@@ -2901,8 +2912,8 @@ fn real_sipp_and_sipr_terminate_each_others_calls_in_mixed_mode() {
     let sipr_dir = tempfile::tempdir().expect("tempdir");
     let uac_path = sipp_dir.path().join("uac-timewait.xml");
     let uas_path = sipp_dir.path().join("uas-receive.xml");
-    std::fs::write(&uac_path, mixed_uac_xml()).expect("write uac");
-    std::fs::write(&uas_path, mixed_uas_xml()).expect("write uas");
+    write_scenario(&uac_path, mixed_uac_xml());
+    write_scenario(&uas_path, mixed_uas_xml());
     let sipp_port = free_port();
     let sipr_port = free_port();
     let mut sipp_mixed = Reaper(
@@ -3003,7 +3014,7 @@ fn sipr_receive_scenario_answers_a_plain_real_sipp_uac() {
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let uac_path = dir.path().join("uac-timewait.xml");
-    std::fs::write(&uac_path, mixed_uac_xml()).expect("write uac");
+    write_scenario(&uac_path, mixed_uac_xml());
     let uas_port = free_port();
     let sipr_port = free_port();
     let _sipp_uas = Reaper(
@@ -3239,7 +3250,7 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
     // sipp UAC → sipr UAS.
     let dir_a = tempfile::tempdir().expect("tempdir");
     let xml_a = dir_a.path().join("counters.xml");
-    std::fs::write(&xml_a, counter_uac_xml()).expect("write scenario");
+    write_scenario(&xml_a, counter_uac_xml());
     let port = free_port();
     let mut sipr_uas = Reaper(
         tool_command(env!("CARGO_BIN_EXE_sipr"))
@@ -3309,7 +3320,7 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
     // sipr UAC → sipp UAS.
     let dir_b = tempfile::tempdir().expect("tempdir");
     let xml_b = dir_b.path().join("counters.xml");
-    std::fs::write(&xml_b, counter_uac_xml()).expect("write scenario");
+    write_scenario(&xml_b, counter_uac_xml());
     let port = free_port();
     let mut sipp_uas = Reaper(
         tool_command(&sipp)
@@ -3503,7 +3514,7 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
     // sipp UAC → sipr UAS.
     let dir_a = tempfile::tempdir().expect("tempdir");
     let xml_a = dir_a.path().join("txn-uac.xml");
-    std::fs::write(&xml_a, txn_uac_xml()).expect("write scenario");
+    write_scenario(&xml_a, txn_uac_xml());
     let port = free_port();
     let mut sipr_uas = Reaper(
         tool_command(env!("CARGO_BIN_EXE_sipr"))
@@ -3571,7 +3582,7 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
     // sipr UAC → sipp UAS.
     let dir_b = tempfile::tempdir().expect("tempdir");
     let xml_b = dir_b.path().join("txn-uac.xml");
-    std::fs::write(&xml_b, txn_uac_xml()).expect("write scenario");
+    write_scenario(&xml_b, txn_uac_xml());
     let port = free_port();
     let mut sipp_uas = Reaper(
         tool_command(&sipp)
@@ -3832,7 +3843,7 @@ fn exec_command_writes_the_same_hook_output_as_real_sipp() {
     ] {
         let dir = tempfile::tempdir().expect("tempdir");
         let xml = dir.path().join("exec-uas.xml");
-        std::fs::write(&xml, exec_uas_xml()).expect("write uas");
+        write_scenario(&xml, exec_uas_xml());
         let port = free_port();
         let mut uas = spawn_uas_bin(uas_bin, &xml, port, 3, dir.path());
         std::thread::sleep(Duration::from_millis(400));
@@ -3918,9 +3929,9 @@ fn setdest_redirects_to_a_second_peer_like_real_sipp() {
         let uas1_xml = dir.path().join("redirecting-uas.xml");
         let uas2_xml = dir.path().join("bye-uas.xml");
         let uac_xml = dir.path().join("setdest-uac.xml");
-        std::fs::write(&uas1_xml, redirecting_uas_xml(port2)).expect("write uas1");
-        std::fs::write(&uas2_xml, bye_uas_xml()).expect("write uas2");
-        std::fs::write(&uac_xml, setdest_uac_xml()).expect("write uac");
+        write_scenario(&uas1_xml, redirecting_uas_xml(port2));
+        write_scenario(&uas2_xml, bye_uas_xml());
+        write_scenario(&uac_xml, setdest_uac_xml());
         let mut uas1 = spawn_uas_bin(peer_bin, &uas1_xml, port1, 3, dir.path());
         let mut uas2 = spawn_uas_bin(peer_bin, &uas2_xml, port2, 3, dir.path());
         std::thread::sleep(Duration::from_millis(500));
@@ -4058,8 +4069,8 @@ fn run_sf_pair(
     let pid = std::process::id();
     let uas_path = dir.join(format!("sipr-interop-pair-uas-{tag}-{pid}.xml"));
     let uac_path = dir.join(format!("sipr-interop-pair-uac-{tag}-{pid}.xml"));
-    std::fs::write(&uas_path, uas_xml).expect("write uas");
-    std::fs::write(&uac_path, uac_xml).expect("write uac");
+    write_scenario(&uas_path, uas_xml);
+    write_scenario(&uac_path, uac_xml);
     let port = free_port();
     let mut uas = Reaper(
         tool_command(uas_bin)
@@ -4771,7 +4782,7 @@ fn run_ext3pcc_pair(
     let slave_path = dir.join(format!("sipr-interop-ext3pcc-slave-{tag}-{pid}.xml"));
     let (pm, p1) = (free_port(), free_port());
     std::fs::write(&cfg_path, format!("m;127.0.0.1:{pm}\ns1;127.0.0.1:{p1}\n")).expect("write cfg");
-    std::fs::write(&master_path, ext3pcc_master_xml()).expect("write master");
+    write_scenario(&master_path, ext3pcc_master_xml());
     std::fs::write(&slave_path, ext3pcc_slave_xml()).expect("write slave");
     let cfg = cfg_path.to_str().expect("utf8").to_owned();
     // One UAS per leg: the two legs share the master's Call-ID.
@@ -4936,7 +4947,7 @@ fn run_jump_over_labels(
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir");
     let xml = dir.join("jump_over_labels.xml");
-    std::fs::write(&xml, jump_over_labels_uac_xml()).expect("write uac");
+    write_scenario(&xml, jump_over_labels_uac_xml());
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let mut args = vec![
         "-sf".to_owned(),
@@ -5075,7 +5086,7 @@ fn jump_resume_uac_xml() -> String {
 fn run_jump_resume_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let xml = dir.path().join("jump_resume.xml");
-    std::fs::write(&xml, jump_resume_uac_xml()).expect("write uac");
+    write_scenario(&xml, jump_resume_uac_xml());
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
@@ -5171,7 +5182,7 @@ fn run_scripted_uas(
 ) -> (Option<i32>, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("scripted_uas.xml");
-    std::fs::write(&path, xml).expect("write uas");
+    write_scenario(&path, xml);
     let port = free_port();
     let mut uas = Reaper(
         tool_command(uas_bin)
@@ -5353,7 +5364,7 @@ fn mask_branch_pids(text: &str) -> String {
 fn run_msg_index_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let xml = dir.path().join("msg_index.xml");
-    std::fs::write(&xml, MSG_INDEX_UAC_XML).expect("write uac");
+    write_scenario(&xml, MSG_INDEX_UAC_XML);
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
@@ -5453,7 +5464,7 @@ fn run_sendcmd_index(bin: &std::path::Path) -> (Option<i32>, String) {
     use std::io::Read;
     let dir = tempfile::tempdir().expect("tempdir");
     let xml = dir.path().join("cmd_index.xml");
-    std::fs::write(&xml, SENDCMD_INDEX_XML).expect("write controller");
+    write_scenario(&xml, SENDCMD_INDEX_XML);
     let twin = TcpListener::bind("127.0.0.1:0").expect("bind twin");
     twin.set_nonblocking(true).expect("nonblocking twin");
     let twin_addr = twin.local_addr().expect("twin addr").to_string();
@@ -5580,7 +5591,7 @@ fn answer_200(request: &str) -> String {
 fn run_abort_index_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let xml = dir.path().join("abort_index.xml");
-    std::fs::write(&xml, ABORT_INDEX_UAC_XML).expect("write uac");
+    write_scenario(&xml, ABORT_INDEX_UAC_XML);
     let peer = UdpSocket::bind("127.0.0.1:0").expect("bind peer");
     let target = peer.local_addr().expect("peer addr").to_string();
     let mut uac = Reaper(
@@ -5684,7 +5695,7 @@ struct TimedRun {
 fn run_timed_uac(bin: &std::path::Path, xml: &str, extra: &[&str]) -> TimedRun {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("timed.xml");
-    std::fs::write(&path, xml).expect("write uac");
+    write_scenario(&path, xml);
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
@@ -5917,7 +5928,7 @@ const NUMBERS_UAC_XML: &str = r#"<scenario name="numbers">
 fn run_numbers_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>, bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let xml = dir.path().join("numbers.xml");
-    std::fs::write(&xml, NUMBERS_UAC_XML).expect("write uac");
+    write_scenario(&xml, NUMBERS_UAC_XML);
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
@@ -6019,7 +6030,7 @@ const RETRANS_UAS_XML: &str = r#"<scenario name="retrans-uas">
 fn run_retrans_uas(uas_bin: &std::path::Path) -> (Option<i32>, Vec<String>, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("retrans_uas.xml");
-    std::fs::write(&path, RETRANS_UAS_XML).expect("write uas");
+    write_scenario(&path, RETRANS_UAS_XML);
     // The first run of a freshly built binary takes ~0.5 s on macOS while
     // the system checks it. The INVITE below goes out once, so warm the
     // binary up first.
@@ -6154,7 +6165,7 @@ fn send_cmd_actions_xml() -> String {
 fn run_send_cmd_actions(bin: &std::path::Path) -> (Option<i32>, Vec<String>, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let xml = dir.path().join("cmd_actions.xml");
-    std::fs::write(&xml, send_cmd_actions_xml()).expect("write controller");
+    write_scenario(&xml, send_cmd_actions_xml());
     let twin = TcpListener::bind("127.0.0.1:0").expect("bind twin");
     let twin_addr = twin.local_addr().expect("twin addr").to_string();
     let held = silent_twin(twin);
@@ -6255,7 +6266,7 @@ fn lost_counts_uac_xml() -> String {
 fn run_lost_counts_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>, String, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let xml = dir.path().join("lost_counts.xml");
-    std::fs::write(&xml, lost_counts_uac_xml()).expect("write uac");
+    write_scenario(&xml, lost_counts_uac_xml());
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
@@ -6377,7 +6388,7 @@ fn run_offsets_uac(
 ) -> (Option<i32>, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let xml = dir.path().join("offsets.xml");
-    std::fs::write(&xml, OFFSETS_UAC_XML).expect("write uac");
+    write_scenario(&xml, OFFSETS_UAC_XML);
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
         tool_command(uac_bin)
@@ -6465,7 +6476,7 @@ fn run_pause_actions_uac(
 ) -> (Option<i32>, Vec<String>, Vec<String>, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let xml = dir.path().join("pause_actions.xml");
-    std::fs::write(&xml, pause_actions_uac_xml()).expect("write uac");
+    write_scenario(&xml, pause_actions_uac_xml());
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
@@ -6602,7 +6613,7 @@ struct TwinTrace {
 fn run_twin_trace(bin: &std::path::Path, xml: &str) -> TwinTrace {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("twin_trace.xml");
-    std::fs::write(&path, xml).expect("write controller");
+    write_scenario(&path, xml);
     let twin = TcpListener::bind("127.0.0.1:0").expect("bind twin");
     let twin_addr = twin.local_addr().expect("twin addr").to_string();
     let held = answering_twin(twin);
@@ -6790,7 +6801,7 @@ const ASSIGN_UAC_XML: &str = r#"<scenario name="assign-forms">
 fn run_assign_uac(uac_bin: &std::path::Path) -> (Option<i32>, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let xml = dir.path().join("assign_forms.xml");
-    std::fs::write(&xml, ASSIGN_UAC_XML).expect("write uac");
+    write_scenario(&xml, ASSIGN_UAC_XML);
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
@@ -6925,7 +6936,7 @@ fn run_recv_timeout_uas(
 ) -> RecvTimeoutOutcome {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("recv_timeout_uas.xml");
-    std::fs::write(&path, xml).expect("write uas");
+    write_scenario(&path, xml);
     let port = free_port();
     let stderr = std::fs::File::create(dir.path().join(UAS_STDERR)).expect("create uas stderr");
     let mut uas = Reaper(
@@ -7393,7 +7404,7 @@ fn run_counters_uac(
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir");
     let scenario = dir.join("counters.xml");
-    std::fs::write(&scenario, counters_uac_xml()).expect("write scenario");
+    write_scenario(&scenario, counters_uac_xml());
     let port = free_port();
     let mut uas = Reaper(
         tool_command(uas_bin)

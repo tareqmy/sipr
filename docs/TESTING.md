@@ -73,6 +73,16 @@ declaration or its loader reports "Unable to load or parse"; never assert
 on the exit code of a sipp started with `-bg` (the forked parent exits 99 at
 once) — run it in the foreground with stdin/stdout/stderr null and reap it;
 sipp as a UAS ignores SIGTERM once curses is up — kill it with SIGKILL.
+CI builds sipp from the `v3.7.7` tag, while a local checkout may be newer.
+Newer sipp parses scenarios with pugixml; 3.7.7's own parser refuses a
+file that does not start with `<?xml`. `tests/interop.rs` therefore writes
+every scenario through `write_scenario()`, which adds that prolog; use it
+for any new one. To reproduce CI exactly, build the tag
+(`git clone --branch v3.7.7 ../../cprojects/sipp /tmp/sipp-3.7.7`) and
+point `SIPP_BIN` at it: on macOS its CMake also misses Homebrew's OpenSSL
+library directory, so pass `LDFLAGS=-L$(brew --prefix openssl@3)/lib` and
+the matching `-I` for GSL and OpenSSL.
+
 A sipp whose stdin is `/dev/null` busy-polls it, a full core each and
 mostly kernel time, so `tests/interop.rs` starts every sipp and sipr
 through `tool_command()`, which passes `-nostdin` (sipr takes it too).
