@@ -6091,12 +6091,15 @@ fn step_kind(step: &Step) -> sipr_stats::StepKind {
                 Expect::Request(m) => m.clone(),
             },
         },
-        // SIPp gives every pause (a bare one carries its default
-        // distribution) and a timewait the Pause columns.
-        Step::Pause { .. } | Step::Timewait { .. } => sipr_stats::StepKind::Pause,
-        Step::SendCmd { .. } => sipr_stats::StepKind::SendCmd,
-        Step::RecvCmd { .. } => sipr_stats::StepKind::RecvCmd,
-        Step::Nop { .. } => sipr_stats::StepKind::Other,
+        // SIPp's Pause test is true for every other message: a pause (a
+        // bare one carries its default distribution) and a timewait, and,
+        // as `pause_variable` defaults to -1, a nop, a sendCmd and a
+        // recvCmd too (`logger.cpp` `print_count_file`).
+        Step::Pause { .. }
+        | Step::Timewait { .. }
+        | Step::Nop { .. }
+        | Step::SendCmd { .. }
+        | Step::RecvCmd { .. } => sipr_stats::StepKind::Pause,
         Step::Label { .. } => sipr_stats::StepKind::Label,
     }
 }
@@ -7434,6 +7437,46 @@ mod tests {
         assert!(!is_abort_command(
             "call-id: c\nContent-Type: application/sdp\n"
         ));
+    }
+
+    /// `-trace_counts` columns: every message that is neither a send nor a
+    /// recv gets SIPp's Pause columns, a nop and the 3PCC commands too.
+    #[test]
+    fn step_kinds_give_every_other_message_the_pause_columns() {
+        use sipr_stats::StepKind;
+        let xml = r#"<scenario name="kinds">
+  <send><![CDATA[
+    OPTIONS sip:x@[remote_ip] SIP/2.0
+    Call-ID: [call_id]
+
+  ]]></send>
+  <recv response="200"/>
+  <nop/>
+  <sendCmd><![CDATA[
+    Call-ID: [call_id]
+  ]]></sendCmd>
+  <recvCmd/>
+  <label id="l"/>
+  <pause milliseconds="1"/>
+  <timewait milliseconds="1"/>
+</scenario>"#;
+        let sc = sipr_scenario::compile("kinds", xml)
+            .scenario
+            .expect("compiles");
+        let kinds: Vec<StepKind> = sc.steps.iter().map(step_kind).collect();
+        assert!(matches!(kinds[0], StepKind::Send { .. }), "{kinds:?}");
+        assert!(matches!(kinds[1], StepKind::Recv { .. }), "{kinds:?}");
+        assert_eq!(
+            kinds[2..],
+            [
+                StepKind::Pause,
+                StepKind::Pause,
+                StepKind::Pause,
+                StepKind::Label,
+                StepKind::Pause,
+                StepKind::Pause,
+            ]
+        );
     }
 
     #[test]

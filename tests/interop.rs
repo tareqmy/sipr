@@ -5022,9 +5022,7 @@ fn jump_over_labels_uac_xml() -> String {
 /// Run `uac_bin` on [`jump_over_labels_uac_xml`] against a UDP sink. Returns
 /// the exit code, what the sink saw (`X-Landed` value plus the Via branch's
 /// message-index suffix, retransmissions collapsed) and the `-trace_counts`
-/// header's send columns. Only those: SIPp also gives every `<nop>` Pause
-/// columns, which sipr does not (docs/SIPP_COMPAT.md §6), and the send
-/// columns' index prefixes are what a label would shift.
+/// header's columns, whose index prefixes are what a label would shift.
 fn run_jump_over_labels(
     uac_bin: &std::path::Path,
     tag: &str,
@@ -5084,7 +5082,6 @@ fn run_jump_over_labels(
     }
     let counts = stat_file_header(&dir, "_counts.csv")
         .split(';')
-        .filter(|column| column.contains("_OPTIONS_"))
         .map(ToOwned::to_owned)
         .collect();
     let _ = std::fs::remove_dir_all(&dir);
@@ -5107,17 +5104,21 @@ fn jumps_and_message_indices_skip_labels_like_real_sipp() {
     assert_eq!(code, Some(0), "real sipp uac");
     assert_eq!(theirs, ["target-a 3 3", "target-b 7 7"], "real sipp");
     assert_eq!(
-        their_counts.first().map(String::as_str),
-        Some("1_OPTIONS_Sent")
+        their_counts.get(..5).unwrap_or_default(),
+        [
+            "CurrentTime",
+            "ElapsedTime",
+            "0_Pause_Sessions",
+            "0_Pause_Unexp",
+            "1_OPTIONS_Sent"
+        ],
+        "real sipp: a nop gets the Pause columns"
     );
     let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
     let (code, ours, our_counts) = run_jump_over_labels(&sipr, "sipr");
     assert_eq!(code, Some(0), "sipr uac");
     assert_eq!(ours, theirs, "sipr sent different messages than real sipp");
-    assert_eq!(
-        our_counts, their_counts,
-        "-trace_counts send columns differ"
-    );
+    assert_eq!(our_counts, their_counts, "-trace_counts columns differ");
 }
 
 // ---- where a <jump> lands: SIPp's next() after msg_index = N - 1 ---------

@@ -1438,17 +1438,21 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `<scenario>_<pid>_counts.csv`: `CurrentTime;ElapsedTime` (the latter
   `hh:mm:ss:uuuuuu`) then per visible step `<index>_<name>_Sent`,
   `_Retrans` and, for a send with `retrans=`, `_Timeout`; for a recv
-  `_Recv`, `_Retrans`, `_Timeout`, `_Unexp`; for a pause or timewait
-  `<index>_Pause_Sessions` (times entered) and `_Pause_Unexp`; for a
-  3PCC `sendCmd` `<index>_SendCmd`, for a `recvCmd` `<index>_RecvCmd` and
-  `_RecvCmd_Timeout`; nothing for a nop or label — `<name>` the method or
-  status code, `<index>` SIPp's message index, which counts pauses and
-  nops but not labels (see "Message indices" below). **Open:** real
-  SIPp's `print_count_file` gives a nop, `sendCmd` and `recvCmd` the
-  `Pause` columns instead — its `else if (pause_distribution ||
-  pause_variable)` test is always true there, because `pause_variable`
-  defaults to -1 — so its NOP, RecvCmd and SendCmd arms never run. SIPp's `_Lost` columns
-  appear only with `-lost` (M42). `-trace_error_codes` writes
+  `_Recv`, `_Retrans`, `_Timeout`, `_Unexp`; for every other message
+  `<index>_Pause_Sessions` (times a pause was entered) and
+  `_Pause_Unexp`; nothing for a label — `<name>` the method or status
+  code, `<index>` SIPp's message index, which counts pauses and nops but
+  not labels (see "Message indices" below). The Pause columns go to a
+  pause and a timewait, and also to a nop, a `sendCmd` and a `recvCmd`:
+  `print_count_file` tests `pause_distribution || pause_variable` after
+  the send and recv arms, and `pause_variable` defaults to -1, so its
+  NOP, RecvCmd and SendCmd arms never run. Their `Sessions` stays 0,
+  and `Unexp` counts the unexpected messages that arrived while the call
+  waited there (at a recvCmd, say). Confirmed against real sipp. sipr
+  used to write nothing for a nop and SIPp's dead `SendCmd` and
+  `RecvCmd` columns for the 3PCC commands. **Open:** SIPp adds a
+  `_Lost` column to every send and recv once packet loss is on (`-lost`
+  or any `lost=`); sipr writes none. `-trace_error_codes` writes
   `<scenario>_<pid>_error_codes.csv`: per dump the time, the elapsed
   time and the status codes of the responses that failed a call as
   unexpected since the last dump, comma-terminated, newest first (SIPp

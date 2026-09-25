@@ -157,6 +157,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `-trace_counts` gives a nop, a `<sendCmd>` and a `<recvCmd>` the
+  `<index>_Pause_Sessions` and `<index>_Pause_Unexp` columns, as real
+  sipp does. SIPp's count file tests for a pause in a way that is true
+  for every message that is neither a send nor a recv. sipr wrote no
+  columns for a nop, and `SendCmd`/`RecvCmd` columns SIPp never
+  writes, so its header did not match sipp's.
 - `[msg_index]` and `[branch]` render as SIPp does where it renders with
   no message index: in action messages (`<log>`, `<assignstr>`, …),
   `<sendCmd>` bodies and the `-default_behaviors` messages. There

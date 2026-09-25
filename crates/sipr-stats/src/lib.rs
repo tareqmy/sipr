@@ -177,14 +177,12 @@ pub enum StepKind {
         /// Method or status code.
         name: String,
     },
-    /// A pause or timewait: `Pause_Sessions` and `Pause_Unexp`.
+    /// Any other message — a pause, a timewait, a nop, a `sendCmd` or a
+    /// `recvCmd`: `Pause_Sessions` and `Pause_Unexp`. SIPp's
+    /// `print_count_file` tests `pause_distribution || pause_variable`
+    /// next, and `pause_variable` defaults to -1, so its nop, `SendCmd`
+    /// and `RecvCmd` arms never run.
     Pause,
-    /// A 3PCC `sendCmd`: `SendCmd`.
-    SendCmd,
-    /// A 3PCC `recvCmd`: `RecvCmd` and `RecvCmd_Timeout`.
-    RecvCmd,
-    /// A nop: no columns.
-    Other,
     /// A label: no columns, and not a SIPp message, so it takes no index —
     /// the columns after it keep SIPp's message numbering.
     Label,
@@ -720,8 +718,9 @@ impl StatSet {
 
     /// The `-trace_counts` header (SIPp `print_count_file(header)`): time,
     /// elapsed, then per visible message `<index>_<name>_Sent`/`_Retrans`
-    /// (+ `_Timeout` when the send has `retrans=`) for sends and
-    /// `_Recv`/`_Retrans`/`_Timeout`/`_Unexp` for recvs.
+    /// (+ `_Timeout` when the send has `retrans=`) for sends,
+    /// `_Recv`/`_Retrans`/`_Timeout`/`_Unexp` for recvs and
+    /// `<index>_Pause_Sessions`/`_Unexp` for everything else.
     #[must_use]
     pub fn counts_header(&self) -> String {
         let d = self.dump.delimiter.as_str();
@@ -743,13 +742,7 @@ impl StatSet {
                 StepKind::Pause => {
                     let _ = write!(out, "{i}_Pause_Sessions{d}{i}_Pause_Unexp{d}");
                 }
-                StepKind::SendCmd => {
-                    let _ = write!(out, "{i}_SendCmd{d}");
-                }
-                StepKind::RecvCmd => {
-                    let _ = write!(out, "{i}_RecvCmd{d}{i}_RecvCmd_Timeout{d}");
-                }
-                StepKind::Other | StepKind::Label => {}
+                StepKind::Label => {}
             }
         }
         out.push('\n');
@@ -784,13 +777,7 @@ impl StatSet {
                 StepKind::Pause => {
                     let _ = write!(out, "{}{d}{}{d}", st.sessions, st.unexpected);
                 }
-                StepKind::SendCmd => {
-                    let _ = write!(out, "{}{d}", st.sent);
-                }
-                StepKind::RecvCmd => {
-                    let _ = write!(out, "{}{d}{}{d}", st.recv, st.timeouts);
-                }
-                StepKind::Other | StepKind::Label => {}
+                StepKind::Label => {}
             }
         }
         out.push('\n');
@@ -1485,17 +1472,20 @@ mod tests {
                 name: "200".into(),
                 retrans: false,
             },
-            StepKind::SendCmd,
-            StepKind::RecvCmd,
-            StepKind::Other,
+            StepKind::Pause,
+            StepKind::Pause,
+            StepKind::Pause,
         ]);
         s.init_steps((0..7).map(|i| format!("s{i}")).collect());
         s.set_step_hidden(vec![false, false, false, true, false, false, false]);
+        // Steps 4-6 stand for a sendCmd, a recvCmd and a nop, which the
+        // engine counts as Pause steps.
         assert_eq!(
             s.counts_header(),
             "CurrentTime;ElapsedTime;0_INVITE_Sent;0_INVITE_Retrans;0_INVITE_Timeout;\
              1_200_Recv;1_200_Retrans;1_200_Timeout;1_200_Unexp;2_Pause_Sessions;\
-             2_Pause_Unexp;4_SendCmd;5_RecvCmd;5_RecvCmd_Timeout;\n"
+             2_Pause_Unexp;4_Pause_Sessions;4_Pause_Unexp;5_Pause_Sessions;\
+             5_Pause_Unexp;6_Pause_Sessions;6_Pause_Unexp;\n"
         );
         s.steps[0].sent = 3;
         s.steps[0].retrans = 1;
@@ -1504,8 +1494,9 @@ mod tests {
         s.steps[2].sessions = 3;
         s.steps[4].sent = 2;
         s.steps[5].recv = 2;
+        s.steps[5].unexpected = 1;
         let row = s.counts_row();
-        assert!(row.ends_with(";3;1;0;2;0;0;1;3;0;2;2;0;\n"), "{row}");
+        assert!(row.ends_with(";3;1;0;2;0;0;1;3;0;0;0;0;1;0;0;\n"), "{row}");
         assert_eq!(row.split(';').count(), s.counts_header().split(';').count());
     }
 
@@ -1515,18 +1506,19 @@ mod tests {
         s.init_steps((0..5).map(|i| format!("s{i}")).collect());
         s.set_step_kinds(vec![
             StepKind::Label,
-            StepKind::SendCmd,
+            StepKind::Pause,
             StepKind::Label,
-            StepKind::Other,
-            StepKind::SendCmd,
+            StepKind::Pause,
+            StepKind::Pause,
         ]);
-        s.steps[4].sent = 7;
-        // Steps 1 and 4 are SIPp messages 0 and 2 (the nop is message 1).
+        s.steps[4].unexpected = 7;
+        // Steps 1, 3 and 4 are SIPp messages 0, 1 and 2.
         assert_eq!(
             s.counts_header(),
-            "CurrentTime;ElapsedTime;0_SendCmd;2_SendCmd;\n"
+            "CurrentTime;ElapsedTime;0_Pause_Sessions;0_Pause_Unexp;1_Pause_Sessions;\
+             1_Pause_Unexp;2_Pause_Sessions;2_Pause_Unexp;\n"
         );
-        assert!(s.counts_row().ends_with(";0;7;\n"));
+        assert!(s.counts_row().ends_with(";0;0;0;0;0;7;\n"));
     }
 
     #[test]

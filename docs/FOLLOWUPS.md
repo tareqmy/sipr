@@ -4,8 +4,6 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **4** is a SIPp divergence found while fixing message indices (commit
-  `5d28c1c`, "count messages, not labels, in jumps and indices").
 - **5-6** are test-harness problems found while fixing the interop
   port-probe race (commit `4ff94ca`). They change only tests, so each one
   replaces steps 1 and 2 below with the check it describes.
@@ -39,30 +37,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 4. Give nops and 3PCC commands SIPp's `-trace_counts` columns
-
-Scope: `fix(stats)`. SIPP_COMPAT §6, the M40 statistics-files note.
-
-- **SIPp:** `print_count_file` (`logger.cpp` ~l.60-190) tests, in order:
-  a send, a `recv_response`, a `recv_request`, then
-  `else if (pause_distribution || pause_variable)`. `pause_variable`
-  defaults to -1 (`scenario.cpp` l.46), which is truthy, so every other
-  message (nop, `sendCmd`, `recvCmd`) gets
-  `<index>_Pause_Sessions;<index>_Pause_Unexp`. Its NOP, RecvCmd and
-  SendCmd arms never run. Confirmed against sipp 3.7.7: a UAC with nops
-  at messages 0 and 4 wrote `0_Pause_Sessions;0_Pause_Unexp;…;4_Pause_Sessions;4_Pause_Unexp`.
-- **sipr:** `counts_header`/`counts_row` in
-  `crates/sipr-stats/src/lib.rs` write nothing for a nop, and their own
-  columns for sendCmd and recvCmd. The `counts_file_follows_sipps_columns`
-  unit test pins that behavior.
-- **Fix:** match SIPp's header and rows. The row values are `sessions`
-  and `unexpected`; check what SIPp counts in `sessions` for a nop.
-  Labels still get no columns and no index.
-- **Then widen the interop test:** it compares only the `_OPTIONS_`
-  columns because of this divergence
-  (`jumps_and_message_indices_skip_labels_like_real_sipp` in
-  `tests/interop.rs`). Make it compare the full header.
 
 ## 5. Stop e2e children inheriting port-probe sockets
 
