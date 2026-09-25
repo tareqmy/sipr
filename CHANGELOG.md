@@ -157,6 +157,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `[msg_index]` and `[branch]` render as SIPp does where it renders with
+  no message index: in action messages (`<log>`, `<assignstr>`, …),
+  `<sendCmd>` bodies and the `-default_behaviors` messages. There
+  `[msg_index]` prints `-1`, and `[branch]` ends in the index of the
+  message the call is at, minus one. sipr printed the current message's
+  index in both, so, for one, an abort BYE did not repeat the branch
+  sipp gives it. `[branch+N]` and `[branch-N]` now add their offset, as
+  SIPp's docs and its `pfca_*` scenarios use them. sipr sent them
+  through verbatim with an unknown-keyword warning.
 - A `<jump>` lands where SIPp's does. SIPp's jump to message N sets its
   message index to N-1 and lets the step carry on, and sipr now does the
   same. The actions after a jump still run, and the last jump wins. A

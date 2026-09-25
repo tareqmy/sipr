@@ -2890,7 +2890,8 @@ impl<'s> Engine<'s> {
             users_total: self.config.users.map_or(0, |n| n as u64),
             pid: self.pid,
             cseq: call.cseq,
-            msg_index: scenario.message_index(index),
+            msg_index: Some(scenario.message_index(index)),
+            call_msg_index: scenario.message_index(index),
             peer_tag: call.peer_tag.as_deref(),
             routes: &call.routes,
             last: call.last_recv.as_ref(),
@@ -3214,7 +3215,7 @@ impl<'s> Engine<'s> {
                     // SIPp runs them after the send, so a <jump> among them
                     // only picks where the call goes next.
                     let AfterActions::Proceed { jump: action_jump } =
-                        self.run_step_actions(call_id, &send.actions, index, index)
+                        self.run_step_actions(call_id, &send.actions, index)
                     else {
                         return;
                     };
@@ -3351,7 +3352,7 @@ impl<'s> Engine<'s> {
                 Step::Nop { common, actions } => {
                     self.book_counter(call_id, index);
                     let AfterActions::Proceed { jump } =
-                        self.run_step_actions(call_id, actions, index, index)
+                        self.run_step_actions(call_id, actions, index)
                     else {
                         return;
                     };
@@ -3973,7 +3974,7 @@ impl<'s> Engine<'s> {
             _ => Vec::new(),
         };
         let AfterActions::Proceed { jump } =
-            self.run_step_actions(call_id, &recv_actions, si, waited.index)
+            self.run_step_actions(call_id, &recv_actions, waited.index)
         else {
             return;
         };
@@ -4026,17 +4027,17 @@ impl<'s> Engine<'s> {
         self.arm_recv_deadline(call_id, wait.deadline);
     }
 
-    /// Execute step `index`'s actions against the call's store. `position`
-    /// is the step the call is at, SIPp's `msg_index` while the actions run
-    /// (for a recv, the one it waited at), which a `<jump>` must not name.
+    /// Execute a step's actions against the call's store. `position` is
+    /// the step the call is at, SIPp's `msg_index` while the actions run
+    /// (for a recv, the one it waited at): a `<jump>` must not name it,
+    /// and `[branch]` in an action message ends in it.
     fn run_step_actions(
         &mut self,
         call_id: &str,
         actions: &[Action],
-        index: usize,
         position: usize,
     ) -> AfterActions {
-        self.run_step_actions_inner(call_id, actions, index, position, None)
+        self.run_step_actions_inner(call_id, actions, position, None)
     }
 
     /// Shared body for step actions. `cmd_text` is set only for `<recvCmd>`,
@@ -4045,7 +4046,6 @@ impl<'s> Engine<'s> {
         &mut self,
         call_id: &str,
         actions: &[Action],
-        index: usize,
         position: usize,
         cmd_text: Option<&str>,
     ) -> AfterActions {
@@ -4093,7 +4093,9 @@ impl<'s> Engine<'s> {
                 users_total: self.config.users.map_or(0, |n| n as u64),
                 pid: self.pid,
                 cseq: call.cseq,
-                msg_index: scenario.message_index(index),
+                // SIPp renders action messages with no message index.
+                msg_index: None,
+                call_msg_index: scenario.message_index(position),
                 peer_tag: call.peer_tag.as_deref(),
                 routes: &call.routes,
                 last: last.as_ref(),
@@ -4819,7 +4821,9 @@ impl<'s> Engine<'s> {
             users_total: self.config.users.map_or(0, |n| n as u64),
             pid: self.pid,
             cseq: call.cseq,
-            msg_index: self.scenario.message_index(index),
+            // SIPp renders these with no message index.
+            msg_index: None,
+            call_msg_index: self.scenario.message_index(index),
             peer_tag: call.peer_tag.as_deref(),
             routes: &call.routes,
             last: call.last_recv.as_ref(),
@@ -4856,7 +4860,7 @@ impl<'s> Engine<'s> {
             s.recv += 1;
         }
         self.book_counter(call_id, index);
-        let after = self.run_step_actions_inner(call_id, actions, index, position, Some(cmd));
+        let after = self.run_step_actions_inner(call_id, actions, position, Some(cmd));
         if matches!(after, AfterActions::Ended) {
             return true;
         }

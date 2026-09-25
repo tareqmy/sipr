@@ -64,7 +64,7 @@ Shipped: `exec play_pcap_audio|video|image=` and `<recv ignoresdp>` (M14),
 
 `[service]` `[remote_ip]` `[remote_port]` `[server_ip]` (the IP this call sends from; `-t ui`) `[local_ip]` `[local_ip_type]`
 `[local_port]` `[transport]` `[call_id]` `[call_number]` `[userid]` `[users]`
-`[cseq]` `[branch]` `[msg_index]` `[pid]` `[routes]` `[next_url]` `[peer_tag_param]`
+`[cseq]` `[branch]` (with `+N`/`-N`) `[msg_index]` `[pid]` `[routes]` `[next_url]` `[peer_tag_param]`
 `[last_*]` (verbatim copy of header(s) from last received message, e.g.
 `[last_Via:]`, `[last_From:]`) `[$var]` `[authentication]` (+ `username=`/
 `password=` params) `[len]` (Content-Length auto-compute) `[field0..N]` (v1.x,
@@ -1590,12 +1590,28 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   Verified against real sipp, which sends the same messages with the
   same `[msg_index]`, `[branch]` and counts prefixes for a UAC whose
   jumps cross labels. It also round-trips `_unexp.retaddr` with a label
-  before the interrupted pause. Where the jump then lands is the next
-  note. **Open**, found on the way: where SIPp renders with no message
-  index (`P_index` -1: actions such as `<log>` and `<assignstr>`,
-  `<sendCmd>`, the `-default_behaviors` abort messages), `[msg_index]`
-  prints `-1`, and `[branch]` ends in the current message index minus
-  one. sipr renders the current message's index in both.
+  before the interrupted pause. Where the jump then lands is in "Where a
+  `<jump>` lands" below.
+- `[msg_index]` and `[branch]` with no message index (verified in
+  `call.cpp` ~l.3892-3902 `E_Message_Branch`/`E_Message_Index`, the
+  `createSendingMessage` default `P_index = -1` in `call.hpp`, and its
+  callers; `message.cpp` ~l.242-250, the `+N`/`-N` offset; confirmed
+  against real sipp, the `msg_index_and_branch_*` and
+  `branch_in_an_abort_bye_renders_like_real_sipp` interop tests). SIPp
+  renders a scenario `<send>` with its message index, `P_index`, and
+  everything else with -1: action messages (`<log>`, `<warning>`,
+  `<error>`, `<assignstr>`, `exec command=`, the `<lookup>`/`<insert>`/
+  `<replace>` and `<setdest>` texts), `<sendCmd>` bodies, the
+  `-default_behaviors` messages (the abort ACK/BYE/CANCEL and the 200s
+  answering an unexpected BYE, CANCEL or PING), and the name in
+  `[file name=]`. There `[msg_index]` prints `-1`, and `[branch]` ends
+  in `msg_index - 1`, the index of the message the call is at minus
+  one: a nop at message 0 logs `z9hG4bK-<pid>-<call>--1`, and an abort
+  BYE sent while the call waits at message 3 repeats the branch of
+  message 2. `[branch+N]`/`[branch-N]` add N either way (`[branch-5]`
+  in SIPp's `pfca_*` scenarios reuses the INVITE's branch). sipr used to
+  render the current step's message index in both, and passed
+  `[branch-N]` through verbatim with an unknown-keyword warning.
 - Where a `<jump>` lands (verified in `call.cpp` ~l.5991-6002 `E_AT_JUMP`,
   ~l.1920-1945 `next()`, the `executeMessage` branches ~l.1985-2144,
   `process_incoming` ~l.5517 and ~l.5629-5687, `process_twinSippCom`

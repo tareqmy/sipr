@@ -4,7 +4,7 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **3-4** are SIPp divergences found while fixing message indices (commit
+- **4** is a SIPp divergence found while fixing message indices (commit
   `5d28c1c`, "count messages, not labels, in jumps and indices").
 - **5-6** are test-harness problems found while fixing the interop
   port-probe race (commit `4ff94ca`). They change only tests, so each one
@@ -37,32 +37,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 3. Render `[msg_index]` and `[branch]` like SIPp when there is no message index
-
-Scope: `fix(engine)`. SIPP_COMPAT §6, "Message indices", open item (3).
-
-- **SIPp:** `createSendingMessage` takes a `P_index` that defaults to
-  -1 whenever it is not rendering a scenario `<send>`:
-  - action messages: `<log>`, `<warning>`, `<error>`, `<assignstr>`,
-    `exec command=` (`call.cpp` ~l.6128-6145)
-  - `<sendCmd>` bodies (~l.2625)
-  - the `-default_behaviors` abort messages, built from
-    `get_default_message("bye"/"ack"/"cancel")` (~l.2554-2582)
-
-  With `P_index` -1, `[msg_index]` (`E_Message_Index`, ~l.3900) prints
-  `-1`. `[branch]` (`E_Message_Branch`, ~l.3892-3898) ends in
-  `msg_index - 1 + offset`, the call's current message index minus one.
-- **sipr:** renders the current message's index for both. See the
-  `RenderCtx` built for actions and `render_call_template` (sendCmd and
-  default messages) in `crates/sipr-engine/src/engine.rs`.
-  `RenderCtx::msg_index` in `crates/sipr-engine/src/render.rs` is a
-  `usize`, so it cannot hold -1.
-- **Fix:** confirm against real sipp first, e.g. with
-  `<log message="[msg_index] [branch]"/>` in a nop and in a sendCmd body,
-  compared through `-trace_logs` or the twin socket. Then model "no
-  message index" in `RenderCtx` and match SIPp's output, including the
-  branch offset if sipr supports `[branch-N]`.
 
 ## 4. Give nops and 3PCC commands SIPp's `-trace_counts` columns
 

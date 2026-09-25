@@ -52,9 +52,14 @@ pub enum Keyword {
     Users,
     /// `[cseq]` — current CSeq value.
     Cseq,
-    /// `[branch]` — per-transaction Via branch.
-    Branch,
-    /// `[msg_index]` — current step index.
+    /// `[branch]`, with an optional `+N`/`-N` — per-transaction Via branch,
+    /// ending in the message index plus the offset (`[branch-2]` repeats
+    /// the branch of the message two before).
+    Branch {
+        /// The `+N`/`-N` suffix (0 without one).
+        offset: i64,
+    },
+    /// `[msg_index]` — the SIPp message index of the send being rendered.
     MsgIndex,
     /// `[pid]` — process id discriminator.
     Pid,
@@ -352,6 +357,9 @@ fn classify(body: &str, generic: &[String]) -> Classified {
             None => Classified::Unknown,
         };
     }
+    if let Some(offset) = body.strip_prefix("branch").and_then(parse_offset) {
+        return Classified::Keyword(Keyword::Branch { offset });
+    }
     // `[last_Header:]`
     if let Some(rest) = body.strip_prefix("last_") {
         let name = rest.strip_suffix(':').unwrap_or(rest);
@@ -385,7 +393,6 @@ fn classify(body: &str, generic: &[String]) -> Classified {
         "userid" => simple(Keyword::UserId),
         "users" => simple(Keyword::Users),
         "cseq" => simple(Keyword::Cseq),
-        "branch" => simple(Keyword::Branch),
         "msg_index" => simple(Keyword::MsgIndex),
         "pid" => simple(Keyword::Pid),
         "routes" => simple(Keyword::Routes),

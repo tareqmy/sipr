@@ -1020,6 +1020,15 @@ fn first_line(t: &MsgTemplate) -> String {
     line
 }
 
+/// A keyword's `+N`/`-N` suffix as written; nothing for 0.
+fn offset_suffix(offset: i64) -> String {
+    match offset {
+        0 => String::new(),
+        n if n > 0 => format!("+{n}"),
+        n => n.to_string(),
+    }
+}
+
 fn keyword_name(k: &Keyword) -> String {
     let simple = match k {
         Keyword::Last(h) => return format!("[last_{h}:]"),
@@ -1076,13 +1085,9 @@ fn keyword_name(k: &Keyword) -> String {
             };
         }
         Keyword::LastCseqNumber { offset } => {
-            let off = match *offset {
-                0 => String::new(),
-                n if n > 0 => format!("+{n}"),
-                n => n.to_string(),
-            };
-            return format!("[last_cseq_number{off}]");
+            return format!("[last_cseq_number{}]", offset_suffix(*offset));
         }
+        Keyword::Branch { offset } => return format!("[branch{}]", offset_suffix(*offset)),
         Keyword::Fill { text, variable } => {
             return format!("[fill variable={variable} text=\"{text}\"]");
         }
@@ -1111,7 +1116,6 @@ fn keyword_name(k: &Keyword) -> String {
         Keyword::UserId => "userid",
         Keyword::Users => "users",
         Keyword::Cseq => "cseq",
-        Keyword::Branch => "branch",
         Keyword::MsgIndex => "msg_index",
         Keyword::Pid => "pid",
         Keyword::Routes => "routes",

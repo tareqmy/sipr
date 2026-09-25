@@ -5404,6 +5404,343 @@ fn jumps_in_a_recvs_actions_follow_real_sipp() {
     assert_eq!(ours, theirs, "sipr answered differently than real sipp");
 }
 
+// ---- [msg_index] and [branch] where SIPp renders with no message index ---
+
+/// A UAC rendering `[msg_index]` and `[branch]`, offsets included, in a
+/// nop's `<log>`, in a send and that send's `<log>`, and through an
+/// `<assignstr>`. Messages: 0 nop, 1 send (behind a label, which does not
+/// count), 2 nop.
+const MSG_INDEX_UAC_XML: &str = r#"<scenario name="msg-index">
+  <nop><action><log message="nop0 [msg_index] [branch] [branch-1] [branch+2]"/></action></nop>
+  <label id="l"/>
+  <send><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:idx@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 OPTIONS
+    Max-Forwards: 70
+    X-Index: [msg_index] [branch-1] [branch+1]
+    Content-Length: 0
+
+  ]]><action><log message="send1 [msg_index] [branch]"/></action></send>
+  <nop><action><assignstr assign_to="s" value="[msg_index] [branch]"/><log message="nop2 [$s]"/></action></nop>
+</scenario>
+"#;
+
+/// `text` with the pid in every `z9hG4bK-<pid>-` branch masked, since the
+/// two tools run as different processes.
+fn mask_branch_pids(text: &str) -> String {
+    let mut parts = text.split("z9hG4bK-");
+    let mut out = parts.next().unwrap_or_default().to_owned();
+    for part in parts {
+        out.push_str("z9hG4bK-PID");
+        out.push_str(part.trim_start_matches(|c: char| c.is_ascii_digit()));
+    }
+    out
+}
+
+/// Run `uac_bin` on [`MSG_INDEX_UAC_XML`] against a UDP sink with
+/// `-trace_logs`. Returns its exit code, then the `X-Index` of the OPTIONS
+/// followed by the log lines, branch pids masked.
+fn run_msg_index_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("msg_index.xml");
+    std::fs::write(&xml, MSG_INDEX_UAC_XML).expect("write uac");
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut uac = Reaper(
+        Command::new(uac_bin)
+            .current_dir(dir.path())
+            .args(["-sf", xml.to_str().expect("utf8")])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20", "-nostdin"])
+            .arg("-trace_logs")
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uac"),
+    );
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut buf = [0u8; 65_535];
+    let sent = sink.recv(&mut buf).map_or_else(
+        |_| "<nothing sent>".to_owned(),
+        |n| {
+            String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .find(|l| l.starts_with("X-Index:"))
+                .unwrap_or("<no X-Index>")
+                .to_owned()
+        },
+    );
+    let logs = std::fs::read_dir(dir.path())
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_logs.log"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("read logs"))
+        .unwrap_or_default();
+    let lines = std::iter::once(sent.as_str())
+        .chain(logs.lines())
+        .map(mask_branch_pids)
+        .collect();
+    (code, lines)
+}
+
+/// SIPp renders action messages with no message index (`P_index` -1):
+/// `[msg_index]` prints -1 and `[branch]` ends in the call's message index
+/// minus one. A send renders its own index, and `[branch±N]` offsets apply
+/// either way (docs/SIPP_COMPAT.md §6).
+#[test]
+fn msg_index_and_branch_in_actions_render_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::msg_index_and_branch_in_actions_render_like_real_sipp — no sipp."
+        );
+        return;
+    };
+    let (code, theirs) = run_msg_index_uac(&sipp);
+    assert_eq!(code, Some(0), "real sipp uac");
+    assert_eq!(
+        theirs,
+        [
+            "X-Index: 1 z9hG4bK-PID-1-0 z9hG4bK-PID-1-2",
+            "nop0 -1 z9hG4bK-PID-1--1 z9hG4bK-PID-1--2 z9hG4bK-PID-1-1",
+            "send1 -1 z9hG4bK-PID-1-0",
+            "nop2 -1 z9hG4bK-PID-1-1",
+        ],
+        "real sipp"
+    );
+    let (code, ours) = run_msg_index_uac(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(code, Some(0), "sipr uac");
+    assert_eq!(ours, theirs, "sipr rendered differently than real sipp");
+}
+
+/// A 3PCC controller that sends an OPTIONS, then a twin command rendering
+/// `[msg_index]` and `[branch]`: message 1, a `<sendCmd>`.
+const SENDCMD_INDEX_XML: &str = r#"<scenario name="cmd-index">
+  <send><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:idx@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 OPTIONS
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <sendCmd><![CDATA[
+    Call-ID: [call_id]
+    X-Index: [msg_index] [branch] [branch+1]
+  ]]></sendCmd>
+</scenario>
+"#;
+
+/// Run `bin` on [`SENDCMD_INDEX_XML`], playing the twin it dials. Returns
+/// its exit code and the `X-Index` of the command it sent, branch pids
+/// masked.
+fn run_sendcmd_index(bin: &std::path::Path) -> (Option<i32>, String) {
+    use std::io::Read;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("cmd_index.xml");
+    std::fs::write(&xml, SENDCMD_INDEX_XML).expect("write controller");
+    let twin = TcpListener::bind("127.0.0.1:0").expect("bind twin");
+    twin.set_nonblocking(true).expect("nonblocking twin");
+    let twin_addr = twin.local_addr().expect("twin addr").to_string();
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut controller = Reaper(
+        Command::new(bin)
+            .current_dir(dir.path())
+            .args(["-sf", xml.to_str().expect("utf8"), "-3pcc", &twin_addr])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "10", "-nostdin"])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn controller"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match twin.accept() {
+            Ok((stream, _)) => break Some(stream),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break None,
+        }
+    };
+    let mut command = Vec::new();
+    if let Some(stream) = stream.as_mut() {
+        stream.set_nonblocking(false).expect("blocking twin");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("twin timeout");
+        let mut byte = [0u8; 1];
+        while let Ok(1) = stream.read(&mut byte) {
+            if byte[0] == 0x1b {
+                break;
+            }
+            command.push(byte[0]);
+        }
+    }
+    let code = wait_with_timeout(&mut controller.0, Duration::from_secs(12));
+    let index = String::from_utf8_lossy(&command)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("X-Index:"))
+        .map_or_else(|| "<no command>".to_owned(), |v| mask_branch_pids(v.trim()));
+    (code, index)
+}
+
+/// A `<sendCmd>` body renders with no message index too: `[msg_index]` is
+/// -1 and `[branch]` ends in the sendCmd's own index minus one.
+#[test]
+fn msg_index_and_branch_in_a_send_cmd_render_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!(
+            "SKIPPED interop::msg_index_and_branch_in_a_send_cmd_render_like_real_sipp — no sipp."
+        );
+        return;
+    };
+    let (code, theirs) = run_sendcmd_index(&sipp);
+    assert_eq!(code, Some(0), "real sipp controller");
+    assert_eq!(theirs, "-1 z9hG4bK-PID-1-0 z9hG4bK-PID-1-1", "real sipp");
+    let (code, ours) = run_sendcmd_index(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(code, Some(0), "sipr controller");
+    assert_eq!(ours, theirs, "sipr rendered differently than real sipp");
+}
+
+/// A UAC that INVITEs, ACKs the 200, then waits 300 ms for an INFO that
+/// never comes: the receive timeout fails the call, and the `bye` default
+/// behavior sends SIPp's default BYE while the call is at message 3.
+const ABORT_INDEX_UAC_XML: &str = r#"<scenario name="abort-index">
+  <send><![CDATA[
+    INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:idx@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 INVITE
+    Contact: <sip:idx@[local_ip]:[local_port]>
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv response="200"/>
+  <send><![CDATA[
+    ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:idx@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+    Call-ID: [call_id]
+    CSeq: 1 ACK
+    Max-Forwards: 70
+    Content-Length: 0
+
+  ]]></send>
+  <recv request="INFO" timeout="300"/>
+</scenario>
+"#;
+
+/// A 200 for `request`, its dialog headers mirrored and a To tag added.
+fn answer_200(request: &str) -> String {
+    let mut out = String::from("SIP/2.0 200 OK\r\n");
+    for line in request.lines() {
+        let lower = line.to_ascii_lowercase();
+        if ["via:", "from:", "call-id:", "cseq:"]
+            .iter()
+            .any(|h| lower.starts_with(h))
+        {
+            out.push_str(line);
+            out.push_str("\r\n");
+        } else if lower.starts_with("to:") {
+            out.push_str(line);
+            if !lower.contains("tag=") {
+                out.push_str(";tag=peer");
+            }
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("Content-Length: 0\r\n\r\n");
+    out
+}
+
+/// Run `uac_bin` on [`ABORT_INDEX_UAC_XML`], answering its INVITE and its
+/// abort BYE. Returns its exit code and each request's method and Via
+/// branch, branch pids masked.
+fn run_abort_index_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("abort_index.xml");
+    std::fs::write(&xml, ABORT_INDEX_UAC_XML).expect("write uac");
+    let peer = UdpSocket::bind("127.0.0.1:0").expect("bind peer");
+    let target = peer.local_addr().expect("peer addr").to_string();
+    let mut uac = Reaper(
+        Command::new(uac_bin)
+            .current_dir(dir.path())
+            .args(["-sf", xml.to_str().expect("utf8")])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "10", "-nostdin"])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uac"),
+    );
+    peer.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let mut requests: Vec<String> = Vec::new();
+    let mut buf = [0u8; 65_535];
+    while let Ok((n, from)) = peer.recv_from(&mut buf) {
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let method = text.split(' ').next().unwrap_or_default().to_owned();
+        let branch = text
+            .lines()
+            .find_map(|l| l.split_once(";branch=").map(|(_, b)| b.trim()))
+            .unwrap_or_default();
+        let entry = format!("{method} {}", mask_branch_pids(branch));
+        if requests.last() != Some(&entry) {
+            requests.push(entry);
+        }
+        if method == "INVITE" || method == "BYE" {
+            peer.send_to(answer_200(&text).as_bytes(), from)
+                .expect("answer");
+        }
+        if method == "BYE" {
+            break;
+        }
+    }
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(12));
+    (code, requests)
+}
+
+/// The `-default_behaviors` messages render with no message index too: the
+/// abort BYE's `[branch]` ends in the call's message index minus one — the
+/// ACK's, here.
+#[test]
+fn branch_in_an_abort_bye_renders_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::branch_in_an_abort_bye_renders_like_real_sipp — no sipp.");
+        return;
+    };
+    let (code, theirs) = run_abort_index_uac(&sipp);
+    assert_eq!(code, Some(1), "real sipp uac");
+    assert_eq!(
+        theirs,
+        [
+            "INVITE z9hG4bK-PID-1-0",
+            "ACK z9hG4bK-PID-1-2",
+            "BYE z9hG4bK-PID-1-2"
+        ],
+        "real sipp"
+    );
+    let (code, ours) = run_abort_index_uac(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(code, Some(1), "sipr uac");
+    assert_eq!(ours, theirs, "sipr sent different branches than real sipp");
+}
+
 // ---- <assign>: SIPp's value= and variable= forms --------------------------
 
 /// A UAC whose nop assigns doubles both ways SIPp's `handle_rhs` allows and

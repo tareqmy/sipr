@@ -162,9 +162,15 @@ pub struct RenderCtx<'a> {
     pub pid: u32,
     /// Current CSeq counter value.
     pub cseq: u32,
-    /// SIPp's message index of the step being rendered (labels are not
-    /// messages: `Scenario::message_index`), for `[msg_index]`/`[branch]`.
-    pub msg_index: usize,
+    /// SIPp's `P_index`: the message index of the scenario `<send>` being
+    /// rendered (labels are not messages: `Scenario::message_index`).
+    /// `None` where SIPp renders with none (-1): action messages,
+    /// `<sendCmd>` bodies, the `-default_behaviors` messages and a
+    /// `[file]` name. `[msg_index]` then prints -1.
+    pub msg_index: Option<usize>,
+    /// The message index the call is at (SIPp's `call::msg_index`), which
+    /// `[branch]` ends in, minus one, when there is no `msg_index`.
+    pub call_msg_index: usize,
     /// Remote tag, once learned (renders `[peer_tag_param]`).
     pub peer_tag: Option<&'a str>,
     /// Captured Record-Route values (via `rrs`), top first.
@@ -427,19 +433,30 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
         Keyword::Cseq => {
             let _ = write!(out, "{}", ctx.cseq);
         }
-        Keyword::Branch => {
-            // SIPp-shaped: magic cookie + pid + call number + msg index.
-            // Stable across retransmissions (buffers are resent verbatim),
-            // distinct across transactions of one call.
+        Keyword::Branch { offset } => {
+            // SIPp `E_Message_Branch` (`call.cpp` ~l.3892): magic cookie +
+            // pid + call number + message index + offset. Stable across
+            // retransmissions (buffers are resent verbatim), distinct
+            // across transactions of one call. Without a message index it
+            // is the call's, minus one — negative at message 0.
+            let index = match ctx.msg_index {
+                Some(index) => signed(index),
+                None => signed(ctx.call_msg_index) - 1,
+            };
             let _ = write!(
                 out,
                 "z9hG4bK-{}-{}-{}",
-                ctx.pid, ctx.call_number, ctx.msg_index
+                ctx.pid,
+                ctx.call_number,
+                index + offset
             );
         }
-        Keyword::MsgIndex => {
-            let _ = write!(out, "{}", ctx.msg_index);
-        }
+        Keyword::MsgIndex => match ctx.msg_index {
+            Some(index) => {
+                let _ = write!(out, "{index}");
+            }
+            None => out.push_str("-1"),
+        },
         Keyword::Pid => {
             let _ = write!(out, "{}", ctx.pid);
         }
@@ -626,7 +643,12 @@ fn fill(kw: &Keyword, ctx: &RenderCtx<'_>, out: &mut String) -> Result<(), Rende
             }
         }
         Keyword::File { name } => {
-            let path = render_to_string(name, ctx, None);
+            // SIPp renders the name with no message index (`SM_UNUSED`).
+            let name_ctx = RenderCtx {
+                msg_index: None,
+                ..ctx.clone()
+            };
+            let path = render_to_string(name, &name_ctx, None);
             let Some(cache) = ctx.run.files else {
                 return Err(RenderError(format!(
                     "[file name={path}] cannot be read outside a run"
@@ -786,6 +808,11 @@ fn resolve_line_expr(expr: &LineExpr, ctx: &RenderCtx<'_>) -> Option<usize> {
     }
 }
 
+/// A message index as SIPp's `int`, for arithmetic that can go negative.
+fn signed(index: usize) -> i64 {
+    i64::try_from(index).unwrap_or(i64::MAX)
+}
+
 /// `[authentication …]`: the digest (or AKA) header for the pending
 /// challenge. SIPp renders the **whole header line** — `Authorization:`
 /// for a 401, `Proxy-Authorization:` for a 407 — and its scenarios put the
@@ -936,7 +963,8 @@ mod tests {
             users_total: 0,
             pid: 99,
             cseq: 1,
-            msg_index: 0,
+            msg_index: Some(0),
+            call_msg_index: 0,
             peer_tag: None,
             routes: &[],
             last,
@@ -1100,13 +1128,40 @@ mod tests {
     fn branch_differs_per_msg_index_only() {
         let t = uac_invite_template();
         let mut a = ctx(None);
-        a.msg_index = 0;
+        a.msg_index = Some(0);
         let mut b = ctx(None);
-        b.msg_index = 7;
+        b.msg_index = Some(7);
         let ra = String::from_utf8(render(&t, &a).unwrap()).unwrap();
         let rb = String::from_utf8(render(&t, &b).unwrap()).unwrap();
         assert!(ra.contains("branch=z9hG4bK-99-1-0"));
         assert!(rb.contains("branch=z9hG4bK-99-1-7"));
+    }
+
+    /// SIPp's `P_index`: a send renders its own message index; without one
+    /// (actions, `<sendCmd>`, the default messages) `[msg_index]` is -1
+    /// and `[branch]` ends in the call's message index minus one. Offsets
+    /// apply either way.
+    #[test]
+    fn msg_index_and_branch_without_a_message_index_follow_sipp() {
+        let text = "[msg_index] [branch] [branch-1] [branch+2]";
+        let mut send = ctx(None);
+        send.msg_index = Some(3);
+        send.call_msg_index = 3;
+        assert_eq!(
+            render_kw(text, &send),
+            "3 z9hG4bK-99-1-3 z9hG4bK-99-1-2 z9hG4bK-99-1-5"
+        );
+        let mut action = send.clone();
+        action.msg_index = None;
+        assert_eq!(
+            render_kw(text, &action),
+            "-1 z9hG4bK-99-1-2 z9hG4bK-99-1-1 z9hG4bK-99-1-4"
+        );
+        action.call_msg_index = 0;
+        assert_eq!(
+            render_kw(text, &action),
+            "-1 z9hG4bK-99-1--1 z9hG4bK-99-1--2 z9hG4bK-99-1-1"
+        );
     }
 
     fn render_kw(text: &str, ctx: &RenderCtx<'_>) -> String {
