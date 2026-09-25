@@ -5120,6 +5120,90 @@ fn jumps_and_message_indices_skip_labels_like_real_sipp() {
     );
 }
 
+// ---- <assign>: SIPp's value= and variable= forms --------------------------
+
+/// A UAC whose nop assigns doubles both ways SIPp's `handle_rhs` allows and
+/// sends them in an OPTIONS: `value=` (the documented form) positive and
+/// negative, then `variable=` from a double, which an `<add>` shows is a
+/// double too.
+const ASSIGN_UAC_XML: &str = r#"<scenario name="assign-forms">
+  <nop>
+    <action>
+      <assign assign_to="seven" value="7"/>
+      <assign assign_to="neg" value="-2.5"/>
+      <assign assign_to="copy" variable="seven"/>
+      <add assign_to="copy" value="1"/>
+    </action>
+  </nop>
+  <send><![CDATA[
+    OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+    Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+    From: <sip:assign@[local_ip]:[local_port]>;tag=[call_number]
+    To: <sip:[service]@[remote_ip]:[remote_port]>
+    Call-ID: [call_id]
+    CSeq: 1 OPTIONS
+    Max-Forwards: 70
+    X-Assigned: [$seven]|[$neg]|[$copy]
+    Content-Length: 0
+
+  ]]></send>
+</scenario>
+"#;
+
+/// Run `uac_bin` on [`ASSIGN_UAC_XML`] against a UDP sink. Returns its exit
+/// code and the `X-Assigned` value of the first OPTIONS the sink got.
+fn run_assign_uac(uac_bin: &std::path::Path) -> (Option<i32>, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("assign_forms.xml");
+    std::fs::write(&xml, ASSIGN_UAC_XML).expect("write uac");
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut uac = Reaper(
+        Command::new(uac_bin)
+            .current_dir(dir.path())
+            .args(["-sf", xml.to_str().expect("utf8")])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20", "-nostdin"])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uac"),
+    );
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut buf = [0u8; 65_535];
+    let assigned = sink.recv(&mut buf).map_or_else(
+        |_| "<nothing sent>".to_owned(),
+        |n| {
+            String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .find_map(|l| l.strip_prefix("X-Assigned:"))
+                .unwrap_or("<no X-Assigned>")
+                .trim()
+                .to_owned()
+        },
+    );
+    (code, assigned)
+}
+
+/// `<assign value=>`, the form SIPp documents, and `<assign variable=>`
+/// both store a double, under sipr as under real sipp.
+#[test]
+fn assign_takes_a_value_or_a_variable_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::assign_takes_a_value_or_a_variable_like_real_sipp — no sipp.");
+        return;
+    };
+    let (code, theirs) = run_assign_uac(&sipp);
+    assert_eq!(code, Some(0), "real sipp uac");
+    assert_eq!(theirs, "7.000000|-2.500000|8.000000", "real sipp");
+    let (code, ours) = run_assign_uac(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(code, Some(0), "sipr uac");
+    assert_eq!(ours, theirs, "sipr assigned differently than real sipp");
+}
+
 // ---- recv timeouts: the recv the call waits at owns the timeout ----------
 
 /// A UAS that answers the INVITE, takes the ACK, then waits in a recv

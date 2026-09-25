@@ -985,6 +985,53 @@ fn rtp_echo_toggle_takes_a_value_or_a_variable() {
     }
 }
 
+/// `<assign>` is one of SIPp's `handle_rhs` actions: it stores a double
+/// from `value=` (the documented form) or from `variable=`, never both and
+/// never neither.
+#[test]
+fn assign_takes_a_value_or_a_variable() {
+    use sipr_scenario::model::Operand;
+    let xml = wrap(&format!(
+        r#"{invite}
+           <nop><action>
+             <assign assign_to="seven" value="7"/>
+             <assign assign_to="copy" variable="seven"/>
+           </action></nop>
+           <Reference variables="copy"/>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let Step::Nop { actions, .. } = &sc.steps[1] else {
+        panic!("nop")
+    };
+    let seven = sc.vars.find("seven").expect("seven");
+    assert!(matches!(
+        &actions[0],
+        Action::Assign { assign_to, operand: Operand::Value(v) }
+            if *assign_to == seven && *v == 7.0
+    ));
+    assert!(matches!(
+        &actions[1],
+        Action::Assign { operand: Operand::Var(v), .. } if *v == seven
+    ));
+
+    for bad in [
+        r#"<assign assign_to="x"/>"#,
+        r#"<assign assign_to="x" value="1" variable="seven"/>"#,
+        r#"<assign assign_to="x" value="seven"/>"#,
+        r#"<assign value="1"/>"#,
+    ] {
+        let xml = wrap(&format!(
+            r#"{invite}
+               <nop><action><assign assign_to="seven" value="7"/>{bad}</action></nop>"#,
+            invite = send_invite()
+        ));
+        assert!(!errors(&xml).is_empty(), "{bad}");
+    }
+}
+
 #[test]
 fn rtp_echo_exec_parses_sipp_verbs() {
     use sipr_scenario::model::{RtpEchoCmd, RtpEchoVerb};

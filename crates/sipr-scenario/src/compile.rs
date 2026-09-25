@@ -1242,12 +1242,12 @@ impl Compiler {
                 })
             }
             "assign" => {
-                self.warn_unknown_attrs(el, &["assign_to", "variable"]);
+                self.warn_unknown_attrs(el, &["assign_to", "value", "variable"]);
                 let to = self.require_attr(el, "assign_to")?;
-                let from = self.require_attr(el, "variable")?;
+                let operand = self.parse_operand(el, line);
                 Some(Action::Assign {
                     assign_to: self.var_writes(&to),
-                    variable: self.var_reads(&from),
+                    operand,
                 })
             }
             "assignstr" => {

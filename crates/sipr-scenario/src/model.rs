@@ -513,12 +513,13 @@ pub enum Action {
         /// The distribution to draw from.
         distribution: crate::distribution::Distribution,
     },
-    /// Copy one variable to another.
+    /// Set a variable to a double: `value=` or another variable's number
+    /// (SIPp's `E_AT_ASSIGN_FROM_VALUE`).
     Assign {
         /// Destination.
         assign_to: VarId,
-        /// Source.
-        variable: VarId,
+        /// The double to store.
+        operand: Operand,
     },
     /// Set a variable to a keyword-expanded string.
     AssignStr {

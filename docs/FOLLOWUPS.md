@@ -4,7 +4,7 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **1-4** are SIPp divergences found while fixing message indices (commit
+- **2-4** are SIPp divergences found while fixing message indices (commit
   `5d28c1c`, "count messages, not labels, in jumps and indices").
 - **5-6** are test-harness problems found while fixing the interop
   port-probe race (commit `4ff94ca`). They change only tests, so each one
@@ -32,23 +32,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 1. Accept SIPp's `<assign value=>` form
-
-Scope: `fix(scenario)`.
-
-- **SIPp:** `assign` is compiled by `handle_arithmetic` → `handle_rhs`
-  (`scenario.cpp` ~l.1344-1365, ~l.1469). It takes `value=` (a double)
-  or `variable=`, which are mutually exclusive, and errors on neither or
-  both. `<assign assign_to="x" value="7"/>` runs in sipp 3.7.7.
-- **sipr:** the `"assign"` arm of the action compiler in
-  `crates/sipr-scenario/src/compile.rs` requires `variable=` and warns
-  that `value` is an unknown attribute. The scenario is refused with
-  "`<assign>` needs a 'variable' attribute".
-- **Fix:** make `Action::Assign` take an `Operand`, as `pauserestore` and
-  the arithmetic actions already do through `parse_operand`, with SIPp's
-  errors for neither or both. Update the action runner in
-  `crates/sipr-engine/src/actions.rs` and the compile tests.
 
 ## 2. Match SIPp's jump semantics after the jump
 

@@ -187,6 +187,14 @@ fn run_actions_impl(
     out
 }
 
+/// SIPp's `get_rhs`: the number an action's `value=` or `variable=` gives.
+fn operand_value(operand: &Operand, store: &VarStore) -> f64 {
+    match operand {
+        Operand::Value(v) => *v,
+        Operand::Var(id) => store.get(*id).as_num(),
+    }
+}
+
 /// Render `t` with `[$var]` resolved from the CURRENT store (not the snapshot
 /// baked into `base_ctx`), so a `<log>` sees earlier actions' writes.
 fn render_with_store(t: &MsgTemplate, store: &VarStore, base_ctx: &RenderCtx<'_>) -> String {
@@ -278,12 +286,9 @@ fn run_one(
         Action::Log(t) => ActionOutcome::Log(render_with_store(t, store, base_ctx)),
         Action::Warn(t) => ActionOutcome::Warn(render_with_store(t, store, base_ctx)),
         Action::Fail(t) => ActionOutcome::FailCall(render_with_store(t, store, base_ctx)),
-        Action::Assign {
-            assign_to,
-            variable,
-        } => {
-            let value = store.get(*variable).clone();
-            store.set(*assign_to, value);
+        Action::Assign { assign_to, operand } => {
+            let value = operand_value(operand, store);
+            store.set(*assign_to, Value::Num(value));
             ActionOutcome::Continue
         }
         Action::AssignStr { assign_to, value } => {
@@ -333,10 +338,7 @@ fn run_one(
             operand,
         } => {
             let lhs = store.get(*assign_to).as_num();
-            let rhs = match operand {
-                Operand::Value(v) => *v,
-                Operand::Var(id) => store.get(*id).as_num(),
-            };
+            let rhs = operand_value(operand, store);
             let result = match op {
                 ArithOp::Add => lhs + rhs,
                 ArithOp::Subtract => lhs - rhs,
@@ -368,10 +370,7 @@ fn run_one(
                 ActionOutcome::JumpToMessage(store.get(*v).as_num().max(0.0) as usize)
             }
         },
-        Action::PauseRestore(op) => ActionOutcome::PauseRestore(match op {
-            Operand::Value(v) => *v,
-            Operand::Var(id) => store.get(*id).as_num(),
-        }),
+        Action::PauseRestore(op) => ActionOutcome::PauseRestore(operand_value(op, store)),
         Action::CloseCon => ActionOutcome::CloseCon,
         Action::Trim { variable } => {
             let v = store.get(*variable).as_str().trim().to_owned();
@@ -405,10 +404,9 @@ fn run_one(
         },
         Action::RtpStream(cmd) => ActionOutcome::RtpStream(cmd.clone()),
         Action::PlayDtmf(t) => ActionOutcome::PlayDtmf(render_with_store(t, store, base_ctx)),
-        Action::RtpEchoState(operand) => ActionOutcome::RtpEcho(match operand {
-            Operand::Value(v) => *v != 0.0,
-            Operand::Var(id) => store.get(*id).as_num() != 0.0,
-        }),
+        Action::RtpEchoState(operand) => {
+            ActionOutcome::RtpEcho(operand_value(operand, store) != 0.0)
+        }
         Action::RtpEcho(cmd) => ActionOutcome::RtpEchoCmd(cmd.clone()),
         Action::ExecCommand(command) => {
             ActionOutcome::ExecCommand(render_with_store(command, store, base_ctx))

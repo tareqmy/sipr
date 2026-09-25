@@ -157,6 +157,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `<assign assign_to="x" value="7"/>`, the form SIPp documents, compiles
+  and stores the double 7. sipr took only `variable=` and refused the
+  scenario ("`<assign>` needs a 'variable' attribute"). As in SIPp,
+  `variable=` now stores the other variable's number instead of a copy of
+  its value, and giving both attributes or neither is an error.
 - `-trace_screen` writes `<scenario>_<pid>_screen.log`, the name real
   sipp uses, instead of `_screens.log`. That name came from sipp's help
   text, which does not match the file sipp writes.

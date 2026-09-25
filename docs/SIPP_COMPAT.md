@@ -33,7 +33,7 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 ### v1 actions (inside `<action>` on recv/nop)
 
 `ereg` (with `assign_to`, `check_it`, `header`, `regexp`, `search_in`
-= `msg|hdr|body|var`, `variable`, `start_line`), `log`, `warning`, `error`, `assign`, `assignstr`, `strcmp`,
+= `msg|hdr|body|var`, `variable`, `start_line`), `log`, `warning`, `error`, `assign` (`value`/`variable`), `assignstr`, `strcmp`,
 `verifyauth` (with `assign_to`, `username`, `password`), `pauserestore`
 (`value`/`variable`), `closecon`, `test`, `add`, `subtract`, `multiply`, `divide`, `todouble`, `jump`, `trim`,
 `gettimeofday`, `urlencode`, `urldecode`, `sample` (`assign_to`, `distribution`
@@ -1164,6 +1164,18 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   double is `""` (the source calls it a bug), so `strcmp`/`trim`/
   `urlencode` on a numeric variable see nothing there; sipr gives them
   the `%lf` text.
+- `<assign>` (verified in `scenario.cpp` ~l.1344-1365 `handle_rhs`,
+  ~l.1469; `call.cpp` ~l.5692 `get_rhs`, ~l.5778
+  `E_AT_ASSIGN_FROM_VALUE`): it takes `value=` (a double, the form SIPp's
+  docs show) or `variable=`, exactly one of them, and stores a **double**
+  either way: `variable=` stores the other variable's number, not a copy
+  of its value. sipr refused `value=` and copied the value as is, until
+  it matched both. Verified against real sipp 3.7.7 by the
+  `assign_takes_a_value_or_a_variable_like_real_sipp` interop test.
+  **Open:** SIPp's number of a variable (`CCallVariable::getDouble`) is 0
+  for anything but a double, so `variable=` naming a string or a bool
+  stores 0. sipr's parses a numeric string and reads a true bool as 1, as
+  in all its `value=`/`variable=` actions.
 - Manual transactions (M36; verified in `scenario.cpp` ~l.343-400
   `get_txn`, ~l.878-931, ~l.588-602 `validate_txn_usage`; `call.cpp`
   ~l.1128, ~l.2110-2116, ~l.4431-4450 `extract_transaction`,
