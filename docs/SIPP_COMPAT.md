@@ -1627,7 +1627,7 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   stayed optional recv's jump to message 0 waits at message 0, where SIPp
   indexes message -1. SIPp also runs the actions of a `<pause>` and a
   `<sendCmd>`. sipr refuses them on a `<sendCmd>`. **Open:** sipr drops
-  them on a `<pause>` without a word.
+  them on a `<pause>` without a word (`docs/FOLLOWUPS.md` 11).
 - Receive timeouts (verified in `call.cpp` ~l.2150-2205 `call::run`,
   ~l.5653-5687 `process_incoming`, ~l.1920-1945 `next()`, `task.cpp`
   `add_paused_task`, and `scenario.cpp` ~l.33-39 the `message` defaults,
