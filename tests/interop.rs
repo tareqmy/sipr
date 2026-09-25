@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 
 fn sipp_bin() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SIPP_BIN") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
+        // Absolute, because tests start sipp in a tempdir: a relative
+        // `SIPP_BIN=../../cprojects/sipp/sipp` would resolve from there.
+        let p = std::fs::canonicalize(p).ok().filter(|p| p.is_file());
+        if p.is_some() {
+            return p;
         }
     }
     let path = std::env::var_os("PATH")?;
