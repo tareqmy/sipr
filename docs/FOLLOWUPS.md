@@ -4,9 +4,6 @@ Work found while fixing something else and left out of that change so it
 stayed one logical fix. Each entry stands alone and can be handed to an
 agent as is. Delete an entry when its fix lands.
 
-- **6** is a test-harness problem found while fixing the interop
-  port-probe race (commit `4ff94ca`). It changes only tests, so it
-  replaces steps 1 and 2 below with the check it describes.
 - **7-8** are SIPp divergences that `docs/SIPP_COMPAT.md` §6 already
   listed as open, with no fix picked up yet.
 - **9-10** are SIPp divergences in how variables read and render, found
@@ -39,30 +36,6 @@ Every task follows the same loop:
    ```
 
 4. Commit per `docs/CONVENTIONS.md`, with the scope given below.
-
-## 6. Pass `-nostdin` to every sipp the interop suite starts
-
-Scope: `test(interop)`.
-
-- **The spin:** a sipp whose stdin is `/dev/null` busy-polls it: `poll()`
-  returns at once, forever, so each sipp burns a full core, mostly in
-  the kernel. `-bg` does not help, because its forked child points stdin
-  at `/dev/null` too. Measured on macOS: a sipp UAS runs at 99.6% CPU,
-  and at 1.5% with `-nostdin`. Five full interop runs used ~405 s of
-  system CPU in ~117 s of wall time.
-- **Done so far:** only `run_recv_timeout_uas` passes `-nostdin` (commit
-  `4ff94ca`). That took one run of `recv_timeouts_arm_like_real_sipp`
-  from ~14 s of CPU to ~0.4 s.
-- **Fix:** pass `-nostdin` to every sipp that `tests/interop.rs` starts.
-  Pass it to sipr too where the two share an argument list: sipr accepts
-  the flag (`src/cli.rs`). A helper would give new tests the flag by
-  default.
-- **Verify:** time the interop test binary before and after, and loop
-  the full suite a few times. Also check whether
-  `real_sipp_tcp_uac_reconnects_to_sipr` is steadier with the load gone.
-  It failed once in 13 full runs after `4ff94ca`: sipp hit its known
-  freed-socket bug and hung past `-timeout`, without logging the text
-  the test's skip looks for.
 
 ## 7. Take `ontimeout=` on `<send>` and `<recvCmd>`
 

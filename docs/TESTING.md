@@ -74,8 +74,8 @@ on the exit code of a sipp started with `-bg` (the forked parent exits 99 at
 once) — run it in the foreground with stdin/stdout/stderr null and reap it;
 sipp as a UAS ignores SIGTERM once curses is up — kill it with SIGKILL.
 A sipp whose stdin is `/dev/null` busy-polls it, a full core each and
-mostly kernel time, so pass `-nostdin` (sipr takes it too) where a test
-runs several at once.
+mostly kernel time, so `tests/interop.rs` starts every sipp and sipr
+through `tool_command()`, which passes `-nostdin` (sipr takes it too).
 
 On macOS a child can inherit a socket another test thread has only just
 created: there is no `SOCK_CLOEXEC`, so std sets `FD_CLOEXEC` a moment

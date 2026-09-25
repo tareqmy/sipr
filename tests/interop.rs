@@ -30,6 +30,17 @@ fn sipp_bin() -> Option<PathBuf> {
         .find(|c| c.is_file())
 }
 
+/// A command for `program`, real sipp or sipr, with `-nostdin`. A sipp whose
+/// stdin is /dev/null busy-polls it at a full core, mostly kernel time
+/// (`-bg` does not help: its forked child points stdin at /dev/null too),
+/// and a suite's worth of them skews every test's timings. sipr takes the
+/// flag too. Start every sipp and sipr through this.
+fn tool_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.arg("-nostdin");
+    command
+}
+
 /// Whether this sipp build has TLS compiled in (`sipp -v` banners `-TLS`).
 fn sipp_supports_tls(sipp: &std::path::Path) -> bool {
     Command::new(sipp)
@@ -116,7 +127,7 @@ fn uac_against_real_sipp_uas() {
         return;
     };
     let port = free_port();
-    let sipp_child = Command::new(&sipp)
+    let sipp_child = tool_command(&sipp)
         .args([
             "-sn",
             "uas",
@@ -142,7 +153,7 @@ fn uac_against_real_sipp_uas() {
     std::thread::sleep(Duration::from_millis(300));
 
     let mut sipr_proc = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .args([
                 "-sn",
                 "uac",
@@ -196,7 +207,7 @@ fn real_sipp_uac_against_sipr_uas() {
     };
     let port = free_port();
     let mut sipr_uas = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .args([
                 "-sn",
                 "uas",
@@ -215,7 +226,7 @@ fn real_sipp_uac_against_sipr_uas() {
     );
     std::thread::sleep(Duration::from_millis(300));
     let mut sipp_uac = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .args([
                 "-sn",
                 "uac",
@@ -280,7 +291,7 @@ fn tls_uac_against_real_sipp_uas() {
     let (_dir, cert, key) = tls_identity_files();
     let port = free_port();
     let mut sipp_proc = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .args([
                 "-sn",
                 "uas",
@@ -309,7 +320,7 @@ fn tls_uac_against_real_sipp_uas() {
     std::thread::sleep(Duration::from_millis(300));
 
     let mut sipr_proc = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .args([
                 "-sn",
                 "uac",
@@ -374,7 +385,7 @@ fn real_sipp_tls_uac_against_sipr_uas() {
     let (_dir, cert, key) = tls_identity_files();
     let port = free_port();
     let mut sipr_uas = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .args([
                 "-sn",
                 "uas",
@@ -403,7 +414,7 @@ fn real_sipp_tls_uac_against_sipr_uas() {
     let uac_port = free_port();
     let log_dir = tempfile::tempdir().expect("sipp log dir");
     let mut sipp_uac = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .args([
                 "-sn",
                 "uac",
@@ -560,7 +571,7 @@ fn uac_pcap_against_real_sipp_uas() {
     )
     .expect("write scenario");
     let mut sipp_proc = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .args([
                 "-sn",
                 "uas",
@@ -586,7 +597,7 @@ fn uac_pcap_against_real_sipp_uas() {
     );
     std::thread::sleep(Duration::from_millis(300));
     let mut sipr_proc = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .args([
                 "-sf",
                 scenario_path.to_str().expect("utf8"),
@@ -711,7 +722,7 @@ fn uac_rtp_stream_against_real_sipp_uas() {
     )
     .expect("write scenario");
     let mut sipp_proc = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .args([
                 "-sn",
                 "uas",
@@ -737,7 +748,7 @@ fn uac_rtp_stream_against_real_sipp_uas() {
     );
     std::thread::sleep(Duration::from_millis(300));
     let mut sipr_proc = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .args([
                 "-sf",
                 scenario_path.to_str().expect("utf8"),
@@ -864,7 +875,7 @@ fn rtpcheck_against_real_sipp_echo() {
     )
     .expect("write scenario");
     let mut sipp_proc = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .args([
                 "-sn",
                 "uas",
@@ -890,7 +901,7 @@ fn rtpcheck_against_real_sipp_echo() {
     );
     std::thread::sleep(Duration::from_millis(300));
     let mut sipr_proc = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .args([
                 "-sf",
                 scenario_path.to_str().expect("utf8"),
@@ -1043,7 +1054,7 @@ fn srtp_against_real_sipp_echo() {
     let _ = std::fs::remove_dir_all(&sipp_dir);
     std::fs::create_dir_all(&sipp_dir).expect("sipp dir");
     let mut sipp_proc = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(&sipp_dir)
             .args([
                 "-sf",
@@ -1070,7 +1081,7 @@ fn srtp_against_real_sipp_echo() {
     );
     std::thread::sleep(Duration::from_millis(400));
     let mut sipr_proc = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .args([
                 "-sf",
                 scenario_path.to_str().expect("utf8"),
@@ -1170,7 +1181,7 @@ fn real_sipp_srtp_uac_against_sipr_echo_server() {
     let _ = std::fs::remove_dir_all(&sipp_dir);
     std::fs::create_dir_all(&sipp_dir).expect("sipp dir");
     let mut sipr_uas = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .current_dir(&sipp_dir)
             .args([
                 "-sf",
@@ -1194,7 +1205,7 @@ fn real_sipp_srtp_uac_against_sipr_echo_server() {
     std::thread::sleep(Duration::from_millis(400));
     // sipp's -rtpcheck_debug file lands in its working directory.
     let mut sipp_uac = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(&sipp_dir)
             .args([
                 "-sf",
@@ -1360,7 +1371,7 @@ fn run_verifyauth_pair(
     std::fs::write(&uac_path, verifyauth_uac_scenario(password, expect)).expect("write uac");
     let port = free_port();
     let mut uas = Reaper(
-        Command::new(uas_bin)
+        tool_command(uas_bin)
             .current_dir(&dir)
             .args([
                 "-sf",
@@ -1382,7 +1393,7 @@ fn run_verifyauth_pair(
     );
     std::thread::sleep(Duration::from_millis(400));
     let mut uac = Reaper(
-        Command::new(uac_bin)
+        tool_command(uac_bin)
             .current_dir(&dir)
             .args([
                 "-sf",
@@ -1538,7 +1549,7 @@ fn run_unexp_pair(
     std::fs::write(&uac_path, info_during_pause_uac_xml(2800)).expect("write uac");
     let port = free_port();
     let mut uas = Reaper(
-        Command::new(uas_bin)
+        tool_command(uas_bin)
             .current_dir(&dir)
             .args([
                 "-sf",
@@ -1561,7 +1572,7 @@ fn run_unexp_pair(
     std::thread::sleep(Duration::from_millis(400));
     let started = std::time::Instant::now();
     let mut uac = Reaper(
-        Command::new(uac_bin)
+        tool_command(uac_bin)
             .current_dir(&dir)
             .args([
                 "-sf",
@@ -1643,7 +1654,7 @@ fn sipr_uac_vs_sipp_uas(
     let port = free_port();
     let dir = std::env::temp_dir();
     let mut sipp_uas = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(&dir)
             .args([
                 "-sn",
@@ -1667,7 +1678,7 @@ fn sipr_uac_vs_sipp_uas(
     );
     std::thread::sleep(Duration::from_millis(400));
     let mut sipr_uac = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .args([
                 "-sn",
                 "uac",
@@ -1746,7 +1757,7 @@ fn real_sipp_per_call_uac_against_sipr_uas() {
         let port = free_port();
         let dir = tempfile::tempdir().expect("tempdir");
         let mut sipr_uas = Reaper(
-            Command::new(env!("CARGO_BIN_EXE_sipr"))
+            tool_command(env!("CARGO_BIN_EXE_sipr"))
                 .args([
                     "-sn",
                     "uas",
@@ -1769,7 +1780,7 @@ fn real_sipp_per_call_uac_against_sipr_uas() {
         );
         std::thread::sleep(Duration::from_millis(300));
         let mut sipp_uac = Reaper(
-            Command::new(&sipp)
+            tool_command(&sipp)
                 .current_dir(dir.path())
                 .args([
                     "-sn",
@@ -1839,7 +1850,7 @@ fn rsa_both_ways_against_real_sipp() {
     let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
     let spawn = |bin: &std::path::Path, args: &[&str]| {
         Reaper(
-            Command::new(bin)
+            tool_command(bin)
                 .current_dir(&dir)
                 .args(args)
                 .stdout(Stdio::null())
@@ -2030,7 +2041,7 @@ fn tcp_reconnect_pair(
         ];
         args.extend_from_slice(uas_extra);
         Reaper(
-            Command::new(uas_bin)
+            tool_command(uas_bin)
                 .current_dir(cwd)
                 .args(&args)
                 .stdout(Stdio::null())
@@ -2066,7 +2077,7 @@ fn tcp_reconnect_pair(
     args.extend_from_slice(uac_extra);
     args.push(&target);
     let mut uac = Reaper(
-        Command::new(uac_bin)
+        tool_command(uac_bin)
             .current_dir(cwd)
             .args(&args)
             .stdout(Stdio::null())
@@ -2210,7 +2221,7 @@ fn per_ip_sockets_both_ways_against_real_sipp() {
     let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
     let spawn = |bin: &std::path::Path, args: &[&str]| {
         Reaper(
-            Command::new(bin)
+            tool_command(bin)
                 .current_dir(dir.path())
                 .args(args)
                 .stdout(Stdio::null())
@@ -2381,7 +2392,7 @@ fn sctp_both_ways_against_real_sipp() {
     let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
     let spawn = |bin: &std::path::Path, args: &[&str]| {
         Reaper(
-            Command::new(bin)
+            tool_command(bin)
                 .current_dir(dir.path())
                 .args(args)
                 .stdout(Stdio::null())
@@ -2530,7 +2541,7 @@ fn real_sipp_ooc_scenario_answers_siprs_out_of_call_options() {
     std::fs::write(&uas_path, ooc_probing_uas_xml()).expect("write uas");
     let port = free_port();
     let mut sipr_uas = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .current_dir(dir.path())
             .args([
                 "-sf",
@@ -2552,7 +2563,7 @@ fn real_sipp_ooc_scenario_answers_siprs_out_of_call_options() {
     );
     std::thread::sleep(Duration::from_millis(400));
     let mut sipp_uac = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(dir.path())
             .args([
                 "-sn",
@@ -2650,7 +2661,7 @@ fn sipr_ooc_scenario_answers_real_sipps_out_of_call_options() {
     std::fs::write(&uas_path, ooc_probing_uas_xml()).expect("write uas");
     let port = free_port();
     let sipp_uas = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(dir.path())
             .args([
                 "-sf",
@@ -2671,7 +2682,7 @@ fn sipr_ooc_scenario_answers_real_sipps_out_of_call_options() {
     );
     std::thread::sleep(Duration::from_millis(400));
     let mut sipr_uac = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .current_dir(dir.path())
             .args([
                 "-sn",
@@ -2892,7 +2903,7 @@ fn real_sipp_and_sipr_terminate_each_others_calls_in_mixed_mode() {
     let sipp_port = free_port();
     let sipr_port = free_port();
     let mut sipp_mixed = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(sipp_dir.path())
             .args([
                 "-sf",
@@ -2922,7 +2933,7 @@ fn real_sipp_and_sipr_terminate_each_others_calls_in_mixed_mode() {
     );
     std::thread::sleep(Duration::from_millis(300));
     let mut sipr_mixed = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .current_dir(sipr_dir.path())
             .args([
                 "-sf",
@@ -2993,7 +3004,7 @@ fn sipr_receive_scenario_answers_a_plain_real_sipp_uac() {
     let uas_port = free_port();
     let sipr_port = free_port();
     let _sipp_uas = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(dir.path())
             .args([
                 "-sn",
@@ -3013,7 +3024,7 @@ fn sipr_receive_scenario_answers_a_plain_real_sipp_uac() {
     );
     std::thread::sleep(Duration::from_millis(300));
     let mut sipr_mixed = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .current_dir(dir.path())
             .args([
                 "-sf",
@@ -3043,7 +3054,7 @@ fn sipr_receive_scenario_answers_a_plain_real_sipp_uac() {
     );
     std::thread::sleep(Duration::from_millis(300));
     let mut sipp_uac = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(dir.path())
             .args([
                 "-sn",
@@ -3228,7 +3239,7 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
     std::fs::write(&xml_a, counter_uac_xml()).expect("write scenario");
     let port = free_port();
     let mut sipr_uas = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .current_dir(dir_a.path())
             .args([
                 "-sn",
@@ -3250,7 +3261,7 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
     );
     std::thread::sleep(Duration::from_millis(400));
     let mut sipp_uac = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(dir_a.path())
             .args([
                 "-sf",
@@ -3298,7 +3309,7 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
     std::fs::write(&xml_b, counter_uac_xml()).expect("write scenario");
     let port = free_port();
     let mut sipp_uas = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(dir_b.path())
             .args([
                 "-sn",
@@ -3320,7 +3331,7 @@ fn user_and_global_variables_count_the_same_as_real_sipp() {
     );
     std::thread::sleep(Duration::from_millis(400));
     let mut sipr_uac = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .current_dir(dir_b.path())
             .args([
                 "-sf",
@@ -3492,7 +3503,7 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
     std::fs::write(&xml_a, txn_uac_xml()).expect("write scenario");
     let port = free_port();
     let mut sipr_uas = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .current_dir(dir_a.path())
             .args([
                 "-sn",
@@ -3514,7 +3525,7 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
     );
     std::thread::sleep(Duration::from_millis(400));
     let mut sipp_uac = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(dir_a.path())
             .args([
                 "-sf",
@@ -3560,7 +3571,7 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
     std::fs::write(&xml_b, txn_uac_xml()).expect("write scenario");
     let port = free_port();
     let mut sipp_uas = Reaper(
-        Command::new(&sipp)
+        tool_command(&sipp)
             .current_dir(dir_b.path())
             .args([
                 "-sn",
@@ -3582,7 +3593,7 @@ fn manual_transactions_complete_against_real_sipp_both_ways() {
     );
     std::thread::sleep(Duration::from_millis(400));
     let mut sipr_uac = Reaper(
-        Command::new(env!("CARGO_BIN_EXE_sipr"))
+        tool_command(env!("CARGO_BIN_EXE_sipr"))
             .current_dir(dir_b.path())
             .args([
                 "-sf",
@@ -3775,7 +3786,7 @@ fn spawn_uas_bin(
     dir: &std::path::Path,
 ) -> Reaper {
     Reaper(
-        Command::new(bin)
+        tool_command(bin)
             .current_dir(dir)
             .args([
                 "-sf",
@@ -3837,7 +3848,7 @@ fn exec_command_writes_the_same_hook_output_as_real_sipp() {
         args.extend(uac_extra.iter().map(|s| (*s).to_owned()));
         args.push(format!("127.0.0.1:{port}"));
         let mut uac = Reaper(
-            Command::new(uac_bin)
+            tool_command(uac_bin)
                 .current_dir(dir.path())
                 .args(&args)
                 .stdout(Stdio::null())
@@ -3924,7 +3935,7 @@ fn setdest_redirects_to_a_second_peer_like_real_sipp() {
         args.extend(uac_extra.iter().map(|s| (*s).to_owned()));
         args.push(format!("127.0.0.1:{port1}"));
         let mut uac = Reaper(
-            Command::new(uac_bin)
+            tool_command(uac_bin)
                 .current_dir(dir.path())
                 .args(&args)
                 .stdout(Stdio::null())
@@ -4048,7 +4059,7 @@ fn run_sf_pair(
     std::fs::write(&uac_path, uac_xml).expect("write uac");
     let port = free_port();
     let mut uas = Reaper(
-        Command::new(uas_bin)
+        tool_command(uas_bin)
             .current_dir(&dir)
             .args([
                 "-sf",
@@ -4091,7 +4102,7 @@ fn run_sf_pair(
     args.extend(uac_extra.iter().map(|a| (*a).to_owned()));
     args.push(format!("127.0.0.1:{port}"));
     let mut uac = Reaper(
-        Command::new(uac_bin)
+        tool_command(uac_bin)
             .current_dir(&dir)
             .args(&args)
             .stdout(Stdio::null())
@@ -4282,7 +4293,7 @@ fn run_with_stat_files(
     std::fs::create_dir_all(&dir).expect("mkdir");
     let port = free_port();
     let mut uas = Reaper(
-        Command::new(uas_bin)
+        tool_command(uas_bin)
             .current_dir(&dir)
             .args([
                 "-sn",
@@ -4334,7 +4345,7 @@ fn run_with_stat_files(
     }
     args.push(format!("127.0.0.1:{port}"));
     let mut uac = Reaper(
-        Command::new(uac_bin)
+        tool_command(uac_bin)
             .current_dir(&dir)
             .args(&args)
             .stdout(Stdio::null())
@@ -4466,7 +4477,7 @@ fn short_message_log_matches_real_sipps() {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let port = free_port();
         let mut uas = Reaper(
-            Command::new(uas_bin)
+            tool_command(uas_bin)
                 .current_dir(&dir)
                 .args([
                     "-sn",
@@ -4510,7 +4521,7 @@ fn short_message_log_matches_real_sipps() {
         }
         args.push(format!("127.0.0.1:{port}"));
         let mut uac = Reaper(
-            Command::new(uac_bin)
+            tool_command(uac_bin)
                 .current_dir(&dir)
                 .args(&args)
                 .stdout(Stdio::null())
@@ -4591,7 +4602,7 @@ fn max_invite_retrans_counts_like_real_sipp() {
         args.push(target.clone());
         let started = std::time::Instant::now();
         let mut child = Reaper(
-            Command::new(bin)
+            tool_command(bin)
                 .current_dir(&dir)
                 .args(&args)
                 .stdout(Stdio::null())
@@ -4763,7 +4774,7 @@ fn run_ext3pcc_pair(
     // One UAS per leg: the two legs share the master's Call-ID.
     let spawn_uas = |port: u16| {
         Reaper(
-            Command::new(sipr)
+            tool_command(sipr)
                 .current_dir(&dir)
                 .args([
                     "-sn",
@@ -4811,7 +4822,7 @@ fn run_ext3pcc_pair(
             }
             args.push(format!("127.0.0.1:{uas}"));
             Reaper(
-                Command::new(bin)
+                tool_command(bin)
                     .current_dir(&dir)
                     .args(&args)
                     .stdout(Stdio::null())
@@ -4940,7 +4951,7 @@ fn run_jump_over_labels(
     }
     args.push(sink.local_addr().expect("sink addr").to_string());
     let mut uac = Reaper(
-        Command::new(uac_bin)
+        tool_command(uac_bin)
             .current_dir(&dir)
             .args(&args)
             .stdout(Stdio::null())
@@ -5065,10 +5076,10 @@ fn run_jump_resume_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>) 
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
-        Command::new(uac_bin)
+        tool_command(uac_bin)
             .current_dir(dir.path())
             .args(["-sf", xml.to_str().expect("utf8")])
-            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20", "-nostdin"])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20"])
             .arg(&target)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -5160,11 +5171,11 @@ fn run_scripted_uas(
     std::fs::write(&path, xml).expect("write uas");
     let port = free_port();
     let mut uas = Reaper(
-        Command::new(uas_bin)
+        tool_command(uas_bin)
             .current_dir(dir.path())
             .args(["-sf", path.to_str().expect("utf8")])
             .args(["-i", "127.0.0.1", "-p", &port.to_string()])
-            .args(["-m", "1", "-timeout", "10", "-nostdin"])
+            .args(["-m", "1", "-timeout", "10"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
@@ -5343,10 +5354,10 @@ fn run_msg_index_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>) {
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
-        Command::new(uac_bin)
+        tool_command(uac_bin)
             .current_dir(dir.path())
             .args(["-sf", xml.to_str().expect("utf8")])
-            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20", "-nostdin"])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20"])
             .arg("-trace_logs")
             .arg(&target)
             .stdout(Stdio::null())
@@ -5446,10 +5457,10 @@ fn run_sendcmd_index(bin: &std::path::Path) -> (Option<i32>, String) {
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut controller = Reaper(
-        Command::new(bin)
+        tool_command(bin)
             .current_dir(dir.path())
             .args(["-sf", xml.to_str().expect("utf8"), "-3pcc", &twin_addr])
-            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "10", "-nostdin"])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "10"])
             .arg(&target)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -5570,10 +5581,10 @@ fn run_abort_index_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>) 
     let peer = UdpSocket::bind("127.0.0.1:0").expect("bind peer");
     let target = peer.local_addr().expect("peer addr").to_string();
     let mut uac = Reaper(
-        Command::new(uac_bin)
+        tool_command(uac_bin)
             .current_dir(dir.path())
             .args(["-sf", xml.to_str().expect("utf8")])
-            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "10", "-nostdin"])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "10"])
             .arg(&target)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -5672,10 +5683,10 @@ fn run_assign_uac(uac_bin: &std::path::Path) -> (Option<i32>, String) {
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
     let target = sink.local_addr().expect("sink addr").to_string();
     let mut uac = Reaper(
-        Command::new(uac_bin)
+        tool_command(uac_bin)
             .current_dir(dir.path())
             .args(["-sf", xml.to_str().expect("utf8")])
-            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20", "-nostdin"])
+            .args(["-i", "127.0.0.1", "-m", "1", "-timeout", "20"])
             .arg(&target)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -5807,7 +5818,7 @@ fn run_recv_timeout_uas(
     let port = free_port();
     let stderr = std::fs::File::create(dir.path().join(UAS_STDERR)).expect("create uas stderr");
     let mut uas = Reaper(
-        Command::new(uas_bin)
+        tool_command(uas_bin)
             .current_dir(dir.path())
             .args([
                 "-sf",
@@ -5821,9 +5832,6 @@ fn run_recv_timeout_uas(
                 "-timeout",
                 "6",
                 "-trace_err",
-                // A foreground sipp busy-polls a /dev/null stdin at 100%
-                // CPU; a test's worth of them at once skews its timings.
-                "-nostdin",
             ])
             .args(extra)
             .stdout(Stdio::null())
@@ -6277,10 +6285,10 @@ fn run_counters_uac(
     std::fs::write(&scenario, counters_uac_xml()).expect("write scenario");
     let port = free_port();
     let mut uas = Reaper(
-        Command::new(uas_bin)
+        tool_command(uas_bin)
             .current_dir(&dir)
             .args(["-sn", "uas", "-i", "127.0.0.1", "-p", &port.to_string()])
-            .args(["-m", "3", "-timeout", "30", "-nostdin"])
+            .args(["-m", "3", "-timeout", "30"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
@@ -6288,12 +6296,12 @@ fn run_counters_uac(
             .expect("spawn uas"),
     );
     std::thread::sleep(Duration::from_millis(400));
-    let mut uac = Command::new(uac_bin);
+    let mut uac = tool_command(uac_bin);
     uac.current_dir(&dir)
         .arg("-sf")
         .arg(&scenario)
         .args(["-i", "127.0.0.1", "-r", "10", "-m", "3", "-timeout", "20"])
-        .args(["-trace_stat", "-trace_screen", "-nostdin"]);
+        .args(["-trace_stat", "-trace_screen"]);
     // sipp's `-bg` forks and the parent exits at once (docs/TESTING.md):
     // real sipp runs in the foreground with its screen on a null stdout.
     if uac_bin == std::path::Path::new(env!("CARGO_BIN_EXE_sipr")) {
