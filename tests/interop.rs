@@ -5973,6 +5973,108 @@ fn variables_read_and_render_like_real_sipp() {
     );
 }
 
+// ---- -trace_counts _Lost columns --------------------------------------------
+
+/// A UAC whose first OPTIONS is always lost (`lost="100"`), which turns on
+/// SIPp's `_Lost` columns. Messages: 0 the lost OPTIONS, 1 a 200 that times
+/// out to `done`, 2 an OPTIONS that goes out.
+fn lost_counts_uac_xml() -> String {
+    format!(
+        r#"<scenario name="lost-counts">
+{first}  <recv response="200" timeout="200" ontimeout="done"/>
+  <label id="done"/>
+{second}</scenario>
+"#,
+        first = step_options("first", r#" lost="100""#),
+        second = step_options("second", ""),
+    )
+}
+
+/// Run `uac_bin` on [`lost_counts_uac_xml`] against a UDP sink with
+/// `-trace_counts`. Returns the exit code, the `X-Step`s the sink got, the
+/// counts header and its last row without the two time columns.
+fn run_lost_counts_uac(uac_bin: &std::path::Path) -> (Option<i32>, Vec<String>, String, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xml = dir.path().join("lost_counts.xml");
+    std::fs::write(&xml, lost_counts_uac_xml()).expect("write uac");
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind sink");
+    let target = sink.local_addr().expect("sink addr").to_string();
+    let mut uac = Reaper(
+        tool_command(uac_bin)
+            .current_dir(dir.path())
+            .args(["-sf", xml.to_str().expect("utf8")])
+            .args([
+                "-i",
+                "127.0.0.1",
+                "-m",
+                "1",
+                "-timeout",
+                "20",
+                "-trace_counts",
+            ])
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn_outside_probes()
+            .expect("spawn uac"),
+    );
+    let code = wait_with_timeout(&mut uac.0, Duration::from_secs(25));
+    sink.set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
+    let mut steps = Vec::new();
+    let mut buf = [0u8; 65_535];
+    while let Ok(n) = sink.recv(&mut buf) {
+        if let Some(step) = String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .find_map(|l| l.strip_prefix("X-Step:"))
+        {
+            steps.push(step.trim().to_owned());
+        }
+    }
+    let counts = std::fs::read_dir(dir.path())
+        .expect("readdir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_counts.csv"))
+        .map(|e| std::fs::read_to_string(e.path()).expect("read counts"))
+        .unwrap_or_default();
+    let header = counts.lines().next().unwrap_or_default().to_owned();
+    let last = counts
+        .lines()
+        .last()
+        .and_then(|row| row.splitn(3, ';').nth(2))
+        .unwrap_or_default()
+        .to_owned();
+    (code, steps, header, last)
+}
+
+/// With packet loss on (`-lost` or any `lost=`), SIPp counts each
+/// simulated loss on its message and gives every send and recv a `_Lost`
+/// column in `-trace_counts` (docs/SIPP_COMPAT.md §6).
+#[test]
+fn lost_messages_are_counted_like_real_sipp() {
+    let Some(sipp) = sipp_bin() else {
+        eprintln!("SKIPPED interop::lost_messages_are_counted_like_real_sipp — no sipp.");
+        return;
+    };
+    let theirs = run_lost_counts_uac(&sipp);
+    assert_eq!(
+        theirs,
+        (
+            Some(0),
+            vec!["second".to_owned()],
+            "CurrentTime;ElapsedTime;0_OPTIONS_Sent;0_OPTIONS_Retrans;0_OPTIONS_Lost;\
+             1_200_Recv;1_200_Retrans;1_200_Timeout;1_200_Unexp;1_200_Lost;\
+             2_OPTIONS_Sent;2_OPTIONS_Retrans;2_OPTIONS_Lost;"
+                .to_owned(),
+            "1;0;1;0;0;1;0;0;1;0;0;".to_owned()
+        ),
+        "real sipp"
+    );
+    let ours = run_lost_counts_uac(&PathBuf::from(env!("CARGO_BIN_EXE_sipr")));
+    assert_eq!(ours, theirs, "sipr counted differently than real sipp");
+}
+
 // ---- +N/-N keyword offsets --------------------------------------------------
 
 /// A UAC rendering SIPp's keyword offsets: kept on `[cseq]`, the ports and

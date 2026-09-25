@@ -21,6 +21,10 @@ pub struct StepStats {
     /// Times a pause step was entered (SIPp `sessions`, the
     /// `-trace_counts` `Pause_Sessions` column).
     pub sessions: u64,
+    /// Simulated losses (`-lost`/`lost=`) of this step's messages: its
+    /// send and retransmissions, or the message its recv matched (SIPp
+    /// `nb_lost`).
+    pub lost: u64,
 }
 
 /// One row of the scenario screen: a step label plus its counters.
@@ -182,6 +186,9 @@ pub struct Snapshot {
     pub call_length_rows: Vec<(String, u64)>,
     /// Per-step rows for the scenario screen.
     pub steps: Vec<StepRow>,
+    /// Packet loss is on (`-lost` or any `lost=`): the scenario screen
+    /// shows each step's losses, as SIPp's does.
+    pub lose_packets: bool,
     /// Which scenario every counter and row above belongs to.
     pub display: Display,
     /// `set hide true|false` (SIPp `do_hide`, default true): whether
@@ -249,6 +256,7 @@ impl crate::StatSet {
         snap.response_rows = self.response_repartition.rows();
         snap.call_length_rows = self.call_length_repartition.rows();
         snap.steps = self.step_rows();
+        snap.lose_packets = self.lose_packets;
         snap.counters = self
             .counters
             .iter()

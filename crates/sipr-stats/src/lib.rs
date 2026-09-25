@@ -109,6 +109,9 @@ pub struct StatSet {
     pub step_hidden: Vec<bool>,
     /// What each step is, for the `-trace_counts` columns.
     pub step_kinds: Vec<StepKind>,
+    /// Packet loss is on (SIPp `lose_packets`: `-lost`, or any message's
+    /// `lost=`): every send and recv gets a `_Lost` column.
+    pub lose_packets: bool,
     /// Delimiter, timestamp form and periodic-repartition switch of the
     /// statistics files.
     pub dump: DumpOptions,
@@ -278,6 +281,7 @@ impl StatSet {
             dead_call_msgs: 0,
             error_codes: Vec::new(),
             step_kinds: Vec::new(),
+            lose_packets: false,
             dump: DumpOptions::default(),
             start_time: SystemTime::now(),
             period_start_time: SystemTime::now(),
@@ -293,11 +297,12 @@ impl StatSet {
 
     /// Zero every counter (SIPp's `set reset`), keeping the scenario-shaped
     /// data: step labels, kinds and hide flags, RTD and counter names, dump
-    /// options.
+    /// options, and whether packet loss is on.
     pub fn reset(&mut self) {
         let labels = std::mem::take(&mut self.step_labels);
         let hidden = std::mem::take(&mut self.step_hidden);
         let kinds = std::mem::take(&mut self.step_kinds);
+        let lose_packets = self.lose_packets;
         let rtd_names = std::mem::take(&mut self.rtd_names);
         let counters = std::mem::take(&mut self.counters);
         let step_counters = std::mem::take(&mut self.step_counters);
@@ -308,6 +313,7 @@ impl StatSet {
         self.init_steps(labels);
         self.step_hidden = hidden;
         self.step_kinds = kinds;
+        self.lose_packets = lose_packets;
         self.rtd_names = rtd_names;
         self.counters = counters
             .into_iter()
@@ -719,8 +725,9 @@ impl StatSet {
     /// The `-trace_counts` header (SIPp `print_count_file(header)`): time,
     /// elapsed, then per visible message `<index>_<name>_Sent`/`_Retrans`
     /// (+ `_Timeout` when the send has `retrans=`) for sends,
-    /// `_Recv`/`_Retrans`/`_Timeout`/`_Unexp` for recvs and
-    /// `<index>_Pause_Sessions`/`_Unexp` for everything else.
+    /// `_Recv`/`_Retrans`/`_Timeout`/`_Unexp` for recvs, each + `_Lost`
+    /// while packet loss is on, and `<index>_Pause_Sessions`/`_Unexp` for
+    /// everything else.
     #[must_use]
     pub fn counts_header(&self) -> String {
         let d = self.dump.delimiter.as_str();
@@ -732,12 +739,18 @@ impl StatSet {
                     if *retrans {
                         let _ = write!(out, "{i}_{name}_Timeout{d}");
                     }
+                    if self.lose_packets {
+                        let _ = write!(out, "{i}_{name}_Lost{d}");
+                    }
                 }
                 StepKind::Recv { name } => {
                     let _ = write!(
                         out,
                         "{i}_{name}_Recv{d}{i}_{name}_Retrans{d}{i}_{name}_Timeout{d}{i}_{name}_Unexp{d}"
                     );
+                    if self.lose_packets {
+                        let _ = write!(out, "{i}_{name}_Lost{d}");
+                    }
                 }
                 StepKind::Pause => {
                     let _ = write!(out, "{i}_Pause_Sessions{d}{i}_Pause_Unexp{d}");
@@ -766,6 +779,9 @@ impl StatSet {
                     if *retrans {
                         let _ = write!(out, "{}{d}", st.timeouts);
                     }
+                    if self.lose_packets {
+                        let _ = write!(out, "{}{d}", st.lost);
+                    }
                 }
                 StepKind::Recv { .. } => {
                     let _ = write!(
@@ -773,6 +789,9 @@ impl StatSet {
                         "{}{d}{}{d}{}{d}{}{d}",
                         st.recv, st.retrans, st.timeouts, st.unexpected
                     );
+                    if self.lose_packets {
+                        let _ = write!(out, "{}{d}", st.lost);
+                    }
                 }
                 StepKind::Pause => {
                     let _ = write!(out, "{}{d}{}{d}", st.sessions, st.unexpected);
@@ -1515,6 +1534,32 @@ mod tests {
         let row = s.counts_row();
         assert!(row.ends_with(";3;1;0;2;0;0;1;3;0;0;0;0;1;0;0;\n"), "{row}");
         assert_eq!(row.split(';').count(), s.counts_header().split(';').count());
+    }
+
+    #[test]
+    fn packet_loss_adds_a_lost_column_to_sends_and_recvs() {
+        let mut s = StatSet::new(&[], &[]);
+        s.init_steps((0..3).map(|i| format!("s{i}")).collect());
+        s.set_step_kinds(vec![
+            StepKind::Send {
+                name: "INVITE".into(),
+                retrans: true,
+            },
+            StepKind::Recv { name: "200".into() },
+            StepKind::Pause,
+        ]);
+        s.lose_packets = true;
+        assert_eq!(
+            s.counts_header(),
+            "CurrentTime;ElapsedTime;0_INVITE_Sent;0_INVITE_Retrans;0_INVITE_Timeout;\
+             0_INVITE_Lost;1_200_Recv;1_200_Retrans;1_200_Timeout;1_200_Unexp;1_200_Lost;\
+             2_Pause_Sessions;2_Pause_Unexp;\n"
+        );
+        s.steps[0].lost = 2;
+        s.steps[1].lost = 1;
+        assert!(s.counts_row().ends_with(";0;0;0;2;0;0;0;0;1;0;0;\n"));
+        s.reset();
+        assert!(s.lose_packets, "the loss switch is configuration");
     }
 
     #[test]

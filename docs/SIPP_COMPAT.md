@@ -1493,9 +1493,16 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   and `Unexp` counts the unexpected messages that arrived while the call
   waited there (at a recvCmd, say). Confirmed against real sipp. sipr
   used to write nothing for a nop and SIPp's dead `SendCmd` and
-  `RecvCmd` columns for the 3PCC commands. **Open:** SIPp adds a
-  `_Lost` column to every send and recv once packet loss is on (`-lost`
-  or any `lost=`); sipr writes none (`docs/FOLLOWUPS.md` 13). `-trace_error_codes` writes
+  `RecvCmd` columns for the 3PCC commands. Once packet loss is on
+  (`-lost`, or any message's `lost=`: SIPp's `lose_packets`), every send
+  and recv gets a `<index>_<name>_Lost` column after its others, counting
+  its simulated losses: the send and its retransmissions, or the message
+  the recv matched (confirmed against real sipp, the
+  `lost_messages_are_counted_like_real_sipp` interop test). The scenario
+  screen gets a `lost` column too. sipr counted no losses and wrote no
+  `_Lost` column. **Open:** SIPp also rolls the loss on a retransmission
+  it receives of the message a recv matched (`call.cpp` ~l.4668), and
+  sipr applies no loss to incoming retransmissions. `-trace_error_codes` writes
   `<scenario>_<pid>_error_codes.csv`: per dump the time, the elapsed
   time and the status codes of the responses that failed a call as
   unexpected since the last dump, comma-terminated, newest first (SIPp

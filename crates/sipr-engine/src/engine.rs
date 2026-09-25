@@ -2029,7 +2029,13 @@ impl<'s> Engine<'s> {
         if let Some(f) = trace_err.as_mut() {
             f.write(sipr_stats::ERROR_LOG_HEADER);
         }
-        let mut stat_set = new_stat_set(scenario);
+        // SIPp `lose_packets`: `-lost`, or any message's `lost=`, in any
+        // scenario of the run.
+        let lose_packets = config.lost.is_some()
+            || std::iter::once(scenario)
+                .chain(secondary.map(|(_, sc)| sc))
+                .any(scenario_loses_packets);
+        let mut stat_set = new_stat_set(scenario, lose_packets);
         stat_set.dump = sipr_stats::DumpOptions {
             delimiter: config.stat_delimiter.clone(),
             rfc3339: config.rfc3339,
@@ -2053,7 +2059,7 @@ impl<'s> Engine<'s> {
         let secondary = secondary.map(|(kind, sc)| SecondaryScenario {
             kind,
             scenario: sc,
-            stats: new_stat_set(sc),
+            stats: new_stat_set(sc, lose_packets),
             expected_cseq_method: precompute_cseq_methods(sc),
         });
         // Load -inf injection files up front (fail fast on bad files). SIPp
@@ -3222,20 +3228,24 @@ impl<'s> Engine<'s> {
                     // SIPp `send_raw`: a send that fails ends the call
                     // (E_FAILED_CANNOT_SEND_MSG); a dead connection is then
                     // reset for the calls that follow (-max_reconnect).
-                    // Simulated drops still count as "sent".
-                    if let Err(e) = self.send_for_call(
+                    // Simulated drops still count as "sent", and as lost.
+                    let went_out = match self.send_for_call(
                         call_id,
                         &buf,
                         remote,
                         send.lost_pct.or(self.config.lost),
                     ) {
-                        self.after_send_failure(call_id, &e);
-                        return;
-                    }
+                        Ok(went_out) => went_out,
+                        Err(e) => {
+                            self.after_send_failure(call_id, &e);
+                            return;
+                        }
+                    };
                     let stats = self.call_stats(call_id);
                     stats.messages_sent += 1;
                     if let Some(s) = stats.step_mut(index) {
                         s.sent += 1;
+                        s.lost += u64::from(!went_out);
                     }
                     self.trace_send(&buf, remote);
                     let retrans_ms = send.retrans_ms;
@@ -3782,6 +3792,9 @@ impl<'s> Engine<'s> {
                 if let Some(p) = lost
                     && self.rng.chance_pct(p)
                 {
+                    if let Some(s) = self.stats_of(secondary).step_mut(si) {
+                        s.lost += 1;
+                    }
                     let transport = self.transport_token;
                     self.call_debug(
                         &call_id,
@@ -5831,9 +5844,17 @@ impl<'s> Engine<'s> {
         let Some(remote) = self.calls.get(call_id).map(|c| c.remote) else {
             return;
         };
-        if let Err(e) = self.send_for_call(call_id, &buf, remote, lost) {
-            self.after_send_failure(call_id, &e);
-            return;
+        match self.send_for_call(call_id, &buf, remote, lost) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Some(s) = self.call_stats(call_id).step_mut(step) {
+                    s.lost += 1;
+                }
+            }
+            Err(e) => {
+                self.after_send_failure(call_id, &e);
+                return;
+            }
         }
         self.call_stats(call_id).retrans_sent += 1;
         self.trace_send(&buf, remote);
@@ -6449,12 +6470,24 @@ fn new_call(
     }
 }
 
-/// A scenario's own stat set: repartitions and per-step counters/labels.
-fn new_stat_set(scenario: &Scenario) -> sipr_stats::StatSet {
+/// Whether a scenario's `lost=` turns SIPp's simulated loss on.
+fn scenario_loses_packets(scenario: &Scenario) -> bool {
+    scenario.steps.iter().any(|step| match step {
+        Step::Send(s) => s.lost_pct.is_some(),
+        Step::Recv(r) => r.lost_pct.is_some(),
+        _ => false,
+    })
+}
+
+/// A scenario's own stat set: repartitions and per-step counters/labels,
+/// and whether the run's packet loss gives its sends and recvs `_Lost`
+/// columns.
+fn new_stat_set(scenario: &Scenario, lose_packets: bool) -> sipr_stats::StatSet {
     let mut stats = sipr_stats::StatSet::new(
         &scenario.response_time_repartition,
         &scenario.call_length_repartition,
     );
+    stats.lose_packets = lose_packets;
     stats.init_steps(scenario.steps.iter().map(step_label).collect());
     stats.set_rtd_names(rtd_names(scenario));
     stats.set_step_kinds(scenario.steps.iter().map(step_kind).collect());

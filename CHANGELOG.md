@@ -157,6 +157,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- With packet loss on (`-lost`, or any `lost=`), each simulated loss
+  counts on its step, and `-trace_counts` gives every send and recv
+  SIPp's `_Lost` column. The scenario screen shows a `lost` column. sipr
+  dropped the messages but counted nothing, so its counts header was
+  shorter than sipp's.
 - The `+N`/`-N` keyword offsets SIPp documents work: `[cseq+1]`,
   `[len+3]`, `[remote_port+3]` and `[local_port-1]` add theirs. An offset
   on a keyword SIPp ignores it on, such as `[call_number+1]`, renders the

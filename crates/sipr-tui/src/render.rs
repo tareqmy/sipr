@@ -228,10 +228,18 @@ fn render_scenario(snap: &Snapshot, pal: &Palette) -> Vec<String> {
         None => "scenario".to_owned(),
     };
     let mut out = vec![title_line(snap, &screen, pal), String::new()];
+    // SIPp adds a Lost column while packet loss is on; the counts narrow
+    // by one each to keep the row within the screen.
+    let (wide, narrow) = if snap.lose_packets { (8, 7) } else { (9, 8) };
+    let lost_header = if snap.lose_packets {
+        format!(" {:>6}", "lost")
+    } else {
+        String::new()
+    };
     out.push(pal.paint(
         pal.label,
         &format!(
-            "  {:>3}  {:<22} {:>9} {:>9} {:>8} {:>8} {:>8}",
+            "  {:>3}  {:<22} {:>wide$} {:>wide$} {:>narrow$} {:>narrow$} {:>narrow$}{lost_header}",
             "#", "step", "sent", "recv", "retrans", "timeout", "unexp"
         ),
     ));
@@ -241,8 +249,13 @@ fn render_scenario(snap: &Snapshot, pal: &Palette) -> Vec<String> {
             continue; // SIPp: `hide="true"` rows stay off while `set hide true`
         }
         let s = &row.stats;
+        let lost = if snap.lose_packets {
+            format!(" {:>6}", s.lost)
+        } else {
+            String::new()
+        };
         out.push(format!(
-            "  {i:>3}  {:<22} {:>9} {:>9} {:>8} {:>8} {:>8}",
+            "  {i:>3}  {:<22} {:>wide$} {:>wide$} {:>narrow$} {:>narrow$} {:>narrow$}{lost}",
             truncate(&row.label, 22),
             s.sent,
             s.recv,
@@ -390,6 +403,25 @@ mod tests {
         let invite = lines.iter().find(|l| l.contains("send INVITE")).unwrap();
         assert!(invite.contains("1000"), "{invite}");
         assert!(invite.contains('5'), "{invite}");
+    }
+
+    #[test]
+    fn packet_loss_adds_a_lost_column_within_the_width() {
+        let quiet = render(&snap(), Screen::Scenario).join("\n");
+        assert!(!quiet.contains("lost"), "{quiet}");
+        let mut s = snap();
+        s.lose_packets = true;
+        s.steps[0].stats.lost = 42;
+        let lines = render(&s, Screen::Scenario);
+        assert!(lines.iter().any(|l| l.contains("lost")), "{lines:#?}");
+        let invite = lines.iter().find(|l| l.contains("send INVITE")).unwrap();
+        assert!(invite.trim_end().ends_with(" 42"), "{invite}");
+        for line in lines
+            .iter()
+            .filter(|l| l.contains("send ") || l.contains("recv "))
+        {
+            assert!(line.chars().count() <= WIDTH, "{line:?}");
+        }
     }
 
     #[test]
