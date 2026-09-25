@@ -9207,10 +9207,21 @@ impl RawUac {
 
     /// Every response that arrives within `limit`.
     fn responses(&self, limit: Duration) -> Vec<String> {
+        self.responses_until(usize::MAX, limit)
+    }
+
+    /// The responses that arrive until there are `count` of them, then any
+    /// more within a short grace, or all that come within `limit`. A slow
+    /// host delays the answers, never the count.
+    fn responses_until(&self, count: usize, limit: Duration) -> Vec<String> {
         let mut out = Vec::new();
         let mut buf = [0u8; 65_535];
         let start = std::time::Instant::now();
+        let mut limit = limit;
         while let Some(left) = limit.checked_sub(start.elapsed()) {
+            if out.len() >= count {
+                limit = limit.min(start.elapsed() + Duration::from_millis(200));
+            }
             self.sock
                 .set_read_timeout(Some(left.max(Duration::from_millis(1))))
                 .expect("timeout");
@@ -9296,7 +9307,7 @@ fn a_copy_gets_the_send_that_answered_it() {
   <recv request="INVITE"/>
 {ringing}{ok}  <recv request="ACK"/>
   <recv request="BYE"/>
-{bye_ok}  <timewait milliseconds="300"/>
+{bye_ok}  <timewait milliseconds="500"/>
 </scenario>
 "#,
         ringing = answer("180 Ringing", ";tag=[pid]SIPpTag01[call_number]"),
@@ -9305,13 +9316,14 @@ fn a_copy_gets_the_send_that_answered_it() {
     );
     let (mut uas, addr) = spawn_counting_uas(dir.path(), &xml);
     let uac = RawUac::new(addr);
+    let wait = Duration::from_secs(3);
     uac.send("INVITE", 1);
-    let first = uac.responses(Duration::from_millis(400));
+    let first = uac.responses_until(2, wait);
     uac.send("INVITE", 1);
-    let copy = uac.responses(Duration::from_millis(400));
+    let copy = uac.responses_until(1, wait);
     uac.send("ACK", 1);
     uac.send("BYE", 2);
-    let bye = uac.responses(Duration::from_millis(400));
+    let bye = uac.responses_until(1, wait);
     let code = wait_exit(&mut uas, Duration::from_secs(8));
     assert_eq!(first, ["180 INVITE", "200 INVITE"]);
     assert_eq!(copy, ["180 INVITE"], "the send that answered the INVITE");
@@ -9327,7 +9339,8 @@ fn a_copy_gets_the_send_that_answered_it() {
 /// A recv's `lost=` is rolled on each copy of its message once a send
 /// answered it, as SIPp does: a lost copy counts on the recv's `_Lost`
 /// column and gets nothing back; the others count on `_Retrans` and get
-/// the answer again.
+/// the answer again. The test counts over the whole call, so a slow host
+/// that delays a 200 until after the next BYE changes nothing.
 #[test]
 fn a_copy_of_an_answered_message_can_be_lost() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -9355,31 +9368,34 @@ fn a_copy_of_an_answered_message_can_be_lost() {
     Content-Length: 0
 
   ]]></send>
-  <timewait milliseconds="2000"/>
+  <timewait milliseconds="4000"/>
 </scenario>
 "#;
     let (mut uas, addr) = spawn_counting_uas(dir.path(), xml);
     let uac = RawUac::new(addr);
     uac.send("INVITE", 1);
-    assert_eq!(uac.responses(Duration::from_millis(300)), ["200 INVITE"]);
+    assert_eq!(
+        uac.responses_until(1, Duration::from_secs(3)),
+        ["200 INVITE"]
+    );
     uac.send("ACK", 1);
-    // The BYE itself may be lost too: resend it until the 200 comes.
-    let mut tries = 0u64;
-    loop {
-        tries += 1;
+    // The BYE itself may be lost too: resend it until a 200 comes.
+    let mut sent = 0u64;
+    let mut oks = 0u64;
+    while oks == 0 {
+        sent += 1;
         uac.send("BYE", 2);
-        if !uac.responses(Duration::from_millis(100)).is_empty() {
-            break;
-        }
-        assert!(tries < 40, "the BYE never got its 200");
+        oks += uac.responses(Duration::from_millis(100)).len() as u64;
+        assert!(sent < 40, "the BYE never got its 200");
     }
     const COPIES: u64 = 20;
     for _ in 0..COPIES {
+        sent += 1;
         uac.send("BYE", 2);
         std::thread::sleep(Duration::from_millis(20));
     }
-    let answered = uac.responses(Duration::from_millis(300)).len() as u64;
-    let code = wait_exit(&mut uas, Duration::from_secs(8));
+    oks += uac.responses(Duration::from_secs(1)).len() as u64;
+    let code = wait_exit(&mut uas, Duration::from_secs(10));
     assert_eq!(code, Some(0));
     // Columns: 0 INVITE (0-4), 1 200 (5-7), 2 ACK (8-12), 3 BYE (13-17),
     // 4 200 (18-20), 5 timewait (21-22). Loss is on, so every send and
@@ -9392,10 +9408,15 @@ fn a_copy_of_an_answered_message_can_be_lost() {
         .collect();
     let (bye_recv, bye_retrans, bye_lost) = (n[13], n[14], n[17]);
     let ok_retrans = n[19];
+    // One BYE matched; every other one sent is a lost match attempt, a
+    // lost copy, or a copy answered with the 200 again.
     assert_eq!(bye_recv, 1, "{row}");
-    assert_eq!(bye_retrans, answered, "{row}");
-    assert_eq!(ok_retrans, answered, "{row}");
-    assert_eq!(bye_lost, tries - 1 + COPIES - answered, "{row}");
-    // Half of 20 copies are lost on average; all or none is 2^-20.
-    assert!(answered > 0 && answered < COPIES, "{answered} of {COPIES}");
+    assert_eq!(bye_retrans, oks - 1, "{row}");
+    assert_eq!(ok_retrans, bye_retrans, "{row}");
+    assert_eq!(bye_lost, sent - 1 - bye_retrans, "{row}");
+    // Half of the 20 copies are lost on average; all or none is 2^-19.
+    assert!(
+        bye_retrans > 0 && bye_lost > sent - 1 - COPIES,
+        "{bye_retrans} answered, {bye_lost} lost of {sent}"
+    );
 }
