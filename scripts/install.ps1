@@ -1,7 +1,7 @@
 # sipr installer for Windows
 # Supported platforms: Windows (x86_64)
 # Usage: irm https://raw.githubusercontent.com/tareqmy/sipr/master/scripts/install.ps1 | iex
-#   $env:VERSION = "v0.27.1"   install a specific release instead of the latest
+#   $env:VERSION = "v0.28.0"   install a specific release instead of the latest
 #   $env:GITHUB_TOKEN = "..."  authenticate GitHub requests
 
 $ErrorActionPreference = "Stop"
