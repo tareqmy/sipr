@@ -671,8 +671,9 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   advertised — the allocated `[rtpstream_*_port]` when used, else the
   `[media_port]` form on that `m=` line; (2) DTMF sequence numbers are
   consecutive (SIPp's warm-up increments two counters and skips every
-  other number); (3) the SIPp sender's post-send recv+memcmp ("RTP check")
-  and the `-audiotolerance` verdict/exit −3 are not implemented; (4) the
+  other number); (3) the sender's post-send RTP check and the
+  `-audiotolerance` verdict are M18's (the RTP echo note below): sipr
+  judges a stream only when a tolerance flag was given; (4) the
   packet grid is per stream (`start + n*interval`), not SIPp's global
   wall-clock grid that fires every stream in the same millisecond; (5)
   `-rtp_threadtasks` is not needed (one scheduler thread) and not accepted.
