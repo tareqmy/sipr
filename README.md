@@ -169,6 +169,8 @@ Everything below is rendered as a site at
 [tareqmy.github.io/sipr](https://tareqmy.github.io/sipr/).
 
 - `PLAN.md` — architecture and roadmap
+- `docs/LIBRARY_API.md` — `sipr-engine` as a library in your own Rust test
+  harness: scenario in, statistics out, no CLI, no TUI
 - `docs/` — installation, architecture, SIPp compatibility surface,
   conventions, testing, releasing, glossary, milestones
 - `AGENTS.md` / `CLAUDE.md` — instructions for AI agents contributing to the repo

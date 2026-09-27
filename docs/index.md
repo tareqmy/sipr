@@ -74,6 +74,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`,
   behavior notes learned from SIPp's source.
 - **[Runtime control](CONTROL_API.md)**: SIPp's UDP control socket and
   sipr's HTTP/JSON API for driving a run from outside.
+- **[Library API](LIBRARY_API.md)**: `sipr-engine` inside your own Rust
+  test harness — scenario in, statistics out, no CLI, no TUI.
 - **[Glossary](GLOSSARY.md)**: transactions, dialogs, calls, RTDs,
   repartitions, 3PCC.
 - **[Architecture](ARCHITECTURE.md)**, **[Testing](TESTING.md)** and

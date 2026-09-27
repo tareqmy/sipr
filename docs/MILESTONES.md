@@ -2023,7 +2023,7 @@ entry. Also found: sipp names the `-trace_screen` file
 `<scenario>_<pid>_screen.log` (its `screen` log-file entry), not the
 `_screens.log` its help text gives and sipr copied — fixed separately.
 
-### M49 — Library API: `sipr-engine` embedded in a Rust test harness
+### M49 — Library API: `sipr-engine` embedded in a Rust test harness ✅
 
 Scenario in, stats out, no CLI, no TUI. The design is
 `docs/LIBRARY_API.md` (decisions D1–D8; the numbers below refer to
@@ -2063,13 +2063,22 @@ The steps are ordered as §6 of the design says; each is one commit.
 - [x] D5 `InjectionSource::{Path, Text}` replaces the `inf_files` and
       `rx_inf_files` path lists (now `inf` and `rxinf`); a test feeds
       `[fieldN]` from a string, and from a file, through the library.
-- [ ] D7 `sipr_scenario::compile_strict` (the `--check` policy as a
-      function, used by the binary); the render family `#[doc(hidden)]`;
-      crate-level rustdoc listing the supported surface; a compiled
-      `examples/embed.rs`; `docs/LIBRARY_API.md` rewritten from design to
-      reference, D8's stability promise in it and in CHANGELOG.
-- [ ] Docs: ARCHITECTURE §1 (the binary is one embedder; the notice sink
-      and the stdin watcher's new home), CHANGELOG.
+- [x] D7 `sipr_scenario::compile_strict` (the `--check` policy as a
+      function; the binary keeps `compile_with`, since its `--check`
+      also prints the compiled steps); the render family and the
+      `run_with_*` entry points `#[doc(hidden)]`; crate-level rustdoc
+      listing the supported surface; `examples/embed.rs`, built by
+      `cargo test` and clippy, run by hand; `docs/LIBRARY_API.md`
+      rewritten from design to reference, D8's stability promise in it
+      and in CHANGELOG.
+- [x] Docs: ARCHITECTURE §1 (the binary is one embedder; the notice sink
+      and the stdin watcher's new home) and §5 (threads end with their
+      owners), README and the book's landing page link the reference,
+      CHANGELOG.
+
+Found on the way, each fixed in its own commit: every listener thread
+held its port until process exit (`fix(net)`, before D2), and two
+engines in one process reused Call-IDs (`fix(engine)`, before D5).
 
 ### M50+ — further additions (after M49)
 

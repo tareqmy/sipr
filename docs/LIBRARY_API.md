@@ -1,316 +1,254 @@
-# Library API — design note for M49
+# Library API — `sipr-engine` in your own harness
 
-Status: **draft, 2026-09-27**. This is the design for the first item of the
-M49+ backlog in `docs/MILESTONES.md`: `sipr-engine` embedded in another Rust
-test harness — scenario in, stats out, no CLI, no TUI. Nothing here is
-implemented yet; the acceptance criteria live in the M49 section of
-`docs/MILESTONES.md` and point back at the numbered decisions below.
+sipr's engine is a library. The `sipr` binary is one program that uses it;
+a Rust integration test that owns a SIP server under test is another:
+scenario in, statistics out, no CLI, no TUI, nothing on the process's
+stdin, stdout or stderr. This page is the reference for that use. The
+history of how the surface got this shape is at the end.
 
-## 1. Who this is for
+## 1. In one page
 
-A Rust integration test (or a CI harness) that owns a SIP server under test
-and wants to drive it with SIPp scenarios from inside `cargo test`:
-
-- start a UAS scenario in-process on a free port, point the server at it;
-- run a UAC scenario against the server at a rate, for N calls;
-- stop it early from the test, or let it run to `-m`;
-- read the counters and the per-step statistics as Rust values, not by
-  scraping `-trace_stat` or the screen;
-- see every warning the engine would have printed, as values;
-- never touch stdin, stdout or stderr of the test process.
-
-Everything the binary can do today stays reachable — the binary becomes the
-first embedder — but this note is about the surface that embedders program
-against, and what has to change so that surface can be promised.
-
-## 2. What exists today (v0.28.0)
-
-The engine's public entry point is one blocking function, and the binary is
-its only real client:
-
-```text
-run_scenarios(&Scenario, Option<(SecondaryKind, &Scenario)>, &EngineConfig,
-              Option<UiChannels>) -> Result<(RunReport, EngineControl), EngineError>
+```toml
+[dev-dependencies]
+sipr-engine = "0.29"
+sipr-scenario = "0.29"
 ```
 
-with `run`, `run_with_control` and `run_with_ui` as thinner wrappers. A
-scenario comes from `sipr_scenario::compile_with`, which returns the
-`Scenario` plus a `Vec<Diagnostic>`. Measured against §1, the gaps are:
-
-1. **`EngineConfig` is 90 public fields, no `Default`, no constructor.** It
-   is "distilled from the CLI": every field documents a SIPp flag and the
-   defaults live in the clap definitions in `src/cli.rs`. An embedder has
-   to fill all 90 (the engine's own `ui_bridge` test does exactly that),
-   and every new flag breaks every embedder at compile time.
-2. **Control arrives too late.** `EngineControl` is returned *with* the
-   report, after the run has finished; the binary never even binds it. The
-   only in-flight control is `UiChannels::keys`, a `Receiver<char>` fed the
-   TUI's key letters (`q`, `Q`, `p`, `+`, `-`, `*`, `/`). The soft-stop
-   flag (`stop_pacer`) is private. A test that wants "run until my server
-   has seen 10 REGISTERs, then stop" has no clean way to say so.
-3. **The engine talks to the terminal.** 37 `eprintln!` sites in
-   `engine.rs` (the control-socket banner, "warning:" lines, socket
-   errors), plus a stdin watcher thread spawned unless `nostdin` is set.
-   A library must not own the process's stdio.
-4. **`EngineError` is a `String` newtype** with `Display` only — it does
-   not implement `std::error::Error`, so `?` into `anyhow`/`Box<dyn Error>`
-   does not work, and there is nothing to match on.
-5. **Input is paths.** Injection files (`inf_files`, `rx_inf_files`) are
-   read with `std::fs::read_to_string` inside the engine; log and trace
-   destinations are paths too. A test wants to hand over a few CSV lines
-   from a string.
-6. **Stats out is adequate but tied to the UI.** Periodic
-   `sipr_stats::Snapshot`s (`Clone`, `Default`, public fields, the same
-   shape `/stats` serialises) only flow when a `UiChannels` is attached,
-   over an `mpsc::Sender` the engine drops when it exits. `RunReport`
-   carries the final counters and a boxed final `Snapshot`. This part
-   mostly needs promising, not redesigning.
-7. **The public surface is what the binary and the bench happened to
-   need.** `RenderCtx`, `VarCtx`, `DynamicId`, `FieldSource`, `RunInfo`
-   and `render` are `pub` for `benches/hot_path.rs` alone; `PeerTable`,
-   `SocketOpts`, `TlsConfig`, `TlsVersion` are re-exported from `sipr-net`
-   for the binary. None of that is API an embedder should build on, and
-   today nothing says which items are.
-
-None of this is a defect in the binary; it is the shape of a crate that
-has had one caller. The decisions below change the shape without changing
-what the binary does — the `cli` and `e2e` test suites are the regression
-net for that.
-
-## 3. Decisions
-
-### D1. `EngineConfig`: `Default` with SIPp's defaults, `#[non_exhaustive]`, fields stay public
-
 ```rust
-let mut cfg = EngineConfig::uac(target);   // or EngineConfig::uas()
-cfg.rate = 5.0;
-cfg.max_calls = Some(20);
-```
+use std::time::Duration;
+use sipr_engine::{EngineConfig, Run, run};
+use sipr_scenario::{CompileOptions, compile_strict};
 
-- `impl Default for EngineConfig` carries **SIPp's defaults** (rate 10,
-  `-rp` 1000 ms, `-d` 0, `-max_socket` 50000, `-base_cseq` 1, media port
-  6000, and so on). The clap definitions in `src/cli.rs` stop being the
-  source of truth for those numbers: the CLI builds `EngineConfig::default()`
-  and overwrites what the user passed. One place, one number.
-- `#[non_exhaustive]` forbids struct-literal construction outside the
-  crate, so adding a field is no longer a breaking change, while the
-  fields stay `pub` for reading and assignment. No 90-method builder: a
-  builder would double the surface for nothing, and `cfg.field = value`
-  is already the most readable form.
-- Two constructors, `uac(target: SocketAddr)` and `uas()`, because the
-  role decides the one field with no sensible default (`target`) and
-  reads better at the call site than `Default` plus an assignment.
-- Parity test: `Cli::parse_from(["sipr", "-sn", "uac", "127.0.0.1"])`
-  converted to a config must equal `EngineConfig::uac(...)` field for
-  field. That test is what keeps the CLI and the library defaults from
-  drifting apart, and it fails the moment someone adds a flag default in
-  only one place.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Compile: any diagnostic, warnings included, is an error here.
+    let uas = compile_strict("uas", sipr_scenario::embedded("uas").ok_or("no uas")?,
+                             &CompileOptions::default())
+        .map_err(|diagnostics| format!("{diagnostics:?}"))?;
 
-### D2. A run handle: start now, control while running, wait for the report
+    // 2. Configure: SIPp's defaults, then the fields you want otherwise.
+    let mut cfg = EngineConfig::uas();
+    cfg.local_ip = Some("127.0.0.1".parse()?);
+    cfg.port = Some(0);                        // any free port
+    cfg.control_port = Some(0);                // no SIPp control socket
 
-```rust
-let run = Run::start(&scenario, cfg)?;          // spawns the engine thread
-let ctl = run.control();                        // EngineControl, cloneable
-ctl.set_rate(20.0);
-ctl.pause(); ctl.resume();
-ctl.stop();                                     // soft: stop the pacer, drain
-ctl.abort();                                    // hard: drop everything
-for snap in run.snapshots() { ... }             // Receiver<Snapshot>, ~1/s
-let report: RunReport = run.wait()?;            // joins the thread
-```
+    // 3. Run: the engine gets its own thread; start returns once bound.
+    let server = Run::start(uas, cfg)?;
+    let listening_on = server.local_addr();    // where the UAS answers
 
-- The engine already runs on one thread and already owns a control
-  channel (`ControlRequest`, fed by the UDP and HTTP front ends). `Run`
-  is that thread with a name: `start` moves the compiled scenario and the
-  config in (the thread cannot borrow them — `run_scenarios` today borrows
-  because the caller blocks), spawns, and hands back the handle.
-- `EngineControl` grows `pause`, `resume`, `stop` and `abort`, wired to
-  the same paths the `p`/`q`/`Q` keys take today (`stop_pacer`,
-  `hard_quit`). The key-letter channel stays for the TUI; the control
-  socket's `ControlRequest` path is untouched.
-- `run()` stays as the blocking convenience: `Run::start(..)?.wait()`.
-  The binary keeps calling the blocking form; only its TUI branch changes
-  to `snapshots()` instead of building `UiChannels` by hand.
-- Secondary scenarios (`-oocsf`, `-rxsf`) are a field of the request, not
-  a second entry point: `Run::start_with(main, Some((kind, second)), cfg)`.
-  `run_scenarios`, `run_with_control` and `run_with_ui` become
-  `#[doc(hidden)]` wrappers for one minor release, then go.
-- Dropping a `Run` without `wait` aborts the run (hard quit, thread
-  joined), so a panicking test does not leave a UAS bound to a port.
+    // ... point the system under test at `listening_on`, exercise it ...
 
-### D3. Notices instead of `eprintln!`
-
-```rust
-pub enum Notice { Info(String), Warning(String), Error(String) }
-pub enum NoticeSink { Stderr, Channel(Sender<Notice>), Discard }
-cfg.notices = NoticeSink::Channel(tx);
-```
-
-- Every `eprintln!` in `sipr-engine` becomes `self.notify(Notice::..)`.
-  The sink defaults to `Stderr` with today's exact `sipr: ...` wording,
-  so the binary's output is byte-identical (the `cli` tests check it).
-- `Discard` exists so a test can opt out explicitly; silence is never the
-  default, per the "never silently ignore" rule.
-- The stdin watcher moves out of the engine into the binary: it is a
-  `Receiver<char>` producer like the TUI, and the binary attaches it when
-  `-nostdin` is absent. `EngineConfig::nostdin` goes away (the CLI flag
-  stays; it now decides whether the binary attaches the watcher).
-- Enforced, not reviewed: `sipr-engine/src/lib.rs` gets
-  `#![deny(clippy::print_stderr, clippy::print_stdout)]`, so the crate
-  cannot grow a new print site.
-
-### D4. `EngineError` becomes an enum that implements `std::error::Error`
-
-```rust
-#[non_exhaustive]
-pub enum EngineError {
-    Config(String),      // bad or contradictory configuration
-    Scenario(String),    // the scenario needs something the config lacks
-    Bind(io::Error),     // a socket could not be bound or connected
-    Io { path: PathBuf, source: io::Error },  // injection/log/trace files
-    Fatal(String),       // the run was cut short (SIPp's ERROR, exit 255)
+    // 4. End it and read the report.
+    server.control().stop();                   // SIPp's q: drain, then stop
+    let report = server.wait()?;
+    assert_eq!(report.exit_code(), 0, "{}", report.summary());
+    Ok(())
 }
 ```
 
-- `Display` keeps every current wording (several are SIPp's own and the
-  interop tests match on them), so this is a type change, not a message
-  change.
-- `thiserror` per `docs/CONVENTIONS.md`, `#[non_exhaustive]` so variants
-  can be added.
+`crates/sipr-engine/examples/embed.rs` is the full version, with a UAC in
+the same process placing calls at that UAS and the engine's notices read
+as values:
 
-### D5. Injection data from memory
-
-```rust
-pub enum InjectionSource { Path(PathBuf), Text { name: String, csv: String } }
-cfg.injection = vec![InjectionSource::Text { name: "users.csv".into(), csv }];
+```sh
+cargo run -p sipr-engine --example embed
 ```
 
-- Replaces `inf_files: Vec<PathBuf>` and `rx_inf_files: Vec<PathBuf>`
-  with one ordered list plus the `rx` marker where it matters (the
-  first `-inf` file is still what a bare `[fieldN]` means). The engine
-  already parses through `InjectionFile::parse(name, text)`; `Path` just
-  reads the file first, exactly as now. `-infindex` keeps matching by
-  basename, which for `Text` is the given `name`.
-- Log and trace destinations stay paths. A test that wants
-  `-trace_msg` can point it at a `tempfile`; making every log a
-  `Box<dyn Write>` would touch the rotation code for no embedder need
-  yet (YAGNI).
+## 2. Compile
 
-### D6. Stats out: promise what is there
+A scenario is SIPp XML, compiled by `sipr-scenario`:
 
-- `Snapshot` (and `StepRow`, `RtdRow`, `CounterRow`) are the stats
-  surface. They already serialise to the `/stats` JSON in
-  `sipr-control`; that mapping stays the one documented shape.
-- `Run::snapshots()` delivers the engine's own once-a-second tick, the
-  same one `--sipr-stats-json` writes; the last snapshot before exit is
-  also in `RunReport::snapshot`.
-- `RunReport::exit_code()` stays the SIPp exit-code oracle so a harness
-  can assert on it exactly as a shell script would.
+- `compile_strict(name, xml, &options) -> Result<Scenario, Vec<Diagnostic>>`
+  is the binary's `--check` policy as a function: the lints run, and any
+  diagnostic — a warning included — is a failure. Use it unless you have a
+  reason to run a scenario that warns.
+- `compile_with(name, xml, &options) -> CompileOutcome` gives you the
+  scenario (when there were no errors) and the diagnostics to print or
+  ignore, which is what the binary does on a normal run.
+- `CompileOptions::generic_keywords` names your `-key` keywords so
+  `[NAME]` is not an unknown-keyword warning; `lint` asks for the lints.
+- `sipr_scenario::embedded("uac" | "uas" | "ooc_default" | "ooc_dummy")`
+  is SIPp's own default scenarios as text; `include_str!` yours.
 
-### D7. Name the supported surface, hide the rest
+`Scenario` is `Clone` and `Send`. Compile once per test and reuse it.
 
-- The supported public items of `sipr-engine` after M49 are exactly:
-  `EngineConfig` (+ `TransportKind`, `Behaviors`, `LogOverwrite`,
-  `Extended3pcc`, `SecondaryKind`, `InjectionSource`, `NoticeSink`,
-  `Notice`), `Run`, `EngineControl`, `RunReport`, `EngineError`, `run`,
-  and the re-exports an embedder needs to fill the config (`SocketOpts`,
-  `TlsConfig`, `TlsVersion`, `PeerTable`, `TdmMap`,
-  `sipr_stats::Snapshot` and its rows). That list is §5 of this document
-  once implemented, and the crate-level rustdoc repeats it.
-- The render family (`RenderCtx`, `VarCtx`, `DynamicId`, `FieldSource`,
-  `RunInfo`, `render`) stays `pub` for the bench but goes
-  `#[doc(hidden)]` with a "not part of the supported API" note. Moving the
-  bench in-crate would be cleaner and is a follow-up, not a blocker.
-- `sipr-scenario` needs one addition: `compile_strict(name, xml,
-  &options) -> Result<Scenario, Vec<Diagnostic>>` — the `--check` policy
-  ("any diagnostic, warnings included, fails") as a function, so an
-  embedder gets it in one call and the binary stops re-implementing it.
-  `compile`/`compile_with` stay for callers who want to print warnings and
-  continue, which is what the binary does without `--check`.
+## 3. Configure
 
-### D8. Stability promise
+`EngineConfig` is one struct with a public field per SIPp flag, each
+documented by the flag it stands for. Start from a constructor:
 
-- The crates stay `0.x`. Within a minor series (`0.29.*`) the surface in
-  D7 is additive only; a minor bump may break it, and `CHANGELOG.md` says
-  what and how to migrate. That is what the pinned internal versions
-  already imply, written down.
-- `1.0` is not on the table until an embedder outside this repo has used
-  the API for a release cycle.
+- `EngineConfig::uac(target)` — placing calls at `target`. `[remote_host]`
+  renders the target's IP, and an IPv6 target binds `::` unless
+  `local_ip` says otherwise.
+- `EngineConfig::uas()` (also `Default`) — answering calls, on every
+  interface at 5060 until `local_ip` and `port` say otherwise.
 
-## 4. Non-goals
+Both carry SIPp's defaults: rate 10 per 1000 ms, `-d` 3000 ms, `-fd` 60 s,
+5 INVITE and 9 non-INVITE retransmissions, every `-default_behaviors` on,
+and so on. Assign the fields you want otherwise; the struct is
+`#[non_exhaustive]`, so a field added in a later release breaks nothing.
 
-- **No async API.** The engine is one thread and sync channels by design
-  (`docs/ARCHITECTURE.md` §2). A tokio harness wraps `Run::wait` in
-  `spawn_blocking`; the crate does not take a runtime dependency for that.
-- **No scenario DSL.** Scenarios are SIPp XML, compiled by `sipr-scenario`;
-  a Rust builder for call flows would fork the compatibility surface that
-  is the product. Embedders write XML (or `include_str!` it).
-- **No FFI, no C header.** Rust embedders only.
-- **No new external dependency.** `thiserror` is already sanctioned;
-  everything else is std channels and threads the engine already uses.
-- **No TUI in the library.** `sipr-tui` stays a separate crate that reads
-  `Snapshot`s; an embedder that wants a screen wires it exactly as the
-  binary does.
+The fields a harness usually touches:
 
-## 5. What the embedder sees (target)
+| Field | SIPp flag | Note |
+|---|---|---|
+| `local_ip`, `port` | `-i`, `-p` | `port = Some(0)` picks a free port; `Run::local_addr()` says which |
+| `rate`, `rate_period`, `limit`, `max_calls`, `users` | `-r`, `-rp`, `-l`, `-m`, `-users` | how many calls, how fast |
+| `pause_default`, `timeout`, `recv_timeout` | `-d`, `-timeout`, `-recv_timeout` | keep `timeout` set in a test, so a stuck run ends |
+| `transport`, `tls` | `-t`, `-tls_*` | `TlsMono`/`TlsPerCall` need `tls: Some(TlsConfig { .. })` |
+| `inf`, `rxinf`, `inf_index` | `-inf`, `-rxinf`, `-infindex` | `InjectionSource::Path(..)` or `InjectionSource::text(name, csv)` |
+| `auth_user`, `auth_password`, `auth_uri` | `-au`, `-ap`, `-auth_uri` | for `[authentication]` |
+| `generic_keywords`, `global_sets` | `-key`, `-set` | `[NAME]` values and `<Global>` variables |
+| `notices` | — | where the engine's messages go, see §5 |
+| `control_port`, `control_ip`, `http_addr`, `http_token` | `-cp`, `-ci`, `--sipr-http`, `--sipr-http-token` | `control_port = Some(0)` disables SIPp's UDP control socket (its default probes 8888..); `http_addr` starts the HTTP API |
+| `trace_msg`, `trace_err`, `trace_stat`, `stats_json`, ... | `-trace_*`, `--sipr-stats-json` | log and statistics files, by path |
+
+Everything else is there too (media, 3PCC, reconnection, log rotation,
+timer knobs); `docs/SIPP_COMPAT.md` §3 explains each flag.
+
+## 4. Run
 
 ```rust
-use sipr_engine::{EngineConfig, Run, Notice, NoticeSink};
-use sipr_scenario::{compile_strict, CompileOptions};
-
-let uas = compile_strict("uas", sipr_scenario::embedded("uas").unwrap(),
-                         &CompileOptions::default())?;
-let mut cfg = EngineConfig::uas();
-cfg.local_ip = Some("127.0.0.1".parse()?);
-cfg.port = Some(0);                       // pick a free port
-cfg.notices = NoticeSink::Channel(tx);
-let server = Run::start(uas, cfg)?;
-let bound = server.local_addr();          // where the UAS is listening
-
-// ... point the system under test at `bound`, exercise it ...
-
-server.control().stop();
-let report = server.wait()?;
-assert_eq!(report.exit_code(), 0, "{}", report.summary());
-assert_eq!(report.successful, 20);
+let mut run = Run::start(scenario, config)?;           // or start_with(main, Some((kind, second)), config)
+let control = run.control().clone();                   // EngineControl, cheap to clone
+let snapshots = run.snapshots();                       // Receiver<Snapshot>, ~1 a second
+let report = run.wait()?;                              // RunReport
 ```
 
-`local_addr()` is new and small: the bound signaling address, for the
-`port = Some(0)` case tests need. Today the binary prints it on the
-control-socket banner; nothing returns it.
+- **`Run::start`** validates the pair, spawns the engine thread and returns
+  once `Engine::new` has bound its sockets — a UAC has also made its first
+  connection — so a port in use, a missing TLS configuration or a scenario
+  keyword the configuration does not provide is an `Err` here, not
+  something a later `wait` reports. `start_with` takes a secondary
+  scenario, `SecondaryKind::OutOfCall` (`-oocsf`) or `SecondaryKind::Receive`
+  (`-rxsf`), under SIPp's rules for them.
+- **`control()`**: `set_rate`, `rate`, `pause`, `resume`, `stop` (SIPp's
+  `q`: no new calls, the live ones finish, then the report), `abort`
+  (`Q`: every live call fails, the loop ends on its next turn), and
+  `key(char)` for any of SIPp's screen keys. Every method returns at once;
+  a handle that outlives its run does nothing.
+- **`snapshots()`** hands over the receiver once; a second call gets one
+  that yields nothing. The channel holds a few snapshots: a reader that
+  falls behind misses some rather than stalling the engine.
+- **`local_addr()`**: the bound signaling address.
+- **`wait()`** joins the thread and returns the `RunReport`. Dropping a
+  `Run` without waiting aborts it and joins, so a test that panics leaves
+  no engine and no bound port behind.
+- **`run(&scenario, &config)`** is `Run::start(..)?.wait()` for a scenario
+  that ends on its own (`max_calls`, `timeout`).
 
-## 6. Order of work
+## 5. Observe
 
-Each step is one commit that keeps the binary's behaviour and the gates
-green; the `cli`, `e2e` and interop suites are the regression net.
+- **`RunReport`**: `created`, `successful`, `failed`, `fatal`, the message
+  and retransmission counters, `elapsed`, the final `snapshot`, and
+  `exit_code()` — SIPp's exit code (0 all calls passed, 1 some failed, 99
+  nothing processed, 253 an RTP check failed, 255 fatal), so a harness can
+  assert exactly what a shell script would. `summary()` is the one-line
+  form the binary prints.
+- **`Snapshot`** (`sipr_stats::Snapshot`): the live counters, rates, the
+  per-step rows, RTD rows and generic counters — what the TUI, `-trace_stat`
+  and the HTTP API's `/stats` show, one a second from `Run::snapshots()`.
+- **Notices**: everything the binary would print to stderr — the bound
+  address, the control-API banners, every warning and error — is a
+  `Notice` (`Info`, `Warning`, `Error`, each with its message and a
+  `Display` that is the binary's exact line) sent where
+  `config.notices` points: `NoticeSink::Stderr` (the default),
+  `NoticeSink::Channel(sender)` to read them as values, or
+  `NoticeSink::Discard`. The engine never prints; the crate denies it.
 
-1. D1 — `Default` + `#[non_exhaustive]` + constructors; the binary and
-   `ui_bridge` switch to them; the CLI-vs-default parity test.
-2. D3 — notices and the print lints; the stdin watcher moves to the
-   binary.
-3. D4 — the error enum.
-4. D2 — `Run`, the control methods, `local_addr()`; `run_scenarios` and
-   friends hidden.
-5. D5 — `InjectionSource`.
-6. D7 — `compile_strict`, `#[doc(hidden)]` on the render family, the
-   crate-level docs listing the surface, an `examples/embed.rs` that CI
-   builds, and this document rewritten from "design" to "reference".
+## 6. Errors
 
-Steps 1–3 are mechanical and unblock the rest; step 4 is the only one
-with real design inside it (thread ownership, drop semantics) and gets
-its own review.
+`EngineError` implements `std::error::Error`, so `?` into `anyhow` or
+`Box<dyn Error>` works, and says which side to look at:
 
-## 7. Open questions
+| Variant | Meaning | Example |
+|---|---|---|
+| `Config(msg)` | the configuration is wrong or incomplete for this run | a UAC without a target; TLS without `tls` |
+| `Scenario(msg)` | the scenario cannot run as given | `[field0]` with no injection file; a 3PCC rule |
+| `Bind { what, source }` | a socket could not be opened; `source` is the `io::Error` | `cannot bind UDP socket: Address already in use` |
+| `Io { what, path, source }` | a file could not be read or created | an injection file, a log file |
+| `Fatal(msg)` | the engine thread could not start, or died without a report | — |
 
-- **Should `Run::start` take the `Scenario` by value or `Arc`?** By value
-  is simplest; an embedder running the same scenario in several `Run`s
-  clones it (it is `Clone`, and compiled once per test anyway). `Arc`
-  only if a test shows cloning a compiled scenario is measurable.
-- **Does the HTTP API belong in the library path?** `http_addr` in the
-  config already starts it inside the engine, so an embedder gets
-  `/stats` and `/metrics` for free by setting the field. Leaving it as is
-  costs nothing; the question is only whether D7's supported list names
-  it. Proposal: yes, as-is.
-- **`RunReport` growth.** It has 15 public fields and no
-  `#[non_exhaustive]`; the same treatment as D1 (attribute, keep fields
-  public) is the obvious call and is folded into D1.
+Several messages are SIPp's own wording. The enum is `#[non_exhaustive]`.
+
+## 7. Threads, ports, numbers
+
+- A run owns its threads: the engine loop, the transport's receive or
+  accept loop, the control listeners, the media and exec helpers. They end
+  when the run does, and the ports go with them — the next run may bind
+  the same port. Nothing waits for process exit.
+- Call numbers (`[call_number]`, the `%u` of the default Call-ID
+  `<number>-<pid>@<ip>`, the auto media port) come from one counter per
+  process. Two runs in one process — a harness's UAS and its UAC, or one
+  run after another — never reuse a Call-ID, which a peer would otherwise
+  take for a late message of a call it just finished and drop.
+- The engine is synchronous by design (`docs/ARCHITECTURE.md` §2). From a
+  tokio test, `spawn_blocking(move || run.wait())`; the crate takes no
+  runtime dependency.
+- A `Run`'s thread panicking is a bug in sipr; `wait()` reports it as
+  `EngineError::Fatal` rather than propagating the panic.
+
+## 8. The supported surface and its stability
+
+The items this page and the crate documentation describe are the supported
+surface of `sipr-engine`:
+
+- `EngineConfig` and the types its fields use: `TransportKind`,
+  `Behaviors`, `LogOverwrite`, `Extended3pcc` with `PeerTable`,
+  `InjectionSource`, `NoticeSink` and `Notice`, `TdmMap`, `SocketOpts`,
+  `TlsConfig` and `TlsVersion`, `sipr_stats::LogRotation`;
+- `Run`, `EngineControl`, `RunReport`, `SecondaryKind`, `run`;
+- `EngineError`;
+- `sipr_stats::Snapshot` and its rows;
+- in `sipr-scenario`: `compile`, `compile_with`, `compile_strict`,
+  `CompileOptions`, `CompileOutcome`, `Diagnostic`, `Scenario` as an
+  opaque value, and `embedded`.
+
+Everything else that is `pub` — the blocking `run_with_*` entry points
+`Run` superseded, the message renderer the bench uses — is hidden from the
+documentation and may change in any release.
+
+The crates are `0.x`. Within a minor series (`0.29.*`) the supported
+surface only grows: fields, variants and methods are added, never removed
+or changed in meaning, and every config and report type is
+`#[non_exhaustive]` so that is source-compatible. A minor bump (`0.30.0`)
+may change it, and `CHANGELOG.md` says what and how to migrate. `1.0` waits
+for an embedder outside this repository to have used the API for a release
+cycle.
+
+## 9. Non-goals
+
+- **No async API.** See §7.
+- **No scenario DSL.** Scenarios are SIPp XML; a Rust builder for call
+  flows would fork the compatibility surface that is the product.
+- **No FFI.** Rust embedders only.
+- **No TUI in the library.** `sipr-tui` reads `Snapshot`s; wire it as the
+  binary does if you want a screen.
+
+## 10. How it got here (M49)
+
+The surface above was built in the order of `docs/MILESTONES.md` M49, as
+decisions D1–D8 of the design note this page replaced:
+
+- D1 `Default` + constructors + `#[non_exhaustive]` on the config;
+  `Cli::default` reads the SIPp defaults from the engine, and a unit test
+  keeps a bare command line equal to the constructors field for field.
+- D3 `NoticeSink` in place of the engine's 38 `eprintln!`s, enforced by
+  `deny(clippy::print_stderr)`; the stdin key reader moved to the binary.
+- D4 `EngineError` as a `thiserror` enum. `Fatal` came with D2 rather than
+  D4, for the thread cases; the engine's own fatal errors stay in
+  `RunReport::fatal`.
+- D2 `Run`. Its drop promise exposed that every listener thread held its
+  port until process exit, fixed in `sipr-net` and `sipr-control` first.
+- D5 `InjectionSource`; the fields are `inf` and `rxinf`, named after the
+  flags. Its test exposed Call-ID reuse between engines in one process,
+  fixed with the per-process call counter.
+- D7 `compile_strict`, the hidden render family, the crate docs, the
+  example, this page. The binary keeps `compile_with`: its `--check` also
+  prints the compiled steps, which `compile_strict` cannot return with the
+  diagnostics.
+- D8 the stability wording in §8.
+
+Open questions from the design were settled as: `Run::start` takes the
+`Scenario` by value (it is `Clone`; compile once, clone per run); the HTTP
+API is part of the surface as the `http_addr` field starts it; `RunReport`
+is `#[non_exhaustive]` like the config.

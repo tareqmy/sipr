@@ -22,7 +22,7 @@ pub mod regex;
 pub mod template;
 mod xml;
 
-pub use compile::{CompileOptions, CompileOutcome, compile, compile_with};
+pub use compile::{CompileOptions, CompileOutcome, compile, compile_strict, compile_with};
 
 /// Names accepted by `-sn`, `-sd` and `-oocsn`, in display order.
 pub const EMBEDDED_NAMES: &[&str] = &["uac", "uas", "ooc_default", "ooc_dummy"];

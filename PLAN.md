@@ -6,8 +6,8 @@ A SIPp-like SIP testing tool and traffic generator, written in Rust.
 (a tester's stack, not a compliant one) · SIPp XML-compatible scenarios · v1 scope is
 signaling-only over UDP · CLI + live TUI.
 
-> **Status (2026-09-27):** v1 shipped (M0–M6) and every parity milestone through M48
-> is done (v0.28.0) — see `docs/MILESTONES.md`. The crate choices below were revisited during
+> **Status (2026-09-27):** v1 shipped (M0–M6), every parity milestone through M48
+> is done (v0.28.0), and M49 made the engine a library — see `docs/MILESTONES.md`. The crate choices below were revisited during
 > implementation: almost everything ended up in-tree (§3.1). The architecture and
 > milestone rationale are otherwise as written.
 
@@ -231,8 +231,9 @@ snapshots, never on the hot path.
 
 ## 7. Next steps
 
-M0–M48 are done (v0.28.0): SIPp parity is complete, the hot path is
-measured against real sipp (M45), and `--check` lints scenarios (M47). What
-remains is sipr's own additions, listed under M49+ at the bottom of
-`docs/MILESTONES.md`; the first candidate is a library API for embedding
-`sipr-engine` in another Rust test harness.
+M0–M49 are done: SIPp parity is complete (v0.28.0), the hot path is
+measured against real sipp (M45), `--check` lints scenarios (M47), and
+`sipr-engine` is a library any Rust harness can embed (M49,
+`docs/LIBRARY_API.md`). What comes next is the M50+ list at the bottom of
+`docs/MILESTONES.md`, empty until the users of the HTTP API and the library
+ask for something.

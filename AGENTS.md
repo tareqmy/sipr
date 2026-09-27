@@ -4,7 +4,7 @@ sipr is a SIPp-like SIP testing tool and traffic generator written in Rust. It p
 call flows described in SIPp's XML scenario format, as UAC or UAS, at a controlled
 rate, and reports live (TUI) and aggregate statistics.
 
-**Current state: v1 shipped, M0–M48 complete (v0.28.0)** (UDP/TCP/TLS transports incl. per-call and per-IP sockets, SCTP behind the `sctp` feature, `-rsa`, reconnection, UAC/UAS, out-of-call scenarios (`-oocsf`/`-oocsn`), mixed mode (`-rxsf`/`-rxsn`, `-rxinf`),
+**Current state: v1 shipped, M0–M49 complete (M49, the library API, lands in the next release after v0.28.0)** (UDP/TCP/TLS transports incl. per-call and per-IP sockets, SCTP behind the `sctp` feature, `-rsa`, reconnection, UAC/UAS, out-of-call scenarios (`-oocsf`/`-oocsn`), mixed mode (`-rxsf`/`-rxsn`, `-rxinf`),
 stats + TUI, the full SIPp action set incl. `_unexp.main`, `exec command=` and `<setdest>`, manual transactions (`start_txn`/`ack_txn`/`response_txn`), `<User>`/`<Global>` variable scopes, auth incl. IMS AKA + AUTS resync + `verifyauth`, `-inf` injection, 3PCC, `-users`, IPv6,
 pcap replay, RTP streaming + DTMF, RTP echo + rtpcheck, SRTP + SRTP echo server, SIPp
 control socket + HTTP API; and post-v1, statistical pauses, the tracing and
@@ -12,9 +12,9 @@ log files at parity, the timer/behavior knobs, extended 3PCC, and the M44
 leftovers — `PRINTF=` injection files, `<rtp_echo variable=>`, the socket
 options, pcapng captures). `PLAN.md` is the
 master plan (its dependency choices were superseded by in-tree implementations —
-`docs/MILESTONES.md` notes record each swap); the post-v1 backlog at the bottom of
-`docs/MILESTONES.md` (M49+, sipr's own additions now that parity is done) is
-what comes next; M47 added the `--check` lints (`docs/LINTS.md`). M45 measured the hot path against real sipp —
+`docs/MILESTONES.md` notes record each swap); M49 made `sipr-engine` a library
+(`docs/LIBRARY_API.md`); the M50+ list at the bottom of `docs/MILESTONES.md`
+is what comes next; M47 added the `--check` lints (`docs/LINTS.md`). M45 measured the hot path against real sipp —
 `docs/PERFORMANCE.md` and `benches/BASELINES.md` hold the numbers, and
 `make bench-vs-sipp` reruns them.
 

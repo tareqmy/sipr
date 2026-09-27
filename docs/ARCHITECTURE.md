@@ -20,6 +20,11 @@ sipr/
 └── src/main.rs           # bin: SIPp-style CLI → assemble and run
 ```
 
+The binary is one embedder of `sipr-engine` — it builds an `EngineConfig`
+from the command line, starts a `Run`, feeds it keys and waits — and the
+library surface it uses is the one `docs/LIBRARY_API.md` documents for any
+other Rust program.
+
 Dependency direction (must stay acyclic):
 `sipr-tui` → `sipr-stats` → (nothing internal);
 `sipr-engine` → `sipr-scenario`, `sipr-net`, `sipr-auth`, `sipr-stats`, `sipr-media`,

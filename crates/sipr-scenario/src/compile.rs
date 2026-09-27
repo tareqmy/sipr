@@ -54,6 +54,31 @@ pub struct CompileOptions {
     pub lint: bool,
 }
 
+/// [`compile_with`] under the `--check` policy: the lints run whatever
+/// `options.lint` says, and any diagnostic — a warning included — is a
+/// failure. For an embedder that wants a scenario it can trust or an error
+/// to print; the binary keeps [`compile_with`] because its `--check` also
+/// prints the compiled steps, and its normal runs continue past warnings.
+///
+/// # Errors
+///
+/// Every diagnostic, in discovery order, when there is at least one.
+pub fn compile_strict(
+    source_name: &str,
+    xml_text: &str,
+    options: &CompileOptions,
+) -> Result<Scenario, Vec<Diagnostic>> {
+    let strict = CompileOptions {
+        generic_keywords: options.generic_keywords.clone(),
+        lint: true,
+    };
+    let outcome = compile_with(source_name, xml_text, &strict);
+    match outcome.scenario {
+        Some(scenario) if outcome.diagnostics.is_empty() => Ok(scenario),
+        _ => Err(outcome.diagnostics),
+    }
+}
+
 /// [`compile`] with [`CompileOptions`].
 #[must_use]
 pub fn compile_with(source_name: &str, xml_text: &str, options: &CompileOptions) -> CompileOutcome {

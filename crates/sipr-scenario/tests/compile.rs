@@ -2,10 +2,10 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use sipr_scenario::compile;
 use sipr_scenario::diag::Severity;
 use sipr_scenario::distribution::Distribution;
 use sipr_scenario::model::{Action, Expect, PauseSpec, Role, Step};
+use sipr_scenario::{CompileOptions, compile, compile_strict, compile_with};
 
 fn wrap(body: &str) -> String {
     format!("<scenario name=\"t\">{body}</scenario>")
@@ -1749,4 +1749,29 @@ fn m39_keywords_compile_and_fill_reads_its_variable() {
     let out = sipr_scenario::compile_with("test", &xml, &opts);
     assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
     assert!(out.scenario.expect("compiles").dump().contains("[pbx]"));
+}
+
+/// `compile_strict` is `--check`: a clean scenario comes back, and a
+/// warning is as fatal as an error.
+#[test]
+fn compile_strict_fails_on_any_diagnostic_and_lints() {
+    let clean = sipr_scenario::embedded("uac").unwrap();
+    assert!(compile_strict("uac", clean, &CompileOptions::default()).is_ok());
+
+    // An unknown keyword is a warning: compile_with keeps the scenario,
+    // compile_strict refuses it.
+    let warned = clean.replace("[service]", "[nosuchkeyword]");
+    let lenient = compile_with("uac", &warned, &CompileOptions::default());
+    assert!(lenient.scenario.is_some());
+    assert_eq!(lenient.diagnostics.len(), 1, "{:?}", lenient.diagnostics);
+    let err = compile_strict("uac", &warned, &CompileOptions::default()).unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert_eq!(err[0].severity, Severity::Warning);
+
+    // A `-key` name makes that keyword known again.
+    let keyed = CompileOptions {
+        generic_keywords: vec!["nosuchkeyword".to_owned()],
+        lint: false,
+    };
+    assert!(compile_strict("uac", &warned, &keyed).is_ok());
 }

@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The library API is documented and promised (M49 D7/D8):
+  `docs/LIBRARY_API.md` is the reference for `sipr-engine` in a Rust
+  harness, the crate documentation lists the supported surface, and
+  `crates/sipr-engine/examples/embed.rs` runs a UAS and a UAC in one
+  process (`cargo run -p sipr-engine --example embed`). Within a `0.x`
+  minor series that surface only grows; a minor bump may change it and
+  this file says how to migrate.
+- `sipr_scenario::compile_strict(name, xml, &options)`: the binary's
+  `--check` policy as a function — the lints run, and any diagnostic, a
+  warning included, is an `Err` carrying every diagnostic.
 - `sipr_engine::Run`, the library entry point (M49 D2,
   `docs/LIBRARY_API.md`): `Run::start(scenario, config)` (or
   `start_with` for a secondary scenario) runs the engine on its own
@@ -44,6 +54,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The message renderer (`RenderCtx`, `VarCtx`, `render` and friends) and
+  the blocking `run_with_*` entry points are hidden from `sipr-engine`'s
+  documentation: reachable for the bench and earlier callers, not part
+  of the supported surface, free to change.
 - `EngineConfig::inf` and `rxinf` (formerly `inf_files` and
   `rx_inf_files`) hold `InjectionSource`s: a `Path` read at start-up, or
   `Text { name, csv }` already in memory, so a harness can feed
