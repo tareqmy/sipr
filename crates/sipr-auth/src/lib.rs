@@ -428,9 +428,13 @@ pub fn verify_authorization(
             .unwrap_or_default()
     };
     let algo = param("algorithm");
-    let algorithm = if algo.is_empty() || algo.len() >= 3 && algo[..3].eq_ignore_ascii_case("MD5") {
+    // SIPp matches the first 3/7 bytes (`strncasecmp`), so `MD5-sess` counts
+    // as MD5. Compare bytes: the header came off the wire through a lossy
+    // UTF-8 decode, and slicing a `str` at a fixed byte index would panic
+    // when a replacement character straddles it.
+    let algorithm = if algo.is_empty() || starts_with_ignore_ascii_case(&algo, "MD5") {
         Algorithm::Md5
-    } else if algo.len() >= 7 && algo[..7].eq_ignore_ascii_case("SHA-256") {
+    } else if starts_with_ignore_ascii_case(&algo, "SHA-256") {
         Algorithm::Sha256
     } else {
         return Err(AuthError::UnsupportedAlgorithm(algo));
@@ -462,6 +466,12 @@ pub fn verify_authorization(
         )
     };
     Ok(expected.eq_ignore_ascii_case(&param("response")))
+}
+
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -810,6 +820,27 @@ mod tests {
     }
 
     /// What sipr itself sends (qop=auth, and the `-auth_uri` form) verifies.
+    /// Found by the `auth` fuzz target (M50): a non-UTF-8 byte in the
+    /// algorithm value decodes to U+FFFD, three bytes wide, and the old
+    /// `algo[..3]` split it. Off the wire that was a panic in `verifyauth`.
+    #[test]
+    fn verify_tolerates_a_multibyte_algorithm_value() {
+        for algo in ["MD\u{FFFD}5", "M\u{e9}", "\u{FFFD}", "SHA-25\u{e9}"] {
+            let header = format!("Digest username=\"u\", realm=\"r\", algorithm={algo}");
+            assert_eq!(
+                verify_authorization(&header, "u", "p", "INVITE", b"", None),
+                Err(AuthError::UnsupportedAlgorithm(algo.to_owned())),
+                "{algo:?}"
+            );
+        }
+        // The prefix match SIPp does still holds.
+        let header = "Digest username=\"u\", realm=\"r\", nonce=\"n\", algorithm=md5-sess";
+        assert_eq!(
+            verify_authorization(header, "u", "p", "INVITE", b"", None),
+            Ok(false)
+        );
+    }
+
     #[test]
     fn verifies_sipr_own_qop_header_and_auth_uri_override() {
         let ch = parse_challenge(

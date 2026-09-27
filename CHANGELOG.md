@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `verifyauth` no longer panics on an Authorization header whose
+  `algorithm=` value carries a non-UTF-8 byte in its first three: the
+  MD5/SHA-256 prefix check compared a `str` slice at a fixed byte index,
+  which split the replacement character the lossy decode had put there.
+  Found by the new `auth` fuzz target on its fourth input.
+
 ## [0.29.0] — 2026-09-27
 
 ### Added
