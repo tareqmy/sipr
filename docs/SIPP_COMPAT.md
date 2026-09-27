@@ -20,7 +20,7 @@ file:line at load; hard error under `--check`). No silent skips, ever.
 | `pause` | common⁺, `milliseconds`, `variable`, `distribution` + its parameters, `sanity_check` | all ten SIPp distributions, SIPp's attribute names and old-style `min`/`max` (M38, §6) |
 | `nop` | common⁺, `display` | carries actions |
 | `label` | `id` | jump target; validated at compile |
-| `timewait` | `milliseconds` | end-of-call linger |
+| `timewait` | common⁺ but `next`/`ontimeout`, and a `pause`'s duration attributes | end-of-call linger; SIPp's pause with a flag (§6) |
 | `Reference` | `variables` | suppress unused-var warnings |
 | `Global` | `variables` | comma list of run-wide variables (M35, §6) |
 | `User` | `variables` | comma list of per-user-id variables (M35, §6) |
@@ -1755,9 +1755,17 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   pause starts: after `sessions++` and its bookkeeping, before the wait.
   A `<pauserestore>` among them sets the deadline that pause waits for.
   A timewait is a pause in that branch, so it also counts a session in
-  `-trace_counts`. sipr ignored every child of both elements, with no
-  diagnostic, so their actions never ran. Any child but `<action>` is now
-  an error, as on a nop. It also counted no session for a timewait.
+  `-trace_counts`, takes a pause's duration (`milliseconds`, `variable`,
+  a distribution, or `-d` when bare — `sipp.dtd` requires
+  `milliseconds`, the parser does not) and every common attribute, and
+  books its `counter=` and RTDs on entry through `do_bookkeeping`; the
+  two branches out of a message are refused on it at load
+  (`getCommonAttributes` ~l.1861 and ~l.1879: `next labels are not
+  allowed in <timewait> elements`, the same for `ontimeout`), which
+  sipr reports as compile errors. sipr ignored every child of both
+  elements, with no diagnostic, so their actions never ran. Any child
+  but `<action>` is now an error, as on a nop. It also counted no
+  session for a timewait, and took nothing but `milliseconds` on one.
 - Receive timeouts (verified in `call.cpp` ~l.2150-2205 `call::run`,
   ~l.5653-5687 `process_incoming`, ~l.1920-1945 `next()`, `task.cpp`
   `add_paused_task`, and `scenario.cpp` ~l.33-39 the `message` defaults,
@@ -1802,9 +1810,9 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `getCommonAttributes`, `call.cpp` ~l.2159-2194 the receive timeout and
   ~l.2253-2298 exhausted retransmissions; confirmed against real sipp,
   the `a_sends_ontimeout_*` and `a_recv_cmds_ontimeout_*` interop tests).
-  It is a common attribute, read on every message but a `<timewait>`,
-  and two places use it. A recv or recvCmd whose receive timeout
-  expires goes there, as the note above describes. A `<recvCmd>` has
+  It is a common attribute, read on every message and refused on a
+  `<timewait>`, and two places use it. A recv or recvCmd whose receive
+  timeout expires goes there, as the note above describes. A `<recvCmd>` has
   no `timeout=`, so only `-recv_timeout` arms it. A send whose UDP
   retransmissions run out goes there from wherever the call waits,
   with the warning `Call-Id: <id>, timeout on max UDP retrans for
@@ -1886,11 +1894,11 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   series each (docs/CONTROL_API.md). sipr kept a per-call map until
   now, which nothing read; it also booked a nop's and a recvCmd's
   counter only when their actions did not move the call, and a send's
-  only after a successful send. **Open:** sipr's `<timewait>` takes
-  only `milliseconds` and warns the common attributes away as unknown,
-  so `<timewait counter=…>` does not count there, where SIPp books it
-  on entry. Found on the way: sipr applied a step's RTDs (`start_rtd`,
-  `rtd`) only on a send and a matched recv, where SIPp's
-  `do_bookkeeping` runs for a pause, a nop, a sendCmd and a recvCmd
-  too; all four book their RTDs since, at the same point as their
-  counter.
+  only after a successful send. sipr's `<timewait>` also used to take
+  only `milliseconds` and warn the common attributes away as unknown,
+  so `<timewait counter=…>` did not count there, where SIPp books it
+  on entry; fixed since (the pause-and-timewait note above). Found on
+  the way: sipr applied a step's RTDs (`start_rtd`, `rtd`) only on a
+  send and a matched recv, where SIPp's `do_bookkeeping` runs for a
+  pause, a timewait, a nop, a sendCmd and a recvCmd too; all five book
+  their RTDs since, at the same point as their counter.

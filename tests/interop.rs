@@ -7354,10 +7354,11 @@ fn assert_rtt_rows(rtt: &str, rtd: &str, calls: usize, range: std::ops::Range<f6
 /// first-mention order: `invites` (the INVITE), `1234567` (the 180, a
 /// numeric name longer than SIPp's column buffer), `7` (the 200 and the
 /// pause, shared), `acks`, `jumper` (a nop whose `<jump>` skips the next
-/// message) and `skipped` (that message, which never runs). Per call:
-/// 1, 1, 2, 1, 1, 0. RTD 1 runs from the INVITE to the nop and RTD 2
-/// from the nop to the pause: SIPp's `do_bookkeeping` books a nop's and
-/// a pause's RTDs as it books a send's and a recv's.
+/// message), `skipped` (that message, which never runs) and `linger`
+/// (the timewait). Per call: 1, 1, 2, 1, 1, 0, 1. RTD 1 runs from the
+/// INVITE to the nop, RTD 2 from the nop to the pause and RTD 3 from the
+/// pause to the timewait, across the 50 ms pause: SIPp's
+/// `do_bookkeeping` books all three steps' RTDs as it books a send's.
 fn counters_uac_xml() -> &'static str {
     r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
 <scenario name="counters">
@@ -7392,7 +7393,7 @@ fn counters_uac_xml() -> &'static str {
     <action><jump value="7"/></action>
   </nop>
   <nop counter="skipped"/>
-  <pause milliseconds="50" counter="7" rtd="2"/>
+  <pause milliseconds="50" counter="7" rtd="2" start_rtd="3"/>
   <send retrans="500"><![CDATA[
       BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
@@ -7406,6 +7407,7 @@ fn counters_uac_xml() -> &'static str {
 
     ]]></send>
   <recv response="200"/>
+  <timewait milliseconds="50" counter="linger" rtd="3"/>
 </scenario>
 "#
 }
@@ -7493,6 +7495,7 @@ fn final_counter_values(stat: &str) -> Vec<String> {
         "acks(C)",
         "jumper(C)",
         "skipped(C)",
+        "linger(C)",
     ]
     .iter()
     .map(|name| {
@@ -7531,24 +7534,27 @@ fn generic_counters_match_real_sipps_statistics() {
         "-trace_stat header"
     );
     // Pin what real sipp counts, so the comparison cannot pass vacuously.
-    let expected = ["3", "3", "6", "3", "3", "0"];
+    let expected = ["3", "3", "6", "3", "3", "0", "3"];
     assert_eq!(final_counter_values(&theirs), expected, "sipp:\n{theirs}");
     assert_eq!(final_counter_values(&ours), expected, "sipr:\n{ours}");
     for (dir, who) in [(&sipp_dir, "sipp"), (&sipr_dir, "sipr")] {
         // `<scenario>_<pid>_screen.log` on both sides: SIPp's `screen` log
         // file, whatever its help text says (`_screens.log`).
         let screens = read_file_ending(dir, "_screen.log");
-        for name in ["invites", "1234567", "7", "acks", "jumper", "skipped"] {
+        for name in [
+            "invites", "1234567", "7", "acks", "jumper", "skipped", "linger",
+        ] {
             assert!(
                 screens.contains(&format!("Counter {name} ")),
                 "{who}: no Counter {name} row:\n{screens}"
             );
         }
         // Real sipp is the oracle for where a step's RTDs are booked: RTD
-        // 1 stops on the nop, RTD 2 on the pause.
+        // 1 stops on the nop, RTD 2 on the pause, RTD 3 on the timewait.
         let rtt = read_file_ending(dir, "_rtt.csv");
         assert_rtt_rows(&rtt, "1", 3, 0.0..5000.0);
         assert_rtt_rows(&rtt, "2", 3, 0.0..5000.0);
+        assert_rtt_rows(&rtt, "3", 3, 50.0..5000.0);
     }
     let _ = std::fs::remove_dir_all(&sipr_dir);
     let _ = std::fs::remove_dir_all(&sipp_dir);

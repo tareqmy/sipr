@@ -87,7 +87,10 @@ mod tests {
         assert_eq!(uas.role, Role::Uas);
         assert!(matches!(
             uas.steps.last(),
-            Some(model::Step::Timewait { ms: 4000, .. })
+            Some(model::Step::Timewait {
+                spec: model::PauseSpec::Fixed(4000),
+                ..
+            })
         ));
     }
 
@@ -106,7 +109,13 @@ mod tests {
             Step::Recv(r) if r.regexp_match && matches!(&r.expect, model::Expect::Request(m) if m == ".*")
         ));
         assert!(matches!(&ooc.steps[1], Step::Send(_)));
-        assert!(matches!(&ooc.steps[2], Step::Timewait { ms: 4000, .. }));
+        assert!(matches!(
+            &ooc.steps[2],
+            Step::Timewait {
+                spec: model::PauseSpec::Fixed(4000),
+                ..
+            }
+        ));
         assert!(!ooc.uses_injection_fields());
         // ooc_dummy: a recv nobody satisfies, so every spawned call fails.
         let dummy = compile("ooc_dummy", embedded("ooc_dummy").unwrap())

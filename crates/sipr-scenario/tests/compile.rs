@@ -1775,3 +1775,83 @@ fn compile_strict_fails_on_any_diagnostic_and_lints() {
     };
     assert!(compile_strict("uac", &warned, &keyed).is_ok());
 }
+
+/// SIPp reads a `<timewait>` in its `<pause>` branch (`scenario.cpp`
+/// ~l.961): it takes a pause's duration attributes and the common ones, so
+/// its `counter=`, RTDs, `crlf`, `hide`, `display` and `condexec` all
+/// apply, and `getCommonAttributes` refuses `next` and `ontimeout` on it.
+#[test]
+fn a_timewait_takes_a_pauses_attributes_but_never_branches() {
+    let xml = wrap(&format!(
+        r#"{invite}
+           <nop><action><assignstr assign_to="x" value="1"/></action></nop>
+           <timewait milliseconds="10" counter="linger" start_rtd="2" rtd="1" crlf="true"
+                     hide="true" display="wait" condexec="x" condexec_inverse="true"/>"#,
+        invite = send_invite()
+    ));
+    let out = compile("test", &xml);
+    assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    let sc = out.scenario.expect("compiles");
+    let Step::Timewait { spec, common, .. } = &sc.steps[2] else {
+        panic!("{:?}", sc.steps[2]);
+    };
+    assert_eq!(*spec, PauseSpec::Fixed(10));
+    assert_eq!(common.counter.as_deref(), Some("linger"));
+    assert_eq!(common.start_rtd.as_deref(), Some("2"));
+    assert_eq!(common.rtd.as_deref(), Some("1"));
+    assert!(common.crlf && common.hide && common.condexec_inverse);
+    assert_eq!(common.display.as_deref(), Some("wait"));
+    assert!(common.condexec.is_some());
+    assert!(common.next.is_none() && common.ontimeout.is_none());
+
+    // The duration is a pause's: `-d` when bare, a variable, a distribution.
+    let spec_of = |element: &str| -> PauseSpec {
+        let xml = wrap(&format!(
+            r#"{}<nop><action><assignstr assign_to="d" value="5"/></action></nop>
+               <Reference variables="d"/>{element}"#,
+            send_invite()
+        ));
+        let out = compile("test", &xml);
+        assert!(
+            out.diagnostics.is_empty(),
+            "{element}: {:?}",
+            out.diagnostics
+        );
+        match out.scenario.expect("compiles").steps.pop() {
+            Some(Step::Timewait { spec, .. }) => spec,
+            other => panic!("{element}: {other:?}"),
+        }
+    };
+    assert_eq!(spec_of("<timewait/>"), PauseSpec::Default);
+    assert!(matches!(
+        spec_of(r#"<timewait variable="d"/>"#),
+        PauseSpec::Variable(_)
+    ));
+    assert!(matches!(
+        spec_of(r#"<timewait distribution="uniform" min="1" max="2"/>"#),
+        PauseSpec::Distribution(_)
+    ));
+
+    for attr in [r#"next="l""#, r#"ontimeout="l""#] {
+        let xml = wrap(&format!(
+            r#"{}<label id="l"/><timewait milliseconds="10" {attr}/>"#,
+            send_invite()
+        ));
+        let errs = errors(&xml);
+        assert!(
+            errs.iter().any(|e| e.contains("not allowed on <timewait>")),
+            "{attr}: {errs:?}"
+        );
+    }
+    let xml = wrap(&format!(
+        r#"{}<timewait milliseconds="10" bogus="1"/>"#,
+        send_invite()
+    ));
+    let warns = warnings(&xml);
+    assert!(
+        warns
+            .iter()
+            .any(|w| w.contains("unknown attribute 'bogus'")),
+        "{warns:?}"
+    );
+}

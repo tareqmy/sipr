@@ -9057,10 +9057,11 @@ fn assert_rtt_rows(rtt: &str, rtd: &str, calls: usize, range: std::ops::Range<f6
 /// first-mention order: `invites` (the INVITE), `1234567` (the 180, a
 /// numeric name longer than SIPp's column buffer), `7` (the 200 and the
 /// pause, shared), `acks`, `jumper` (a nop whose `<jump>` skips the next
-/// message) and `skipped` (that message, which never runs). Per call:
-/// 1, 1, 2, 1, 1, 0. RTD 1 runs from the INVITE to the nop and RTD 2
-/// from the nop to the pause: SIPp's `do_bookkeeping` books a nop's and
-/// a pause's RTDs as it books a send's and a recv's.
+/// message), `skipped` (that message, which never runs) and `linger`
+/// (the timewait). Per call: 1, 1, 2, 1, 1, 0, 1. RTD 1 runs from the
+/// INVITE to the nop, RTD 2 from the nop to the pause and RTD 3 from the
+/// pause to the timewait, across the 50 ms pause: SIPp's
+/// `do_bookkeeping` books all three steps' RTDs as it books a send's.
 fn counters_uac_xml() -> &'static str {
     r#"<?xml version="1.0" encoding="ISO-8859-1" ?>
 <scenario name="counters">
@@ -9095,7 +9096,7 @@ fn counters_uac_xml() -> &'static str {
     <action><jump value="7"/></action>
   </nop>
   <nop counter="skipped"/>
-  <pause milliseconds="50" counter="7" rtd="2"/>
+  <pause milliseconds="50" counter="7" rtd="2" start_rtd="3"/>
   <send retrans="500"><![CDATA[
       BYE sip:svc@[remote_ip]:[remote_port] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
@@ -9109,6 +9110,7 @@ fn counters_uac_xml() -> &'static str {
 
     ]]></send>
   <recv response="200"/>
+  <timewait milliseconds="50" counter="linger" rtd="3"/>
 </scenario>
 "#
 }
@@ -9174,19 +9176,20 @@ fn generic_counters_reach_the_statistics_file_screen_and_api() {
         "acks",
         "jumper",
         "skipped",
+        "linger",
     ];
     let expected_header: Vec<String> = names
         .iter()
         .flat_map(|n| [format!("{n}(P)"), format!("{n}(C)")])
         .collect();
-    assert_eq!(&header[at..at + 12], expected_header.as_slice(), "{stat}");
+    assert_eq!(&header[at..at + 14], expected_header.as_slice(), "{stat}");
     // No repartitions in this scenario: the counters close the header,
     // which ends with the delimiter.
-    assert_eq!(&header[at + 12..], [""], "{stat}");
+    assert_eq!(&header[at + 14..], [""], "{stat}");
     let last: Vec<&str> = stat.lines().last().expect("row").split(';').collect();
     assert_eq!(last.len(), header.len(), "{stat}");
-    let cumulative: Vec<&str> = (0..6).map(|i| last[at + 2 * i + 1]).collect();
-    assert_eq!(cumulative, ["3", "3", "6", "3", "3", "0"], "{stat}");
+    let cumulative: Vec<&str> = (0..7).map(|i| last[at + 2 * i + 1]).collect();
+    assert_eq!(cumulative, ["3", "3", "6", "3", "3", "0", "3"], "{stat}");
 
     let screens = read("_screen.log");
     for (name, total) in [
@@ -9196,6 +9199,7 @@ fn generic_counters_reach_the_statistics_file_screen_and_api() {
         ("acks", 3),
         ("jumper", 3),
         ("skipped", 0),
+        ("linger", 3),
     ] {
         let line = screens
             .lines()
@@ -9208,10 +9212,11 @@ fn generic_counters_reach_the_statistics_file_screen_and_api() {
     }
 
     // RTD 1 stops on the nop and RTD 2 on the pause, both before the
-    // 50 ms pause runs.
+    // 50 ms pause runs; RTD 3 stops on the timewait, after it.
     let rtt = read("_rtt.csv");
     assert_rtt_rows(&rtt, "1", 3, 0.0..5000.0);
     assert_rtt_rows(&rtt, "2", 3, 0.0..5000.0);
+    assert_rtt_rows(&rtt, "3", 3, 50.0..5000.0);
 
     let snaps = std::fs::read_to_string(&json).expect("stats json");
     let final_state = snaps.lines().last().expect("a snapshot");

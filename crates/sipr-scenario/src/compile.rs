@@ -20,6 +20,14 @@ use crate::template::{self, Keyword, MsgTemplate};
 use crate::xml::{self, Element, Node};
 
 /// The declaring element of a non-call scope (call has none).
+/// The attributes a `<pause>` takes beyond the common ones; a `<timewait>`
+/// takes the same (SIPp reads both elements in one branch).
+fn pause_attrs() -> Vec<&'static str> {
+    let mut attrs = vec!["milliseconds", "variable", "sanity_check"];
+    attrs.extend(crate::distribution::all_param_attrs(true));
+    attrs
+}
+
 fn element_for(scope: VarScope) -> &'static str {
     match scope {
         VarScope::Global => "Global",
@@ -792,9 +800,19 @@ impl Compiler {
     }
 
     fn compile_pause(&mut self, el: &Element) {
-        let mut attrs = vec!["milliseconds", "variable", "sanity_check"];
-        attrs.extend(crate::distribution::all_param_attrs(true));
-        let common = self.parse_common(el, &attrs);
+        let common = self.parse_common(el, &pause_attrs());
+        let spec = self.parse_pause_spec(el);
+        let actions = self.parse_step_actions(el);
+        self.steps.push(Step::Pause {
+            spec,
+            actions,
+            common,
+        });
+    }
+
+    /// How long a `<pause>` or a `<timewait>` lasts: `milliseconds`, a
+    /// `variable`, a distribution, or nothing (`-d`).
+    fn parse_pause_spec(&mut self, el: &Element) -> PauseSpec {
         // SIPp's default is a sanity check on; `sanity_check="false"` turns
         // the 99th-percentile guard off.
         let sanity_check = match el.attr("sanity_check") {
@@ -804,7 +822,7 @@ impl Compiler {
         let ms = el.attr("milliseconds");
         let var = el.attr("variable").map(ToOwned::to_owned);
         let kind = crate::distribution::kind_of(&|name| el.attr(name), true);
-        let spec = match (ms, &var, kind) {
+        match (ms, &var, kind) {
             (None, None, None) => PauseSpec::Default,
             (Some(_), None, None) => match self.parse_num_attr(el, "milliseconds") {
                 Some(v) => PauseSpec::Fixed(v),
@@ -821,17 +839,14 @@ impl Compiler {
             _ => {
                 self.diags.error(
                     Some(el.line),
-                    "<pause> takes at most one of 'milliseconds', 'variable', 'distribution'",
+                    format!(
+                        "<{}> takes at most one of 'milliseconds', 'variable', 'distribution'",
+                        el.name
+                    ),
                 );
                 PauseSpec::Default
             }
-        };
-        let actions = self.parse_step_actions(el);
-        self.steps.push(Step::Pause {
-            spec,
-            actions,
-            common,
-        });
+        }
     }
 
     fn compile_nop(&mut self, el: &Element) {
@@ -967,18 +982,18 @@ impl Compiler {
         });
     }
 
+    /// `<timewait>`: SIPp reads it in its `<pause>` branch (`scenario.cpp`
+    /// ~l.961) with a flag that ends the call when the wait is over, so it
+    /// takes everything a pause takes; `parse_common` refuses `next` and
+    /// `ontimeout` on it, as SIPp does.
     fn compile_timewait(&mut self, el: &Element) {
-        self.warn_unknown_attrs(el, &["milliseconds"]);
-        let Some(ms) = self.parse_num_attr(el, "milliseconds") else {
-            self.diags
-                .error(Some(el.line), "<timewait> needs 'milliseconds'");
-            return;
-        };
+        let common = self.parse_common(el, &pause_attrs());
+        let spec = self.parse_pause_spec(el);
         let actions = self.parse_step_actions(el);
         self.steps.push(Step::Timewait {
-            ms,
+            spec,
             actions,
-            line: el.line,
+            common,
         });
     }
 
@@ -1003,7 +1018,18 @@ impl Compiler {
         ];
         let allowed: Vec<&str> = COMMON.iter().chain(element_attrs).copied().collect();
         self.warn_unknown_attrs(el, &allowed);
-        if let Some(label) = el.attr("next") {
+        // SIPp `getCommonAttributes` (~l.1861, ~l.1879): a timewait ends the
+        // call, so a branch out of it is refused at load.
+        let is_timewait = el.name == "timewait";
+        for branch in ["next", "ontimeout"] {
+            if is_timewait && el.attr(branch).is_some() {
+                self.diags.error(
+                    Some(el.line),
+                    format!("'{branch}' is not allowed on <timewait>: the call ends after it"),
+                );
+            }
+        }
+        if let Some(label) = el.attr("next").filter(|_| !is_timewait) {
             self.pending.push(Pending {
                 step: self.steps.len(),
                 slot: Slot::Next,
@@ -1011,7 +1037,7 @@ impl Compiler {
                 line: el.line,
             });
         }
-        if let Some(label) = el.attr("ontimeout") {
+        if let Some(label) = el.attr("ontimeout").filter(|_| !is_timewait) {
             self.pending.push(Pending {
                 step: self.steps.len(),
                 slot: Slot::Ontimeout,
@@ -1890,7 +1916,7 @@ impl Compiler {
         let mut bad_jumps = Vec::new();
         for step in &mut self.steps {
             let line = match step {
-                Step::Timewait { line, .. } | Step::Label { line, .. } => *line,
+                Step::Label { line, .. } => *line,
                 _ => step.common().map_or(0, |c| c.line),
             };
             let Some(actions) = step.actions_mut() else {

@@ -2017,9 +2017,12 @@ statistics screen (`screen.cpp` `draw_stats_screen`) and written as
 
 Found on the way: a nop's and a recvCmd's counter was booked only when
 their actions did not move the call, and a send's only after it went
-out; SIPp books all three first. Left open (SIPP_COMPAT §6): sipr's
-`<timewait>` warns `counter=` away as unknown where SIPp books it on
-entry. Also found: sipp names the `-trace_screen` file
+out; SIPp books all three first. Left open here, and fixed after M50
+(SIPP_COMPAT §6): sipr's `<timewait>` warned `counter=` away as
+unknown where SIPp books it on entry — it now takes what a `<pause>`
+takes, `next`/`ontimeout` excepted — and the RTDs of a pause, nop,
+sendCmd, recvCmd and timewait were never booked. Also found: sipp
+names the `-trace_screen` file
 `<scenario>_<pid>_screen.log` (its `screen` log-file entry), not the
 `_screens.log` its help text gives and sipr copied — fixed separately.
 

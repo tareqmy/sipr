@@ -4028,12 +4028,19 @@ impl<'s> Engine<'s> {
                         call.index = index + 1;
                     }
                 }
-                Step::Timewait { ms, actions, .. } => {
+                Step::Timewait {
+                    spec,
+                    actions,
+                    common,
+                } => {
                     // SIPp's timewait is a pause (`call.cpp` ~l.1956): it
-                    // counts a session and runs its actions on entry.
+                    // counts a session, books its counter and RTDs and runs
+                    // its actions on entry.
+                    let mut dur = self.sample_pause(spec, call_id);
                     if let Some(s) = self.call_stats(call_id).step_mut(index) {
                         s.sessions += 1;
                     }
+                    self.do_bookkeeping(call_id, index, common);
                     let AfterActions::Proceed { jump } =
                         self.run_step_actions(call_id, actions, index)
                     else {
@@ -4045,6 +4052,11 @@ impl<'s> Engine<'s> {
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
+                    // A <pauserestore> among the actions sets the deadline
+                    // the linger waits for, as on a pause.
+                    if let Some(deadline) = call.paused_until.take() {
+                        dur = deadline.saturating_duration_since(Instant::now());
+                    }
                     call.generation += 1;
                     let kind = match resume {
                         Some(step) => {
@@ -4058,7 +4070,7 @@ impl<'s> Engine<'s> {
                         }
                     };
                     let timer = self.timers.arm(
-                        Duration::from_millis(*ms),
+                        dur,
                         Event::CallTimer {
                             call_id: call_id.to_owned(),
                             generation: call.generation,
@@ -4094,9 +4106,9 @@ impl<'s> Engine<'s> {
     /// this call, so its `counter=`, if any, adds one on the scenario's
     /// stat set, which every call of the scenario shares, and its RTDs
     /// start or stop. SIPp books a step before its actions run (a nop, a
-    /// recvCmd, a pause) and before a send is built, so a step whose
-    /// action jumps away, or whose send fails, still counts. A matched
-    /// recv books itself inline (`on_recv_match`).
+    /// recvCmd, a pause, a timewait) and before a send is built, so a step
+    /// whose action jumps away, or whose send fails, still counts. A
+    /// matched recv books itself inline (`on_recv_match`).
     fn do_bookkeeping(&mut self, call_id: &str, index: usize, common: &StepCommon) {
         let now = Instant::now();
         let Some(call) = self.calls.get_mut(call_id) else {
@@ -6924,17 +6936,23 @@ fn step_label(step: &Step) -> String {
                 format!("recv {what}")
             }
         }
-        Step::Pause { spec, .. } => match spec {
-            PauseSpec::Default => "pause".to_owned(),
-            PauseSpec::Fixed(ms) => format!("pause {ms}ms"),
-            PauseSpec::Variable(_) => "pause [$var]".to_owned(),
-            PauseSpec::Distribution(d) => format!("pause {}", d.describe()),
-        },
+        Step::Pause { spec, .. } => format!("pause{}", pause_length(spec)),
         Step::Nop { .. } => "nop".to_owned(),
         Step::SendCmd { .. } => "sendCmd".to_owned(),
         Step::RecvCmd { .. } => "recvCmd".to_owned(),
         Step::Label { id, .. } => format!("label {id}"),
-        Step::Timewait { ms, .. } => format!("timewait {ms}ms"),
+        Step::Timewait { spec, .. } => format!("timewait{}", pause_length(spec)),
+    }
+}
+
+/// The scenario screen's rendering of how long a pause or a timewait
+/// lasts, with its leading space; nothing for the `-d` default.
+fn pause_length(spec: &PauseSpec) -> String {
+    match spec {
+        PauseSpec::Default => String::new(),
+        PauseSpec::Fixed(ms) => format!(" {ms}ms"),
+        PauseSpec::Variable(_) => " [$var]".to_owned(),
+        PauseSpec::Distribution(d) => format!(" {}", d.describe()),
     }
 }
 

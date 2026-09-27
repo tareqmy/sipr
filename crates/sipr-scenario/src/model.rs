@@ -301,20 +301,22 @@ pub enum Step {
         /// Source line.
         line: u32,
     },
-    /// Post-scenario linger absorbing late retransmissions.
+    /// Post-scenario linger absorbing late retransmissions. SIPp's
+    /// `<timewait>` is a `<pause>` with a flag (`scenario.cpp` reads both
+    /// in one branch), so it takes a pause's duration and the common
+    /// attributes, `next` and `ontimeout` excepted.
     Timewait {
-        /// Duration in ms.
-        ms: u64,
+        /// How long the linger lasts.
+        spec: PauseSpec,
         /// Actions run when the linger starts.
         actions: Vec<Action>,
-        /// Source line.
-        line: u32,
+        /// Shared attributes (never `next` or `ontimeout`).
+        common: StepCommon,
     },
 }
 
 impl Step {
-    /// The attributes every message command shares; a label and a
-    /// timewait have none.
+    /// The attributes every message command shares; a label has none.
     #[must_use]
     pub fn common(&self) -> Option<&StepCommon> {
         match self {
@@ -323,8 +325,9 @@ impl Step {
             Self::Pause { common, .. }
             | Self::Nop { common, .. }
             | Self::SendCmd { common, .. }
-            | Self::RecvCmd { common, .. } => Some(common),
-            Self::Label { .. } | Self::Timewait { .. } => None,
+            | Self::RecvCmd { common, .. }
+            | Self::Timewait { common, .. } => Some(common),
+            Self::Label { .. } => None,
         }
     }
 
@@ -336,8 +339,9 @@ impl Step {
             Self::Pause { common, .. }
             | Self::Nop { common, .. }
             | Self::SendCmd { common, .. }
-            | Self::RecvCmd { common, .. } => Some(common),
-            Self::Label { .. } | Self::Timewait { .. } => None,
+            | Self::RecvCmd { common, .. }
+            | Self::Timewait { common, .. } => Some(common),
+            Self::Label { .. } => None,
         }
     }
 
@@ -1005,15 +1009,11 @@ impl Scenario {
                     format!("recv {what}{extra}{}", self.common_suffix(&r.common))
                 }
                 Step::Pause { spec, common, .. } => {
-                    let what = match spec {
-                        PauseSpec::Default => "default (-d)".to_owned(),
-                        PauseSpec::Fixed(ms) => format!("{ms}ms"),
-                        PauseSpec::Variable(v) => format!("variable ${}", self.vars.name(*v)),
-                        PauseSpec::Distribution(d) => {
-                            format!("{} {}", d.kind(), d.describe())
-                        }
-                    };
-                    format!("pause {what}{}", self.common_suffix(common))
+                    format!(
+                        "pause {}{}",
+                        self.pause_length(spec),
+                        self.common_suffix(common)
+                    )
                 }
                 Step::Nop { actions, common } => {
                     format!(
@@ -1041,7 +1041,13 @@ impl Scenario {
                     self.common_suffix(common)
                 ),
                 Step::Label { id, .. } => format!("label '{id}'"),
-                Step::Timewait { ms, .. } => format!("timewait {ms}ms"),
+                Step::Timewait { spec, common, .. } => {
+                    format!(
+                        "timewait {}{}",
+                        self.pause_length(spec),
+                        self.common_suffix(common)
+                    )
+                }
             };
             // Numbered as SIPp numbers messages, so the numbers are what
             // `<jump value=>` and `[msg_index]` mean; a label has none.
@@ -1052,6 +1058,16 @@ impl Scenario {
             }
         }
         out
+    }
+
+    /// The dump's rendering of how long a pause or a timewait lasts.
+    fn pause_length(&self, spec: &PauseSpec) -> String {
+        match spec {
+            PauseSpec::Default => "default (-d)".to_owned(),
+            PauseSpec::Fixed(ms) => format!("{ms}ms"),
+            PauseSpec::Variable(v) => format!("variable ${}", self.vars.name(*v)),
+            PauseSpec::Distribution(d) => format!("{} {}", d.kind(), d.describe()),
+        }
     }
 
     /// The dump's rendering of the shared attributes; `next` as the

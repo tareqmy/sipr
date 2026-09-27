@@ -18,15 +18,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `<timewait>` takes what a `<pause>` takes, as SIPp reads both in one
+  branch: the common attributes — so `<timewait counter=…>` counts, and
+  its `rtd=`, `crlf`, `hide`, `display` and `condexec` apply — and a
+  pause's duration (`variable=`, a distribution, or `-d` when bare).
+  `next=` and `ontimeout=` on it are compile errors, as SIPp refuses
+  them. sipr used to accept only `milliseconds` there and warn the rest
+  away as unknown (the item left open in M48).
+- A pause's, nop's, sendCmd's, recvCmd's and timewait's `start_rtd=`
+  and `rtd=` are booked on entry, where SIPp's `do_bookkeeping` runs
+  them with the step's counter; sipr applied RTDs only on a send and a
+  matched recv, so an RTD that started or stopped on any other step
+  measured nothing.
 - `-trace_rtt` rows carry milliseconds, as their column names say and
   as real sipp writes them: its clock counts microseconds since the
   process started and `computeRtt` divides by 1000. sipr divided once
   more and wrote seconds, in both columns. Found when the counters
   interop test started reading real sipp's rtt file.
-- A pause's, nop's, sendCmd's and recvCmd's `start_rtd=` and `rtd=`
-  are booked on entry, where SIPp's `do_bookkeeping` runs them with the
-  step's counter; sipr applied RTDs only on a send and a matched recv,
-  so an RTD that started or stopped on any other step measured nothing.
 - `verifyauth` no longer panics on an Authorization header whose
   `algorithm=` value carries a non-UTF-8 byte in its first three: the
   MD5/SHA-256 prefix check compared a `str` slice at a fixed byte index,

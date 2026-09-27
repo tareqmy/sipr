@@ -219,8 +219,9 @@ fn successors(steps: &[Step], i: StepIndex, retaddr: Option<VarId>) -> Option<Ve
     let mut out = Vec::new();
     match step.common() {
         // The call ends after a <timewait> (SIPp refuses any step after
-        // one), unless a jump among its actions sends it elsewhere.
-        None if matches!(step, Step::Timewait { .. }) => {}
+        // one, and a `next` on it), unless a jump among its actions sends
+        // it elsewhere.
+        Some(_) if matches!(step, Step::Timewait { .. }) => {}
         None => return Some(vec![i + 1]), // a label
         Some(common) => {
             // An optional recv is a window: a message for a later step can
@@ -452,7 +453,7 @@ fn readable(line: &str) -> String {
 
 fn line_of(step: &Step) -> u32 {
     match step {
-        Step::Label { line, .. } | Step::Timewait { line, .. } => *line,
+        Step::Label { line, .. } => *line,
         _ => step.common().map_or(0, |c| c.line),
     }
 }
