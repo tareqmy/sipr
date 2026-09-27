@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -107,8 +108,21 @@ pub struct TlsTransport {
     sink: Sender<NetEvent>,
     /// Client configuration, kept for per-call connections (`ln`).
     client: Option<Arc<ClientConfig>>,
-    /// Kept so the accept loop lives as long as the transport (server only).
-    _accept: Option<std::thread::JoinHandle<()>>,
+    /// Raised when the transport is dropped, so the accept loop ends.
+    stop: Arc<AtomicBool>,
+    /// The accept loop (server only), joined on drop.
+    accept: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for TlsTransport {
+    /// Ends the accept thread and with it the listener, so the port is free
+    /// once the transport is gone.
+    fn drop(&mut self) {
+        let local = self.local_addr;
+        crate::wake::stop_and_join(&self.stop, self.accept.take(), || {
+            crate::wake::wake_tcp(local)
+        });
+    }
 }
 
 /// A per-call TLS connection (`-t ln`): dialed and handshaken for one call,
@@ -179,7 +193,8 @@ impl TlsTransport {
             send_loss_pct: config.send_loss_pct,
             sink,
             client: Some(client_config),
-            _accept: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            accept: None,
         })
     }
 
@@ -203,7 +218,8 @@ impl TlsTransport {
             send_loss_pct: config.send_loss_pct,
             sink,
             client: Some(client_config(tls_config)?),
-            _accept: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            accept: None,
         })
     }
 
@@ -324,10 +340,15 @@ impl TlsTransport {
         let accept_conns = conns.clone();
         let accept_sink = sink.clone();
         let accept_opts = config.sockopts.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
         let accept = std::thread::Builder::new()
             .name("sipr-tls-accept".into())
             .spawn(move || {
                 for stream in listener.incoming() {
+                    if stop_flag.load(Ordering::Acquire) {
+                        return;
+                    }
                     let Ok(mut sock) = stream else { continue };
                     let Ok(peer) = sock.peer_addr() else {
                         continue;
@@ -369,7 +390,8 @@ impl TlsTransport {
             sink,
             // A server still dials out under `-rsa`; the same identity serves.
             client: client_config(tls_config).ok(),
-            _accept: accept,
+            stop,
+            accept,
         })
     }
 

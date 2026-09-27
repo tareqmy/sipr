@@ -5,9 +5,10 @@
 //! a control plane on a loopback port, not a web server.
 
 use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// A parsed request.
@@ -99,16 +100,18 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long dropping the server waits for requests it is still answering.
 const DRAIN_LIMIT: Duration = Duration::from_secs(1);
 
-/// The listening server; dropping it does not stop the accept thread (the
-/// thread ends when the process does), which is fine for a control plane.
-/// Dropping it does wait, briefly, for the requests it is answering: the
-/// engine drops it as the run ends, and `POST /quit` is answered only once
-/// the engine has taken the quit, so without the wait the process could
-/// end in the middle of that reply.
+/// The listening server. Dropping it waits, briefly, for the requests it
+/// is answering — the engine drops it as the run ends, and `POST /quit` is
+/// answered only once the engine has taken the quit, so without the wait
+/// the process could end in the middle of that reply — and then ends the
+/// accept thread, so the port is free once the server is gone.
 pub struct HttpServer {
     local_addr: SocketAddr,
     /// Requests read and not yet answered in full.
     answering: Arc<AtomicUsize>,
+    /// Raised on drop, so the accept loop ends.
+    stop: Arc<AtomicBool>,
+    accept: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HttpServer {
@@ -122,10 +125,15 @@ impl HttpServer {
         let local_addr = listener.local_addr()?;
         let answering = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&answering);
-        std::thread::Builder::new()
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let accept = std::thread::Builder::new()
             .name("sipr-http".into())
             .spawn(move || {
                 for stream in listener.incoming() {
+                    if stop_flag.load(Ordering::Acquire) {
+                        return;
+                    }
                     let Ok(stream) = stream else { continue };
                     let handler = Arc::clone(&handler);
                     let counter = Arc::clone(&counter);
@@ -137,6 +145,8 @@ impl HttpServer {
         Ok(Self {
             local_addr,
             answering,
+            stop,
+            accept: Some(accept),
         })
     }
 
@@ -152,6 +162,26 @@ impl Drop for HttpServer {
         let deadline = Instant::now() + DRAIN_LIMIT;
         while self.answering.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
+        }
+        self.stop.store(true, Ordering::Release);
+        let Some(accept) = self.accept.take() else {
+            return;
+        };
+        // A connection of our own returns the blocked accept, which sees
+        // the flag; if it cannot reach the listener the thread is left to
+        // end on its own.
+        let ip = match self.local_addr.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            ip => ip,
+        };
+        let woke = TcpStream::connect_timeout(
+            &SocketAddr::new(ip, self.local_addr.port()),
+            Duration::from_millis(200),
+        )
+        .is_ok();
+        if woke {
+            let _ = accept.join();
         }
     }
 }
@@ -381,7 +411,10 @@ mod tests {
         .unwrap();
         let _idle = TcpStream::connect(quiet.local_addr()).unwrap();
         let started = Instant::now();
+        let quiet_addr = quiet.local_addr();
         drop(quiet);
         assert!(started.elapsed() < Duration::from_millis(100));
+        // And the accept thread went with it: the port is free.
+        TcpListener::bind(quiet_addr).expect("port free again");
     }
 }

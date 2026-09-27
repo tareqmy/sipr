@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- A dropped transport frees its port at once. Every listener's thread —
+  the UDP receive loop, the TCP, TLS and SCTP accept loops, SIPp's UDP
+  control socket and the HTTP API's accept loop — used to block in the
+  kernel holding its socket until the process ended, so a run's ports
+  stayed bound after the run. Each now owns its thread: dropping the
+  transport raises a flag, wakes the thread with a datagram or a
+  connection of its own, and joins it. An embedder can start a UAS on a
+  port, wait for it, and start another on the same port.
+
 ### Changed
 
 - `sipr_engine::EngineError` is an enum — `Config`, `Scenario`, `Bind`

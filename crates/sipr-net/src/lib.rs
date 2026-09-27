@@ -26,6 +26,7 @@ pub mod timer;
 pub mod tls;
 pub mod transport;
 pub mod twin;
+mod wake;
 
 pub use message::{Inbound, MsgKind, ParseError};
 pub use retrans::{RetransCaps, RetransSchedule};

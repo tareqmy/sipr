@@ -1699,6 +1699,8 @@ struct Engine<'s> {
     stats_json: Option<sipr_stats::TraceFile>,
     /// Keeps the HTTP listener alive for the run.
     _http: Option<sipr_control::http::HttpServer>,
+    /// SIPp's UDP control socket; dropping it frees the control port.
+    _ctrl_udp: Option<sipr_control::udp::ControlSocket>,
     /// `set rate-scale`: the step multiplier for the rate keys.
     rate_scale: f64,
     /// `-rtp_echo`: the global echo sockets, when enabled.
@@ -2029,6 +2031,7 @@ impl<'s> Engine<'s> {
                 }
             })
             .ok();
+        let mut ctrl_udp = None;
         if config.control_port != Some(0) {
             match sipr_control::udp::bind(config.control_ip, config.control_port) {
                 Ok(sock) => {
@@ -2038,13 +2041,14 @@ impl<'s> Engine<'s> {
                             .info(format!("control socket (UDP, SIPp -cp protocol) on {addr}"));
                     }
                     let warnings = config.notices.clone();
-                    sipr_control::udp::serve(sock, ctrl_tx.clone(), move |w| {
+                    let served = sipr_control::udp::serve(sock, ctrl_tx.clone(), move |w| {
                         warnings.warning(w);
                     })
                     .map_err(|e| EngineError::Bind {
                         what: "cannot start the control socket".to_owned(),
                         source: e,
                     })?;
+                    ctrl_udp = Some(served);
                 }
                 Err(e) if config.control_port.is_some() => {
                     return Err(EngineError::Bind {
@@ -2401,6 +2405,7 @@ impl<'s> Engine<'s> {
             control_snapshot,
             stats_json,
             _http: http,
+            _ctrl_udp: ctrl_udp,
             rate_scale: config.rate_scale.unwrap_or(1.0),
             echo,
             call_echoes: HashMap::new(),

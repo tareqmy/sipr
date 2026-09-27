@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -85,7 +86,24 @@ pub struct SctpTransport {
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
     sink: Sender<NetEvent>,
-    _accept: Option<std::thread::JoinHandle<()>>,
+    /// Raised when the transport is dropped, so the accept loop ends.
+    stop: Arc<AtomicBool>,
+    /// The accept loop (server only), joined on drop.
+    accept: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for SctpTransport {
+    /// Ends the accept thread and with it the listener, so the port is free
+    /// once the transport is gone. The wake-up is an SCTP association to
+    /// the listener from this host.
+    fn drop(&mut self) {
+        let local = crate::wake::reachable(self.local_addr);
+        crate::wake::stop_and_join(&self.stop, self.accept.take(), || {
+            sctp_socket(domain_of(local))
+                .and_then(|s| s.connect(&local.into()))
+                .is_ok()
+        });
+    }
 }
 
 /// A per-call SCTP association (`-t sn`); dropping it shuts it down.
@@ -138,7 +156,8 @@ impl SctpTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0031)),
             send_loss_pct: config.send_loss_pct,
             sink,
-            _accept: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            accept: None,
         })
     }
 
@@ -162,6 +181,8 @@ impl SctpTransport {
         let accept_conns = conns.clone();
         let accept_sink = sink.clone();
         let accept_opts = config.sockopts.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
         let accept = std::thread::Builder::new()
             .name("sipr-sctp-accept".into())
             .spawn(move || {
@@ -169,6 +190,9 @@ impl SctpTransport {
                     let Ok((sock, _)) = listener.accept() else {
                         continue;
                     };
+                    if stop_flag.load(Ordering::Acquire) {
+                        return;
+                    }
                     let _ = accept_opts.apply(&sock);
                     let stream: TcpStream = sock.into();
                     let Ok(peer) = stream.peer_addr() else {
@@ -185,7 +209,8 @@ impl SctpTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0032)),
             send_loss_pct: config.send_loss_pct,
             sink,
-            _accept: accept,
+            stop,
+            accept,
         })
     }
 
@@ -200,7 +225,8 @@ impl SctpTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0033)),
             send_loss_pct: config.send_loss_pct,
             sink,
-            _accept: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            accept: None,
         }
     }
 

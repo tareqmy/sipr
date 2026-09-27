@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -135,8 +136,21 @@ pub struct TcpTransport {
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
     sink: Sender<NetEvent>,
-    /// Kept so the accept loop lives as long as the transport (server only).
-    _accept: Option<std::thread::JoinHandle<()>>,
+    /// Raised when the transport is dropped, so the accept loop ends.
+    stop: Arc<AtomicBool>,
+    /// The accept loop (server only), joined on drop.
+    accept: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for TcpTransport {
+    /// Ends the accept thread and with it the listener, so the port is free
+    /// once the transport is gone.
+    fn drop(&mut self) {
+        let local = self.local_addr;
+        crate::wake::stop_and_join(&self.stop, self.accept.take(), || {
+            crate::wake::wake_tcp(local)
+        });
+    }
 }
 
 /// A per-call TCP connection (`-t tn`): dialed for one call, read by its own
@@ -186,7 +200,8 @@ impl TcpTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0011)),
             send_loss_pct: config.send_loss_pct,
             sink,
-            _accept: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            accept: None,
         })
     }
 
@@ -202,7 +217,8 @@ impl TcpTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0013)),
             send_loss_pct: config.send_loss_pct,
             sink,
-            _accept: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            accept: None,
         }
     }
 
@@ -293,10 +309,15 @@ impl TcpTransport {
         let accept_conns = conns.clone();
         let accept_sink = sink.clone();
         let accept_opts = config.sockopts.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
         let accept = std::thread::Builder::new()
             .name("sipr-tcp-accept".into())
             .spawn(move || {
                 for stream in listener.incoming() {
+                    if stop_flag.load(Ordering::Acquire) {
+                        return;
+                    }
                     let Ok(stream) = stream else { continue };
                     let Ok(peer) = stream.peer_addr() else {
                         continue;
@@ -314,7 +335,8 @@ impl TcpTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0012)),
             send_loss_pct: config.send_loss_pct,
             sink,
-            _accept: accept,
+            stop,
+            accept,
         })
     }
 
@@ -425,6 +447,26 @@ fn read_loop(mut stream: TcpStream, peer: SocketAddr, sink: &Sender<NetEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accept thread goes with the transport, so the port is free as
+    /// soon as it is dropped.
+    #[test]
+    fn dropping_the_listener_frees_its_port() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let cfg = TransportConfig {
+            local_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..TransportConfig::default()
+        };
+        let t = TcpTransport::listen(&cfg, tx).expect("listen");
+        let addr = t.local_addr();
+        let started = std::time::Instant::now();
+        drop(t);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "drop joined promptly"
+        );
+        TcpListener::bind(addr).expect("port free again");
+    }
     use std::sync::mpsc;
     use std::time::Duration;
 

@@ -172,6 +172,13 @@ finish, run `timewait`, exit with SIPp-compatible exit codes: 0 all calls passed
 1 some failed, 97 aborted by user, 99 aborted on error (check exact codes vs
 SIPp docs before M3 completion). Hard quit (`Q`, second SIGINT): drop everything.
 
+Every socket thread ends with its owner: a transport, the control socket and
+the HTTP server each hold a stop flag and their thread's handle, and their
+`Drop` raises the flag, wakes the blocked `recv_from`/`accept` with a datagram
+or connection of its own (`sipr-net/src/wake.rs`), and joins. So when a run's
+engine is gone its ports are free — the library's `Run` relies on it, and the
+binary no longer leans on process exit to close anything.
+
 ## 6. Where things will NOT go
 
 - No global mutable state; SIPp's C++ is a museum of it and it's the main reason

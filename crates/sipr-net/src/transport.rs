@@ -7,7 +7,7 @@
 //! RNG) applies on both paths *before* any real I/O or delivery, exactly as
 //! if the network dropped the packet.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -91,6 +91,7 @@ pub struct UdpTransport {
     recv_loss_pct: f64,
     loss_seed: u64,
     sink: Sender<NetEvent>,
+    stop: Arc<AtomicBool>,
     recv_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -114,30 +115,23 @@ impl UdpCallSocket {
 
 impl Drop for UdpCallSocket {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
-        // Wake the blocking recv with an empty datagram, then reap it.
-        let any: IpAddr = match self.local_addr.ip() {
-            IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
-            IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
-        };
-        if let Ok(waker) = UdpSocket::bind(SocketAddr::new(any, 0)) {
-            let _ = waker.send_to(&[], self.local_addr);
-        }
-        let _ = thread.join();
+        let local = self.local_addr;
+        crate::wake::stop_and_join(&self.stop, self.thread.take(), || {
+            crate::wake::wake_udp(local)
+        });
     }
 }
 
 /// One socket's receive loop: parse, route, deliver until the sink is gone,
-/// the socket dies, or `stop` is raised (per-call sockets).
+/// the socket dies, or `stop` is raised. A socket error ends the run when
+/// `report_errors` (the main socket); a per-call socket's is its own.
 fn recv_loop(
     socket: &UdpSocket,
     sink: &Sender<NetEvent>,
     recv_loss_pct: f64,
     mut recv_rng: Rng,
-    stop: Option<&AtomicBool>,
+    stop: &AtomicBool,
+    report_errors: bool,
 ) {
     let local = socket
         .local_addr()
@@ -146,7 +140,7 @@ fn recv_loop(
     loop {
         match socket.recv_from(&mut buf) {
             Ok((n, from)) => {
-                if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+                if stop.load(Ordering::Acquire) {
                     return;
                 }
                 if n == 0 {
@@ -171,7 +165,7 @@ fn recv_loop(
             }
             Err(e) if is_transient_recv_error(&e) => continue,
             Err(e) => {
-                if stop.is_none() {
+                if report_errors && !stop.load(Ordering::Acquire) {
                     let _ = sink.send(NetEvent::SocketError(e.kind()));
                 }
                 return;
@@ -210,9 +204,20 @@ impl UdpTransport {
         let recv_loss_pct = config.recv_loss_pct;
         let recv_rng = Rng::new(config.loss_seed ^ 0x5EED_0002);
         let recv_sink = sink.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
         let recv_thread = std::thread::Builder::new()
             .name("sipr-udp-recv".into())
-            .spawn(move || recv_loop(&recv_socket, &recv_sink, recv_loss_pct, recv_rng, None))
+            .spawn(move || {
+                recv_loop(
+                    &recv_socket,
+                    &recv_sink,
+                    recv_loss_pct,
+                    recv_rng,
+                    &stop_flag,
+                    true,
+                );
+            })
             .ok();
         Ok(Self {
             socket,
@@ -223,6 +228,7 @@ impl UdpTransport {
             recv_loss_pct: config.recv_loss_pct,
             loss_seed: config.loss_seed,
             sink,
+            stop,
             recv_thread,
         })
     }
@@ -262,7 +268,8 @@ impl UdpTransport {
                     &sink,
                     recv_loss_pct,
                     recv_rng,
-                    Some(&stop_flag),
+                    &stop_flag,
+                    false,
                 );
             })?;
         Ok(UdpCallSocket {
@@ -335,14 +342,13 @@ impl UdpTransport {
 }
 
 impl Drop for UdpTransport {
+    /// Ends the receive thread and with it the socket, so the port is free
+    /// once the transport is gone.
     fn drop(&mut self) {
-        // Unblock the recv thread by shutting the socket down via a
-        // self-addressed empty-ish datagram is unreliable; instead we rely on
-        // process teardown in the binary. In tests, dropping the receiver
-        // makes the loop exit on the next datagram. Detach the handle.
-        if let Some(t) = self.recv_thread.take() {
-            drop(t); // detach; recv loop exits when sink or socket dies
-        }
+        let local = self.local_addr;
+        crate::wake::stop_and_join(&self.stop, self.recv_thread.take(), || {
+            crate::wake::wake_udp(local)
+        });
     }
 }
 
@@ -358,6 +364,28 @@ mod tests {
         cfg.local_ip = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let t = UdpTransport::bind(&cfg, tx).expect("bind");
         (t, rx)
+    }
+
+    /// The receive thread goes with the transport, so the port is free
+    /// as soon as it is dropped — not when the process ends.
+    #[test]
+    fn dropping_the_transport_frees_its_port() {
+        let (t, _rx) = bind(&TransportConfig::default());
+        let addr = t.local_addr();
+        drop(t);
+        UdpSocket::bind(addr).expect("port free again");
+        // Bound to every interface, the wake-up goes over loopback.
+        let (tx, _rx) = mpsc::channel();
+        let cfg = TransportConfig::default();
+        let t = UdpTransport::bind(&cfg, tx).expect("bind any");
+        let addr = t.local_addr();
+        let started = std::time::Instant::now();
+        drop(t);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "drop joined promptly"
+        );
+        UdpSocket::bind(addr).expect("port free again (any)");
     }
 
     const OPTIONS: &[u8] = b"OPTIONS sip:x SIP/2.0\r\nCall-ID: t-1\r\nCSeq: 9 OPTIONS\r\n\r\n";

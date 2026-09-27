@@ -11,6 +11,8 @@
 //! unless `-ci` says so.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 use crate::command::{Datagram, parse_command, parse_datagram};
@@ -45,19 +47,66 @@ pub fn bind(ip: Option<IpAddr>, port: Option<u16>) -> std::io::Result<UdpSocket>
     }
 }
 
+/// The served control socket. Dropping it ends its thread and closes the
+/// socket, so the control port is free once the run is over.
+pub struct ControlSocket {
+    local_addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ControlSocket {
+    /// The bound address.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+impl Drop for ControlSocket {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        // An empty datagram returns the blocked recv, which sees the flag.
+        let ip = match self.local_addr.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            ip => ip,
+        };
+        let any: IpAddr = match ip {
+            IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+            IpAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+        };
+        let woke = UdpSocket::bind(SocketAddr::new(any, 0))
+            .and_then(|waker| waker.send_to(&[], SocketAddr::new(ip, self.local_addr.port())))
+            .is_ok();
+        if woke {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Serve `socket` on a background thread: every datagram becomes a
 /// [`ControlRequest`] without a reply channel. Parse errors (SIPp's
-/// warning text) go to `warn`.
+/// warning text) go to `warn`. The returned guard owns the thread.
 pub fn serve(
     socket: UdpSocket,
     requests: Sender<ControlRequest>,
     warn: impl Fn(&str) + Send + 'static,
-) -> std::io::Result<()> {
-    std::thread::Builder::new()
+) -> std::io::Result<ControlSocket> {
+    let local_addr = socket.local_addr()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
         .name("sipr-ctrl-udp".into())
         .spawn(move || {
             let mut buf = [0u8; 65_536];
             while let Ok((n, _)) = socket.recv_from(&mut buf) {
+                if stop_flag.load(Ordering::Acquire) {
+                    return;
+                }
                 let cmd = match parse_datagram(&buf[..n]) {
                     None => continue,
                     Some(Datagram::Key(c)) => ControlCmd::Key(c),
@@ -74,7 +123,11 @@ pub fn serve(
                 }
             }
         })?;
-    Ok(())
+    Ok(ControlSocket {
+        local_addr,
+        stop,
+        thread: Some(thread),
+    })
 }
 
 #[cfg(test)]
@@ -90,10 +143,11 @@ mod tests {
         let addr = sock.local_addr().unwrap();
         let (tx, rx) = channel();
         let (warn_tx, warn_rx) = channel::<String>();
-        serve(sock, tx, move |w| {
+        let served = serve(sock, tx, move |w| {
             let _ = warn_tx.send(w.to_owned());
         })
         .unwrap();
+        assert_eq!(served.local_addr(), addr);
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.send_to(b"p\n", addr).unwrap();
         client.send_to(b"cset rate 5\n", addr).unwrap();
@@ -107,6 +161,9 @@ mod tests {
             warn_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             "Unknown set attribute: bogus"
         );
+        // Dropping the guard ends the thread and frees the port.
+        drop(served);
+        UdpSocket::bind(addr).expect("the control port is free again");
     }
 
     #[test]
