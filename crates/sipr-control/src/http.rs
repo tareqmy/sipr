@@ -330,22 +330,45 @@ mod tests {
     /// not for a connection that sent nothing.
     #[test]
     fn dropping_the_server_lets_a_reply_in_progress_finish() {
-        let handler: Handler = Arc::new(|_: &Request| {
-            std::thread::sleep(Duration::from_millis(300));
-            Response::text(202, "done")
-        });
+        use std::sync::atomic::AtomicBool;
+
+        // The handler reports when it starts and when it is done, so the
+        // test keys off those rather than off how long its own sleeps
+        // take — a loaded CI runner oversleeps by hundreds of ms.
+        let entered = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let handler: Handler = {
+            let entered = Arc::clone(&entered);
+            let finished = Arc::clone(&finished);
+            Arc::new(move |_: &Request| {
+                entered.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(300));
+                finished.store(true, Ordering::Release);
+                Response::text(202, "done")
+            })
+        };
         let server = HttpServer::start("127.0.0.1:0".parse().unwrap(), handler).unwrap();
         let addr = server.local_addr();
         let _idle = TcpStream::connect(addr).unwrap();
         let client = std::thread::spawn(move || roundtrip(addr, "POST /quit HTTP/1.1\r\n\r\n"));
-        std::thread::sleep(Duration::from_millis(100));
+        let arrival = Instant::now();
+        while !entered.load(Ordering::Acquire) {
+            assert!(
+                arrival.elapsed() < Duration::from_secs(5),
+                "request never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let started = Instant::now();
         drop(server);
         let waited = started.elapsed();
+        // The reply was still being computed when the drop began, and the
+        // drop returned only once it was done — and well inside the limit.
         assert!(
-            waited >= Duration::from_millis(100) && waited < DRAIN_LIMIT,
-            "{waited:?}"
+            finished.load(Ordering::Acquire),
+            "dropped before the reply was done"
         );
+        assert!(waited < DRAIN_LIMIT, "{waited:?}");
         let out = client.join().unwrap();
         assert!(out.starts_with("HTTP/1.1 202"), "{out}");
         assert!(out.ends_with("done"), "{out}");
