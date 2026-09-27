@@ -8999,7 +8999,32 @@ fn a_matched_recv_follows_next_test_and_chance() {
         .iter()
         .map(|&(name, _, branch, at_ms)| (name, Some((branch.to_owned(), at_ms))))
         .collect();
-    assert_eq!(got, expected, "which BYE the UAS sent, and when");
+    // On a mismatch, the unrounded delays and each UAS's stderr: a
+    // 260 ms slip on a loaded runner and a 500 ms one mean different
+    // things, and the buckets alone cannot tell them apart.
+    let raw: Vec<String> = RECV_BRANCH_CASES
+        .iter()
+        .zip(&runs)
+        .map(|(&(name, ..), run)| {
+            let when = run
+                .request
+                .as_ref()
+                .map_or("no request".to_owned(), |(branch, after)| {
+                    format!("{branch} after {} ms", after.as_millis())
+                });
+            format!(
+                "{name}: {when}; exit {:?}\n{}",
+                run.code,
+                run.stderr.trim_end()
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        expected,
+        "which BYE the UAS sent, and when\n--- raw ---\n{}",
+        raw.join("\n")
+    );
     for (&(name, ..), run) in RECV_BRANCH_CASES.iter().zip(&runs) {
         let err = &run.stderr;
         assert!(!err.contains("warning"), "{name}: {err}");
