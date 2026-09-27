@@ -80,6 +80,44 @@ fn uas_runs_and_exits_99_when_no_calls_arrive() {
     assert!(err.contains("answering calls"), "{err}");
 }
 
+/// Headless runs read SIPp's key commands from stdin: `q` soft-quits a
+/// UAS that has processed nothing long before its `-timeout`; `-nostdin`
+/// leaves stdin alone and the same `q` does nothing.
+#[test]
+fn headless_run_quits_on_q_from_stdin_unless_nostdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let run = |args: &[&str]| {
+        let started = Instant::now();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sipr"))
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sipr");
+        child.stdin.take().unwrap().write_all(b"q\n").unwrap();
+        let o = child.wait_with_output().expect("wait");
+        (o, started.elapsed())
+    };
+
+    let (o, took) = run(&["-sn", "uas", "-timeout", "10"]);
+    assert_code(&o, 99);
+    assert!(
+        took < Duration::from_secs(5),
+        "q on stdin should quit at once, took {took:?}"
+    );
+
+    let (o, took) = run(&["-sn", "uas", "-timeout", "1", "-nostdin"]);
+    assert_code(&o, 99);
+    assert!(
+        took >= Duration::from_millis(900),
+        "-nostdin must ignore stdin, took {took:?}"
+    );
+}
+
 #[test]
 fn unresolvable_target_is_fatal() {
     let o = sipr(&["-sn", "uac", "definitely-not-a-real-host.invalid."]);

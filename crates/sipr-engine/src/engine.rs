@@ -211,8 +211,9 @@ pub struct EngineConfig {
     /// `-callid_slash_ign`: keep a `///` prefix in Call-IDs (SIPp strips
     /// it as its 3PCC marker otherwise).
     pub callid_slash_ign: bool,
-    /// `-nostdin`: no keyboard control on stdin.
-    pub nostdin: bool,
+    /// Where the engine's [`crate::Notice`]s go: stderr with the binary's
+    /// wording by default, a channel for an embedder, or nowhere.
+    pub notices: crate::NoticeSink,
     /// `-tls_*` options; required when `transport` is [`TransportKind::TlsMono`].
     pub tls: Option<sipr_net::TlsConfig>,
     /// `-mi`: media address for `[media_ip]` and the RTP sockets (default:
@@ -345,7 +346,7 @@ impl Default for EngineConfig {
             pause_msg_ign: false,
             behaviors: Behaviors::default(),
             callid_slash_ign: false,
-            nostdin: false,
+            notices: crate::NoticeSink::Stderr,
             tls: None,
             media_ip: None,
             media_port: None,
@@ -990,11 +991,13 @@ impl std::fmt::Display for EngineError {
 
 /// Channels wiring a live UI to the engine: snapshots flow out about once
 /// a second; single-character key commands flow in (`+ - * / p q Q`).
+/// Either half may be absent — the binary's headless mode attaches only a
+/// stdin key reader, a TUI both.
 pub struct UiChannels {
     /// Engine → UI: periodic stat snapshots.
-    pub snapshots: std::sync::mpsc::Sender<sipr_stats::Snapshot>,
+    pub snapshots: Option<std::sync::mpsc::Sender<sipr_stats::Snapshot>>,
     /// UI → engine: key commands.
-    pub keys: Receiver<char>,
+    pub keys: Option<Receiver<char>>,
 }
 
 /// Run a UAC scenario to completion. Blocks until done.
@@ -1292,9 +1295,9 @@ fn open_twin(
                 .iter()
                 .any(|s| matches!(s, Step::RecvCmd { src: Some(_), .. }))
             {
-                eprintln!(
-                    "sipr: warning: recvCmd src= is only checked in extended 3PCC mode \
-                     (-slave_cfg); classic -3pcc has a single twin"
+                config.notices.warning(
+                    "recvCmd src= is only checked in extended 3PCC mode \
+                     (-slave_cfg); classic -3pcc has a single twin",
                 );
             }
             let ch = match role {
@@ -1727,19 +1730,20 @@ impl<'s> Engine<'s> {
         let main_layout = var_space.layout(&scenario.vars);
         let secondary_layout = secondary.map(|(_, sc)| var_space.layout(&sc.vars));
         let (tx, rx) = channel::<Event>();
-        let snapshot_tx = ui.map(|ui| {
+        let snapshot_tx = ui.and_then(|ui| {
             // Forward UI key presses into the event loop.
-            let key_tx = tx.clone();
-            let keys = ui.keys;
-            let _keys = std::thread::Builder::new()
-                .name("sipr-ui-keys".into())
-                .spawn(move || {
-                    while let Ok(c) = keys.recv() {
-                        if key_tx.send(Event::Stdin(c)).is_err() {
-                            return;
+            if let Some(keys) = ui.keys {
+                let key_tx = tx.clone();
+                let _keys = std::thread::Builder::new()
+                    .name("sipr-ui-keys".into())
+                    .spawn(move || {
+                        while let Ok(c) = keys.recv() {
+                            if key_tx.send(Event::Stdin(c)).is_err() {
+                                return;
+                            }
                         }
-                    }
-                });
+                    });
+            }
             ui.snapshots
         });
         // Bridge net events into the engine channel.
@@ -1772,10 +1776,10 @@ impl<'s> Engine<'s> {
             );
             let file = InjectionFile::parse(&name, &text).map_err(EngineError)?;
             if file.mode == InjectMode::User && config.users.is_none() {
-                eprintln!(
-                    "sipr: warning: injection file {name} uses USER mode but -users \
+                config.notices.warning(format!(
+                    "injection file {name} uses USER mode but -users \
                      was not given; its [fieldN] will render empty"
-                );
+                ));
             }
             inf_files.push(std::cell::RefCell::new(file));
         }
@@ -1924,16 +1928,16 @@ impl<'s> Engine<'s> {
             let server = sipr_media::EchoServer::start(echo_ip, media_port, bufsize)
                 .map_err(|e| EngineError(format!("-rtp_echo: cannot bind media sockets: {e}")))?;
             media_port = server.media_port;
-            eprintln!(
-                "sipr: RTP echo on {echo_ip}:{media_port} and {echo_ip}:{}",
+            config.notices.info(format!(
+                "RTP echo on {echo_ip}:{media_port} and {echo_ip}:{}",
                 media_port.wrapping_add(2)
-            );
+            ));
             Some(server)
         } else {
             if scenario.toggles_rtp_echo() || second.is_some_and(Scenario::toggles_rtp_echo) {
-                eprintln!(
-                    "sipr: warning: the scenario uses <rtp_echo> but -rtp_echo was not given — \
-                     nothing is echoing"
+                config.notices.warning(
+                    "the scenario uses <rtp_echo> but -rtp_echo was not given — \
+                     nothing is echoing",
                 );
             }
             None
@@ -1973,10 +1977,13 @@ impl<'s> Engine<'s> {
             match sipr_control::udp::bind(config.control_ip, config.control_port) {
                 Ok(sock) => {
                     if let Ok(addr) = sock.local_addr() {
-                        eprintln!("sipr: control socket (UDP, SIPp -cp protocol) on {addr}");
+                        config
+                            .notices
+                            .info(format!("control socket (UDP, SIPp -cp protocol) on {addr}"));
                     }
-                    sipr_control::udp::serve(sock, ctrl_tx.clone(), |w| {
-                        eprintln!("sipr: warning: {w}");
+                    let warnings = config.notices.clone();
+                    sipr_control::udp::serve(sock, ctrl_tx.clone(), move |w| {
+                        warnings.warning(w);
                     })
                     .map_err(|e| EngineError(format!("cannot start the control socket: {e}")))?;
                 }
@@ -1986,10 +1993,10 @@ impl<'s> Engine<'s> {
                         config.control_port.unwrap_or_default()
                     )));
                 }
-                Err(e) => eprintln!(
-                    "sipr: warning: no free control port in 8888..8947 ({e}); running without a \
+                Err(e) => config.notices.warning(format!(
+                    "no free control port in 8888..8947 ({e}); running without a \
                      control socket (pass -cp PORT to choose one, -cp 0 to silence this)"
-                ),
+                )),
             }
         }
         let mut control_snapshot = None;
@@ -2025,7 +2032,10 @@ impl<'s> Engine<'s> {
                 sipr_control::api::handler(link, config.http_token.clone()),
             )
             .map_err(|e| EngineError(format!("cannot bind --sipr-http {addr}: {e}")))?;
-            eprintln!("sipr: HTTP control API on http://{}/", server.local_addr());
+            config.notices.info(format!(
+                "HTTP control API on http://{}/",
+                server.local_addr()
+            ));
             control_snapshot = Some(snapshot);
             http = Some(server);
         }
@@ -2044,10 +2054,10 @@ impl<'s> Engine<'s> {
         if let Some(uri) = &config.auth_uri
             && (uri.starts_with("sip:") || uri.starts_with("sips:"))
         {
-            eprintln!(
-                "sipr: warning: -auth_uri '{uri}' already has a scheme; SIPp (and sipr) \
+            config.notices.warning(format!(
+                "-auth_uri '{uri}' already has a scheme; SIPp (and sipr) \
                  prepend 'sip:' regardless, so the digest uri= will be 'sip:{uri}'"
-            );
+            ));
         }
         let timers = TimerService::start(tx.clone());
         let control = EngineControl {
@@ -2071,28 +2081,6 @@ impl<'s> Engine<'s> {
                     }
                 }
             });
-        // Stdin watcher: 'q' = soft quit, 'Q' = hard quit (`-nostdin` off).
-        let stdin_tx = tx.clone();
-        let _stdin = (!config.nostdin).then(|| {
-            std::thread::Builder::new()
-                .name("sipr-stdin".into())
-                .spawn(move || {
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        match std::io::stdin().read_line(&mut line) {
-                            Ok(0) | Err(_) => return, // EOF: no interactive control
-                            Ok(_) => {
-                                if let Some(c) = line.trim().chars().next() {
-                                    if stdin_tx.send(Event::Stdin(c)).is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                })
-        });
         if let Some(t) = config.timeout {
             timers.arm(t, Event::GlobalTimeout);
         }
@@ -2132,18 +2120,18 @@ impl<'s> Engine<'s> {
             }
         }
         if per_call && !matches!(transport, Transport::Udp(_)) {
-            eprintln!(
-                "sipr: one connection per call from {} (placing calls)",
+            config.notices.info(format!(
+                "one connection per call from {} (placing calls)",
                 local_addr.ip()
-            );
+            ));
         } else {
-            eprintln!(
-                "sipr: bound to {local_addr} ({})",
+            config.notices.info(format!(
+                "bound to {local_addr} ({})",
                 match scenario.role {
                     Role::Uac => "placing calls",
                     Role::Uas => "answering calls",
                 }
-            );
+            ));
         }
         // The statistics CSVs are plain files; the logs rotate and honour
         // `-<kind>_overwrite`, named for SIPp's `<scenario>_<pid>_<kind>.log`.
@@ -2372,7 +2360,9 @@ impl<'s> Engine<'s> {
                 Ok(Event::Net(NetEvent::Packet(p))) => self.on_packet(&p),
                 Ok(Event::Net(NetEvent::Garbage { .. })) => self.stats.garbage += 1,
                 Ok(Event::Net(NetEvent::SocketError(kind))) => {
-                    eprintln!("sipr: socket error: {kind:?}; stopping");
+                    self.config
+                        .notices
+                        .info(format!("socket error: {kind:?}; stopping"));
                     self.fail_all("socket error");
                     break;
                 }
@@ -2386,7 +2376,9 @@ impl<'s> Engine<'s> {
                 }) => self.on_call_timer(&call_id, generation, kind),
                 Ok(Event::PacerTick) => self.on_pacer_tick(),
                 Ok(Event::GlobalTimeout) => {
-                    eprintln!("sipr: global timeout reached; failing active calls");
+                    self.config
+                        .notices
+                        .info("global timeout reached; failing active calls");
                     if self.config.timeout_error {
                         // SIPp `timeout_alarm`: an ERROR, so the run exits fatal.
                         self.fatal = Some(format!(
@@ -2416,7 +2408,7 @@ impl<'s> Engine<'s> {
                 self.dead_calls.retain(|_, d| d.expires > now);
                 self.sample_media_counters();
                 if self.config.periodic_stats {
-                    eprintln!("sipr: {}", self.stats.line(self.live_main()));
+                    self.config.notices.info(self.stats.line(self.live_main()));
                 }
                 self.publish_snapshot();
                 // SIPp `screentask`: every refresh resets the displayed
@@ -2668,7 +2660,9 @@ impl<'s> Engine<'s> {
         );
         self.control.set_rate(rate);
         if quit {
-            eprintln!("sipr: rate reached -rate_max {rate}; quitting (drain)");
+            self.config
+                .notices
+                .info(format!("rate reached -rate_max {rate}; quitting (drain)"));
             self.soft_quit();
         }
     }
@@ -2775,7 +2769,7 @@ impl<'s> Engine<'s> {
             }
             None => {
                 if let Err(e) = result {
-                    eprintln!("sipr: warning: {e}");
+                    self.config.notices.warning(&e);
                     self.log_err(&e);
                 }
             }
@@ -3373,7 +3367,9 @@ impl<'s> Engine<'s> {
                     // before substitution; a failed dial fails this call only.
                     if let Err(why) = self.ensure_call_socket(call_id) {
                         self.call_stats(call_id).failed_other += 1;
-                        eprintln!("sipr: warning: call {call_id}: {why}");
+                        self.config
+                            .notices
+                            .warning(format!("call {call_id}: {why}"));
                         self.log_err(&format!("call {call_id} failed: {why}"));
                         self.remove_call(call_id);
                         return;
@@ -4491,8 +4487,9 @@ impl<'s> Engine<'s> {
                     self.on_rtp_echo(call_id, &cmd);
                 }
                 crate::actions::ActionOutcome::ExecCommand(command) => {
+                    let notices = self.config.notices.clone();
                     self.exec_runner
-                        .get_or_insert_with(crate::exec::ExecRunner::start)
+                        .get_or_insert_with(|| crate::exec::ExecRunner::start(notices))
                         .run(command);
                 }
                 crate::actions::ActionOutcome::SetDest {
@@ -4605,7 +4602,7 @@ impl<'s> Engine<'s> {
                 // credits it is "Max number of reconnections reached".
                 if !self.reconnect_allowed() {
                     let msg = "Max number of reconnections reached".to_owned();
-                    eprintln!("sipr: error: {msg}");
+                    self.config.notices.error(&msg);
                     self.log_err(&msg);
                     self.fatal = Some(msg.clone());
                     self.fail_all("connection lost");
@@ -4677,7 +4674,7 @@ impl<'s> Engine<'s> {
             }
             Err(e) => {
                 let line = format!("call {call_id}: rtp_echo: cannot bind {local}: {e}");
-                eprintln!("sipr: warning: {line}");
+                self.config.notices.warning(&line);
                 self.log_err(&line);
             }
         }
@@ -4902,7 +4899,7 @@ impl<'s> Engine<'s> {
                      {remote}: {e}",
                     self.media_ip
                 );
-                eprintln!("sipr: warning: {line}");
+                self.config.notices.warning(&line);
                 self.log_err(&line);
             }
         }
@@ -4966,7 +4963,7 @@ impl<'s> Engine<'s> {
                      {remote}: {e}",
                     self.media_ip
                 );
-                eprintln!("sipr: warning: {line}");
+                self.config.notices.warning(&line);
                 self.log_err(&line);
             }
         }
@@ -5019,7 +5016,7 @@ impl<'s> Engine<'s> {
                      {}:{local_port} → {remote}: {e}",
                     self.media_ip
                 );
-                eprintln!("sipr: warning: {line}");
+                self.config.notices.warning(&line);
                 self.log_err(&line);
             }
         }
@@ -5069,7 +5066,7 @@ impl<'s> Engine<'s> {
                 let line = format!(
                     "call {call_id}: play_pcap_{tag}: send failed: {error} — replay aborted"
                 );
-                eprintln!("sipr: warning: {line}");
+                self.config.notices.warning(&line);
                 self.log_err(&line);
             }
         }
@@ -5185,7 +5182,7 @@ impl<'s> Engine<'s> {
             return;
         }
         if let Err(e) = links.connect_all(dests) {
-            eprintln!("sipr: error: {e}");
+            self.config.notices.error(&e);
             self.log_err(&e.to_string());
             self.fail_all("twin peer unreachable");
             self.hard_stop = true;
@@ -5212,7 +5209,7 @@ impl<'s> Engine<'s> {
             }
             _ => ("3PCC twin has ended -> no more calls", false),
         };
-        eprintln!("sipr: warning: {line}");
+        self.config.notices.warning(line);
         self.log_err(line);
         if hard {
             self.fail_all("twin instance ended");
@@ -5542,7 +5539,7 @@ impl<'s> Engine<'s> {
                 }
                 Err(e) => {
                     let msg = format!("Unable to bind UDP socket {ip}:{}: {e}", main_addr.port());
-                    eprintln!("sipr: error: {msg}");
+                    self.config.notices.error(&msg);
                     self.log_err(&msg);
                     self.fatal = Some(msg.clone());
                     self.hard_stop = true;
@@ -5650,7 +5647,7 @@ impl<'s> Engine<'s> {
     fn reset_mono_connection(&mut self, peer: SocketAddr) -> bool {
         if !self.reconnect_allowed() {
             let msg = "Max number of reconnections reached".to_owned();
-            eprintln!("sipr: error: {msg}");
+            self.config.notices.error(&msg);
             self.log_err(&msg);
             self.fatal = Some(msg);
             self.fail_all("connection lost");
@@ -5675,12 +5672,14 @@ impl<'s> Engine<'s> {
             Ok(()) => {
                 self.mono_conn_invalid = false;
                 self.log_err("Socket required a reconnection.");
-                eprintln!("sipr: warning: socket required a reconnection");
+                self.config
+                    .notices
+                    .warning("socket required a reconnection");
                 true
             }
             Err(e) => {
                 let line = format!("Could not reconnect TCP socket: {e}");
-                eprintln!("sipr: warning: {line}");
+                self.config.notices.warning(&line);
                 self.log_err(&line);
                 self.close_calls_to(peer);
                 false
@@ -6355,10 +6354,10 @@ impl<'s> Engine<'s> {
     fn on_send_buffer_error(&mut self, line: &str) {
         self.log_err(line);
         if !self.config.sendbuffer_warn {
-            eprintln!("sipr: warning: {line}");
+            self.config.notices.warning(line);
             return;
         }
-        eprintln!("sipr: error: {line}");
+        self.config.notices.error(line);
         self.fatal = Some(line.to_owned());
         self.fail_all("cannot send message");
         self.hard_stop = true;
@@ -7177,19 +7176,19 @@ fn load_rtp_files(
         match source {
             RtpSource::Pattern { video, id } => {
                 if *video != params.video {
-                    eprintln!(
-                        "sipr: warning: rtp_stream {}pattern {id} with an {} payload type — \
+                    config.notices.warning(format!(
+                        "rtp_stream {}pattern {id} with an {} payload type — \
                          the payload decides the stream (SIPp does the same)",
                         if *video { "v" } else { "a" },
                         if params.video { "video" } else { "audio" }
-                    );
+                    ));
                 }
             }
             RtpSource::File(name) => {
                 if files.contains_key(name) {
                     continue;
                 }
-                let path = resolve_media_file(name, config.scenario_dir.as_deref());
+                let path = resolve_media_file(name, config);
                 let bytes = std::fs::read(&path).map_err(|e| {
                     EngineError(format!(
                         "exec rtp_stream=: cannot read '{name}' ({}): {e}",
@@ -7198,12 +7197,12 @@ fn load_rtp_files(
                 })?;
                 let data = sipr_media::rtp::stream_bytes(&bytes);
                 if data.len() < params.bytes_per_packet {
-                    eprintln!(
-                        "sipr: warning: rtp_stream '{name}' is shorter than one packet ({} < {} \
+                    config.notices.warning(format!(
+                        "rtp_stream '{name}' is shorter than one packet ({} < {} \
                          bytes)",
                         data.len(),
                         params.bytes_per_packet
-                    );
+                    ));
                 }
                 files.insert(name.clone(), data);
             }
@@ -7223,7 +7222,7 @@ fn load_pcaps(
         if pcaps.contains_key(file) {
             continue;
         }
-        let path = resolve_media_file(file, config.scenario_dir.as_deref());
+        let path = resolve_media_file(file, config);
         let bytes = std::fs::read(&path).map_err(|e| {
             EngineError(format!(
                 "play_pcap_{}: cannot read '{file}' ({}): {e}",
@@ -7239,17 +7238,17 @@ fn load_pcaps(
             ))
         })?;
         if stream.is_empty() {
-            eprintln!(
-                "sipr: warning: pcap '{file}' contains no UDP packets — play_pcap_{} will \
+            config.notices.warning(format!(
+                "pcap '{file}' contains no UDP packets — play_pcap_{} will \
                  send nothing",
                 kind.as_str()
-            );
+            ));
         } else if stream.skipped > 0 {
-            eprintln!(
-                "sipr: pcap '{file}': {} packets, {} non-UDP packets skipped",
+            config.notices.info(format!(
+                "pcap '{file}': {} packets, {} non-UDP packets skipped",
                 stream.len(),
                 stream.skipped
-            );
+            ));
         }
         pcaps.insert(file.to_owned(), Arc::new(stream));
     }
@@ -7259,22 +7258,22 @@ fn load_pcaps(
 /// SIPp `find_file`: absolute paths as-is; otherwise next to the scenario
 /// file when that exists, else relative to the working directory (with the
 /// same warning SIPp prints when it falls back).
-fn resolve_media_file(file: &str, scenario_dir: Option<&std::path::Path>) -> std::path::PathBuf {
+fn resolve_media_file(file: &str, config: &EngineConfig) -> std::path::PathBuf {
     let raw = std::path::Path::new(file);
     if raw.is_absolute() {
         return raw.to_path_buf();
     }
-    if let Some(dir) = scenario_dir {
+    if let Some(dir) = config.scenario_dir.as_deref() {
         let beside = dir.join(raw);
         if beside.is_file() {
             return beside;
         }
         if !dir.as_os_str().is_empty() {
-            eprintln!(
-                "sipr: warning: '{file}' not found next to the scenario ({}); trying the \
+            config.notices.warning(format!(
+                "'{file}' not found next to the scenario ({}); trying the \
                  working directory",
                 dir.display()
-            );
+            ));
         }
     }
     raw.to_path_buf()

@@ -194,8 +194,8 @@ fn run(cli: &Cli) -> ExitCode {
             secondary.as_ref().map(|(kind, sc)| (*kind, sc)),
             &config,
             Some(sipr_engine::UiChannels {
-                snapshots: snap_tx,
-                keys: key_rx,
+                snapshots: Some(snap_tx),
+                keys: Some(key_rx),
             }),
         );
         if let Some(t) = tui {
@@ -203,11 +203,16 @@ fn run(cli: &Cli) -> ExitCode {
         }
         outcome.map(|(report, _)| report)
     } else {
+        // Headless: 'q' and 'Q' on stdin still quit unless -nostdin.
+        let keys = (!cli.nostdin).then(stdin_keys);
         sipr_engine::run_scenarios(
             &scenario,
             secondary.as_ref().map(|(kind, sc)| (*kind, sc)),
             &config,
-            None,
+            keys.map(|keys| sipr_engine::UiChannels {
+                snapshots: None,
+                keys: Some(keys),
+            }),
         )
         .map(|(report, _)| report)
     };
@@ -355,7 +360,6 @@ fn engine_config(
         cli.default_behaviors.unwrap_or_default()
     };
     config.callid_slash_ign = cli.callid_slash_ign;
-    config.nostdin = cli.nostdin;
     config.transport = match cli.transport {
         crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
         crate::cli::Transport::UdpPerCall => sipr_engine::TransportKind::UdpPerCall,
@@ -431,6 +435,32 @@ fn engine_config(
         },
     });
     Ok(config)
+}
+
+/// SIPp's keyboard control without a screen: the first character of each
+/// stdin line is a key command for the engine (`q` soft quit, `Q` hard
+/// quit, the rate keys). EOF ends the reader; `-nostdin` never starts it.
+fn stdin_keys() -> std::sync::mpsc::Receiver<char> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("sipr-stdin".into())
+        .spawn(move || {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        if let Some(c) = line.trim().chars().next() {
+                            if tx.send(c).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    rx
 }
 
 /// Resolve `host[:port]` to a socket address (port defaults to 5060).

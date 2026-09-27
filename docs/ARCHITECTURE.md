@@ -37,6 +37,12 @@ thread never forks, waits or blocks on an external process.
 The media thread (`sipr-media::replay`) follows the same rule as every other
 thread: it owns its sockets, receives owned stream specs over a channel, and
 reports back with events — it never touches engine state.
+The engine never prints: what it has to say outside its statistics is a
+`Notice` (`sipr-engine/src/notice.rs`) sent where `EngineConfig::notices`
+points — stderr with the `sipr: ` wording by default, a channel for an
+embedder — and the crate denies `print_stderr`/`print_stdout`. Stdin is the
+binary's: its headless mode reads key commands from stdin and feeds them to
+the engine over `UiChannels::keys`, the same channel a TUI uses.
 The binary depends on all. `rsip` types may appear in `sipr-net` and `sipr-engine`
 APIs; scenario IR types must not leak rsip types (templates are raw bytes + slots).
 

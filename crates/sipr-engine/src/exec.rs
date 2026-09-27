@@ -11,6 +11,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
+use crate::NoticeSink;
+
 /// How often the runner checks its children while waiting for commands.
 const REAP_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -23,13 +25,14 @@ pub struct ExecRunner {
 }
 
 impl ExecRunner {
-    /// Start the runner thread.
+    /// Start the runner thread; a command that cannot be spawned is a
+    /// warning on `notices`.
     #[must_use]
-    pub fn start() -> Self {
+    pub fn start(notices: NoticeSink) -> Self {
         let (tx, rx) = channel();
         let thread = std::thread::Builder::new()
             .name("sipr-exec".into())
-            .spawn(move || run(&rx))
+            .spawn(move || run(&rx, &notices))
             .ok();
         Self {
             tx: Some(tx),
@@ -55,14 +58,14 @@ impl Drop for ExecRunner {
     }
 }
 
-fn run(rx: &Receiver<String>) {
+fn run(rx: &Receiver<String>, notices: &NoticeSink) {
     let mut children: Vec<(Child, String)> = Vec::new();
     loop {
         match rx.recv_timeout(REAP_INTERVAL) {
             Ok(command) => match spawn_shell(&command) {
                 Ok(child) => children.push((child, command)),
                 // SIPp's grandchild prints this when `system()` fails.
-                Err(e) => eprintln!("sipr: warning: system call error for {command}: {e}"),
+                Err(e) => notices.warning(format!("system call error for {command}: {e}")),
             },
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -98,7 +101,7 @@ mod tests {
         // write on Windows (the file is locked by the first).
         let out_one = dir.join("one.txt");
         let out_two = dir.join("two.txt");
-        let runner = ExecRunner::start();
+        let runner = ExecRunner::start(NoticeSink::Discard);
         // A shell feature (redirection) and two commands in a row.
         assert!(runner.run(format!("echo one >> {}", out_one.display())));
         assert!(runner.run(format!("echo two >> {}", out_two.display())));

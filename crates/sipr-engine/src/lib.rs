@@ -6,9 +6,15 @@
 //! uses M3-supported features and refuses loudly otherwise (actions,
 //! variables, and auth execute at M6; UAS mode lands at M4).
 
+// The engine never prints: everything it has to say is a `Notice` and goes
+// where `EngineConfig::notices` points (D3 of docs/LIBRARY_API.md).
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
 mod actions;
 mod engine;
 mod exec;
+mod notice;
+pub use notice::{Notice, NoticeSink};
 mod render;
 mod sample;
 mod tdm;

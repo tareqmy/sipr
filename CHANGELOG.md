@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The engine no longer prints. Everything it had to say on stderr — the
+  bound address, the control-socket and HTTP banners, every `warning:`
+  and `error:` line, the `-bg` statistics line — is a
+  `sipr_engine::Notice` sent where `EngineConfig::notices` points: stderr
+  with the same wording by default, a channel for an embedder, or nowhere
+  (`NoticeSink::Discard`, an explicit choice). `sipr-engine` denies
+  clippy's `print_stderr`/`print_stdout` so it stays that way (M49 D3).
+  `-nostdin` is the binary's business now: the stdin key reader (`q`,
+  `Q`, the rate keys) lives in the binary and is attached in headless
+  mode only — a TUI run reads keys through the screen, where the engine's
+  own reader used to compete with it for stdin. `UiChannels` takes each
+  half as an `Option`, so a key producer needs no snapshot reader.
 - `sipr_engine::EngineConfig` has `Default` (SIPp's defaults) and the
   constructors `EngineConfig::uac(target)` and `EngineConfig::uas()`, and
   is `#[non_exhaustive]`, as is `RunReport`: build one from a constructor

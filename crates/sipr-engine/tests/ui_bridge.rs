@@ -32,8 +32,8 @@ fn snapshots_flow_and_keys_take_effect() {
             &scenario,
             &uas_config(),
             Some(UiChannels {
-                snapshots: snap_tx,
-                keys: key_rx,
+                snapshots: Some(snap_tx),
+                keys: Some(key_rx),
             }),
         )
         .map(|(report, _)| report)

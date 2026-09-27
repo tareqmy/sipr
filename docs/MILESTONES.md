@@ -2039,7 +2039,7 @@ The steps are ordered as §6 of the design says; each is one commit.
       and the `ui_bridge` test build from the constructors. Parity test:
       the config the CLI builds from `-sn uac HOST` equals
       `EngineConfig::uac(HOST)` field for field.
-- [ ] D3 Notices: every `eprintln!` in `sipr-engine` goes through a
+- [x] D3 Notices: every `eprintln!` in `sipr-engine` goes through a
       `NoticeSink` (`Stderr` default with today's wording, `Channel`,
       `Discard`); the stdin watcher moves into the binary and
       `EngineConfig::nostdin` goes; `#![deny(clippy::print_stderr,
