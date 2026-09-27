@@ -18,6 +18,7 @@
 - [Conventions](CONVENTIONS.md)
 - [Testing](TESTING.md)
 - [Releasing](RELEASING.md)
+- [Library API (M49 design)](LIBRARY_API.md)
 - [Contributing](contributing.md)
 - [Instructions for AI agents](agents.md)
 - [Brand](brand.md)

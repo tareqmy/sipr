@@ -2023,11 +2023,52 @@ entry. Also found: sipp names the `-trace_screen` file
 `<scenario>_<pid>_screen.log` (its `screen` log-file entry), not the
 `_screens.log` its help text gives and sipr copied — fixed separately.
 
-### M49+ — sipr's own additions (after parity)
+### M49 — Library API: `sipr-engine` embedded in a Rust test harness
+
+Scenario in, stats out, no CLI, no TUI. The design is
+`docs/LIBRARY_API.md` (decisions D1–D8; the numbers below refer to
+them); the binary becomes the first embedder and the `cli`, `e2e` and
+interop suites are the regression net — its output stays byte-identical.
+The steps are ordered as §6 of the design says; each is one commit.
+
+- [ ] D1 `EngineConfig`: `Default` carrying SIPp's defaults (the clap
+      definitions in `src/cli.rs` stop being their source of truth),
+      `#[non_exhaustive]`, `uac(target)`/`uas()` constructors, fields
+      still public; `RunReport` gets `#[non_exhaustive]` too. The binary
+      and the `ui_bridge` test build from the constructors. Parity test:
+      the config the CLI builds from `-sn uac HOST` equals
+      `EngineConfig::uac(HOST)` field for field.
+- [ ] D3 Notices: every `eprintln!` in `sipr-engine` goes through a
+      `NoticeSink` (`Stderr` default with today's wording, `Channel`,
+      `Discard`); the stdin watcher moves into the binary and
+      `EngineConfig::nostdin` goes; `#![deny(clippy::print_stderr,
+      clippy::print_stdout)]` on the crate keeps it that way.
+- [ ] D4 `EngineError` is a `#[non_exhaustive]` `thiserror` enum
+      (`Config`, `Scenario`, `Bind`, `Io`, `Fatal`) implementing
+      `std::error::Error`; every `Display` wording unchanged (the interop
+      tests match SIPp's).
+- [ ] D2 `Run::start(scenario, config)` spawns the engine thread and
+      returns a handle: `control()` (`set_rate`, `pause`, `resume`,
+      `stop`, `abort`), `snapshots()` (the engine's 1 s tick),
+      `local_addr()`, `wait()`; drop without `wait` aborts and joins.
+      `run()` stays as `start(..)?.wait()`; `run_scenarios`,
+      `run_with_control`, `run_with_ui` become `#[doc(hidden)]` for one
+      minor release. e2e test: a harness starts the embedded UAS
+      in-process on port 0, runs the embedded UAC against it, stops the
+      UAS through the handle, asserts both reports.
+- [ ] D5 `InjectionSource::{Path, Text}` replaces the `inf_files` and
+      `rx_inf_files` path lists; a test feeds `[fieldN]` from a string.
+- [ ] D7 `sipr_scenario::compile_strict` (the `--check` policy as a
+      function, used by the binary); the render family `#[doc(hidden)]`;
+      crate-level rustdoc listing the supported surface; a compiled
+      `examples/embed.rs`; `docs/LIBRARY_API.md` rewritten from design to
+      reference, D8's stability promise in it and in CHANGELOG.
+- [ ] Docs: ARCHITECTURE §1 (the binary is one embedder; the notice sink
+      and the stdin watcher's new home), CHANGELOG.
+
+### M50+ — further additions (after M49)
 
 Candidates, to be promoted into numbered milestones in the order the
-users of the HTTP API ask for them:
-
-- Library API: `sipr-engine` embedded in another Rust test harness
-  (scenario in, stats out, no CLI, no TUI) — needs a stable
-  `EngineConfig` and a documented public surface.
+users of the HTTP API and the library ask for them. None listed yet:
+the parity backlog is closed and M49 is the first item that is sipr's
+own.
