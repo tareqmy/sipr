@@ -25,6 +25,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Call numbers — `[call_number]`, the `%u` of a default Call-ID, the
+  auto media port — come from one counter for the whole process, as
+  SIPp's do for its one engine. Two engines in one process (a harness's
+  UAS and its UAC, or one run after another) used to number from 1 each
+  and so produce the same default Call-ID, which the peer took for a
+  late message of a call it had just finished and dropped, leaving the
+  new call to time out. The binary, one engine per process, is
+  unaffected.
 - A dropped transport frees its port at once. Every listener's thread —
   the UDP receive loop, the TCP, TLS and SCTP accept loops, SIPp's UDP
   control socket and the HTTP API's accept loop — used to block in the

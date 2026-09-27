@@ -398,6 +398,20 @@ impl EngineConfig {
     }
 }
 
+/// Call numbers — `[call_number]`, the `%u` of a default Call-ID, the auto
+/// media port — come from one counter for the whole process, as SIPp's
+/// `number` does for its one engine. So two runs in one process, a
+/// harness's UAS and its UAC or one run after another, never produce the
+/// same default Call-ID, which a peer would otherwise take for a message
+/// of a call it has just finished (`-deadcall_wait`) and drop. A process
+/// with one engine, the binary, numbers from 1 as it always did.
+static NEXT_CALL_NUMBER: AtomicU64 = AtomicU64::new(1);
+
+/// The next call number in this process.
+fn next_call_number() -> u64 {
+    NEXT_CALL_NUMBER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// SIPp's `DEFAULT_MEDIA_PORT`.
 const DEFAULT_MEDIA_PORT: u16 = 6000;
 /// SIPp's `rtp_default_payload` (PCMA).
@@ -3522,7 +3536,7 @@ impl<'s> Engine<'s> {
             }
         };
         self.stats.outgoing_created += 1;
-        let number = self.stats.created();
+        let number = next_call_number();
         let call_id = self.make_call_id(number);
         self.insert_outgoing_call(call_id, number, target, tdm_number, user_id);
     }
@@ -3543,7 +3557,7 @@ impl<'s> Engine<'s> {
             }
         };
         self.stats.outgoing_created += 1;
-        let number = self.stats.created();
+        let number = next_call_number();
         self.insert_outgoing_call(call_id.to_owned(), number, target, tdm_number, None);
     }
 
@@ -4193,7 +4207,7 @@ impl<'s> Engine<'s> {
                 )
             {
                 self.stats.incoming_created += 1;
-                let number = self.stats.created();
+                let number = next_call_number();
                 let cnonce = self.make_cnonce(number);
                 // Incoming (UAS) calls have no user id.
                 let field_lines = self.assign_field_lines(None);
@@ -4400,7 +4414,7 @@ impl<'s> Engine<'s> {
             return;
         };
         o.stats.incoming_created += 1;
-        let number = o.stats.created();
+        let number = next_call_number();
         if kind == SecondaryKind::OutOfCall {
             self.stats.auto_answered += 1;
         }
