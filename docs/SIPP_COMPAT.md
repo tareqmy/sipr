@@ -1359,7 +1359,11 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   about it — closing the connection is what the test is *for* — so
   `real_sipp_tcp_uac_reconnects_to_sipr` skips **visibly** when sipp's
   error log shows it, alongside the pre-existing "Unable to bind TCP
-  socket" guard.
+  socket" guard. A third form, seen once in about forty full runs
+  (2026-09-27): `write_primitive`'s own guard (`socket.cpp` ~l.2105)
+  logs "Returning EPIPE on invalid socket: … (-1)" and "Broken pipe on
+  TCP connection", and sipp then never exits — neither its `-timeout`
+  nor the test's wait ends it — so that line is a skip too.
 - (append new findings above this line, with a pointer to where in the C++ you
   verified them)
 - Statistical pauses and `<sample>` (M38; verified in `scenario.cpp`

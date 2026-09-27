@@ -2187,7 +2187,8 @@ fn real_sipp_tcp_uac_reconnects_to_sipr() {
         eprintln!(
             "SKIPPED interop::real_sipp_tcp_uac_reconnects_to_sipr — sipp tripped over its \
              own use-after-free on the reset connection (socket.cpp ~l.2151): it either \
-             died on the fatal 'unknown transport type' or spun past its -timeout."
+             died on the fatal 'unknown transport type', or logged EPIPE on the invalid \
+             socket and spun past its -timeout."
         );
         return;
     }
