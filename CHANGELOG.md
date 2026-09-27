@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `sipr_engine::Run`, the library entry point (M49 D2,
+  `docs/LIBRARY_API.md`): `Run::start(scenario, config)` (or
+  `start_with` for a secondary scenario) runs the engine on its own
+  thread and returns once its sockets are bound, so a port in use is an
+  error there; `control()` is an `EngineControl` with the new `pause`,
+  `resume`, `stop`, `abort` and `key` next to `set_rate`; `snapshots()`
+  is the engine's once-a-second statistics as a channel; `local_addr()`
+  is the bound signaling address, for the port-0 case a test needs; and
+  `wait()` joins the thread and returns the `RunReport`. Dropping a
+  `Run` without waiting aborts it and joins. `run(&scenario, &config)`
+  stays as the blocking shorthand. The binary runs its engine this way
+  now, its TUI and stdin key readers feeding `EngineControl::key`.
+- `EngineError::Fatal`: the engine thread could not be started, or
+  ended without a report.
+
 ### Fixed
 
 - A dropped transport frees its port at once. Every listener's thread —
@@ -19,6 +36,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `run_with_control`, `run_with_ui` and `run_scenarios` are hidden from
+  the documentation and kept for one minor release; `UiChannels::snapshots`
+  is a bounded `SyncSender`, and a reader that falls behind misses
+  snapshots instead of growing a queue or stalling the engine.
 - `sipr_engine::EngineError` is an enum — `Config`, `Scenario`, `Bind`
   (with the OS error as its `source()`) and `Io` (with the path and the
   OS error) — that implements `std::error::Error`, so `?` into `anyhow`

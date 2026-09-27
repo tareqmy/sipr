@@ -748,15 +748,55 @@ impl RunReport {
     }
 }
 
-/// Handle for runtime control (rate changes from the future TUI; tests).
+/// A handle on a running engine: change its load, pause it, end it. It is
+/// cheap to clone and every clone drives the same run; each method returns
+/// at once and the loop acts on its next turn. A handle outliving its run
+/// is harmless — the methods then do nothing.
 #[derive(Clone)]
 pub struct EngineControl {
     /// Rate in milli-calls-per-period, adjustable while running.
     rate_millis: Arc<AtomicU64>,
     stop_pacer: Arc<AtomicBool>,
+    /// Into the engine loop.
+    events: Sender<Event>,
 }
 
 impl EngineControl {
+    /// Stop placing new calls (SIPp's `p`, first press). Calls in progress
+    /// continue; [`resume`](Self::resume) starts placing again.
+    pub fn pause(&self) {
+        self.send(Command::Pause);
+    }
+
+    /// Place calls again after [`pause`](Self::pause).
+    pub fn resume(&self) {
+        self.send(Command::Resume);
+    }
+
+    /// End the run gracefully (SIPp's `q`): no new calls, the live ones
+    /// finish, then the report comes. A second `stop` does not escalate;
+    /// [`abort`](Self::abort) does.
+    pub fn stop(&self) {
+        self.send(Command::Stop);
+    }
+
+    /// End the run now (SIPp's `Q`): every live call fails and the loop
+    /// exits on its next turn.
+    pub fn abort(&self) {
+        self.send(Command::Abort);
+    }
+
+    /// One of SIPp's screen keys, as a TUI or a stdin reader would send
+    /// it: `q`/`Q` quit, `p` toggles the pause, `+ - * /` step the rate,
+    /// `1`..`9` ask for a screen. Anything else is ignored.
+    pub fn key(&self, key: char) {
+        let _ = self.events.send(Event::Stdin(key));
+    }
+
+    fn send(&self, command: Command) {
+        // A closed channel means the run has ended: nothing to do.
+        let _ = self.events.send(Event::Command(command));
+    }
     /// Replace the call rate (calls per rate period).
     pub fn set_rate(&self, rate: f64) {
         let clamped = rate.clamp(0.0, 1_000_000.0);
@@ -799,6 +839,17 @@ enum Event {
     Media(MediaEvent),
     /// A runtime control command (UDP control socket or HTTP API).
     Control(ControlRequest),
+    /// A method of [`EngineControl`] was called.
+    Command(Command),
+}
+
+/// What an [`EngineControl`] method asks of the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Pause,
+    Resume,
+    Stop,
+    Abort,
 }
 
 /// What tells a received message's copies apart: its top Via branch, its
@@ -1004,6 +1055,10 @@ pub enum EngineError {
         #[source]
         source: std::io::Error,
     },
+    /// The engine thread could not be started, or ended without a report
+    /// (it panicked). The message says which.
+    #[error("{0}")]
+    Fatal(String),
     /// A file could not be read or created.
     #[error("{what}: {source}")]
     Io {
@@ -1023,30 +1078,225 @@ pub enum EngineError {
 /// Either half may be absent — the binary's headless mode attaches only a
 /// stdin key reader, a TUI both.
 pub struct UiChannels {
-    /// Engine → UI: periodic stat snapshots.
-    pub snapshots: Option<std::sync::mpsc::Sender<sipr_stats::Snapshot>>,
+    /// Engine → UI: periodic stat snapshots. Bounded: a reader that falls
+    /// behind misses snapshots rather than stalling the engine or growing
+    /// a queue.
+    pub snapshots: Option<std::sync::mpsc::SyncSender<sipr_stats::Snapshot>>,
     /// UI → engine: key commands.
     pub keys: Option<Receiver<char>>,
 }
 
-/// Run a UAC scenario to completion. Blocks until done.
+/// Run a scenario to completion on this thread and return its report:
+/// [`Run::start`] followed by [`Run::wait`].
 ///
 /// # Errors
 ///
-/// [`EngineError`] when the scenario needs features beyond M3 (actions,
-/// variables, auth, UAS role) or the transport cannot bind.
+/// See [`Run::start`].
 pub fn run(scenario: &Scenario, config: &EngineConfig) -> Result<RunReport, EngineError> {
-    let (report, _control) = run_with_control(scenario, config)?;
-    Ok(report)
+    Run::start(scenario.clone(), config.clone())?.wait()
 }
 
-/// [`run`], also exposing the runtime control handle to the caller thread
-/// via a callback-free pattern: control is returned only after completion in
-/// M3 (the TUI consumes it live at M5).
+/// How many snapshots a reader may leave unread before the engine drops
+/// newer ones instead of queueing them (one is produced a second).
+const SNAPSHOT_BACKLOG: usize = 8;
+
+/// A run in progress on its own thread: started with [`Run::start`],
+/// driven through [`Run::control`], observed through [`Run::snapshots`],
+/// finished with [`Run::wait`]. Dropping a `Run` without waiting aborts it
+/// and joins the thread, so a test that panics leaves no engine behind.
+///
+/// ```no_run
+/// use sipr_engine::{EngineConfig, Run};
+///
+/// let uas = sipr_scenario::compile("uas", sipr_scenario::embedded("uas").unwrap())
+///     .scenario
+///     .unwrap();
+/// let mut cfg = EngineConfig::uas();
+/// cfg.port = Some(0); // any free port
+/// let server = Run::start(uas, cfg)?;
+/// let listening_on = server.local_addr();
+/// // ... point the system under test at `listening_on` ...
+/// server.control().stop();
+/// let report = server.wait()?;
+/// assert_eq!(report.exit_code(), 0, "{}", report.summary());
+/// # Ok::<(), sipr_engine::EngineError>(())
+/// ```
+pub struct Run {
+    thread: Option<std::thread::JoinHandle<Option<RunReport>>>,
+    control: EngineControl,
+    local_addr: SocketAddr,
+    snapshots: Option<Receiver<sipr_stats::Snapshot>>,
+}
+
+impl Run {
+    /// Start `scenario` under `config` on a new thread. Returns once the
+    /// engine is up — its sockets bound and, for a UAC, its first
+    /// connection made — so a port in use or a bad configuration is an
+    /// error here, not later.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Config`] and [`EngineError::Scenario`] for a run that
+    /// cannot start as configured (a UAC without a target, a keyword the
+    /// configuration does not provide, ...), [`EngineError::Bind`] for a
+    /// socket that cannot be opened, [`EngineError::Io`] for an injection
+    /// or log file, [`EngineError::Fatal`] if the thread cannot start.
+    pub fn start(scenario: Scenario, config: EngineConfig) -> Result<Self, EngineError> {
+        Self::start_with(scenario, None, config)
+    }
+
+    /// [`Run::start`] with a secondary scenario next to the main one — an
+    /// out-of-call responder or a mixed-mode receive scenario, as
+    /// [`SecondaryKind`] says. Client mode only, as in SIPp.
+    ///
+    /// # Errors
+    ///
+    /// See [`Run::start`]; additionally, with SIPp's wordings where it has
+    /// them, the rules of [`SecondaryKind`].
+    pub fn start_with(
+        scenario: Scenario,
+        secondary: Option<(SecondaryKind, Scenario)>,
+        config: EngineConfig,
+    ) -> Result<Self, EngineError> {
+        validate_run(&scenario, secondary.as_ref().map(|(k, s)| (*k, s)), &config)?;
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(SNAPSHOT_BACKLOG);
+        let (started_tx, started_rx) =
+            channel::<Result<(EngineControl, SocketAddr), EngineError>>();
+        let thread = std::thread::Builder::new()
+            .name("sipr-engine".into())
+            .spawn(move || {
+                let ui = UiChannels {
+                    snapshots: Some(snapshot_tx),
+                    keys: None,
+                };
+                let secondary = secondary.as_ref().map(|(k, s)| (*k, s));
+                let mut engine = match Engine::new(&scenario, secondary, &config, Some(ui)) {
+                    Ok(engine) => engine,
+                    Err(e) => {
+                        let _ = started_tx.send(Err(e));
+                        return None;
+                    }
+                };
+                let _ = started_tx.send(Ok((engine.control.clone(), engine.local_addr())));
+                Some(engine.run_loop())
+            })
+            .map_err(|e| EngineError::Fatal(format!("cannot start the engine thread: {e}")))?;
+        match started_rx.recv() {
+            Ok(Ok((control, local_addr))) => Ok(Self {
+                thread: Some(thread),
+                control,
+                local_addr,
+                snapshots: Some(snapshot_rx),
+            }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            // The thread went away before it could say anything.
+            Err(_) => Err(EngineError::Fatal(match thread.join() {
+                Err(panic) => panic_message(panic.as_ref()),
+                Ok(_) => "the engine thread ended before it started".to_owned(),
+            })),
+        }
+    }
+
+    /// The handle that drives this run: rate, pause, stop, abort. Clone it
+    /// to keep one after [`wait`](Self::wait).
+    #[must_use]
+    pub fn control(&self) -> &EngineControl {
+        &self.control
+    }
+
+    /// The signaling address the engine bound — the port to point a peer
+    /// at when the configuration asked for port 0.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// The engine's statistics, one [`Snapshot`](sipr_stats::Snapshot) a
+    /// second, the same that `-trace_stat`, the HTTP API and the TUI see.
+    /// The channel holds a few; a reader that falls behind misses some
+    /// rather than stalling the engine. The receiver is handed over once:
+    /// a second call gets one that yields nothing.
+    pub fn snapshots(&mut self) -> Receiver<sipr_stats::Snapshot> {
+        self.snapshots.take().unwrap_or_else(|| channel().1)
+    }
+
+    /// Wait for the run to end — because its calls are done, its `-m` or
+    /// `-timeout` was reached, or [`stop`](EngineControl::stop) or
+    /// [`abort`](EngineControl::abort) was called — and return its report.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Fatal`] if the engine thread ended without a report.
+    pub fn wait(mut self) -> Result<RunReport, EngineError> {
+        let Some(thread) = self.thread.take() else {
+            return Err(EngineError::Fatal(
+                "the run was already waited for".to_owned(),
+            ));
+        };
+        match thread.join() {
+            Ok(Some(report)) => Ok(report),
+            Ok(None) => Err(EngineError::Fatal(
+                "the engine thread ended without a report".to_owned(),
+            )),
+            Err(panic) => Err(EngineError::Fatal(panic_message(panic.as_ref()))),
+        }
+    }
+}
+
+impl Drop for Run {
+    /// A run nobody waited for is aborted and joined, so it never outlives
+    /// its handle.
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.control.abort();
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The text of a panic payload, for the report of a thread that died.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_owned());
+    format!("the engine thread panicked: {message}")
+}
+
+/// The checks a run must pass before any socket opens.
+fn validate_run(
+    scenario: &Scenario,
+    secondary: Option<(SecondaryKind, &Scenario)>,
+    config: &EngineConfig,
+) -> Result<(), EngineError> {
+    if config.tdm_map.is_none() && uses_tdmmap(scenario) {
+        // SIPp's wording, at start-up rather than at the first render.
+        return Err(EngineError::Scenario(
+            "[tdmmap] keyword without -tdmmap parameter on command line".to_owned(),
+        ));
+    }
+    if let Some((kind, second)) = secondary {
+        validate_secondary(kind, scenario, second)?;
+    }
+    if scenario.role == Role::Uac && config.target.is_none() {
+        return Err(EngineError::Config(
+            "this scenario places calls (UAC): a remote target is required".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// [`run`] on the caller's thread, returning the control handle with the
+/// report. Superseded by [`Run`]; kept for one minor release.
 ///
 /// # Errors
 ///
 /// See [`run`].
+#[doc(hidden)]
 pub fn run_with_control(
     scenario: &Scenario,
     config: &EngineConfig,
@@ -1054,11 +1304,13 @@ pub fn run_with_control(
     run_with_ui(scenario, config, None)
 }
 
-/// [`run`] with an optional live UI attached (see [`UiChannels`]).
+/// [`run`] on the caller's thread with a live UI attached (see
+/// [`UiChannels`]). Superseded by [`Run`]; kept for one minor release.
 ///
 /// # Errors
 ///
 /// See [`run`].
+#[doc(hidden)]
 pub fn run_with_ui(
     scenario: &Scenario,
     config: &EngineConfig,
@@ -1084,6 +1336,7 @@ pub enum SecondaryKind {
 /// a request whose Call-ID matches no live call spawns a call on it instead
 /// of being discarded (SIPp `socket.cpp` `process_message`, the
 /// `ooc_scenario` and `MODE_MIXED` branches). Client mode only, as in SIPp.
+/// Superseded by [`Run::start_with`]; kept for one minor release.
 ///
 /// # Errors
 ///
@@ -1091,26 +1344,14 @@ pub enum SecondaryKind {
 /// out-of-call scenario in server mode or reading injection files
 /// (`[fieldN]`); a receive scenario next to a server-mode main scenario, or
 /// one that is not itself server-mode.
+#[doc(hidden)]
 pub fn run_scenarios(
     scenario: &Scenario,
     secondary: Option<(SecondaryKind, &Scenario)>,
     config: &EngineConfig,
     ui: Option<UiChannels>,
 ) -> Result<(RunReport, EngineControl), EngineError> {
-    if config.tdm_map.is_none() && uses_tdmmap(scenario) {
-        // SIPp's wording, at start-up rather than at the first render.
-        return Err(EngineError::Scenario(
-            "[tdmmap] keyword without -tdmmap parameter on command line".to_owned(),
-        ));
-    }
-    if let Some((kind, second)) = secondary {
-        validate_secondary(kind, scenario, second)?;
-    }
-    if scenario.role == Role::Uac && config.target.is_none() {
-        return Err(EngineError::Config(
-            "this scenario places calls (UAC): a remote target is required".into(),
-        ));
-    }
+    validate_run(scenario, secondary, config)?;
     let mut engine = Engine::new(scenario, secondary, config, ui)?;
     let control = engine.control.clone();
     let report = engine.run_loop();
@@ -1665,7 +1906,7 @@ struct Engine<'s> {
     /// credits the whole interval it covers rather than a nominal one.
     last_pacer_tick: Instant,
     paused: bool,
-    snapshot_tx: Option<std::sync::mpsc::Sender<sipr_stats::Snapshot>>,
+    snapshot_tx: Option<std::sync::mpsc::SyncSender<sipr_stats::Snapshot>>,
     /// (when, created-count) at the last snapshot, for the period rate.
     last_snapshot: (Instant, u64),
     soft_stopping: bool,
@@ -2135,6 +2376,7 @@ impl<'s> Engine<'s> {
         let control = EngineControl {
             rate_millis: Arc::new(AtomicU64::new(0)),
             stop_pacer: Arc::new(AtomicBool::new(false)),
+            events: tx.clone(),
         };
         control.set_rate(config.rate);
         // Pacer: tick faster than the rate period and start fractional
@@ -2467,6 +2709,7 @@ impl<'s> Engine<'s> {
                     self.control.stop_pacer.store(true, Ordering::Relaxed);
                 }
                 Ok(Event::Stdin(c)) => self.apply_key(c),
+                Ok(Event::Command(command)) => self.on_command(command),
                 Ok(Event::Control(req)) => self.on_control(req),
                 Ok(Event::Twin(ev)) => self.on_twin_event(ev),
                 Ok(Event::Media(ev)) => self.on_media_event(ev),
@@ -2606,7 +2849,9 @@ impl<'s> Engine<'s> {
             file.flush();
         }
         if let Some(tx) = self.snapshot_tx.as_ref() {
-            let _ = tx.send(snap); // UI gone → ignored; run continues headless
+            // A full channel (the reader is behind) or a gone reader: the
+            // snapshot is dropped and the run continues headless.
+            let _ = tx.try_send(snap);
         }
     }
 
@@ -2785,6 +3030,21 @@ impl<'s> Engine<'s> {
         } else {
             self.control
                 .set_rate((self.control.rate() + delta).max(0.0));
+        }
+    }
+
+    /// The signaling address the transport bound.
+    fn local_addr(&self) -> SocketAddr {
+        self.transport.local_addr()
+    }
+
+    /// An [`EngineControl`] method, on the loop's own thread.
+    fn on_command(&mut self, command: Command) {
+        match command {
+            Command::Pause => self.paused = true,
+            Command::Resume => self.paused = false,
+            Command::Stop => self.soft_quit(),
+            Command::Abort => self.hard_quit(),
         }
     }
 

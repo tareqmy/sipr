@@ -25,7 +25,7 @@ fn snapshots_flow_and_keys_take_effect() {
     let scenario = sipr_scenario::compile("uas", sipr_scenario::embedded("uas").unwrap())
         .scenario
         .expect("uas compiles");
-    let (snap_tx, snap_rx) = channel();
+    let (snap_tx, snap_rx) = std::sync::mpsc::sync_channel(8);
     let (key_tx, key_rx) = channel();
     let engine = std::thread::spawn(move || {
         run_with_ui(

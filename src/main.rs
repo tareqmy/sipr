@@ -182,39 +182,29 @@ fn run(cli: &Cli) -> ExitCode {
         use std::io::IsTerminal;
         std::io::stdout().is_terminal() && std::io::stdin().is_terminal() && !cli.background
     };
+    let mut run = match sipr_engine::Run::start_with(scenario, secondary, config) {
+        Ok(run) => run,
+        Err(e) => return fatal(&e.to_string()),
+    };
     let result = if use_tui {
-        let (snap_tx, snap_rx) = std::sync::mpsc::channel::<sipr_stats::Snapshot>();
+        let snapshots = run.snapshots();
         let (key_tx, key_rx) = std::sync::mpsc::channel::<char>();
         let tui = std::thread::Builder::new()
             .name("sipr-tui".into())
-            .spawn(move || sipr_tui::run(&snap_rx, &key_tx))
+            .spawn(move || sipr_tui::run(&snapshots, &key_tx))
             .ok();
-        let outcome = sipr_engine::run_scenarios(
-            &scenario,
-            secondary.as_ref().map(|(kind, sc)| (*kind, sc)),
-            &config,
-            Some(sipr_engine::UiChannels {
-                snapshots: Some(snap_tx),
-                keys: Some(key_rx),
-            }),
-        );
+        forward_keys(key_rx, run.control().clone());
+        let outcome = run.wait();
         if let Some(t) = tui {
             let _ = t.join(); // restores the terminal before we print
         }
-        outcome.map(|(report, _)| report)
+        outcome
     } else {
         // Headless: 'q' and 'Q' on stdin still quit unless -nostdin.
-        let keys = (!cli.nostdin).then(stdin_keys);
-        sipr_engine::run_scenarios(
-            &scenario,
-            secondary.as_ref().map(|(kind, sc)| (*kind, sc)),
-            &config,
-            keys.map(|keys| sipr_engine::UiChannels {
-                snapshots: None,
-                keys: Some(keys),
-            }),
-        )
-        .map(|(report, _)| report)
+        if !cli.nostdin {
+            forward_keys(stdin_keys(), run.control().clone());
+        }
+        run.wait()
     };
     match result {
         Ok(report) => {
@@ -435,6 +425,17 @@ fn engine_config(
         },
     });
     Ok(config)
+}
+
+/// Hand every key a producer sends (the TUI, or stdin) to the engine.
+fn forward_keys(keys: std::sync::mpsc::Receiver<char>, control: sipr_engine::EngineControl) {
+    let _ = std::thread::Builder::new()
+        .name("sipr-keys".into())
+        .spawn(move || {
+            for key in keys {
+                control.key(key);
+            }
+        });
 }
 
 /// SIPp's keyboard control without a screen: the first character of each
