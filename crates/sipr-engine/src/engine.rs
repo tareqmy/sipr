@@ -3752,7 +3752,7 @@ impl<'s> Engine<'s> {
             }
             match step {
                 Step::Send(send) => {
-                    self.book_counter(call_id, index);
+                    self.do_bookkeeping(call_id, index, &send.common);
                     let first = template_first_word(&send.template).unwrap_or_default();
                     let is_req = first != "SIP/2.0";
                     let method_is_new_txn = is_req && first != "ACK" && first != "CANCEL";
@@ -3814,23 +3814,14 @@ impl<'s> Engine<'s> {
                         Some(target) => self.step_after_jump(call_id, target),
                         None => self.next_step(&send.common, index, call_id),
                     };
-                    let now = Instant::now();
-                    let common = send.common.clone();
                     let Some(call) = self.calls.get_mut(call_id) else {
                         return;
                     };
-                    let on_secondary = call.secondary;
                     if first == "ACK" {
                         // SIPp `call_established = true` on sending an ACK.
                         call.established = true;
                         call.ack_pending = false;
                     }
-                    apply_rtds(
-                        call,
-                        stats_for(&mut self.stats, self.secondary.as_mut(), on_secondary),
-                        &common,
-                        now,
-                    );
                     if method_is_new_txn {
                         call.cseq = call.cseq.wrapping_add(1);
                     }
@@ -3918,7 +3909,7 @@ impl<'s> Engine<'s> {
                     if let Some(s) = self.call_stats(call_id).step_mut(index) {
                         s.sessions += 1;
                     }
-                    self.book_counter(call_id, index);
+                    self.do_bookkeeping(call_id, index, common);
                     let AfterActions::Proceed { jump } =
                         self.run_step_actions(call_id, actions, index)
                     else {
@@ -3952,7 +3943,7 @@ impl<'s> Engine<'s> {
                     return;
                 }
                 Step::Nop { common, actions } => {
-                    self.book_counter(call_id, index);
+                    self.do_bookkeeping(call_id, index, common);
                     let AfterActions::Proceed { jump } =
                         self.run_step_actions(call_id, actions, index)
                     else {
@@ -4000,7 +3991,7 @@ impl<'s> Engine<'s> {
                     if let Some(s) = self.call_stats(call_id).step_mut(index) {
                         s.sent += 1;
                     }
-                    self.book_counter(call_id, index);
+                    self.do_bookkeeping(call_id, index, common);
                     // SIPp runs a sendCmd's actions once the command is out
                     // (`call.cpp` ~l.2004), then `next()` as after a nop.
                     let AfterActions::Proceed { jump } =
@@ -4099,16 +4090,22 @@ impl<'s> Engine<'s> {
         }
     }
 
-    /// SIPp `do_bookkeeping`'s counter: step `index` ran for this call, so
-    /// its `counter=`, if any, adds one on the scenario's stat set, which
-    /// every call of the scenario shares. SIPp books a step before its
-    /// actions run (a nop, a recvCmd) and before a send is built, so a step
-    /// whose action jumps away, or whose send fails, still counts.
-    fn book_counter(&mut self, call_id: &str, index: usize) {
-        if let Some(call) = self.calls.get(call_id) {
-            let secondary = call.secondary;
-            self.stats_of(secondary).tick_counter(index);
-        }
+    /// SIPp `do_bookkeeping` (`call.cpp` ~l.1777): step `index` ran for
+    /// this call, so its `counter=`, if any, adds one on the scenario's
+    /// stat set, which every call of the scenario shares, and its RTDs
+    /// start or stop. SIPp books a step before its actions run (a nop, a
+    /// recvCmd, a pause) and before a send is built, so a step whose
+    /// action jumps away, or whose send fails, still counts. A matched
+    /// recv books itself inline (`on_recv_match`).
+    fn do_bookkeeping(&mut self, call_id: &str, index: usize, common: &StepCommon) {
+        let now = Instant::now();
+        let Some(call) = self.calls.get_mut(call_id) else {
+            return;
+        };
+        let on_secondary = call.secondary;
+        let stats = stats_for(&mut self.stats, self.secondary.as_mut(), on_secondary);
+        apply_rtds(call, stats, common, now);
+        stats.tick_counter(index);
     }
 
     /// SIPp `next()` (`call.cpp` ~l.1920): the step's `next` when its `test`
@@ -5544,7 +5541,7 @@ impl<'s> Engine<'s> {
         if let Some(s) = self.call_stats(call_id).step_mut(index) {
             s.recv += 1;
         }
-        self.book_counter(call_id, index);
+        self.do_bookkeeping(call_id, index, common);
         let after = self.run_step_actions_inner(call_id, actions, position, Some(cmd));
         if matches!(after, AfterActions::Ended) {
             return true;

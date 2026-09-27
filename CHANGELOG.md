@@ -23,6 +23,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   process started and `computeRtt` divides by 1000. sipr divided once
   more and wrote seconds, in both columns. Found when the counters
   interop test started reading real sipp's rtt file.
+- A pause's, nop's, sendCmd's and recvCmd's `start_rtd=` and `rtd=`
+  are booked on entry, where SIPp's `do_bookkeeping` runs them with the
+  step's counter; sipr applied RTDs only on a send and a matched recv,
+  so an RTD that started or stopped on any other step measured nothing.
 - `verifyauth` no longer panics on an Authorization header whose
   `algorithm=` value carries a non-UTF-8 byte in its first three: the
   MD5/SHA-256 prefix check compared a `str` slice at a fixed byte index,

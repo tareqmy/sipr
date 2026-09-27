@@ -1889,4 +1889,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   only after a successful send. **Open:** sipr's `<timewait>` takes
   only `milliseconds` and warns the common attributes away as unknown,
   so `<timewait counter=…>` does not count there, where SIPp books it
-  on entry.
+  on entry. Found on the way: sipr applied a step's RTDs (`start_rtd`,
+  `rtd`) only on a send and a matched recv, where SIPp's
+  `do_bookkeeping` runs for a pause, a nop, a sendCmd and a recvCmd
+  too; all four book their RTDs since, at the same point as their
+  counter.
