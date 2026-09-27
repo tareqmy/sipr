@@ -231,9 +231,10 @@ snapshots, never on the hot path.
 
 ## 7. Next steps
 
-M0–M49 are done: SIPp parity is complete (v0.28.0), the hot path is
-measured against real sipp (M45), `--check` lints scenarios (M47), and
+M0–M50 are done: SIPp parity is complete (v0.28.0), the hot path is
+measured against real sipp (M45), `--check` lints scenarios (M47),
 `sipr-engine` is a library any Rust harness can embed (M49,
-`docs/LIBRARY_API.md`). What comes next is the M50+ list at the bottom of
+`docs/LIBRARY_API.md`), and every parser of untrusted bytes has a fuzz
+target (M50, `make fuzz`). What comes next is the M51+ list at the bottom of
 `docs/MILESTONES.md`, empty until the users of the HTTP API and the library
 ask for something.

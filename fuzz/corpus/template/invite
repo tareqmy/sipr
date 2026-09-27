@@ -1,0 +1,11 @@
+INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+Call-ID: [call_id]
+CSeq: 1 INVITE
+[field0 line=2 file="x.csv"]
+[authentication username=u password=p]
+[FUZZKEY] [last_Via:] [$1] [routes]
+[fill variable=v]
+[$unknown][not a keyword]
+Content-Length: [len]

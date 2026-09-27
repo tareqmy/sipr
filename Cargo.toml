@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The fuzz harness (docs/TESTING.md §6) builds with nightly and libFuzzer;
+# it is a separate package so the workspace gates stay on stable.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.29.0"

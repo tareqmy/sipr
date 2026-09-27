@@ -1,6 +1,6 @@
 # Testing
 
-Five layers. A change is done when the layers it touches pass.
+Six layers. A change is done when the layers it touches pass.
 
 ## 1. Unit tests (`cargo test --workspace`)
 
@@ -119,10 +119,48 @@ peak RSS, retransmissions and concurrency for each, read from `/usr/bin/time`
 and from each tool's own `-trace_stat` CSV. Results and their caveats live in
 `docs/PERFORMANCE.md`; rerun it when the engine's hot path changes.
 
+## 6. Fuzzing (`make fuzz`)
+
+`fuzz/` is a cargo-fuzz (libFuzzer) package outside the workspace, one
+target per parser that reads untrusted bytes:
+
+| target          | what it feeds                                                        |
+|-----------------|----------------------------------------------------------------------|
+| `sip_message`   | `sipr_net::message::Inbound::parse` and every accessor on the result |
+| `sdp`           | `sipr_media::sdp` endpoint and `a=crypto` scans                      |
+| `scenario_xml`  | `sipr_scenario::compile` and `compile_strict` on the text            |
+| `template`      | the keyword tokenizer, with a `-key` generic keyword in scope        |
+| `regex`         | the in-tree `<ereg>` engine: pattern NUL haystack, both capped       |
+| `injection_csv` | `InjectionFile::parse` and the table operations the keywords use    |
+| `pcap`          | the pcap/pcapng readers and the replay-side accessors                |
+| `control`       | control-socket datagrams, command lines and the HTTP API's JSON      |
+| `auth`          | digest and AKA challenges, answering them, and `verifyauth`          |
+
+It needs nightly and cargo-fuzz (`rustup toolchain install nightly` and
+`cargo install cargo-fuzz`); the stable gates do not build it. `make fuzz`
+runs every target for `FUZZ_SECS` seconds (30 by default) through
+`scripts/fuzz.sh`, which is what the CI job runs on every push. To dig
+into one target:
+
+```
+cd fuzz
+cargo +nightly fuzz run sip_message -- -max_total_time=600
+cargo +nightly fuzz run regex fuzz/artifacts/regex/crash-…   # replay a finding
+```
+
+Seeds live in `fuzz/corpus/<target>/` and are read-only to the script:
+libFuzzer grows its working corpus in a scratch directory, so a run never
+dirties the tree. A finding lands in `fuzz/artifacts/<target>/`; the fix
+carries it into the crate's own tests as a regression case rather than
+into the seed corpus, so the stable gates keep guarding it. The fuzz
+package is harness code: `#![forbid(unsafe_code)]` and the no-panic rule
+do not apply to it, only to what it calls.
+
 ## CI order
 
-fmt → clippy → unit+golden+property → build sipp (cached) → interop → benches
-(benches on-demand/nightly, not per-PR).
+fmt → clippy → unit+golden+property → build sipp (cached) → interop → fuzz
+(30 s per target, nightly toolchain) → benches (benches on-demand/nightly,
+not per-PR).
 
 Both benches run from `.github/workflows/bench.yml` on a nightly cron and on
 `workflow_dispatch` (which takes the rates and the window as inputs). Neither

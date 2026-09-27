@@ -2080,9 +2080,44 @@ Found on the way, each fixed in its own commit: every listener thread
 held its port until process exit (`fix(net)`, before D2), and two
 engines in one process reused Call-IDs (`fix(engine)`, before D5).
 
-### M50+ — further additions (after M49)
+### M50 — Fuzz targets for every untrusted-input parser ✅
+
+AGENTS.md asks for defensive design at every boundary, and docs/TESTING.md
+§3 promised a fuzz-shaped corpus; until now the only mechanical check was
+the seeded no-panic test on the SIP parser. This makes the rule
+enforceable: a cargo-fuzz (libFuzzer) package under `fuzz/`, outside the
+workspace so the stable gates stay as they are, with one target per
+parser that reads bytes it did not produce, run for a short while on
+every push.
+
+- [x] `fuzz/` package, `exclude`d from the workspace, with nine targets:
+      `sip_message`, `sdp`, `scenario_xml`, `template`, `regex`,
+      `injection_csv`, `pcap`, `control`, `auth`. Each calls the parser
+      and then every accessor its real caller uses on the result, so a
+      panic in a lazy getter counts too. `regex` caps pattern and
+      haystack so a slow pattern reads as slow, not as a hang.
+- [x] Seed corpora under `fuzz/corpus/<target>/`, read-only to the runs:
+      `scripts/fuzz.sh` gives libFuzzer a scratch directory to grow in,
+      so a run never dirties the tree.
+- [x] `make fuzz` (`FUZZ_SECS`, 30 by default) and a `fuzz` CI job on
+      every push: nightly toolchain, 30 s per target, `-timeout=10` so a
+      hang is a finding, the reproducer uploaded as a workflow artifact.
+- [x] Docs: TESTING §6 (layer six, the target table, how to replay a
+      finding and where its regression test goes), CONVENTIONS
+      §Dependencies (`libfuzzer-sys`, harness only), CHANGELOG.
+
+Findings: the `auth` target crashed on its fourth input. `verifyauth`
+sliced the `algorithm=` value at byte 3 to compare it with `MD5`; a
+non-UTF-8 byte there decodes to U+FFFD, three bytes wide, and the slice
+panicked the engine on a header any peer could send. Fixed in its own
+commit before this one (`fix(auth)`), with the reproducer as a unit test.
+The other eight ran 30 s each without a finding. A finding's fix goes
+into the crate it hit with the reproducer as a regression test, per
+docs/TESTING.md §6.
+
+### M51+ — further additions (after M50)
 
 Candidates, to be promoted into numbered milestones in the order the
 users of the HTTP API and the library ask for them. None listed yet:
-the parity backlog is closed and M49 is the first item that is sipr's
-own.
+the parity backlog is closed, M49 was the first item that is sipr's
+own and M50 the second.

@@ -1,0 +1,92 @@
+# Fuzz harness for every sipr parser that reads untrusted bytes
+# (docs/TESTING.md §6). Not a workspace member: libFuzzer needs nightly and
+# sanitizer flags the workspace gates do not, and nothing here ships.
+#
+#   cargo +nightly fuzz list
+#   cargo +nightly fuzz run sip_message -- -max_total_time=60
+#
+# `make fuzz` runs every target for a short while, as CI does.
+
+[package]
+name = "sipr-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sipr-net = { path = "../crates/sipr-net" }
+sipr-scenario = { path = "../crates/sipr-scenario" }
+sipr-media = { path = "../crates/sipr-media" }
+sipr-control = { path = "../crates/sipr-control" }
+sipr-auth = { path = "../crates/sipr-auth" }
+
+# libFuzzer wants symbols in the optimized build so a crash names the frame.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "sip_message"
+path = "fuzz_targets/sip_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sdp"
+path = "fuzz_targets/sdp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scenario_xml"
+path = "fuzz_targets/scenario_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "template"
+path = "fuzz_targets/template.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "regex"
+path = "fuzz_targets/regex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "injection_csv"
+path = "fuzz_targets/injection_csv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcap"
+path = "fuzz_targets/pcap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control"
+path = "fuzz_targets/control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth"
+path = "fuzz_targets/auth.rs"
+test = false
+doc = false
+bench = false

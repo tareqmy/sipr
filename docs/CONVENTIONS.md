@@ -52,7 +52,9 @@ M32; unconditional in `sipr-net` since M44, which needs `SO_SNDBUF`/
 of which std exposes and both of which would otherwise need `unsafe`),
 and for tests `proptest`, `criterion` (bench-only, `default-features = false`:
 its `html_reports` pulls in plotters and a pile of transitive crates for output
-nobody reads in CI), `assert_cmd`, `tempfile`, `rcgen`. Add them to
+nobody reads in CI), `assert_cmd`, `tempfile`, `rcgen`, and for the
+fuzz harness only `libfuzzer-sys` (in `fuzz/`, a package outside the
+workspace so the gates stay on stable — docs/TESTING.md §6). Add them to
 `[workspace.dependencies]` when a milestone first needs them. The CLI is a
 deliberate exception: `src/cli.rs` is a bespoke table-driven parser (not clap)
 because SIPp's single-dash multi-char flags don't fit clap's model — extend

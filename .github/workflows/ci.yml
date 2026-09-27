@@ -75,6 +75,31 @@ jobs:
       - name: Interop against real SIPp
         run: SIPP_BIN=/tmp/sipp/sipp SIPP_SRC=/tmp/sipp cargo test --test interop -- --nocapture
 
+  # Every parser that reads untrusted bytes has a libFuzzer target under
+  # fuzz/ (docs/TESTING.md §6). A short run per push is the point: a crash
+  # or a hang in a parser is a real bug, and libFuzzer finds the shallow
+  # ones in seconds. The seed corpora are checked in; the reproducer for a
+  # finding is uploaded so it can become a regression test.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz every target for 30s
+        run: scripts/fuzz.sh 30
+      - name: Upload the reproducer
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
   # SCTP needs an OS stack and a sipp built with USE_SCTP; only Linux has both.
   sctp:
     runs-on: ubuntu-latest

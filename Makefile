@@ -7,6 +7,7 @@ RATE    ?= 50                   # calls per second
 CALLS   ?= 1000                 # total calls (-m)
 SCENARIO ?=                     # path to a -sf scenario (blank = embedded)
 SIPP_BIN ?= $(HOME)/development/cprojects/sipp/sipp   # real sipp for interop
+FUZZ_SECS ?= 30                 # seconds per fuzz target (make fuzz)
 
 CARGO   ?= cargo
 BIN     := ./target/release/sipr
@@ -76,6 +77,10 @@ dump: build ## Print an embedded scenario: make dump NAME=uac
 .PHONY: interop
 interop: ## Interop tests against real sipp (set SIPP_BIN if not on PATH)
 	SIPP_BIN=$(SIPP_BIN) $(CARGO) test --test interop -- --nocapture
+
+.PHONY: fuzz
+fuzz: ## Fuzz every parser for $(FUZZ_SECS)s each (nightly + cargo-fuzz; docs/TESTING.md §6)
+	scripts/fuzz.sh $(FUZZ_SECS)
 
 .PHONY: bench
 bench: release ## Loopback throughput: sipr-UAC vs sipr-UAS at $(RATE) cps

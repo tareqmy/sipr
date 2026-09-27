@@ -1,0 +1,1 @@
+Digest username="u", realm="r", nonce="n", uri="sip:x", response="00000000000000000000000000000000", algorithm=MD5, cnonce="c", qop=auth, nc=00000001

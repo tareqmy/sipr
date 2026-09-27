@@ -1,0 +1,5 @@
+# cargo-fuzz output: the sanitized build and the crash/timeout reproducers.
+# A reproducer worth keeping becomes a regression test in the crate it hit.
+target/
+artifacts/
+coverage/

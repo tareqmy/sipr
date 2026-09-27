@@ -5,3 +5,5 @@
 * text=auto eol=lf
 *.png binary
 *.woff2 binary
+# Fuzz seeds are byte-exact inputs (CRLF, binary pcap); never normalize.
+fuzz/corpus/** -text

@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Fuzz targets for every parser that reads untrusted bytes (M50): a
+  cargo-fuzz package under `fuzz/` with nine libFuzzer targets (the SIP
+  message parser, the SDP scan, the scenario compiler, the keyword
+  tokenizer, the `<ereg>` regex engine, injection files, pcap/pcapng,
+  the control socket and JSON, digest/AKA auth), seed corpora, `make
+  fuzz`, and a CI job that runs each target for 30 s on every push
+  (`docs/TESTING.md` §6).
+
 ### Fixed
 
 - `verifyauth` no longer panics on an Authorization header whose

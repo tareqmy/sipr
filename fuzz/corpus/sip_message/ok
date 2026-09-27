@@ -1,0 +1,10 @@
+SIP/2.0 200 OK
+Via: SIP/2.0/UDP 10.0.0.1:5061;branch=z9hG4bK-1-1-7
+From: sipr <sip:sipr@10.0.0.1>;tag=1a2b3c
+To: service <sip:service@10.0.0.2>;tag=9f8e
+Call-ID: 1-42@10.0.0.1
+CSeq: 1 INVITE
+Record-Route: <sip:p1;lr>,
+ <sip:p2;lr>
+Content-Length: 0
+
