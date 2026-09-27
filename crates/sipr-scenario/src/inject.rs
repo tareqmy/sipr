@@ -384,6 +384,24 @@ fn expand_printf(field: &str, value: i64) -> Result<String, String> {
     Ok(out)
 }
 
+/// The most padding one `%d` conversion yields: SIPp's `SIPP_MAX_MSG_SIZE`
+/// less the terminator, the buffer its `getField` expands into.
+const MAX_PRINTF_WIDTH: usize = 65_535;
+
+/// A width or precision from a conversion spec. SIPp writes the expansion
+/// into a buffer of `SIPP_MAX_MSG_SIZE` bytes, so a count past that pads
+/// to the buffer and no further; digits saturate there, and anything that
+/// is not a number (an empty text, a stray `-`) is 0. Without the bound a
+/// field like `%3097370663998281045d` asked for exabytes of padding and
+/// aborted the process (found by the `injection_csv` fuzz target).
+fn bounded_count(text: &str) -> usize {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    text.parse::<usize>()
+        .map_or(MAX_PRINTF_WIDTH, |n| n.min(MAX_PRINTF_WIDTH))
+}
+
 /// C's `%d` conversion for the flags/width/precision in `spec` — the text
 /// between `%` and `d`, which SIPp limits to digits, `.` and `-`.
 fn format_decimal(spec: &str, value: i64) -> String {
@@ -402,8 +420,8 @@ fn format_decimal(spec: &str, value: i64) -> String {
         Some((w, p)) => (w, Some(p)),
         None => (rest, None),
     };
-    let width: usize = width_text.parse().unwrap_or(0);
-    let precision: Option<usize> = precision_text.map(|p| p.parse().unwrap_or(0));
+    let width = bounded_count(width_text);
+    let precision = precision_text.map(bounded_count);
 
     let mut digits = value.unsigned_abs().to_string();
     if let Some(p) = precision
@@ -604,6 +622,27 @@ mod tests {
         // Not a printf file: a stray % is just data.
         let ok = InjectionFile::parse("u", "SEQUENTIAL\nx%s\n").unwrap();
         assert_eq!(field(&ok, 0, 0).as_deref(), Some("x%s"));
+    }
+
+    /// Found by the `injection_csv` fuzz target (M50): a width in the
+    /// exabytes made the expansion allocate that much padding and abort.
+    /// SIPp's expansion stops at its message buffer; so does ours.
+    #[test]
+    fn printf_width_and_precision_stop_at_the_message_buffer() {
+        let f = InjectionFile::parse(
+            "t",
+            "SEQUENTIAL,PRINTF=1\n%3097370663998281045d;%.99999999999999999999d;%-70000d",
+        )
+        .expect("parse");
+        let padded = field(&f, 0, 0).expect("field");
+        assert_eq!(padded.len(), MAX_PRINTF_WIDTH);
+        assert!(padded.ends_with(" 0"));
+        let precise = field(&f, 0, 1).expect("field");
+        assert_eq!(precise.len(), MAX_PRINTF_WIDTH);
+        assert!(precise.chars().all(|c| c == '0'));
+        let left = field(&f, 0, 2).expect("field");
+        assert_eq!(left.len(), MAX_PRINTF_WIDTH);
+        assert!(left.starts_with("0 "));
     }
 
     #[test]

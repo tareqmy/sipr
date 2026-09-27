@@ -23,6 +23,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   MD5/SHA-256 prefix check compared a `str` slice at a fixed byte index,
   which split the replacement character the lossy decode had put there.
   Found by the new `auth` fuzz target on its fourth input.
+- A `PRINTF=` injection field whose `%d` width or precision runs into
+  the exabytes no longer aborts the process: the padding stops at
+  SIPp's message-buffer size, as SIPp's own expansion does. Found by the
+  `injection_csv` fuzz target.
 
 ## [0.29.0] — 2026-09-27
 
