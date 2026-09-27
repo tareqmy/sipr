@@ -126,7 +126,7 @@ pub struct StatSet {
     /// This period's response-time and call-length samples.
     rtd_period: HashMap<String, Histogram>,
     call_length_period: Histogram,
-    /// Buffered `-trace_rtt` rows: (seconds since start, rtt in seconds,
+    /// Buffered `-trace_rtt` rows: (ms since start, rtt in ms,
     /// rtd name).
     rtt_rows: Vec<(f64, f64, String)>,
     /// The scenario's generic counters (`counter=`), in the order the
@@ -377,11 +377,12 @@ impl StatSet {
             self.rtd_names.push(name.to_owned());
         }
         if self.dump.trace_rtt {
-            // SIPp `computeRtt`: the stop time and the rtt, both in seconds
-            // (its columns say ms; the values are divided by 1000).
+            // SIPp `computeRtt`: the stop time and the rtt, both in
+            // milliseconds — its clock counts microseconds since the
+            // process started, and both are divided by 1000.
             self.rtt_rows.push((
-                self.started.elapsed().as_secs_f64(),
-                d.as_secs_f64(),
+                self.started.elapsed().as_secs_f64() * 1000.0,
+                d.as_secs_f64() * 1000.0,
                 name.to_owned(),
             ));
         }
@@ -1601,8 +1602,8 @@ mod tests {
         let rows = s.take_rtt_rows();
         let lines: Vec<&str> = rows.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].ends_with(";0.025;1"), "{rows}");
-        assert!(lines[1].ends_with(";1.5;x"), "{rows}");
+        assert!(lines[0].ends_with(";25;1"), "{rows}");
+        assert!(lines[1].ends_with(";1500;x"), "{rows}");
         assert!(s.take_rtt_rows().is_empty());
     }
 

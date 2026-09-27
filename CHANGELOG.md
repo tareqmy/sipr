@@ -18,6 +18,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `-trace_rtt` rows carry milliseconds, as their column names say and
+  as real sipp writes them: its clock counts microseconds since the
+  process started and `computeRtt` divides by 1000. sipr divided once
+  more and wrote seconds, in both columns. Found when the counters
+  interop test started reading real sipp's rtt file.
 - `verifyauth` no longer panics on an Authorization header whose
   `algorithm=` value carries a non-UTF-8 byte in its first three: the
   MD5/SHA-256 prefix check compared a `str` slice at a fixed byte index,

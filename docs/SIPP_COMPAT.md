@@ -1479,9 +1479,12 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   is written at exit regardless; `-f` (default 1 s) paces the screen
   snapshot and the `-bg` line. `-trace_rtt` writes
   `<scenario>_<pid>_rtt.csv`: `Date_ms;response_time_ms;rtd_no`, then
-  per `rtd=` close the stop time and the response time — both in
-  **seconds** despite the names, as SIPp divides by 1000 — and the RTD
-  name, in C++ `ostream` default number form (six significant digits),
+  per `rtd=` close the stop time (since the process started) and the
+  response time — both in milliseconds, as the names say: SIPp's clock
+  counts microseconds since start and both are divided by 1000 (sipr
+  wrote seconds until the timewait fix after M50, having misread that
+  division) — and the RTD name, in C++ `ostream` default number form
+  (six significant digits),
   buffered `-rtt_freq` (200) rows between flushes. `-trace_counts` writes
   `<scenario>_<pid>_counts.csv`: `CurrentTime;ElapsedTime` (the latter
   `hh:mm:ss:uuuuuu`) then per visible step `<index>_<name>_Sent`,
