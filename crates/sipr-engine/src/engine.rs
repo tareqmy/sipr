@@ -216,7 +216,9 @@ pub struct EngineConfig {
     /// Where the engine's [`crate::Notice`]s go: stderr with the binary's
     /// wording by default, a channel for an embedder, or nowhere.
     pub notices: crate::NoticeSink,
-    /// `-tls_*` options; required when `transport` is [`TransportKind::TlsMono`].
+    /// `-tls_*` options; required for the TLS and WebSocket-over-TLS
+    /// transports ([`TransportKind::TlsMono`] and its per-call and `wss`
+    /// siblings).
     pub tls: Option<sipr_net::TlsConfig>,
     /// `-mi`: media address for `[media_ip]` and the RTP sockets (default:
     /// the local signaling IP).
@@ -494,6 +496,16 @@ pub enum TransportKind {
     TlsMono,
     /// `ln`: TLS, one connection per call (client side).
     TlsPerCall,
+    /// `ws1`: SIP over WebSocket (RFC 7118) on TCP, one connection per
+    /// peer. A sipr addition: SIPp has no WebSocket transport (M51).
+    WsMono,
+    /// `wsn`: WebSocket, one connection per call (client side).
+    WsPerCall,
+    /// `wss1`: WebSocket over TLS (`-tls_*` material as for `l1`), one
+    /// connection per peer.
+    WssMono,
+    /// `wssn`: WebSocket over TLS, one connection per call (client side).
+    WssPerCall,
     /// `s1`: SCTP, one association per peer (cargo feature `sctp`; needs an
     /// OS SCTP stack at run time).
     SctpMono,
@@ -507,7 +519,12 @@ impl TransportKind {
     pub fn per_call(self) -> bool {
         matches!(
             self,
-            Self::UdpPerCall | Self::TcpPerCall | Self::TlsPerCall | Self::SctpPerCall
+            Self::UdpPerCall
+                | Self::TcpPerCall
+                | Self::TlsPerCall
+                | Self::WsPerCall
+                | Self::WssPerCall
+                | Self::SctpPerCall
         )
     }
 }
@@ -2152,6 +2169,7 @@ impl<'s> Engine<'s> {
             recv_loss_pct: 0.0,
             loss_seed: config.seed,
             sockopts: config.sockopts.clone(),
+            framing: sipr_net::Framing::Sip,
         };
         let per_call = config.transport.per_call() && scenario.role == Role::Uac;
         // `-t ui`: the main socket binds the first injected IP (SIPp: "on some
@@ -2174,6 +2192,20 @@ impl<'s> Engine<'s> {
             tcfg.local_ip = Some(ip);
         }
         let rsa_server = config.remote_sending_addr.is_some() && scenario.role == Role::Uas;
+        // `-t ws*`/`wss*`: the stream transports frame WebSocket (M51), and
+        // `[transport]` names it as RFC 7118 §5 has the Via say.
+        let websocket = matches!(
+            config.transport,
+            TransportKind::WsMono
+                | TransportKind::WsPerCall
+                | TransportKind::WssMono
+                | TransportKind::WssPerCall
+        );
+        tcfg.framing = if websocket {
+            sipr_net::Framing::WebSocket
+        } else {
+            sipr_net::Framing::Sip
+        };
         let (transport, transport_token, reliable) = match config.transport {
             TransportKind::UdpMono | TransportKind::UdpPerCall | TransportKind::UdpPerIp => {
                 let u = UdpTransport::bind(&tcfg, net_tx).map_err(|e| EngineError::Bind {
@@ -2182,19 +2214,23 @@ impl<'s> Engine<'s> {
                 })?;
                 (Transport::Udp(u), "UDP", false)
             }
-            TransportKind::TcpMono | TransportKind::TcpPerCall => {
+            TransportKind::TcpMono
+            | TransportKind::TcpPerCall
+            | TransportKind::WsMono
+            | TransportKind::WsPerCall => {
+                let token = if websocket { "WS" } else { "TCP" };
                 let t = match scenario.role {
                     // `tn` client: every call dials its own connection later.
                     Role::Uac if per_call => TcpTransport::client_pool(&tcfg, net_tx),
                     // Client: one mono-socket connection to the target, opened now.
                     Role::Uac => {
                         let remote = config.target.ok_or_else(|| {
-                            EngineError::Config("TCP UAC needs a remote target".into())
+                            EngineError::Config(format!("{token} UAC needs a remote target"))
                         })?;
                         let remote = config.remote_sending_addr.unwrap_or(remote);
                         TcpTransport::connect(&tcfg, net_tx, remote).map_err(|e| {
                             EngineError::Bind {
-                                what: format!("cannot connect TCP to {remote}"),
+                                what: format!("cannot connect {token} to {remote}"),
                                 source: e,
                             }
                         })?
@@ -2202,19 +2238,23 @@ impl<'s> Engine<'s> {
                     // Server: listen and accept, framing each connection.
                     Role::Uas => {
                         TcpTransport::listen(&tcfg, net_tx).map_err(|e| EngineError::Bind {
-                            what: "cannot bind TCP listener".to_owned(),
+                            what: format!("cannot bind {token} listener"),
                             source: e,
                         })?
                     }
                 };
-                (Transport::Tcp(t), "TCP", true)
+                (Transport::Tcp(t), token, true)
             }
             TransportKind::SctpMono | TransportKind::SctpPerCall => {
                 build_sctp_transport(config, &tcfg, net_tx, scenario.role, per_call)?
             }
-            TransportKind::TlsMono | TransportKind::TlsPerCall => {
+            TransportKind::TlsMono
+            | TransportKind::TlsPerCall
+            | TransportKind::WssMono
+            | TransportKind::WssPerCall => {
+                let token = if websocket { "WSS" } else { "TLS" };
                 let tls_cfg = config.tls.as_ref().ok_or_else(|| {
-                    EngineError::Config("TLS transport needs TLS configuration".into())
+                    EngineError::Config(format!("{token} transport needs TLS configuration"))
                 })?;
                 let t = match scenario.role {
                     // `ln` client: every call dials and handshakes its own.
@@ -2223,12 +2263,12 @@ impl<'s> Engine<'s> {
                     // Client: dial + handshake now; a failure is a startup error.
                     Role::Uac => {
                         let remote = config.target.ok_or_else(|| {
-                            EngineError::Config("TLS UAC needs a remote target".into())
+                            EngineError::Config(format!("{token} UAC needs a remote target"))
                         })?;
                         let remote = config.remote_sending_addr.unwrap_or(remote);
                         TlsTransport::connect(&tcfg, tls_cfg, net_tx, remote).map_err(|e| {
                             EngineError::Bind {
-                                what: format!("cannot connect TLS to {remote}"),
+                                what: format!("cannot connect {token} to {remote}"),
                                 source: e,
                             }
                         })?
@@ -2237,12 +2277,12 @@ impl<'s> Engine<'s> {
                     // its own thread and a bad client is dropped, not fatal.
                     Role::Uas => TlsTransport::listen(&tcfg, tls_cfg, net_tx).map_err(|e| {
                         EngineError::Bind {
-                            what: "cannot bind TLS listener".to_owned(),
+                            what: format!("cannot bind {token} listener"),
                             source: e,
                         }
                     })?,
                 };
-                (Transport::Tls(t), "TLS", true)
+                (Transport::Tls(t), token, true)
             }
         };
         let twin = open_twin(scenario, config, &tx)?;
@@ -7705,17 +7745,25 @@ enum SetDestWire {
     Tcp,
     Tls,
     Sctp,
+    /// sipr's `ws` (M51): a per-call WebSocket connection is re-dialed
+    /// like a TCP one.
+    Ws,
+    /// sipr's `wss`: refused like TLS.
+    Wss,
 }
 
-/// SIPp's `setdest` protocol checks: one of the four names in either case,
-/// the run's own transport, never TLS, and TCP/SCTP only in the per-call
-/// (`-t tn|sn`, "multisocket") modes.
+/// SIPp's `setdest` protocol checks: one of the four names in either case
+/// (sipr adds `ws` and `wss`), the run's own transport, never TLS (nor
+/// WSS), and TCP/SCTP (and WS) only in the per-call (`-t tn|sn|wsn`,
+/// "multisocket") modes.
 fn setdest_protocol(protocol: &str, transport: TransportKind) -> Result<SetDestWire, String> {
     let wire = match protocol.to_ascii_lowercase().as_str() {
         "udp" => SetDestWire::Udp,
         "tcp" => SetDestWire::Tcp,
         "tls" => SetDestWire::Tls,
         "sctp" => SetDestWire::Sctp,
+        "ws" => SetDestWire::Ws,
+        "wss" => SetDestWire::Wss,
         _ => return Err(format!("Unknown transport for setdest: '{protocol}'")),
     };
     let running = match transport {
@@ -7724,16 +7772,29 @@ fn setdest_protocol(protocol: &str, transport: TransportKind) -> Result<SetDestW
         }
         TransportKind::TcpMono | TransportKind::TcpPerCall => SetDestWire::Tcp,
         TransportKind::TlsMono | TransportKind::TlsPerCall => SetDestWire::Tls,
+        TransportKind::WsMono | TransportKind::WsPerCall => SetDestWire::Ws,
+        TransportKind::WssMono | TransportKind::WssPerCall => SetDestWire::Wss,
         TransportKind::SctpMono | TransportKind::SctpPerCall => SetDestWire::Sctp,
     };
     if wire != running {
         return Err("Can not switch protocols during setdest.".to_owned());
     }
-    if wire == SetDestWire::Tls {
-        return Err("Changing destinations is not supported for TLS.".to_owned());
-    }
-    if matches!(wire, SetDestWire::Tcp | SetDestWire::Sctp) && !transport.per_call() {
-        return Err("Changing destinations for TCP or SCTP requires multisocket mode.".to_owned());
+    match wire {
+        SetDestWire::Tls => {
+            return Err("Changing destinations is not supported for TLS.".to_owned());
+        }
+        SetDestWire::Wss => {
+            return Err("Changing destinations is not supported for WSS.".to_owned());
+        }
+        SetDestWire::Tcp | SetDestWire::Sctp if !transport.per_call() => {
+            return Err(
+                "Changing destinations for TCP or SCTP requires multisocket mode.".to_owned(),
+            );
+        }
+        SetDestWire::Ws if !transport.per_call() => {
+            return Err("Changing destinations for WS requires multisocket mode.".to_owned());
+        }
+        _ => {}
     }
     Ok(wire)
 }
@@ -8152,6 +8213,20 @@ mod tests {
         assert_eq!(
             setdest_protocol("tcp", T::TcpMono),
             Err("Changing destinations for TCP or SCTP requires multisocket mode.".to_owned())
+        );
+        // sipr's WebSocket wires (M51) follow the TCP and TLS rules.
+        assert_eq!(setdest_protocol("ws", T::WsPerCall), Ok(SetDestWire::Ws));
+        assert_eq!(
+            setdest_protocol("ws", T::WsMono),
+            Err("Changing destinations for WS requires multisocket mode.".to_owned())
+        );
+        assert_eq!(
+            setdest_protocol("wss", T::WssPerCall),
+            Err("Changing destinations is not supported for WSS.".to_owned())
+        );
+        assert_eq!(
+            setdest_protocol("tcp", T::WsPerCall),
+            Err("Can not switch protocols during setdest.".to_owned())
         );
         assert_eq!(setdest_port("5060"), Ok(5060));
         assert_eq!(setdest_port(" 5062 "), Ok(5062));

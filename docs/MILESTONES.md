@@ -2126,9 +2126,56 @@ abort, where SIPp's `snprintf` stops at its message buffer; fixed in
 goes into the crate it hit with the reproducer as a regression test,
 per docs/TESTING.md §6.
 
-### M51+ — further additions (after M50)
+### M51 — WebSocket transport (`-t ws1|wsn|wss1|wssn`) ✅
+
+A sipr addition: SIPp has no WebSocket transport, so the oracles are
+RFC 7118 (SIP over WebSocket) and RFC 6455 (the protocol), and the
+interop suite has nothing to compare against — the tests are sipr
+against sipr and against hand-rolled peers. Design: WebSocket is a
+second *framing* of the stream transports, not a third transport. The
+TCP and TLS transports take a `Framing` (`Sip`: Content-Length, as
+before; `WebSocket`: one SIP message per WebSocket message) and keep
+their connection tables, per-call connections, reconnection and `-rsa`
+behavior; a dialed connection is the WebSocket client (it sends the
+upgrade request and masks its frames, RFC 6455 §5.3) and an accepted
+one the server, whatever the SIP role. The handshake and the frame
+codec live in `sipr-net/src/ws.rs`, std-only plus `sipr-auth`'s SHA-1
+and base64 for `Sec-WebSocket-Accept` (the first internal dependency of
+`sipr-net`, noted in ARCHITECTURE §1).
+
+- [x] `sipr-net/src/ws.rs`: the client and server halves of the HTTP
+      upgrade (RFC 6455 §4: `Upgrade`/`Connection`, `Sec-WebSocket-Key`
+      → `-Accept`, version 13, subprotocol `sip` per RFC 7118 §4, a
+      tolerant server that answers 400/426 and drops the peer, never the
+      run); the frame codec (§5: 7/16/64-bit lengths, masking, text and
+      binary data frames, fragmentation reassembled, ping answered with
+      pong, close answered with close; a message cap so a hostile length
+      cannot allocate the machine); `StreamFramer` = the SIP or the
+      WebSocket framer behind one interface for the two read loops.
+- [x] `tcp.rs`/`tls.rs`: `TransportConfig.framing`; the handshake after
+      connect (client) and after accept (server, on the per-connection
+      thread like the TLS handshake); every write goes through one frame
+      writer under the connection's lock, so a pong from the reader
+      thread never interleaves with a send; the reader delivers whole
+      SIP messages exactly as for raw TCP/TLS.
+- [x] Engine and CLI: `TransportKind::{WsMono, WsPerCall, WssMono,
+      WssPerCall}`, `-t ws1|wsn|wss1|wssn` (`wss` needs the `-tls_*`
+      material like `l1`), `[transport]` renders `WS`/`WSS` (Via
+      `SIP/2.0/WS`, RFC 7118 §5), `reliable = true`, `<setdest>` takes
+      `ws`/`wss` and refuses a protocol switch as for the others.
+- [x] Tests: ws.rs vectors (the RFC 6455 §4.2.2 accept key, the §5.7
+      example frames, a 64 KiB frame, fragments, ping, a masked client
+      frame, an oversize length, refused handshakes); tcp.rs and tls.rs
+      round trips over WebSocket framing including a ping from a raw
+      peer; e2e sipr UAC against sipr UAS over `ws1`, `wsn` and `wss1`
+      (rcgen identity), the Via checked, and a raw WebSocket client that
+      drives a sipr UAS with masked text frames.
+- [x] Docs: SIPP_COMPAT §3 (`-t`) and a §6 note, README (feature list;
+      out of "Not yet"), ARCHITECTURE §1, CHANGELOG, AGENTS/PLAN state
+      lines.
+
+### M52+ — further additions (after M51)
 
 Candidates, to be promoted into numbered milestones in the order the
 users of the HTTP API and the library ask for them. None listed yet:
-the parity backlog is closed, M49 was the first item that is sipr's
-own and M50 the second.
+the parity backlog is closed; M49, M50 and M51 are sipr's own.

@@ -12,6 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# SHA-1 and base64 for the WebSocket handshake's accept key (M51).
+sipr-auth = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 socket2 = { workspace = true }

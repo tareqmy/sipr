@@ -29,6 +29,15 @@ pub enum Transport {
     TlsMono,
     /// `ln`: TLS with one connection per call.
     TlsPerCall,
+    /// `ws1`: SIP over WebSocket (RFC 7118) on TCP, one connection per peer
+    /// (a sipr addition; SIPp has no WebSocket transport).
+    WsMono,
+    /// `wsn`: WebSocket with one connection per call.
+    WsPerCall,
+    /// `wss1`: WebSocket over TLS, one connection per peer.
+    WssMono,
+    /// `wssn`: WebSocket over TLS with one connection per call.
+    WssPerCall,
     /// `s1`: SCTP with one association per peer (needs the `sctp` build feature).
     SctpMono,
     /// `sn`: SCTP with one association per call.
@@ -673,7 +682,7 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "t",
         true,
         "MODE",
-        "Transport: u1 (UDP, default), un (UDP, one socket per call), ui (UDP, one socket per injected IP; needs -inf and -ip_field), s1 (SCTP), sn (SCTP, one association per call; both need a build with the sctp feature and a Linux SCTP stack), t1 (TCP), tn (TCP, one connection per call), l1 (TLS), ln (TLS, one connection per call)",
+        "Transport: u1 (UDP, default), un (UDP, one socket per call), ui (UDP, one socket per injected IP; needs -inf and -ip_field), s1 (SCTP), sn (SCTP, one association per call; both need a build with the sctp feature and a Linux SCTP stack), t1 (TCP), tn (TCP, one connection per call), l1 (TLS), ln (TLS, one connection per call), ws1 (SIP over WebSocket, RFC 7118; a sipr addition), wsn (WebSocket, one connection per call), wss1 (WebSocket over TLS, with the -tls_* material), wssn (WebSocket over TLS, one connection per call)",
     ),
     (
         "s",
@@ -1570,10 +1579,15 @@ fn parse_transport(s: &str) -> Result<Transport, String> {
         "tn" => Ok(Transport::TcpPerCall),
         "l1" => Ok(Transport::TlsMono),
         "ln" => Ok(Transport::TlsPerCall),
+        "ws1" => Ok(Transport::WsMono),
+        "wsn" => Ok(Transport::WsPerCall),
+        "wss1" => Ok(Transport::WssMono),
+        "wssn" => Ok(Transport::WssPerCall),
         "s1" => Ok(Transport::SctpMono),
         "sn" => Ok(Transport::SctpPerCall),
         other => Err(format!(
-            "unknown transport mode '{other}' (expected u1, un, ui, t1, tn, l1, ln, s1, or sn)"
+            "unknown transport mode '{other}' (expected u1, un, ui, t1, tn, l1, ln, ws1, wsn, \
+             wss1, wssn, s1, or sn)"
         )),
     }
 }
@@ -1789,6 +1803,13 @@ mod tests {
         assert_eq!(cli(&["-t", "un", "host"]).transport, Transport::UdpPerCall);
         assert_eq!(cli(&["-t", "tn", "host"]).transport, Transport::TcpPerCall);
         assert_eq!(cli(&["-t", "ln", "host"]).transport, Transport::TlsPerCall);
+        assert_eq!(cli(&["-t", "ws1", "host"]).transport, Transport::WsMono);
+        assert_eq!(cli(&["-t", "wsn", "host"]).transport, Transport::WsPerCall);
+        assert_eq!(cli(&["-t", "wss1", "host"]).transport, Transport::WssMono);
+        assert_eq!(
+            cli(&["-t", "wssn", "host"]).transport,
+            Transport::WssPerCall
+        );
         assert_eq!(cli(&["-max_socket", "3", "host"]).max_socket, Some(3));
         assert_eq!(
             cli(&["-rsa", "10.0.0.9:5080", "host"])

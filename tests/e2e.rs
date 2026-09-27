@@ -9489,3 +9489,267 @@ fn a_copy_of_an_answered_message_can_be_lost() {
         "{bye_retrans} answered, {bye_lost} lost of {sent}"
     );
 }
+
+// ---- WebSocket transport (M51) -------------------------------------------
+
+/// What a scripted WebSocket UAS observed.
+#[derive(Default, Debug)]
+struct WsUasStats {
+    invites: u64,
+    byes: u64,
+    saw_ws_via: bool,
+}
+
+/// A scripted UAS speaking SIP over WebSocket (RFC 7118) by hand: accept one
+/// connection, serve the upgrade, and answer INVITE with 180 and 200 and BYE
+/// with 200 in unmasked text frames. Returns once the peer closes or goes
+/// idle for `idle`.
+fn spawn_ws_uas(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<WsUasStats>) {
+    use sipr_net::ws::{Opcode, WsEvent, frame, server_handshake};
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ws uas");
+    let addr = listener.local_addr().expect("addr");
+    let handle = std::thread::spawn(move || {
+        let mut stats = WsUasStats::default();
+        let Ok((mut stream, _peer)) = listener.accept() else {
+            return stats;
+        };
+        stream.set_read_timeout(Some(idle)).ok();
+        let Ok(initial) = server_handshake(&mut stream) else {
+            return stats;
+        };
+        let mut framer = sipr_net::WsFramer::new();
+        framer.push(&initial);
+        let mut buf = [0u8; 16_384];
+        loop {
+            loop {
+                let raw = match framer.next_event() {
+                    Ok(Some(WsEvent::Message(raw))) => raw,
+                    Ok(Some(WsEvent::Ping(payload))) => {
+                        let _ = stream.write_all(&frame(Opcode::Pong, &payload, None));
+                        continue;
+                    }
+                    Ok(Some(WsEvent::Close(_))) | Err(_) => return stats,
+                    Ok(None) => break,
+                };
+                let Ok(msg) = Inbound::parse(&raw) else {
+                    continue;
+                };
+                match msg.method() {
+                    Some("INVITE") => {
+                        stats.invites += 1;
+                        if msg.header_lines("Via").iter().any(|v| v.contains("/WS ")) {
+                            stats.saw_ws_via = true;
+                        }
+                        for status in ["180 Ringing", "200 OK"] {
+                            let response = mirror_response(&msg, status, true);
+                            let _ = stream.write_all(&frame(Opcode::Text, &response, None));
+                        }
+                    }
+                    Some("BYE") => {
+                        stats.byes += 1;
+                        let response = mirror_response(&msg, "200 OK", false);
+                        let _ = stream.write_all(&frame(Opcode::Text, &response, None));
+                    }
+                    _ => {}
+                }
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break, // peer closed, idle timeout or reset
+                Ok(n) => framer.push(&buf[..n]),
+            }
+        }
+        stats
+    });
+    (addr, handle)
+}
+
+/// sipr as a WebSocket UAC (`-t ws1`): it upgrades the connection, sends
+/// masked text frames, reads the UAS's unmasked ones, and the Via says WS.
+#[test]
+fn ws_uac_places_call_over_websocket() {
+    let (addr, uas) = spawn_ws_uas(Duration::from_secs(3));
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "ws1",
+        "-m",
+        "1",
+        "-d",
+        "20",
+        "-timeout",
+        "15",
+        "-bg",
+        &addr.to_string(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(err.contains("retrans-sent 0"), "{err}");
+    let stats = uas.join().expect("ws uas thread");
+    assert_eq!(stats.invites, 1, "one INVITE framed off the WebSocket");
+    assert_eq!(stats.byes, 1, "call torn down with BYE");
+    assert!(stats.saw_ws_via, "[transport] rendered WS in the Via");
+}
+
+/// sipr as a WebSocket UAS (`-t ws1`): a raw RFC 6455 client upgrades with
+/// the `sip` subprotocol, sends masked text frames, and gets 180, 200 and a
+/// 200 to its BYE in text frames.
+#[test]
+fn ws_uas_answers_a_raw_websocket_client() {
+    use sipr_net::ws::{Opcode, WsEvent, client_handshake, frame, mask_key};
+    let port = free_port();
+    let (mut child, uas_err) = spawn_sipr_bg(&[
+        "-sn",
+        "uas",
+        "-t",
+        "ws1",
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-m",
+        "1",
+        "-timeout",
+        "10",
+        "-bg",
+    ]);
+    let mut sock = None;
+    for _ in 0..80 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            sock = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut sock = sock.expect("connect to sipr uas");
+    sock.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let mut rng = sipr_net::rng::Rng::new(42);
+    let initial =
+        client_handshake(&mut sock, &format!("127.0.0.1:{port}"), &mut rng).expect("upgrade");
+    let mut framer = sipr_net::WsFramer::new();
+    framer.push(&initial);
+
+    let request = |method: &str, cseq: u32, to_tag: &str| {
+        format!(
+            "{method} sip:svc@127.0.0.1:{port} SIP/2.0\r\n\
+             Via: SIP/2.0/WS 127.0.0.1:55062;branch=z9hG4bK-ws-{cseq}-{method}\r\n\
+             From: <sip:caller@127.0.0.1>;tag=cli-ws-1\r\n\
+             To: <sip:svc@127.0.0.1:{port}>{to_tag}\r\n\
+             Call-ID: ws-call-1\r\n\
+             CSeq: {cseq} {method}\r\n\
+             Contact: <sip:caller@127.0.0.1:55062;transport=ws>\r\n\
+             Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
+        )
+    };
+    let mut send = |sock: &mut TcpStream, text: String| {
+        sock.write_all(&frame(
+            Opcode::Text,
+            text.as_bytes(),
+            Some(mask_key(&mut rng)),
+        ))
+        .expect("client write");
+    };
+    // Statuses until `until` shows up, with the To tag of the last response.
+    let read_statuses =
+        |sock: &mut TcpStream, framer: &mut sipr_net::WsFramer, until: u16| -> (Vec<u16>, String) {
+            let mut buf = [0u8; 16_384];
+            let mut seen = Vec::new();
+            let mut to_tag = String::new();
+            while !seen.contains(&until) {
+                match framer.next_event() {
+                    Ok(Some(WsEvent::Message(raw))) => {
+                        if let Ok(m) = Inbound::parse(&raw)
+                            && let Some(code) = m.status_code()
+                        {
+                            seen.push(code);
+                            if let Some(tag) = m.to_tag() {
+                                to_tag = format!(";tag={tag}");
+                            }
+                        }
+                    }
+                    Ok(Some(WsEvent::Close(_))) | Err(_) => break,
+                    Ok(Some(WsEvent::Ping(_))) => {}
+                    Ok(None) => {
+                        let Ok(n) = sock.read(&mut buf) else { break };
+                        if n == 0 {
+                            break;
+                        }
+                        framer.push(&buf[..n]);
+                    }
+                }
+            }
+            (seen, to_tag)
+        };
+
+    send(&mut sock, request("INVITE", 1, ""));
+    let (statuses, to_tag) = read_statuses(&mut sock, &mut framer, 200);
+    assert_eq!(statuses, [180, 200], "INVITE answered over WebSocket");
+    send(&mut sock, request("ACK", 1, &to_tag));
+    send(&mut sock, request("BYE", 2, &to_tag));
+    let (statuses, _) = read_statuses(&mut sock, &mut framer, 200);
+    assert_eq!(statuses, [200], "BYE answered over WebSocket");
+    drop(sock);
+    let code = wait_exit(&mut child, Duration::from_secs(10));
+    let err = uas_err.join().expect("uas stderr");
+    assert_eq!(code, Some(0), "uas stderr:\n{err}");
+    assert!(err.contains("successful 1 failed 0"), "{err}");
+}
+
+/// sipr against sipr over WebSocket on TLS: a `wss1` UAS accepts per-call
+/// `wssn` connections, each upgraded inside its own TLS session.
+#[test]
+fn wss_per_call_connections_complete_calls() {
+    let id = tls_identity();
+    let port = free_port();
+    let (mut uas, uas_err) = spawn_sipr_bg(&[
+        "-sn",
+        "uas",
+        "-t",
+        "wss1",
+        "-tls_cert",
+        id.cert_path.to_str().expect("utf8"),
+        "-tls_key",
+        id.key_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-m",
+        "2",
+        "-timeout",
+        "15",
+        "-bg",
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "wssn",
+        "-tls_cert",
+        id.cert_path.to_str().expect("utf8"),
+        "-tls_key",
+        id.key_path.to_str().expect("utf8"),
+        "-i",
+        "127.0.0.1",
+        "-r",
+        "10",
+        "-m",
+        "2",
+        "-d",
+        "300",
+        "-timeout",
+        "10",
+        "-bg",
+        &format!("127.0.0.1:{port}"),
+    ]);
+    let uac_err = String::from_utf8_lossy(&out.stderr);
+    let uas_code = wait_exit(&mut uas, Duration::from_secs(10));
+    let uas_err = uas_err.join().expect("uas stderr");
+    assert_eq!(out.status.code(), Some(0), "uac stderr:\n{uac_err}");
+    assert!(uac_err.contains("successful 2 failed 0"), "{uac_err}");
+    assert_eq!(uas_code, Some(0), "uas stderr:\n{uas_err}");
+    assert!(uas_err.contains("successful 2 failed 0"), "{uas_err}");
+}

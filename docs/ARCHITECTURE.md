@@ -10,7 +10,7 @@ sipr/
 ├── Cargo.toml            # workspace root
 ├── crates/
 │   ├── sipr-scenario/    # XML → Scenario IR; keyword tokenizer; actions; (later) infile
-│   ├── sipr-net/         # UDP transport, socket mgmt, timer service, retransmit schedule
+│   ├── sipr-net/         # UDP/TCP/TLS/WebSocket transports, socket mgmt, timer service, retransmit schedule
 │   ├── sipr-engine/      # call state machine, call table, pacer, dialog bookkeeping
 │   ├── sipr-auth/        # digest auth (RFC 2617/7616) for [authentication]
 │   ├── sipr-stats/       # counters, RTD histograms, repartitions, CSV export
@@ -30,7 +30,9 @@ Dependency direction (must stay acyclic):
 `sipr-engine` → `sipr-scenario`, `sipr-net`, `sipr-auth`, `sipr-stats`, `sipr-media`,
 `sipr-control`; `sipr-control` → `sipr-stats`;
 `sipr-media` → `sipr-auth` (AES/HMAC/KDF for SRTP);
-`sipr-scenario`, `sipr-net`, `sipr-auth` depend on no internal crate.
+`sipr-scenario` and `sipr-auth` depend on no internal crate; `sipr-net`
+depends on `sipr-auth` alone (SHA-1 and base64 for the WebSocket handshake,
+M51).
 The control front ends (UDP socket, HTTP server) are threads that only send
 `ControlRequest`s into the engine's channel and read the shared once-a-second
 snapshot — the same rule as the TUI: nothing outside the loop touches a call.

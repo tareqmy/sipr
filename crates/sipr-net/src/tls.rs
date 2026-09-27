@@ -1,6 +1,7 @@
 //! TLS transport (`l1`): the TCP connection-per-peer model with a rustls
-//! layer in between. Same framing ([`TcpFramer`]), same routing (writes go
-//! back by peer address), same reliability rule (no SIP retransmissions).
+//! layer in between. Same framing ([`crate::TcpFramer`], or WebSocket
+//! frames under `-t wss*`, M51), same routing (writes go back by peer
+//! address), same reliability rule (no SIP retransmissions).
 //!
 //! Verification semantics follow SIPp (`sslsocket.cpp`), not TLS best
 //! practice — this is a test tool talking to lab equipment:
@@ -27,17 +28,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore, ServerConfig};
 
-use crate::message::Inbound;
 use crate::rng::Rng;
 use crate::sockopt::SocketOpts;
-use crate::tcp::TcpFramer;
-use crate::transport::{InboundPacket, NetEvent, TransportConfig};
+use crate::transport::{NetEvent, TransportConfig, framed_event};
+use crate::ws::{self, Framing, Next, Opcode, StreamFramer, Wire};
 
 /// One read from the socket (ciphertext); the framer copes with any split.
 const READ_CHUNK: usize = 64 * 1024;
@@ -92,6 +91,7 @@ impl TlsVersion {
 struct TlsConn {
     tls: Arc<Mutex<Connection>>,
     sock: TcpStream,
+    wire: Wire,
 }
 
 /// Live connections keyed by peer address.
@@ -105,6 +105,10 @@ pub struct TlsTransport {
     sockopts: SocketOpts,
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
+    /// SIP or WebSocket framing on every connection (M51).
+    framing: Framing,
+    /// Masking keys for the frames of dialed WebSocket connections.
+    mask_rng: Arc<Mutex<Rng>>,
     sink: Sender<NetEvent>,
     /// Client configuration, kept for per-call connections (`ln`).
     client: Option<Arc<ClientConfig>>,
@@ -131,6 +135,7 @@ pub struct TlsCallConn {
     tls: Arc<Mutex<Connection>>,
     sock: TcpStream,
     local_addr: SocketAddr,
+    wire: Wire,
 }
 
 impl TlsCallConn {
@@ -183,14 +188,18 @@ impl TlsTransport {
         );
         complete_handshake(&mut tls, &mut sock)
             .map_err(|e| std::io::Error::other(format!("TLS handshake with {remote}: {e}")))?;
+        let mask_rng = Arc::new(Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0024)));
+        let upgraded = upgrade_dialed(&mut tls, &sock, config.framing, remote, &mask_rng)?;
         let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
-        register(&conns, peer, sock, tls, &sink)?;
+        register(&conns, peer, sock, tls, upgraded, &sink, &mask_rng)?;
         Ok(Self {
             local_addr,
             conns,
             sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0021)),
             send_loss_pct: config.send_loss_pct,
+            framing: config.framing,
+            mask_rng,
             sink,
             client: Some(client_config),
             stop: Arc::new(AtomicBool::new(false)),
@@ -216,6 +225,8 @@ impl TlsTransport {
             sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0023)),
             send_loss_pct: config.send_loss_pct,
+            framing: config.framing,
+            mask_rng: Arc::new(Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0025))),
             sink,
             client: Some(client_config(tls_config)?),
             stop: Arc::new(AtomicBool::new(false)),
@@ -251,7 +262,16 @@ impl TlsTransport {
         );
         complete_handshake(&mut tls, &mut sock)
             .map_err(|e| std::io::Error::other(format!("TLS handshake with {remote}: {e}")))?;
-        register(&self.conns, peer, sock, tls, &self.sink)
+        let upgraded = upgrade_dialed(&mut tls, &sock, self.framing, remote, &self.mask_rng)?;
+        register(
+            &self.conns,
+            peer,
+            sock,
+            tls,
+            upgraded,
+            &self.sink,
+            &self.mask_rng,
+        )
     }
 
     /// Dial and handshake a per-call connection to `remote` (`-t ln`).
@@ -274,17 +294,21 @@ impl TlsTransport {
         );
         complete_handshake(&mut tls, &mut sock)
             .map_err(|e| std::io::Error::other(format!("TLS handshake with {remote}: {e}")))?;
+        let Upgraded { wire, initial } =
+            upgrade_dialed(&mut tls, &sock, self.framing, remote, &self.mask_rng)?;
         let read_sock = sock.try_clone()?;
         let tls = Arc::new(Mutex::new(tls));
         let reader_tls = Arc::clone(&tls);
         let sink = self.sink.clone();
+        let reply = frame_writer(&tls, &sock, wire, &self.mask_rng)?;
         std::thread::Builder::new()
             .name("sipr-tls-call".into())
-            .spawn(move || read_loop(read_sock, &reader_tls, peer, &sink))?;
+            .spawn(move || read_loop(read_sock, &reader_tls, peer, &sink, wire, initial, reply))?;
         Ok(TlsCallConn {
             tls,
             sock,
             local_addr,
+            wire,
         })
     }
 
@@ -302,7 +326,14 @@ impl TlsTransport {
         if self.simulate_loss(lost_pct) {
             return Ok(false);
         }
-        write_tls(&conn.tls, &conn.sock, data)?;
+        write_frame(
+            &conn.tls,
+            &conn.sock,
+            conn.wire,
+            Opcode::Text,
+            data,
+            &self.mask_rng,
+        )?;
         Ok(true)
     }
 
@@ -340,6 +371,9 @@ impl TlsTransport {
         let accept_conns = conns.clone();
         let accept_sink = sink.clone();
         let accept_opts = config.sockopts.clone();
+        let framing = config.framing;
+        let mask_rng = Arc::new(Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0026)));
+        let accept_rng = Arc::clone(&mask_rng);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
         let accept = std::thread::Builder::new()
@@ -360,21 +394,23 @@ impl TlsTransport {
                     };
                     let conns = accept_conns.clone();
                     let sink = accept_sink.clone();
+                    let rng = Arc::clone(&accept_rng);
                     // Handshake per connection, off the accept loop.
                     let _ = std::thread::Builder::new()
                         .name("sipr-tls-handshake".into())
                         .spawn(move || {
                             let mut tls = Connection::from(server_conn);
-                            match complete_handshake(&mut tls, &mut sock) {
-                                Ok(()) => {
-                                    let _ = register(&conns, peer, sock, tls, &sink);
+                            match complete_handshake(&mut tls, &mut sock)
+                                .and_then(|()| upgrade_accepted(&mut tls, &sock, framing))
+                            {
+                                Ok(upgraded) => {
+                                    let _ =
+                                        register(&conns, peer, sock, tls, upgraded, &sink, &rng);
                                 }
                                 Err(e) => {
                                     // Loud but per-peer: one bad client must
                                     // not stop a server.
-                                    eprintln!(
-                                        "sipr: warning: TLS handshake with {peer} failed: {e}"
-                                    );
+                                    eprintln!("sipr: warning: handshake with {peer} failed: {e}");
                                 }
                             }
                         });
@@ -387,6 +423,8 @@ impl TlsTransport {
             sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0022)),
             send_loss_pct: config.send_loss_pct,
+            framing,
+            mask_rng,
             sink,
             // A server still dials out under `-rsa`; the same identity serves.
             client: client_config(tls_config).ok(),
@@ -427,23 +465,136 @@ impl TlsTransport {
                 format!("no TLS connection to {to}"),
             ));
         };
-        write_tls(&conn.tls, &conn.sock, data)?;
+        write_frame(
+            &conn.tls,
+            &conn.sock,
+            conn.wire,
+            Opcode::Text,
+            data,
+            &self.mask_rng,
+        )?;
         Ok(true)
     }
 }
 
-/// Encrypt `data` under the connection lock and push the records out.
-fn write_tls(tls: &Mutex<Connection>, sock: &TcpStream, data: &[u8]) -> std::io::Result<()> {
-    let mut tls = match tls.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    tls.writer().write_all(data)?;
-    let mut out = sock;
-    while tls.wants_write() {
-        tls.write_tls(&mut out)?;
+/// Plaintext I/O through the TLS layer on a blocking socket: what rustls's
+/// `Stream` does, for the `Connection` enum the transport keeps. Reads
+/// block for ciphertext; writes queue records that `flush` pushes out.
+struct PlainIo<'a> {
+    tls: &'a mut Connection,
+    sock: &'a TcpStream,
+}
+
+impl Read for PlainIo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match self.tls.reader().read(buf) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            if self.tls.read_tls(&mut &*self.sock)? == 0 {
+                return Ok(0);
+            }
+            self.tls
+                .process_new_packets()
+                .map_err(std::io::Error::other)?;
+            self.flush()?;
+        }
     }
-    out.flush()
+}
+
+impl Write for PlainIo<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tls.writer().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut out = self.sock;
+        while self.tls.wants_write() {
+            self.tls.write_tls(&mut out)?;
+        }
+        out.flush()
+    }
+}
+
+/// The wire of an upgraded connection and the bytes that arrived with the
+/// handshake.
+struct Upgraded {
+    wire: Wire,
+    initial: Vec<u8>,
+}
+
+/// The client side of the WebSocket upgrade through the TLS layer, on a
+/// connection sipr dialed; a raw SIP stream needs nothing.
+fn upgrade_dialed(
+    tls: &mut Connection,
+    sock: &TcpStream,
+    framing: Framing,
+    remote: SocketAddr,
+    mask_rng: &Mutex<Rng>,
+) -> std::io::Result<Upgraded> {
+    let initial = match framing {
+        Framing::Sip => Vec::new(),
+        Framing::WebSocket => {
+            let mut plain = PlainIo { tls, sock };
+            ws::client_handshake(&mut plain, &remote.to_string(), &mut ws::lock(mask_rng)).map_err(
+                |e| std::io::Error::other(format!("WebSocket upgrade with {remote}: {e}")),
+            )?
+        }
+    };
+    Ok(Upgraded {
+        wire: Wire::dialed(framing),
+        initial,
+    })
+}
+
+/// The server side of the WebSocket upgrade, on a connection sipr accepted.
+fn upgrade_accepted(
+    tls: &mut Connection,
+    sock: &TcpStream,
+    framing: Framing,
+) -> std::io::Result<Upgraded> {
+    let initial = match framing {
+        Framing::Sip => Vec::new(),
+        Framing::WebSocket => ws::server_handshake(&mut PlainIo { tls, sock })?,
+    };
+    Ok(Upgraded {
+        wire: Wire::accepted(framing),
+        initial,
+    })
+}
+
+/// Encrypt one SIP message or control frame under the connection lock and
+/// push the records out. Two threads interleaving TLS records on one
+/// stream would corrupt it, so every write happens here.
+fn write_frame(
+    tls: &Mutex<Connection>,
+    sock: &TcpStream,
+    wire: Wire,
+    opcode: Opcode,
+    payload: &[u8],
+    rng: &Mutex<Rng>,
+) -> std::io::Result<()> {
+    let mut tls = ws::lock(tls);
+    let mut plain = PlainIo {
+        tls: &mut tls,
+        sock,
+    };
+    wire.write(&mut plain, opcode, payload, rng)
+}
+
+/// A reader thread's way to answer pings and closes on its connection.
+fn frame_writer(
+    tls: &Arc<Mutex<Connection>>,
+    sock: &TcpStream,
+    wire: Wire,
+    mask_rng: &Arc<Mutex<Rng>>,
+) -> std::io::Result<impl FnMut(Opcode, &[u8]) -> std::io::Result<()> + Send + 'static> {
+    let tls = Arc::clone(tls);
+    let sock = sock.try_clone()?;
+    let rng = Arc::clone(mask_rng);
+    Ok(move |opcode: Opcode, payload: &[u8]| write_frame(&tls, &sock, wire, opcode, payload, &rng))
 }
 
 /// Drive the handshake to completion on a blocking socket.
@@ -462,21 +613,24 @@ fn register(
     peer: SocketAddr,
     sock: TcpStream,
     tls: Connection,
+    upgraded: Upgraded,
     sink: &Sender<NetEvent>,
+    mask_rng: &Arc<Mutex<Rng>>,
 ) -> std::io::Result<()> {
+    let Upgraded { wire, initial } = upgraded;
     let read_sock = sock.try_clone()?;
     let tls = Arc::new(Mutex::new(tls));
     let reader_tls = tls.clone();
+    // As for TCP: the reader only reports the end; the engine `forget`s.
+    // Its pongs are encrypted under the connection lock, like every send.
+    let reply = frame_writer(&tls, &sock, wire, mask_rng)?;
     if let Ok(mut map) = conns.lock() {
-        map.insert(peer, TlsConn { tls, sock });
+        map.insert(peer, TlsConn { tls, sock, wire });
     }
     let sink = sink.clone();
-    let conns = conns.clone();
-    // As for TCP: the reader only reports the end; the engine `forget`s.
-    let _ = conns;
     std::thread::Builder::new()
         .name("sipr-tls-recv".into())
-        .spawn(move || read_loop(read_sock, &reader_tls, peer, &sink))
+        .spawn(move || read_loop(read_sock, &reader_tls, peer, &sink, wire, initial, reply))
         .ok();
     Ok(())
 }
@@ -490,12 +644,16 @@ fn read_loop(
     tls: &Arc<Mutex<Connection>>,
     peer: SocketAddr,
     sink: &Sender<NetEvent>,
+    wire: Wire,
+    initial: Vec<u8>,
+    mut reply: impl FnMut(Opcode, &[u8]) -> std::io::Result<()>,
 ) {
     let local = sock
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
     let mut clean = false;
-    let mut framer = TcpFramer::new();
+    // A WebSocket handshake may have carried the first frames already.
+    let mut framer = StreamFramer::new(wire.framing(), &initial);
     let mut buf = vec![0u8; READ_CHUNK];
     let mut plain = vec![0u8; READ_CHUNK];
     // First pass runs with an empty cipher slice: handshake reads can
@@ -535,19 +693,20 @@ fn read_loop(
                 }
                 state.peer_has_closed()
             };
-            while let Some(raw) = framer.next_message() {
-                let event = match Inbound::parse(&raw) {
-                    Ok(message) => NetEvent::Packet(InboundPacket {
-                        message,
-                        raw,
-                        from: peer,
-                        local,
-                        received_at: Instant::now(),
-                    }),
-                    Err(reason) => NetEvent::Garbage { from: peer, reason },
-                };
-                if sink.send(event).is_err() {
-                    return; // engine gone
+            // Control frames are answered outside the lock, which the
+            // reply takes itself.
+            loop {
+                match framer.next_message(&mut reply) {
+                    Next::Message(raw) => {
+                        if sink.send(framed_event(raw, peer, local)).is_err() {
+                            return; // engine gone
+                        }
+                    }
+                    Next::NeedMore => break,
+                    Next::Closed { clean: orderly } => {
+                        clean = orderly;
+                        break 'outer;
+                    }
                 }
             }
             if closed {
@@ -893,6 +1052,54 @@ mod tests {
             .expect("client rx")
         {
             NetEvent::Packet(p) => assert_eq!(p.message.status_code(), Some(200)),
+            other => panic!("expected Packet, got {other:?}"),
+        }
+    }
+
+    /// `-t wss*` (M51): the WebSocket upgrade runs inside the TLS session,
+    /// then SIP messages travel as masked (client) and unmasked (server)
+    /// frames on the encrypted stream.
+    #[test]
+    fn websocket_framing_round_trips_over_tls() {
+        let (_dir, tls) = test_identity();
+        let cfg = TransportConfig {
+            framing: Framing::WebSocket,
+            ..config()
+        };
+        let (srv_tx, srv_rx) = mpsc::channel();
+        let server = TlsTransport::listen(&cfg, &tls, srv_tx).expect("listen");
+        let srv_addr = server.local_addr();
+        let (cli_tx, cli_rx) = mpsc::channel();
+        let client = TlsTransport::connect(&cfg, &tls, cli_tx, srv_addr).expect("connect");
+        assert!(client.send_to(MSG, srv_addr, None).expect("send"));
+        let from = match srv_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server rx")
+        {
+            NetEvent::Packet(p) => {
+                assert_eq!(p.message.call_id(), Some("s-1"));
+                p.from
+            }
+            other => panic!("expected Packet, got {other:?}"),
+        };
+        let reply =
+            b"SIP/2.0 200 OK\r\nCall-ID: s-1\r\nCSeq: 7 OPTIONS\r\nContent-Length: 0\r\n\r\n";
+        assert!(server.send_to(reply, from, None).expect("reply"));
+        match cli_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client rx")
+        {
+            NetEvent::Packet(p) => assert_eq!(p.message.status_code(), Some(200)),
+            other => panic!("expected Packet, got {other:?}"),
+        }
+        // A per-call connection upgrades and frames the same way.
+        let call = client.connect_call(srv_addr).expect("per-call connect");
+        assert!(client.send_via(&call, MSG, None).expect("send via"));
+        match srv_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server rx")
+        {
+            NetEvent::Packet(p) => assert_eq!(p.message.call_id(), Some("s-1")),
             other => panic!("expected Packet, got {other:?}"),
         }
     }

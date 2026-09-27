@@ -26,7 +26,7 @@ on the other end of the call. sipr exists for people who want that workflow
 in a single static binary with no system libraries, and it is not intended
 to replace SIPp.
 
-**Status: v1 feature-complete for signaling over UDP, TCP, and TLS.** In
+**Status: v1 feature-complete for signaling over UDP, TCP, TLS, and WebSocket.** In
 loopback runs on a shared cloud sandbox it has sustained about 5000 calls per
 second (50,000 calls, all completed, with a small number of retransmissions
 covering kernel drops); the exact runs are in `benches/BASELINES.md`.
@@ -131,7 +131,8 @@ Flags use SIPp's single-dash names (`-sf`, `-r`, `-l`, `-m`, `-d`, `-trace_msg`,
 - UDP, TCP, and TLS transports, one socket (`-t u1|t1|l1`), one per call
   (`-t un|tn|ln`, `-max_socket`), or one UDP socket per injected IP
   (`-t ui`, `-ip_field`, `[server_ip]`); SCTP (`-t s1|sn`) with
-  `--features sctp` on Linux; streams frame by
+  `--features sctp` on Linux; SIP over WebSocket (`-t ws1|wsn|wss1|wssn`,
+  RFC 7118, a sipr addition); streams frame by
   Content-Length and carry no SIP retransmissions (reliable transports). TLS
   takes SIPp's `-tls_cert`/`-tls_key`/`-tls_ca`/`-tls_crl`/`-tls_version`
   flags with SIPp's verification semantics. Socket knobs: `-i`/`-bind_local`
@@ -185,7 +186,6 @@ Parts of SIPp that sipr does not implement, and where that is deliberate:
 
 - The standalone `<index>` action (sipr builds injection indexes from
   `-infindex` at load time).
-- WebSocket transport (`-t ws`).
 - SIPp's plugins (`-plugin`), its scheduler and watchdog knobs
   (`-watchdog_*`, `-max_recv_loops`, `-max_sched_loops`,
   `-rtp_threadtasks`, `-skip_rlimit`) and its SCTP socket options

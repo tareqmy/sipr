@@ -358,6 +358,10 @@ fn engine_config(
         crate::cli::Transport::TcpPerCall => sipr_engine::TransportKind::TcpPerCall,
         crate::cli::Transport::TlsMono => sipr_engine::TransportKind::TlsMono,
         crate::cli::Transport::TlsPerCall => sipr_engine::TransportKind::TlsPerCall,
+        crate::cli::Transport::WsMono => sipr_engine::TransportKind::WsMono,
+        crate::cli::Transport::WsPerCall => sipr_engine::TransportKind::WsPerCall,
+        crate::cli::Transport::WssMono => sipr_engine::TransportKind::WssMono,
+        crate::cli::Transport::WssPerCall => sipr_engine::TransportKind::WssPerCall,
         crate::cli::Transport::SctpMono => sipr_engine::TransportKind::SctpMono,
         crate::cli::Transport::SctpPerCall => sipr_engine::TransportKind::SctpPerCall,
     };
@@ -411,7 +415,10 @@ fn engine_config(
     // cakey.pem, like SIPp) would otherwise error on absent files.
     config.tls = matches!(
         cli.transport,
-        crate::cli::Transport::TlsMono | crate::cli::Transport::TlsPerCall
+        crate::cli::Transport::TlsMono
+            | crate::cli::Transport::TlsPerCall
+            | crate::cli::Transport::WssMono
+            | crate::cli::Transport::WssPerCall
     )
     .then(|| sipr_engine::TlsConfig {
         cert: cli.tls_cert.clone(),

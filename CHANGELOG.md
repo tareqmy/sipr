@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- SIP over WebSocket (M51, RFC 7118; a sipr addition, SIPp has none):
+  `-t ws1|wsn` on TCP and `-t wss1|wssn` on TLS, one connection per
+  peer or per call like `t1|tn|l1|ln`, with the same reconnection,
+  `-rsa` and `-max_socket` behavior; `[transport]` renders `WS`/`WSS`.
+  sipr is the WebSocket client on a connection it dials and the server
+  on one it accepts, masks accordingly, answers pings and closes, and
+  drops a peer whose upgrade or frames break RFC 6455 without ending
+  the run (`docs/SIPP_COMPAT.md` §6).
 - Fuzz targets for every parser that reads untrusted bytes (M50): a
   cargo-fuzz package under `fuzz/` with nine libFuzzer targets (the SIP
   message parser, the SDP scan, the scenario compiler, the keyword

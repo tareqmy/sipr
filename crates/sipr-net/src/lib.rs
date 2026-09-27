@@ -8,7 +8,8 @@
 //! workspace later gains tokio, only the thin drivers here change, not the
 //! pure logic ([`timer::TimerQueue`], [`retrans::RetransSchedule`],
 //! [`message::Inbound`]). The lone external dependency is `rustls` for the
-//! TLS transport (M13) — SIP itself is still served by std sockets.
+//! TLS transport (M13) — SIP itself is still served by std sockets, and SIP
+//! over WebSocket (M51, [`ws`]) rides on the TCP and TLS transports.
 //!
 //! This crate knows how to move bytes, fire timers, and extract routing
 //! fields. It does NOT know what an INVITE means — scenario semantics live
@@ -27,6 +28,7 @@ pub mod tls;
 pub mod transport;
 pub mod twin;
 mod wake;
+pub mod ws;
 
 pub use message::{Inbound, MsgKind, ParseError};
 pub use retrans::{RetransCaps, RetransSchedule};
@@ -39,3 +41,4 @@ pub use timer::{TimerQueue, TimerService};
 pub use tls::{TlsCallConn, TlsConfig, TlsTransport, TlsVersion};
 pub use transport::{InboundPacket, NetEvent, TransportConfig, UdpCallSocket, UdpTransport};
 pub use twin::{EscFramer, PeerLinks, PeerTable, TwinChannel, TwinEvent};
+pub use ws::{Framing, WsFramer};

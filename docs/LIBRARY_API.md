@@ -94,7 +94,7 @@ The fields a harness usually touches:
 | `local_ip`, `port` | `-i`, `-p` | `port = Some(0)` picks a free port; `Run::local_addr()` says which |
 | `rate`, `rate_period`, `limit`, `max_calls`, `users` | `-r`, `-rp`, `-l`, `-m`, `-users` | how many calls, how fast |
 | `pause_default`, `timeout`, `recv_timeout` | `-d`, `-timeout`, `-recv_timeout` | keep `timeout` set in a test, so a stuck run ends |
-| `transport`, `tls` | `-t`, `-tls_*` | `TlsMono`/`TlsPerCall` need `tls: Some(TlsConfig { .. })` |
+| `transport`, `tls` | `-t`, `-tls_*` | `TlsMono`/`TlsPerCall` and `WssMono`/`WssPerCall` need `tls: Some(TlsConfig { .. })`; the `Ws*`/`Wss*` kinds are SIP over WebSocket (M51) |
 | `inf`, `rxinf`, `inf_index` | `-inf`, `-rxinf`, `-infindex` | `InjectionSource::Path(..)` or `InjectionSource::text(name, csv)` |
 | `auth_user`, `auth_password`, `auth_uri` | `-au`, `-ap`, `-auth_uri` | for `[authentication]` |
 | `generic_keywords`, `global_sets` | `-key`, `-set` | `[NAME]` values and `<Global>` variables |

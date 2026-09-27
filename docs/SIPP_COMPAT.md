@@ -115,7 +115,8 @@ Traffic: `-r <rate>` `-rp <ms>` `-l <max concurrent>` `-m <total calls>`
 Network: `-p <local port>` `-i <local ip>` `-t u1|un|ui|t1|tn|l1|ln` (UDP /
 TCP / TLS, one socket, one socket per call, or one UDP socket per injected
 IP; `s1|sn` = SCTP, only in a build with the `sctp` cargo feature on a host
-with an SCTP stack) `-ip_field <n>` (the `-inf` column holding that IP)
+with an SCTP stack; `ws1|wsn|wss1|wssn` = SIP over WebSocket on TCP or TLS,
+a sipr addition, M51, §6) `-ip_field <n>` (the `-inf` column holding that IP)
 `-max_socket <n>` (per-call modes share sockets past n) `-rsa <host[:port]>`
 (remote sending address) `-max_reconnect <n>` `-reconnect_close <bool>`
 `-reconnect_sleep <ms>` (TCP/TLS reconnection) `-s <service>` (called number)
@@ -456,6 +457,27 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   (180, ACK, empty 200); UDP datagrams hid it, but TCP framing and real SIPp
   need it, so normalization now restores the separator when a message has no
   body.
+- WebSocket transport `-t ws1|wsn|wss1|wssn` (M51; a sipr addition — SIPp
+  has none, so RFC 7118 and RFC 6455 are the oracle and the interop suite
+  has nothing to compare against): SIP over WebSocket rides on the TCP
+  (`ws`) and TLS (`wss`) transports as a second framing, so the
+  connection table, per-call connections (`wsn`/`wssn`), `-max_socket`,
+  reconnection, `-rsa` and the no-retransmission rule are those of
+  `t1`/`l1`, and `wss` takes the `-tls_*` material. A connection sipr
+  dials is the WebSocket client (`GET / HTTP/1.1` with `Upgrade:
+  websocket`, `Sec-WebSocket-Version: 13` and `Sec-WebSocket-Protocol:
+  sip`, then masked frames); one it accepts is the server (`101` with the
+  accept key, `sip` echoed when offered; a request that is not a
+  version-13 upgrade gets `400`/`426` and loses the connection, not the
+  run) — whatever the SIP role. Every SIP message goes out as one text
+  frame (RFC 7118 §5) and comes in from text or binary frames, fragmented
+  or not; a ping is answered, a close is answered and reported as an
+  orderly disconnect, a message over 16 MiB or a reserved opcode drops
+  the peer. `[transport]` renders `WS`/`WSS` (Via `SIP/2.0/WS`); a
+  Contact that needs `;transport=ws` writes it as SIPp scenarios do,
+  `transport=[transport]`. Not offered: a request path other than `/`,
+  an `Origin` header, and extensions (none is negotiated, whatever the
+  peer offers).
 - Classic 3PCC `-3pcc HOST:PORT` (M10, verified in `scenario.cpp` role
   detection, `call.cpp` `sendCmdMessage`/`sendCmdBuffer`, `sipp.cpp`
   `SIPP_OPTION_3PCC`): two instances coordinate over a separate TCP "twin"

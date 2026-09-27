@@ -79,6 +79,25 @@ pub struct TransportConfig {
     /// `-buff_size` / `-bind_to_device`, applied to every socket opened
     /// from this config (SIPp's `sipp_customize_socket`).
     pub sockopts: SocketOpts,
+    /// How the stream transports (TCP, TLS) cut their bytes into messages:
+    /// SIP's `Content-Length`, or WebSocket frames (`-t ws*`, M51). UDP
+    /// and SCTP ignore it.
+    pub framing: crate::ws::Framing,
+}
+
+/// The event for a whole message `raw` that a stream connection framed:
+/// a parsed packet, or garbage the engine counts.
+pub(crate) fn framed_event(raw: Vec<u8>, from: SocketAddr, local: SocketAddr) -> NetEvent {
+    match crate::message::Inbound::parse(&raw) {
+        Ok(message) => NetEvent::Packet(InboundPacket {
+            message,
+            raw,
+            from,
+            local,
+            received_at: std::time::Instant::now(),
+        }),
+        Err(reason) => NetEvent::Garbage { from, reason },
+    }
 }
 
 /// The `u1` UDP transport (also the main socket of `un`).

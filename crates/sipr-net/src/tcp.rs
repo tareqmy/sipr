@@ -12,17 +12,16 @@
 //! no SIP retransmissions on this transport (RFC 3261 §18.2).
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
-use crate::message::Inbound;
 use crate::rng::Rng;
 use crate::sockopt::SocketOpts;
-use crate::transport::{InboundPacket, NetEvent, TransportConfig};
+use crate::transport::{NetEvent, TransportConfig, framed_event};
+use crate::ws::{self, Framing, Next, Opcode, StreamFramer, Wire};
 
 /// One read from the socket; big enough to hold most whole messages, but the
 /// framer copes with any split.
@@ -123,8 +122,14 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
     b
 }
 
+/// A live connection: the write handle and what it carries.
+struct Conn {
+    stream: TcpStream,
+    wire: Wire,
+}
+
 /// Shared table of live connections, keyed by peer address.
-type Conns = Arc<Mutex<HashMap<SocketAddr, TcpStream>>>;
+type Conns = Arc<Mutex<HashMap<SocketAddr, Conn>>>;
 
 /// The `t1` TCP transport: one connection per peer, framed reader threads,
 /// writes routed back by peer address. In `tn` client mode it is only the
@@ -135,6 +140,10 @@ pub struct TcpTransport {
     sockopts: SocketOpts,
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
+    /// SIP or WebSocket framing on every connection (M51).
+    framing: Framing,
+    /// Masking keys for the frames of dialed WebSocket connections.
+    mask_rng: Arc<Mutex<Rng>>,
     sink: Sender<NetEvent>,
     /// Raised when the transport is dropped, so the accept loop ends.
     stop: Arc<AtomicBool>,
@@ -159,6 +168,10 @@ impl Drop for TcpTransport {
 pub struct TcpCallConn {
     stream: TcpStream,
     local_addr: SocketAddr,
+    wire: Wire,
+    /// Serializes the engine's sends with the reader's pongs, so two
+    /// WebSocket frames never interleave.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl TcpCallConn {
@@ -187,18 +200,22 @@ impl TcpTransport {
         sink: Sender<NetEvent>,
         remote: SocketAddr,
     ) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(remote)?;
+        let mask_rng = Arc::new(Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0014)));
+        let mut stream = TcpStream::connect(remote)?;
         config.sockopts.apply(&stream)?;
         let local_addr = stream.local_addr()?;
         let peer = stream.peer_addr()?;
+        let (wire, initial) = upgrade_dialed(&mut stream, config.framing, remote, &mask_rng)?;
         let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
-        register(&conns, peer, stream, &sink)?;
+        register(&conns, peer, stream, wire, initial, &sink, &mask_rng)?;
         Ok(Self {
             local_addr,
             conns,
             sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0011)),
             send_loss_pct: config.send_loss_pct,
+            framing: config.framing,
+            mask_rng,
             sink,
             stop: Arc::new(AtomicBool::new(false)),
             accept: None,
@@ -216,6 +233,8 @@ impl TcpTransport {
             sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0013)),
             send_loss_pct: config.send_loss_pct,
+            framing: config.framing,
+            mask_rng: Arc::new(Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0015))),
             sink,
             stop: Arc::new(AtomicBool::new(false)),
             accept: None,
@@ -238,10 +257,19 @@ impl TcpTransport {
     ///
     /// Connection failures.
     pub fn reconnect(&self, remote: SocketAddr) -> std::io::Result<()> {
-        let stream = TcpStream::connect(remote)?;
+        let mut stream = TcpStream::connect(remote)?;
         self.sockopts.apply(&stream)?;
         let peer = stream.peer_addr()?;
-        register(&self.conns, peer, stream, &self.sink)
+        let (wire, initial) = upgrade_dialed(&mut stream, self.framing, remote, &self.mask_rng)?;
+        register(
+            &self.conns,
+            peer,
+            stream,
+            wire,
+            initial,
+            &self.sink,
+            &self.mask_rng,
+        )
     }
 
     /// Dial a per-call connection to `remote` (`-t tn`, SIPp's
@@ -251,16 +279,33 @@ impl TcpTransport {
     ///
     /// Connection failures (the call fails, not the run).
     pub fn connect_call(&self, remote: SocketAddr) -> std::io::Result<TcpCallConn> {
-        let stream = TcpStream::connect(remote)?;
+        let mut stream = TcpStream::connect(remote)?;
         self.sockopts.apply(&stream)?;
         let local_addr = stream.local_addr()?;
         let peer = stream.peer_addr()?;
+        let (wire, initial) = upgrade_dialed(&mut stream, self.framing, remote, &self.mask_rng)?;
         let read_half = stream.try_clone()?;
+        let write_half = stream.try_clone()?;
+        let write_lock = Arc::new(Mutex::new(()));
         let sink = self.sink.clone();
+        // The reader's pongs share the call's write lock with `send_via`.
+        let reply = {
+            let write_lock = Arc::clone(&write_lock);
+            let rng = Arc::clone(&self.mask_rng);
+            move |opcode: Opcode, payload: &[u8]| {
+                let _guard = ws::lock(&write_lock);
+                wire.write(&mut &write_half, opcode, payload, &rng)
+            }
+        };
         std::thread::Builder::new()
             .name("sipr-tcp-call".into())
-            .spawn(move || read_loop(read_half, peer, &sink))?;
-        Ok(TcpCallConn { stream, local_addr })
+            .spawn(move || read_loop(read_half, peer, &sink, wire, initial, reply))?;
+        Ok(TcpCallConn {
+            stream,
+            local_addr,
+            wire,
+            write_lock,
+        })
     }
 
     /// Send `data` on a per-call connection, honoring simulated loss.
@@ -277,9 +322,9 @@ impl TcpTransport {
         if self.simulate_loss(lost_pct) {
             return Ok(false);
         }
-        let mut out = &conn.stream;
-        out.write_all(data)?;
-        out.flush()?;
+        let _guard = ws::lock(&conn.write_lock);
+        conn.wire
+            .write(&mut &conn.stream, Opcode::Text, data, &self.mask_rng)?;
         Ok(true)
     }
 
@@ -309,6 +354,9 @@ impl TcpTransport {
         let accept_conns = conns.clone();
         let accept_sink = sink.clone();
         let accept_opts = config.sockopts.clone();
+        let framing = config.framing;
+        let mask_rng = Arc::new(Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0016)));
+        let accept_rng = Arc::clone(&mask_rng);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
         let accept = std::thread::Builder::new()
@@ -324,7 +372,14 @@ impl TcpTransport {
                     };
                     // A dead connection here is a per-peer problem, not fatal.
                     let _ = accept_opts.apply(&stream);
-                    let _ = register(&accept_conns, peer, stream, &accept_sink);
+                    accept_connection(
+                        stream,
+                        peer,
+                        framing,
+                        &accept_conns,
+                        &accept_sink,
+                        &accept_rng,
+                    );
                 }
             })
             .ok();
@@ -334,6 +389,8 @@ impl TcpTransport {
             sockopts: config.sockopts.clone(),
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0012)),
             send_loss_pct: config.send_loss_pct,
+            framing,
+            mask_rng,
             sink,
             stop,
             accept,
@@ -366,15 +423,70 @@ impl TcpTransport {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let Some(stream) = map.get_mut(&to) else {
+        let Some(conn) = map.get_mut(&to) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 format!("no TCP connection to {to}"),
             ));
         };
-        stream.write_all(data)?;
-        stream.flush()?;
+        conn.wire
+            .write(&mut conn.stream, Opcode::Text, data, &self.mask_rng)?;
         Ok(true)
+    }
+}
+
+/// The client side of the WebSocket upgrade on a connection sipr dialed,
+/// when the transport frames WebSocket; a raw SIP stream needs nothing.
+/// Returns the wire and the bytes that arrived with the handshake.
+fn upgrade_dialed(
+    stream: &mut TcpStream,
+    framing: Framing,
+    remote: SocketAddr,
+    mask_rng: &Mutex<Rng>,
+) -> std::io::Result<(Wire, Vec<u8>)> {
+    let initial = match framing {
+        Framing::Sip => Vec::new(),
+        Framing::WebSocket => {
+            ws::client_handshake(stream, &remote.to_string(), &mut ws::lock(mask_rng)).map_err(
+                |e| std::io::Error::other(format!("WebSocket upgrade with {remote}: {e}")),
+            )?
+        }
+    };
+    Ok((Wire::dialed(framing), initial))
+}
+
+/// Take an accepted connection into the table: at once for a SIP stream;
+/// after the server side of the WebSocket upgrade, on its own thread so a
+/// slow or bogus client never stalls the accept loop (as the TLS handshake
+/// does). A failed upgrade drops that peer with a warning, never the run.
+fn accept_connection(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    framing: Framing,
+    conns: &Conns,
+    sink: &Sender<NetEvent>,
+    mask_rng: &Arc<Mutex<Rng>>,
+) {
+    let wire = Wire::accepted(framing);
+    match framing {
+        Framing::Sip => {
+            let _ = register(conns, peer, stream, wire, Vec::new(), sink, mask_rng);
+        }
+        Framing::WebSocket => {
+            let conns = conns.clone();
+            let sink = sink.clone();
+            let mask_rng = Arc::clone(mask_rng);
+            let _ = std::thread::Builder::new()
+                .name("sipr-ws-handshake".into())
+                .spawn(move || match ws::server_handshake(&mut stream) {
+                    Ok(initial) => {
+                        let _ = register(&conns, peer, stream, wire, initial, &sink, &mask_rng);
+                    }
+                    Err(e) => {
+                        eprintln!("sipr: warning: WebSocket upgrade from {peer} failed: {e}");
+                    }
+                });
+        }
     }
 }
 
@@ -386,22 +498,35 @@ fn register(
     conns: &Conns,
     peer: SocketAddr,
     stream: TcpStream,
+    wire: Wire,
+    initial: Vec<u8>,
     sink: &Sender<NetEvent>,
+    mask_rng: &Arc<Mutex<Rng>>,
 ) -> std::io::Result<()> {
     let read_half = stream.try_clone()?;
     if let Ok(mut map) = conns.lock() {
-        map.insert(peer, stream);
+        map.insert(peer, Conn { stream, wire });
     }
     let sink = sink.clone();
-    let conns = conns.clone();
     // The reader only reports the end of the connection; the engine calls
     // `forget` when it processes that event, so a send it has already
     // queued (an ACK for the 200 that came just before the FIN) still goes
-    // out on the half-closed socket, as SIPp's does.
-    let _ = conns;
+    // out on the half-closed socket, as SIPp's does. Its pongs go through
+    // the table's lock, like the engine's sends.
+    let reply = {
+        let conns = conns.clone();
+        let rng = Arc::clone(mask_rng);
+        move |opcode: Opcode, payload: &[u8]| {
+            let mut map = ws::lock(&conns);
+            let conn = map.get_mut(&peer).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "connection gone")
+            })?;
+            conn.wire.write(&mut conn.stream, opcode, payload, &rng)
+        }
+    };
     std::thread::Builder::new()
         .name("sipr-tcp-recv".into())
-        .spawn(move || read_loop(read_half, peer, &sink))
+        .spawn(move || read_loop(read_half, peer, &sink, wire, initial, reply))
         .ok();
     Ok(())
 }
@@ -410,33 +535,35 @@ fn register(
 /// then tell the engine how it ended (`Disconnected`): the engine decides
 /// whether calls die and whether to reconnect (`-reconnect_*`); a server
 /// never stops because one client hung up.
-fn read_loop(mut stream: TcpStream, peer: SocketAddr, sink: &Sender<NetEvent>) {
+fn read_loop(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    sink: &Sender<NetEvent>,
+    wire: Wire,
+    initial: Vec<u8>,
+    mut reply: impl FnMut(Opcode, &[u8]) -> std::io::Result<()>,
+) {
     let local = stream
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-    let mut framer = TcpFramer::new();
+    // A WebSocket handshake may have carried the first frames already.
+    let mut framer = StreamFramer::new(wire.framing(), &initial);
     let mut buf = vec![0u8; READ_CHUNK];
-    let clean = loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break true, // peer closed
-            Ok(n) => {
-                framer.push(&buf[..n]);
-                while let Some(raw) = framer.next_message() {
-                    let event = match Inbound::parse(&raw) {
-                        Ok(message) => NetEvent::Packet(InboundPacket {
-                            message,
-                            raw,
-                            from: peer,
-                            local,
-                            received_at: Instant::now(),
-                        }),
-                        Err(reason) => NetEvent::Garbage { from: peer, reason },
-                    };
-                    if sink.send(event).is_err() {
+    let clean = 'outer: loop {
+        loop {
+            match framer.next_message(&mut reply) {
+                Next::Message(raw) => {
+                    if sink.send(framed_event(raw, peer, local)).is_err() {
                         return; // engine gone
                     }
                 }
+                Next::NeedMore => break,
+                Next::Closed { clean } => break 'outer clean,
             }
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break true, // peer closed
+            Ok(n) => framer.push(&buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break false,
         }
@@ -496,8 +623,8 @@ mod tests {
         };
         // The server drops the client's connection.
         if let Ok(mut map) = server.conns.lock() {
-            let stream = map.remove(&from).expect("registered");
-            let _ = stream.shutdown(Shutdown::Both);
+            let conn = map.remove(&from).expect("registered");
+            let _ = conn.stream.shutdown(Shutdown::Both);
         }
         match crx
             .recv_timeout(Duration::from_secs(2))
@@ -685,6 +812,71 @@ mod tests {
             NetEvent::Packet(p) => assert_eq!(p.message.status_code(), Some(200)),
             other => panic!("expected Packet, got {other:?}"),
         }
+    }
+
+    /// WebSocket framing (M51): the client upgrades and masks, the server
+    /// answers in unmasked frames, and a raw WebSocket peer's ping gets its
+    /// pong from the reader thread.
+    #[test]
+    fn websocket_framing_round_trips_and_answers_pings() {
+        use std::io::Write;
+        let cfg = TransportConfig {
+            framing: Framing::WebSocket,
+            ..config()
+        };
+        let (srv_tx, srv_rx) = mpsc::channel();
+        let server = TcpTransport::listen(&cfg, srv_tx).expect("listen");
+        let srv_addr = server.local_addr();
+        let (cli_tx, cli_rx) = mpsc::channel();
+        let client = TcpTransport::connect(&cfg, cli_tx, srv_addr).expect("connect");
+        let reply =
+            b"SIP/2.0 200 OK\r\nCall-ID: t-1\r\nCSeq: 9 OPTIONS\r\nContent-Length: 0\r\n\r\n";
+        assert!(client.send_to(MSG, srv_addr, None).expect("send"));
+        let from = match srv_rx.recv_timeout(Duration::from_secs(2)).expect("rx") {
+            NetEvent::Packet(p) => {
+                assert_eq!(p.message.call_id(), Some("t-1"));
+                p.from
+            }
+            other => panic!("expected Packet, got {other:?}"),
+        };
+        assert!(server.send_to(reply, from, None).expect("reply"));
+        match cli_rx.recv_timeout(Duration::from_secs(2)).expect("rx") {
+            NetEvent::Packet(p) => assert_eq!(p.message.status_code(), Some(200)),
+            other => panic!("expected Packet, got {other:?}"),
+        }
+
+        // A raw peer speaking RFC 6455 by hand.
+        let mut raw = TcpStream::connect(srv_addr).expect("raw connect");
+        let mut rng = Rng::new(3);
+        ws::client_handshake(&mut raw, &srv_addr.to_string(), &mut rng).expect("upgrade");
+        raw.write_all(&ws::frame(Opcode::Text, MSG, Some(ws::mask_key(&mut rng))))
+            .expect("frame");
+        raw.write_all(&ws::frame(
+            Opcode::Ping,
+            b"hi",
+            Some(ws::mask_key(&mut rng)),
+        ))
+        .expect("ping");
+        let from = match srv_rx.recv_timeout(Duration::from_secs(2)).expect("rx") {
+            NetEvent::Packet(p) => p.from,
+            other => panic!("expected Packet, got {other:?}"),
+        };
+        assert!(server.send_to(reply, from, None).expect("reply"));
+        raw.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let expected_reply = ws::frame(Opcode::Text, reply, None);
+        let pong = ws::frame(Opcode::Pong, b"hi", None);
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !(contains(&got, &expected_reply) && contains(&got, &pong)) {
+            let n = raw.read(&mut buf).expect("read");
+            assert!(n > 0, "server closed: {got:?}");
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     #[test]
