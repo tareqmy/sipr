@@ -413,7 +413,10 @@ mod tests {
         let started = Instant::now();
         let quiet_addr = quiet.local_addr();
         drop(quiet);
-        assert!(started.elapsed() < Duration::from_millis(100));
+        // No drain wait — only the wake-up connection and the join, which
+        // a loaded runner may still take tens of milliseconds over.
+        let took = started.elapsed();
+        assert!(took < DRAIN_LIMIT / 2, "{took:?}");
         // And the accept thread went with it: the port is free.
         TcpListener::bind(quiet_addr).expect("port free again");
     }
