@@ -529,6 +529,7 @@ dependencies = [
  "sipr-net",
  "sipr-scenario",
  "sipr-stats",
+ "tempfile",
  "thiserror",
 ]
 

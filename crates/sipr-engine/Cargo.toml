@@ -20,6 +20,10 @@ sipr-media = { workspace = true }
 sipr-control = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# The library tests write an injection file to feed the engine from disk.
+tempfile = { workspace = true }
+
 [features]
 sctp = ["sipr-net/sctp"]
 

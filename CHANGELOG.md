@@ -44,6 +44,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `EngineConfig::inf` and `rxinf` (formerly `inf_files` and
+  `rx_inf_files`) hold `InjectionSource`s: a `Path` read at start-up, or
+  `Text { name, csv }` already in memory, so a harness can feed
+  `[fieldN]` from a string. The name — the path's basename, or the
+  given one — is what `[fieldN file=NAME]` and `-infindex NAME` refer
+  to, as before (M49 D5).
 - `run_with_control`, `run_with_ui` and `run_scenarios` are hidden from
   the documentation and kept for one minor release; `UiChannels::snapshots`
   is a bounded `SyncSender`, and a reader that falls behind misses

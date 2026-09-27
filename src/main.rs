@@ -283,8 +283,8 @@ fn engine_config(
     if let Some(secs) = cli.stat_interval_s {
         config.stat_interval = Duration::from_secs(secs);
     }
-    config.inf_files.clone_from(&cli.inf);
-    config.rx_inf_files.clone_from(&cli.rxinf);
+    config.inf = cli.inf.iter().cloned().map(Into::into).collect();
+    config.rxinf = cli.rxinf.iter().cloned().map(Into::into).collect();
     config.inf_index.clone_from(&cli.inf_index);
     config.global_sets.clone_from(&cli.set_vars);
     config.generic_keywords.clone_from(&cli.generic_keywords);

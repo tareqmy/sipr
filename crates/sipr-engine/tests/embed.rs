@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use sipr_engine::{EngineConfig, EngineError, NoticeSink, Run, run};
+use sipr_engine::{EngineConfig, EngineError, InjectionSource, NoticeSink, Run, run};
 use sipr_scenario::model::Scenario;
 
 fn embedded(name: &str) -> Scenario {
@@ -126,4 +126,75 @@ fn a_uac_run_completes_calls_against_an_in_process_uas() {
     let report = server.wait().expect("uas reports");
     assert_eq!(report.successful, 3, "{}", report.summary());
     assert_eq!(report.exit_code(), 0, "{}", report.summary());
+}
+
+/// The embedded UAC with `[field0]` for the called user, so it reads an
+/// injection file.
+fn uac_reading_field0() -> Scenario {
+    let xml = sipr_scenario::embedded("uac")
+        .unwrap()
+        .replace("[service]", "[field0]");
+    sipr_scenario::compile("uac-field0", &xml)
+        .scenario
+        .expect("compiles")
+}
+
+fn quiet_uac(target: std::net::SocketAddr) -> EngineConfig {
+    let mut client = EngineConfig::uac(target);
+    client.local_ip = Some("127.0.0.1".parse().unwrap());
+    client.port = Some(0);
+    client.pause_default = Duration::from_millis(100);
+    client.rate = 50.0;
+    client.timeout = Some(Duration::from_secs(20));
+    client.control_port = Some(0);
+    client.notices = NoticeSink::Discard;
+    client
+}
+
+#[test]
+fn injection_data_comes_from_memory_as_well_as_from_files() {
+    let server = Run::start(embedded("uas"), uas_config()).expect("uas starts");
+
+    // From memory, under a name -infindex can use.
+    let mut client = quiet_uac(server.local_addr());
+    client.max_calls = Some(2);
+    client.inf = vec![InjectionSource::text(
+        "users.csv",
+        "SEQUENTIAL\nalice;\nbob;\n",
+    )];
+    client.inf_index = vec![("users.csv".to_owned(), 0)];
+    let report = run(&uac_reading_field0(), &client).expect("uac runs");
+    assert_eq!(report.successful, 2, "{}", report.summary());
+
+    // From a file, named by its basename.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("people.csv");
+    std::fs::write(&path, "RANDOM\ncarol;\n").unwrap();
+    let mut client = quiet_uac(server.local_addr());
+    client.max_calls = Some(1);
+    client.inf = vec![path.into()];
+    client.inf_index = vec![("people.csv".to_owned(), 0)];
+    let report = run(&uac_reading_field0(), &client).expect("uac runs");
+    assert_eq!(report.successful, 1, "{}", report.summary());
+
+    // Without any, the scenario's [field0] is refused at start, SIPp's way.
+    let err =
+        run(&uac_reading_field0(), &quiet_uac(server.local_addr())).expect_err("no injection file");
+    assert!(
+        matches!(&err, EngineError::Scenario(m) if m.starts_with("No injection file was specified!")),
+        "{err}"
+    );
+    // And a name -infindex cannot find is a configuration error.
+    let mut client = quiet_uac(server.local_addr());
+    client.inf = vec![InjectionSource::text("users.csv", "SEQUENTIAL\nalice;\n")];
+    client.inf_index = vec![("other.csv".to_owned(), 0)];
+    let err = run(&uac_reading_field0(), &client).expect_err("unknown file");
+    assert!(
+        matches!(&err, EngineError::Config(m) if m == "-infindex: no injection file named 'other.csv'"),
+        "{err}"
+    );
+
+    server.control().stop();
+    let report = server.wait().expect("uas reports");
+    assert_eq!(report.successful, 3, "{}", report.summary());
 }

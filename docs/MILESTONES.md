@@ -2060,8 +2060,9 @@ The steps are ordered as §6 of the design says; each is one commit.
       minor release. e2e test: a harness starts the embedded UAS
       in-process on port 0, runs the embedded UAC against it, stops the
       UAS through the handle, asserts both reports.
-- [ ] D5 `InjectionSource::{Path, Text}` replaces the `inf_files` and
-      `rx_inf_files` path lists; a test feeds `[fieldN]` from a string.
+- [x] D5 `InjectionSource::{Path, Text}` replaces the `inf_files` and
+      `rx_inf_files` path lists (now `inf` and `rxinf`); a test feeds
+      `[fieldN]` from a string, and from a file, through the library.
 - [ ] D7 `sipr_scenario::compile_strict` (the `--check` policy as a
       function, used by the binary); the render family `#[doc(hidden)]`;
       crate-level rustdoc listing the supported surface; a compiled

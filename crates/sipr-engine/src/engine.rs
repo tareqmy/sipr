@@ -134,12 +134,14 @@ pub struct EngineConfig {
     pub trace_stat: Option<std::path::PathBuf>,
     /// `-fd`: statistics dump interval.
     pub stat_interval: Duration,
-    /// `-inf`: injection-file paths (CSV) for `[fieldN]`, in order.
-    pub inf_files: Vec<std::path::PathBuf>,
+    /// `-inf`: the injection files `[fieldN]` reads, in order — the first
+    /// is what a bare `[fieldN]` means. Each is a CSV on disk or text
+    /// already in memory, see [`InjectionSource`].
+    pub inf: Vec<InjectionSource>,
     /// `-rxinf`: further injection files, loaded after the `-inf` ones into
     /// the same table (SIPp's shared `inFiles` map) and reachable by name
     /// from either scenario; a bare `[fieldN]` still means the first `-inf`.
-    pub rx_inf_files: Vec<std::path::PathBuf>,
+    pub rxinf: Vec<InjectionSource>,
     /// `-infindex FILE FIELD`: build a lookup index on `FIELD` of the injection
     /// file named `FILE` (matched by basename), enabling `<lookup>`.
     pub inf_index: Vec<(String, usize)>,
@@ -312,8 +314,8 @@ impl Default for EngineConfig {
             trace_err: None,
             trace_stat: None,
             stat_interval: Duration::from_secs(60),
-            inf_files: Vec::new(),
-            rx_inf_files: Vec::new(),
+            inf: Vec::new(),
+            rxinf: Vec::new(),
             inf_index: Vec::new(),
             transport: TransportKind::UdpMono,
             twin_addr: None,
@@ -418,6 +420,58 @@ const DEFAULT_MEDIA_PORT: u16 = 6000;
 const DEFAULT_RTP_PAYLOAD: u8 = 8;
 /// SIPp's initial `play_args_a.last_seq_no` for `play_dtmf`.
 const DTMF_FIRST_SEQ: u16 = 1200;
+
+/// Where an injection file's rows come from: a CSV on disk, as `-inf PATH`
+/// names one, or the same text already in memory. Either way the file is
+/// known by a name — the path's basename, or the given one — which is what
+/// `[fieldN file=NAME]` and `-infindex NAME` refer to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InjectionSource {
+    /// A CSV file, read at start-up.
+    Path(std::path::PathBuf),
+    /// CSV text, under this name.
+    Text {
+        /// The name the scenario and `-infindex` use for it.
+        name: String,
+        /// The file's text, header line included.
+        csv: String,
+    },
+}
+
+impl InjectionSource {
+    /// In-memory injection data under `name`.
+    pub fn text(name: impl Into<String>, csv: impl Into<String>) -> Self {
+        Self::Text {
+            name: name.into(),
+            csv: csv.into(),
+        }
+    }
+
+    /// The name and the text, reading the file for [`Self::Path`].
+    fn load(&self) -> Result<(String, std::borrow::Cow<'_, str>), EngineError> {
+        match self {
+            Self::Path(path) => {
+                let text = std::fs::read_to_string(path).map_err(|e| EngineError::Io {
+                    what: format!("cannot read injection file {}", path.display()),
+                    path: path.clone(),
+                    source: e,
+                })?;
+                let name = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                Ok((name, std::borrow::Cow::Owned(text)))
+            }
+            Self::Text { name, csv } => Ok((name.clone(), std::borrow::Cow::Borrowed(csv))),
+        }
+    }
+}
+
+impl From<std::path::PathBuf> for InjectionSource {
+    fn from(path: std::path::PathBuf) -> Self {
+        Self::Path(path)
+    }
+}
 
 /// Transport selection (`-t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2055,18 +2109,10 @@ impl<'s> Engine<'s> {
         // Injection files first: `-t ui` binds sockets from their IP column.
         // `-inf` files lead, `-rxinf` ones follow in the same table (SIPp's
         // one `inFiles` map): the first `-inf` stays the default file.
-        let inf_default_files = config.inf_files.len();
-        let mut inf_files = Vec::with_capacity(inf_default_files + config.rx_inf_files.len());
-        for path in config.inf_files.iter().chain(&config.rx_inf_files) {
-            let text = std::fs::read_to_string(path).map_err(|e| EngineError::Io {
-                what: format!("cannot read injection file {}", path.display()),
-                path: path.clone(),
-                source: e,
-            })?;
-            let name = path.file_name().map_or_else(
-                || path.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
+        let inf_default_files = config.inf.len();
+        let mut inf_files = Vec::with_capacity(inf_default_files + config.rxinf.len());
+        for source in config.inf.iter().chain(&config.rxinf) {
+            let (name, text) = source.load()?;
             let file = InjectionFile::parse(&name, &text).map_err(EngineError::Config)?;
             if file.mode == InjectMode::User && config.users.is_none() {
                 config.notices.warning(format!(
