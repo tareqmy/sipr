@@ -2111,9 +2111,17 @@ sliced the `algorithm=` value at byte 3 to compare it with `MD5`; a
 non-UTF-8 byte there decodes to U+FFFD, three bytes wide, and the slice
 panicked the engine on a header any peer could send. Fixed in its own
 commit before this one (`fix(auth)`), with the reproducer as a unit test.
-The other eight ran 30 s each without a finding. A finding's fix goes
-into the crate it hit with the reproducer as a regression test, per
-docs/TESTING.md §6.
+The other eight ran 30 s each without a finding on the development
+host. CI's first run then reported an out-of-memory in `injection_csv`
+that was the harness, not the parser: it indexed a `PRINTF=344444444`
+file, one entry per virtual line as SIPp's `index()` does too, so the
+target now skips `-infindex` past 4096 virtual lines, as `regex` caps
+its inputs. The same target's next run found a real one: a `%d` width
+in the exabytes made the expansion allocate that much padding and
+abort, where SIPp's `snprintf` stops at its message buffer; fixed in
+`fix(scenario)` by bounding width and precision there. A finding's fix
+goes into the crate it hit with the reproducer as a regression test,
+per docs/TESTING.md §6.
 
 ### M51+ — further additions (after M50)
 

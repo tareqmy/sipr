@@ -131,7 +131,7 @@ target per parser that reads untrusted bytes:
 | `scenario_xml`  | `sipr_scenario::compile` and `compile_strict` on the text            |
 | `template`      | the keyword tokenizer, with a `-key` generic keyword in scope        |
 | `regex`         | the in-tree `<ereg>` engine: pattern NUL haystack, both capped       |
-| `injection_csv` | `InjectionFile::parse` and the table operations the keywords use    |
+| `injection_csv` | `InjectionFile::parse` and the table operations the keywords use; `-infindex` only up to 4096 virtual lines |
 | `pcap`          | the pcap/pcapng readers and the replay-side accessors                |
 | `control`       | control-socket datagrams, command lines and the HTTP API's JSON      |
 | `auth`          | digest and AKA challenges, answering them, and `verifyauth`          |
