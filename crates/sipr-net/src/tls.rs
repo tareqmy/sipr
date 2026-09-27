@@ -42,7 +42,7 @@ use crate::transport::{InboundPacket, NetEvent, TransportConfig};
 const READ_CHUNK: usize = 64 * 1024;
 
 /// TLS-specific configuration (`-tls_*` flags), alongside [`TransportConfig`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsConfig {
     /// Certificate chain file, PEM (`-tls_cert`; SIPp default `cacert.pem`).
     pub cert: PathBuf,

@@ -38,8 +38,24 @@ use sipr_scenario::template::{CryptoKw, Keyword, MsgTemplate, Span};
 
 use crate::render::{RenderCtx, render};
 
-/// Engine configuration, distilled from the CLI.
-#[derive(Debug, Clone)]
+/// Engine configuration.
+///
+/// Start from [`EngineConfig::uac`] or [`EngineConfig::uas`] (or
+/// [`Default`], which is a UAS with SIPp's defaults) and assign the fields
+/// to change; the struct is `#[non_exhaustive]`, so a field added later
+/// does not break an embedder. Every field documents the SIPp flag it
+/// stands for, and every default is SIPp's.
+///
+/// ```
+/// use sipr_engine::EngineConfig;
+///
+/// let mut cfg = EngineConfig::uac("127.0.0.1:5060".parse().unwrap());
+/// cfg.rate = 5.0;
+/// cfg.max_calls = Some(20);
+/// assert_eq!(cfg.remote_host, "127.0.0.1");
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EngineConfig {
     /// Remote target for outbound calls (required for UAC scenarios).
     pub target: Option<SocketAddr>,
@@ -252,6 +268,135 @@ pub struct EngineConfig {
     pub trace_name_base: Option<String>,
 }
 
+impl Default for EngineConfig {
+    /// A UAS configuration with SIPp's defaults: rate 10 per 1000 ms,
+    /// `-d` 3000 ms, `-fd` 60 s, `-f` 1 s, `-base_cseq` 1, `-max_socket`
+    /// 50000, `-deadcall_wait` 33 s, 5 INVITE and 9 non-INVITE
+    /// retransmissions, `-rtt_freq` 200, the `;` statistics delimiter,
+    /// the `[dynamic_id]` triple 10000/4/18000, every `-default_behaviors`
+    /// on, every log truncated, reconnection off with a 1 s sleep, and no
+    /// target — see [`EngineConfig::uac`] for one.
+    fn default() -> Self {
+        Self {
+            target: None,
+            local_ip: None,
+            bind_local: false,
+            sockopts: SocketOpts::default(),
+            sendbuffer_warn: false,
+            port: None,
+            service: "service".to_owned(),
+            rate: 10.0,
+            rate_period: Duration::from_millis(1000),
+            limit: None,
+            max_calls: None,
+            pause_default: Duration::from_millis(3000),
+            max_retrans: None,
+            max_socket: 50_000,
+            remote_sending_addr: None,
+            ip_field: 0,
+            max_reconnect: 0,
+            reconnect_close: true,
+            reconnect_sleep: Duration::from_millis(1000),
+            no_retrans: false,
+            timeout: None,
+            base_cseq: 1,
+            call_id_format: None,
+            seed: 0,
+            periodic_stats: false,
+            auto_answer: false,
+            auth_user: None,
+            auth_password: None,
+            auth_uri: None,
+            trace_msg: None,
+            trace_err: None,
+            trace_stat: None,
+            stat_interval: Duration::from_secs(60),
+            inf_files: Vec::new(),
+            rx_inf_files: Vec::new(),
+            inf_index: Vec::new(),
+            transport: TransportKind::UdpMono,
+            twin_addr: None,
+            extended_3pcc: None,
+            users: None,
+            global_sets: Vec::new(),
+            remote_host: String::new(),
+            generic_keywords: Vec::new(),
+            dynamic_id: (10_000, 4, 18_000),
+            tdm_map: None,
+            rfc3339: false,
+            report_interval: Duration::from_secs(1),
+            trace_rtt: None,
+            trace_counts: None,
+            trace_error_codes: None,
+            rtt_freq: 200,
+            stat_delimiter: ";".to_owned(),
+            periodic_rtd: false,
+            trace_logs: None,
+            trace_shortmsg: None,
+            trace_calldebug: None,
+            log_overwrite: LogOverwrite::default(),
+            log_rotation: sipr_stats::LogRotation::default(),
+            deadcall_wait: Duration::from_millis(33_000),
+            max_invite_retrans: 5,
+            max_non_invite_retrans: 9,
+            recv_timeout: None,
+            timeout_error: false,
+            lost: None,
+            pause_msg_ign: false,
+            behaviors: Behaviors::default(),
+            callid_slash_ign: false,
+            nostdin: false,
+            tls: None,
+            media_ip: None,
+            media_port: None,
+            max_rtp_port: None,
+            rtp_payload: None,
+            random_base_ssrc: false,
+            rate_increase: None,
+            rate_max: None,
+            rate_interval: None,
+            rate_quit: true,
+            rate_scale: None,
+            rtp_echo: false,
+            media_bufsize: None,
+            audio_tolerance: None,
+            video_tolerance: None,
+            scenario_dir: None,
+            control_port: None,
+            control_ip: None,
+            http_addr: None,
+            http_token: None,
+            stats_json: None,
+            trace_name_base: None,
+        }
+    }
+}
+
+impl EngineConfig {
+    /// A UAC configuration: SIPp's defaults (see [`Default`]) placing calls
+    /// at `target`. `[remote_host]` renders the target's IP, and an IPv6
+    /// target binds an IPv6 local socket (`::`) unless `local_ip` is set.
+    #[must_use]
+    pub fn uac(target: SocketAddr) -> Self {
+        Self {
+            target: Some(target),
+            local_ip: target
+                .is_ipv6()
+                .then_some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            remote_host: target.ip().to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// A UAS configuration: SIPp's defaults (see [`Default`]), listening on
+    /// every interface at port 5060 until `local_ip` and `port` say
+    /// otherwise.
+    #[must_use]
+    pub fn uas() -> Self {
+        Self::default()
+    }
+}
+
 /// SIPp's `DEFAULT_MEDIA_PORT`.
 const DEFAULT_MEDIA_PORT: u16 = 6000;
 /// SIPp's `rtp_default_payload` (PCMA).
@@ -300,7 +445,7 @@ impl TransportKind {
 
 /// SIPp's `-<kind>_overwrite` flags: truncate (true, the default) or append
 /// to each log file.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogOverwrite {
     /// `-message_overwrite`.
     pub messages: bool,
@@ -514,8 +659,10 @@ struct DeadCall {
     reason: String,
 }
 
-/// Final counters of a run.
+/// Final counters of a run. `#[non_exhaustive]`: read the fields, do not
+/// build one.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct RunReport {
     /// Calls started.
     pub created: u64,

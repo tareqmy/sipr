@@ -173,209 +173,9 @@ fn run(cli: &Cli) -> ExitCode {
     if let Some(d) = cli.sleep {
         std::thread::sleep(d);
     }
-    // A v6 target needs a v6 local socket; default the bind family to `::` when
-    // the target is IPv6 and no explicit -i was given.
-    let local_ip = cli.local_ip.or_else(|| {
-        target.and_then(|t| {
-            t.is_ipv6()
-                .then_some(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
-        })
-    });
-    let config = sipr_engine::EngineConfig {
-        target,
-        local_ip,
-        bind_local: cli.bind_local,
-        sockopts: sipr_engine::SocketOpts {
-            buff_size: cli.buff_size,
-            bind_device: cli.bind_to_device.clone(),
-        },
-        sendbuffer_warn: cli.sendbuffer_warn,
-        port: cli.port,
-        service: cli.service.clone(),
-        rate: cli.rate,
-        rate_period: std::time::Duration::from_millis(cli.rate_period_ms),
-        limit: cli.limit,
-        max_calls: cli.max_calls,
-        pause_default: std::time::Duration::from_millis(cli.pause_ms),
-        max_retrans: cli.max_retrans,
-        no_retrans: cli.no_retrans,
-        timeout: cli.timeout_s.map(std::time::Duration::from_secs),
-        base_cseq: cli.base_cseq.unwrap_or(1),
-        call_id_format: cli.call_id_format.clone(),
-        seed: 0,
-        periodic_stats: cli.background,
-        auto_answer: cli.auto_answer,
-        auth_user: cli.auth_user.clone(),
-        auth_password: cli.auth_password.clone(),
-        auth_uri: cli.auth_uri.clone(),
-        trace_msg: cli.trace_msg.then(|| {
-            cli.message_file
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_messages.log")))
-        }),
-        trace_err: cli.trace_err.then(|| {
-            cli.error_file
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_errors.log")))
-        }),
-        trace_stat: cli.trace_stat.then(|| {
-            cli.stat_file
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_.csv")))
-        }),
-        // SIPp's -fd default is 60 s; the final row is written regardless.
-        stat_interval: std::time::Duration::from_secs(cli.stat_interval_s.unwrap_or(60)),
-        inf_files: cli.inf.clone(),
-        rx_inf_files: cli.rxinf.clone(),
-        inf_index: cli.inf_index.clone(),
-        global_sets: cli.set_vars.clone(),
-        remote_host: cli.target.as_deref().map(host_part).unwrap_or_default(),
-        generic_keywords: cli.generic_keywords.clone(),
-        dynamic_id: (
-            cli.dynamic_start.unwrap_or(10_000),
-            cli.dynamic_step.unwrap_or(4),
-            cli.dynamic_max.unwrap_or(18_000),
-        ),
-        tdm_map: cli.tdmmap.clone(),
-        rfc3339: cli.rfc3339,
-        report_interval: std::time::Duration::from_secs(cli.report_interval_s.unwrap_or(1)),
-        trace_rtt: cli
-            .trace_rtt
-            .then(|| std::path::PathBuf::from(format!("{base}_{pid}_rtt.csv"))),
-        trace_counts: cli
-            .trace_counts
-            .then(|| std::path::PathBuf::from(format!("{base}_{pid}_counts.csv"))),
-        trace_error_codes: cli
-            .trace_error_codes
-            .then(|| std::path::PathBuf::from(format!("{base}_{pid}_error_codes.csv"))),
-        rtt_freq: cli.rtt_freq.unwrap_or(200),
-        stat_delimiter: cli.stat_delimiter.clone().unwrap_or_else(|| ";".to_owned()),
-        periodic_rtd: cli.periodic_rtd,
-        trace_logs: cli.trace_logs.then(|| {
-            cli.log_file
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_logs.log")))
-        }),
-        trace_shortmsg: cli.trace_shortmsg.then(|| {
-            cli.shortmessage_file.clone().unwrap_or_else(|| {
-                std::path::PathBuf::from(format!("{base}_{pid}_shortmessages.log"))
-            })
-        }),
-        trace_calldebug: cli.trace_calldebug.then(|| {
-            cli.calldebug_file
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from(format!("{base}_{pid}_calldebug.log")))
-        }),
-        log_overwrite: sipr_engine::LogOverwrite {
-            messages: cli.message_overwrite,
-            errors: cli.error_overwrite,
-            logs: cli.log_overwrite,
-            shortmessages: cli.shortmessage_overwrite,
-            calldebug: cli.calldebug_overwrite,
-        },
-        log_rotation: sipr_stats::LogRotation {
-            ringbuffer_files: cli.ringbuffer_files.unwrap_or(0),
-            ringbuffer_size: cli.ringbuffer_size.unwrap_or(0),
-            max_log_size: cli.max_log_size.unwrap_or(0),
-        },
-        deadcall_wait: std::time::Duration::from_millis(cli.deadcall_wait_ms.unwrap_or(33_000)),
-        max_invite_retrans: cli.max_invite_retrans.unwrap_or(5),
-        max_non_invite_retrans: cli.max_non_invite_retrans.unwrap_or(9),
-        recv_timeout: cli.recv_timeout,
-        timeout_error: cli.timeout_error,
-        lost: cli.lost,
-        pause_msg_ign: cli.pause_msg_ign,
-        behaviors: if cli.no_defaults {
-            sipr_engine::Behaviors::none()
-        } else {
-            cli.default_behaviors.unwrap_or_default()
-        },
-        callid_slash_ign: cli.callid_slash_ign,
-        nostdin: cli.nostdin,
-        transport: match cli.transport {
-            crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
-            crate::cli::Transport::UdpPerCall => sipr_engine::TransportKind::UdpPerCall,
-            crate::cli::Transport::UdpPerIp => sipr_engine::TransportKind::UdpPerIp,
-            crate::cli::Transport::TcpMono => sipr_engine::TransportKind::TcpMono,
-            crate::cli::Transport::TcpPerCall => sipr_engine::TransportKind::TcpPerCall,
-            crate::cli::Transport::TlsMono => sipr_engine::TransportKind::TlsMono,
-            crate::cli::Transport::TlsPerCall => sipr_engine::TransportKind::TlsPerCall,
-            crate::cli::Transport::SctpMono => sipr_engine::TransportKind::SctpMono,
-            crate::cli::Transport::SctpPerCall => sipr_engine::TransportKind::SctpPerCall,
-        },
-        max_socket: cli.max_socket.unwrap_or(50_000),
-        ip_field: cli.ip_field,
-        max_reconnect: cli.max_reconnect,
-        reconnect_close: cli.reconnect_close,
-        reconnect_sleep: std::time::Duration::from_millis(cli.reconnect_sleep_ms),
-        remote_sending_addr: match &cli.remote_sending {
-            Some(raw) => match resolve_target(raw) {
-                Ok(addr) => Some(addr),
-                Err(e) => return fatal(&format!("-rsa: {e}")),
-            },
-            None => None,
-        },
-        twin_addr: match &cli.three_pcc {
-            Some(raw) => match resolve_target(raw) {
-                Ok(addr) => Some(addr),
-                Err(e) => return fatal(&format!("-3pcc: {e}")),
-            },
-            None => None,
-        },
-        extended_3pcc: match extended_3pcc(cli) {
-            Ok(ext) => ext,
-            Err(e) => return fatal(&e),
-        },
-        users: cli.users,
-        media_ip: cli.media_ip,
-        media_port: cli.media_port,
-        max_rtp_port: cli.max_rtp_port,
-        rtp_payload: cli.rtp_payload,
-        random_base_ssrc: cli.random_base_ssrc,
-        rate_increase: cli.rate_increase,
-        rate_max: cli.rate_max,
-        rate_interval: cli.rate_interval,
-        rate_quit: !cli.no_rate_quit,
-        rate_scale: cli.rate_scale,
-        rtp_echo: cli.rtp_echo,
-        media_bufsize: cli.media_bufsize,
-        audio_tolerance: cli.audio_tolerance,
-        video_tolerance: cli.video_tolerance,
-        control_port: cli.control_port,
-        control_ip: cli.control_ip,
-        http_addr: match cli.http.as_deref() {
-            None => None,
-            Some(raw) => match resolve_http_addr(raw) {
-                Ok(a) => Some(a),
-                Err(e) => return fatal(&format!("--sipr-http: {e}")),
-            },
-        },
-        http_token: cli.http_token.clone(),
-        stats_json: cli.stats_json.clone(),
-        trace_name_base: Some(format!("{base}_{pid}")),
-        // pcap paths resolve next to the scenario file first (SIPp find_file).
-        scenario_dir: cli
-            .sf
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .map(std::path::Path::to_path_buf),
-        // Built only when TLS is selected: cert/key defaults (cacert.pem /
-        // cakey.pem, like SIPp) would otherwise error on absent files.
-        tls: matches!(
-            cli.transport,
-            crate::cli::Transport::TlsMono | crate::cli::Transport::TlsPerCall
-        )
-        .then(|| sipr_engine::TlsConfig {
-            cert: cli.tls_cert.clone(),
-            key: cli.tls_key.clone(),
-            ca: cli.tls_ca.clone(),
-            crl: cli.tls_crl.clone(),
-            version: match cli.tls_version {
-                crate::cli::TlsVersionArg::Auto => sipr_engine::TlsVersion::Auto,
-                crate::cli::TlsVersionArg::V1_2 => sipr_engine::TlsVersion::V1_2,
-                crate::cli::TlsVersionArg::V1_3 => sipr_engine::TlsVersion::V1_3,
-            },
-        }),
+    let config = match engine_config(cli, target, &base, pid) {
+        Ok(config) => config,
+        Err(e) => return fatal(&e),
     };
     // Live TUI when attached to a terminal (and not headless/lint mode).
     let use_tui = {
@@ -424,6 +224,213 @@ fn run(cli: &Cli) -> ExitCode {
         }
         Err(e) => fatal(&e.to_string()),
     }
+}
+
+/// The engine configuration for this invocation: SIPp's defaults from
+/// [`sipr_engine::EngineConfig`] with what the command line set on top.
+/// Only the command line's own values appear here — a default number
+/// belongs in the engine, and the parity test below keeps the two in step.
+/// `base` and `pid` name the trace files (`<scenario>_<pid>_<kind>`).
+fn engine_config(
+    cli: &Cli,
+    target: Option<std::net::SocketAddr>,
+    base: &str,
+    pid: u32,
+) -> Result<sipr_engine::EngineConfig, String> {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    let mut config = match target {
+        Some(target) => sipr_engine::EngineConfig::uac(target),
+        None => sipr_engine::EngineConfig::uas(),
+    };
+    // `[remote_host]` is the host as typed, brackets and port stripped.
+    config.remote_host = cli.target.as_deref().map(host_part).unwrap_or_default();
+    if let Some(ip) = cli.local_ip {
+        config.local_ip = Some(ip);
+    }
+    config.bind_local = cli.bind_local;
+    config.sockopts = sipr_engine::SocketOpts {
+        buff_size: cli.buff_size,
+        bind_device: cli.bind_to_device.clone(),
+    };
+    config.sendbuffer_warn = cli.sendbuffer_warn;
+    config.port = cli.port;
+    config.service.clone_from(&cli.service);
+    config.rate = cli.rate;
+    config.rate_period = Duration::from_millis(cli.rate_period_ms);
+    config.limit = cli.limit;
+    config.max_calls = cli.max_calls;
+    config.pause_default = Duration::from_millis(cli.pause_ms);
+    config.max_retrans = cli.max_retrans;
+    config.no_retrans = cli.no_retrans;
+    config.timeout = cli.timeout_s.map(Duration::from_secs);
+    if let Some(cseq) = cli.base_cseq {
+        config.base_cseq = cseq;
+    }
+    config.call_id_format.clone_from(&cli.call_id_format);
+    config.periodic_stats = cli.background;
+    config.auto_answer = cli.auto_answer;
+    config.auth_user.clone_from(&cli.auth_user);
+    config.auth_password.clone_from(&cli.auth_password);
+    config.auth_uri.clone_from(&cli.auth_uri);
+    let named = |explicit: &Option<PathBuf>, suffix: &str| {
+        explicit
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("{base}_{pid}_{suffix}")))
+    };
+    config.trace_msg = cli
+        .trace_msg
+        .then(|| named(&cli.message_file, "messages.log"));
+    config.trace_err = cli.trace_err.then(|| named(&cli.error_file, "errors.log"));
+    config.trace_stat = cli.trace_stat.then(|| named(&cli.stat_file, ".csv"));
+    // The final `-trace_stat` row is written whatever the interval.
+    if let Some(secs) = cli.stat_interval_s {
+        config.stat_interval = Duration::from_secs(secs);
+    }
+    config.inf_files.clone_from(&cli.inf);
+    config.rx_inf_files.clone_from(&cli.rxinf);
+    config.inf_index.clone_from(&cli.inf_index);
+    config.global_sets.clone_from(&cli.set_vars);
+    config.generic_keywords.clone_from(&cli.generic_keywords);
+    let (start, step, max) = config.dynamic_id;
+    config.dynamic_id = (
+        cli.dynamic_start.unwrap_or(start),
+        cli.dynamic_step.unwrap_or(step),
+        cli.dynamic_max.unwrap_or(max),
+    );
+    config.tdm_map.clone_from(&cli.tdmmap);
+    config.rfc3339 = cli.rfc3339;
+    if let Some(secs) = cli.report_interval_s {
+        config.report_interval = Duration::from_secs(secs);
+    }
+    config.trace_rtt = cli.trace_rtt.then(|| named(&None, "rtt.csv"));
+    config.trace_counts = cli.trace_counts.then(|| named(&None, "counts.csv"));
+    config.trace_error_codes = cli
+        .trace_error_codes
+        .then(|| named(&None, "error_codes.csv"));
+    if let Some(freq) = cli.rtt_freq {
+        config.rtt_freq = freq;
+    }
+    if let Some(delimiter) = &cli.stat_delimiter {
+        config.stat_delimiter.clone_from(delimiter);
+    }
+    config.periodic_rtd = cli.periodic_rtd;
+    config.trace_logs = cli.trace_logs.then(|| named(&cli.log_file, "logs.log"));
+    config.trace_shortmsg = cli
+        .trace_shortmsg
+        .then(|| named(&cli.shortmessage_file, "shortmessages.log"));
+    config.trace_calldebug = cli
+        .trace_calldebug
+        .then(|| named(&cli.calldebug_file, "calldebug.log"));
+    config.log_overwrite = sipr_engine::LogOverwrite {
+        messages: cli.message_overwrite,
+        errors: cli.error_overwrite,
+        logs: cli.log_overwrite,
+        shortmessages: cli.shortmessage_overwrite,
+        calldebug: cli.calldebug_overwrite,
+    };
+    let rotation = config.log_rotation;
+    config.log_rotation = sipr_stats::LogRotation {
+        ringbuffer_files: cli.ringbuffer_files.unwrap_or(rotation.ringbuffer_files),
+        ringbuffer_size: cli.ringbuffer_size.unwrap_or(rotation.ringbuffer_size),
+        max_log_size: cli.max_log_size.unwrap_or(rotation.max_log_size),
+    };
+    if let Some(ms) = cli.deadcall_wait_ms {
+        config.deadcall_wait = Duration::from_millis(ms);
+    }
+    if let Some(n) = cli.max_invite_retrans {
+        config.max_invite_retrans = n;
+    }
+    if let Some(n) = cli.max_non_invite_retrans {
+        config.max_non_invite_retrans = n;
+    }
+    config.recv_timeout = cli.recv_timeout;
+    config.timeout_error = cli.timeout_error;
+    config.lost = cli.lost;
+    config.pause_msg_ign = cli.pause_msg_ign;
+    config.behaviors = if cli.no_defaults {
+        sipr_engine::Behaviors::none()
+    } else {
+        cli.default_behaviors.unwrap_or_default()
+    };
+    config.callid_slash_ign = cli.callid_slash_ign;
+    config.nostdin = cli.nostdin;
+    config.transport = match cli.transport {
+        crate::cli::Transport::UdpMono => sipr_engine::TransportKind::UdpMono,
+        crate::cli::Transport::UdpPerCall => sipr_engine::TransportKind::UdpPerCall,
+        crate::cli::Transport::UdpPerIp => sipr_engine::TransportKind::UdpPerIp,
+        crate::cli::Transport::TcpMono => sipr_engine::TransportKind::TcpMono,
+        crate::cli::Transport::TcpPerCall => sipr_engine::TransportKind::TcpPerCall,
+        crate::cli::Transport::TlsMono => sipr_engine::TransportKind::TlsMono,
+        crate::cli::Transport::TlsPerCall => sipr_engine::TransportKind::TlsPerCall,
+        crate::cli::Transport::SctpMono => sipr_engine::TransportKind::SctpMono,
+        crate::cli::Transport::SctpPerCall => sipr_engine::TransportKind::SctpPerCall,
+    };
+    if let Some(n) = cli.max_socket {
+        config.max_socket = n;
+    }
+    config.ip_field = cli.ip_field;
+    config.max_reconnect = cli.max_reconnect;
+    config.reconnect_close = cli.reconnect_close;
+    config.reconnect_sleep = Duration::from_millis(cli.reconnect_sleep_ms);
+    config.remote_sending_addr = match &cli.remote_sending {
+        Some(raw) => Some(resolve_target(raw).map_err(|e| format!("-rsa: {e}"))?),
+        None => None,
+    };
+    config.twin_addr = match &cli.three_pcc {
+        Some(raw) => Some(resolve_target(raw).map_err(|e| format!("-3pcc: {e}"))?),
+        None => None,
+    };
+    config.extended_3pcc = extended_3pcc(cli)?;
+    config.users = cli.users;
+    config.media_ip = cli.media_ip;
+    config.media_port = cli.media_port;
+    config.max_rtp_port = cli.max_rtp_port;
+    config.rtp_payload = cli.rtp_payload;
+    config.random_base_ssrc = cli.random_base_ssrc;
+    config.rate_increase = cli.rate_increase;
+    config.rate_max = cli.rate_max;
+    config.rate_interval = cli.rate_interval;
+    config.rate_quit = !cli.no_rate_quit;
+    config.rate_scale = cli.rate_scale;
+    config.rtp_echo = cli.rtp_echo;
+    config.media_bufsize = cli.media_bufsize;
+    config.audio_tolerance = cli.audio_tolerance;
+    config.video_tolerance = cli.video_tolerance;
+    config.control_port = cli.control_port;
+    config.control_ip = cli.control_ip;
+    config.http_addr = match cli.http.as_deref() {
+        Some(raw) => Some(resolve_http_addr(raw).map_err(|e| format!("--sipr-http: {e}"))?),
+        None => None,
+    };
+    config.http_token.clone_from(&cli.http_token);
+    config.stats_json.clone_from(&cli.stats_json);
+    config.trace_name_base = Some(format!("{base}_{pid}"));
+    // pcap paths resolve next to the scenario file first (SIPp find_file).
+    config.scenario_dir = cli
+        .sf
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_path_buf);
+    // Built only when TLS is selected: cert/key defaults (cacert.pem /
+    // cakey.pem, like SIPp) would otherwise error on absent files.
+    config.tls = matches!(
+        cli.transport,
+        crate::cli::Transport::TlsMono | crate::cli::Transport::TlsPerCall
+    )
+    .then(|| sipr_engine::TlsConfig {
+        cert: cli.tls_cert.clone(),
+        key: cli.tls_key.clone(),
+        ca: cli.tls_ca.clone(),
+        crl: cli.tls_crl.clone(),
+        version: match cli.tls_version {
+            crate::cli::TlsVersionArg::Auto => sipr_engine::TlsVersion::Auto,
+            crate::cli::TlsVersionArg::V1_2 => sipr_engine::TlsVersion::V1_2,
+            crate::cli::TlsVersionArg::V1_3 => sipr_engine::TlsVersion::V1_3,
+        },
+    });
+    Ok(config)
 }
 
 /// Resolve `host[:port]` to a socket address (port defaults to 5060).
@@ -639,7 +646,51 @@ fn fatal(msg: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_target;
+    use super::{engine_config, resolve_target};
+    use crate::cli::{Invocation, parse};
+    use sipr_engine::EngineConfig;
+
+    /// The engine configuration a bare command line produces, with the
+    /// trace-file stem the binary would name.
+    fn config_for(argv: &[&str]) -> EngineConfig {
+        let mut full = vec!["sipr"];
+        full.extend_from_slice(argv);
+        let Invocation::Run(cli) = parse(full.into_iter().map(str::to_owned)).unwrap() else {
+            panic!("not a run");
+        };
+        let target = cli.target.as_deref().map(|t| resolve_target(t).unwrap());
+        engine_config(&cli, target, "sn", 1).unwrap()
+    }
+
+    /// A command line that sets nothing must produce exactly the engine's
+    /// own defaults: the numbers live in `EngineConfig::default()`, and this
+    /// is what catches a default added or changed on only one side.
+    #[test]
+    fn bare_command_line_equals_the_engine_defaults() {
+        let mut uac = EngineConfig::uac("127.0.0.1:5060".parse().unwrap());
+        uac.trace_name_base = Some("sn_1".into());
+        assert_eq!(config_for(&["-sn", "uac", "127.0.0.1"]), uac);
+
+        let mut uas = EngineConfig::uas();
+        uas.trace_name_base = Some("sn_1".into());
+        assert_eq!(config_for(&["-sn", "uas"]), uas);
+    }
+
+    /// The v6 local-socket default and `[remote_host]` come from the
+    /// constructor, not from the binary.
+    #[test]
+    fn ipv6_target_binds_a_v6_socket_by_default() {
+        let config = config_for(&["-sn", "uac", "[::1]"]);
+        assert_eq!(
+            config.local_ip,
+            Some(std::net::Ipv6Addr::UNSPECIFIED.into())
+        );
+        assert_eq!(config.remote_host, "::1");
+        assert_eq!(config.target, Some("[::1]:5060".parse().unwrap()));
+        // An explicit -i wins.
+        let config = config_for(&["-sn", "uac", "-i", "::1", "[::1]"]);
+        assert_eq!(config.local_ip, Some("::1".parse().unwrap()));
+    }
 
     #[test]
     fn resolve_target_covers_v4_v6_and_hostnames() {

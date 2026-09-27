@@ -2031,8 +2031,9 @@ them); the binary becomes the first embedder and the `cli`, `e2e` and
 interop suites are the regression net — its output stays byte-identical.
 The steps are ordered as §6 of the design says; each is one commit.
 
-- [ ] D1 `EngineConfig`: `Default` carrying SIPp's defaults (the clap
-      definitions in `src/cli.rs` stop being their source of truth),
+- [x] D1 `EngineConfig`: `Default` carrying SIPp's defaults (`Cli::default`
+      in `src/cli.rs` now reads them from there, and `main.rs` carries no
+      default number),
       `#[non_exhaustive]`, `uac(target)`/`uas()` constructors, fields
       still public; `RunReport` gets `#[non_exhaustive]` too. The binary
       and the `ui_bridge` test build from the constructors. Parity test:

@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `sipr_engine::EngineConfig` has `Default` (SIPp's defaults) and the
+  constructors `EngineConfig::uac(target)` and `EngineConfig::uas()`, and
+  is `#[non_exhaustive]`, as is `RunReport`: build one from a constructor
+  and assign the fields to change. A struct literal outside the crate no
+  longer compiles, and a field added later no longer breaks an embedder
+  (M49 D1, `docs/LIBRARY_API.md`). The binary builds its configuration
+  the same way, and a unit test keeps a bare command line equal to the
+  engine's defaults field for field. `TlsConfig` and `LogOverwrite`
+  gained `PartialEq`.
+
 ## [0.28.0] — 2026-09-26
 
 ### Added

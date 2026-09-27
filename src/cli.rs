@@ -300,7 +300,12 @@ pub struct Cli {
 }
 
 impl Default for Cli {
+    /// Nothing set. The values a bare command line implies are the
+    /// engine's (`EngineConfig::default()`), read from there so that a
+    /// SIPp default exists in one place; the fields the parser cannot
+    /// leave unset are seeded from that config here.
     fn default() -> Self {
+        let engine = sipr_engine::EngineConfig::default();
         Self {
             target: None,
             sf: None,
@@ -312,11 +317,11 @@ impl Default for Cli {
             rxsn: None,
             rxinf: Vec::new(),
             check: false,
-            rate: 10.0,
-            rate_period_ms: 1000,
+            rate: engine.rate,
+            rate_period_ms: duration_ms(engine.rate_period),
             limit: None,
             max_calls: None,
-            pause_ms: 3000,
+            pause_ms: duration_ms(engine.pause_default),
             port: None,
             local_ip: None,
             bind_local: false,
@@ -345,11 +350,11 @@ impl Default for Cli {
             transport: Transport::UdpMono,
             max_socket: None,
             remote_sending: None,
-            ip_field: 0,
-            max_reconnect: 0,
-            reconnect_close: true,
-            reconnect_sleep_ms: 1000,
-            service: "service".to_owned(),
+            ip_field: engine.ip_field,
+            max_reconnect: engine.max_reconnect,
+            reconnect_close: engine.reconnect_close,
+            reconnect_sleep_ms: duration_ms(engine.reconnect_sleep),
+            service: engine.service,
             auth_user: None,
             auth_password: None,
             auth_uri: None,
@@ -380,11 +385,11 @@ impl Default for Cli {
             trace_timeout: false,
             error_file: None,
             message_file: None,
-            message_overwrite: true,
-            error_overwrite: true,
-            log_overwrite: true,
-            shortmessage_overwrite: true,
-            calldebug_overwrite: true,
+            message_overwrite: engine.log_overwrite.messages,
+            error_overwrite: engine.log_overwrite.errors,
+            log_overwrite: engine.log_overwrite.logs,
+            shortmessage_overwrite: engine.log_overwrite.shortmessages,
+            calldebug_overwrite: engine.log_overwrite.calldebug,
             screen_overwrite: true,
             ringbuffer_files: None,
             ringbuffer_size: None,
@@ -428,6 +433,11 @@ impl Default for Cli {
             warnings: Vec::new(),
         }
     }
+}
+
+/// A default duration as the whole milliseconds the flag takes.
+fn duration_ms(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// What an argv parse resolved to.
