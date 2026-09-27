@@ -25,6 +25,9 @@ sipr-stats = { path = "crates/sipr-stats", version = "0.28.0" }
 sipr-tui = { path = "crates/sipr-tui", version = "0.28.0" }
 sipr-media = { path = "crates/sipr-media", version = "0.28.0" }
 sipr-control = { path = "crates/sipr-control", version = "0.28.0" }
+# Typed errors (docs/CONVENTIONS.md §Errors): the engine's error enum is the
+# first to use it (M49 D4); other crates' errors are small enough by hand.
+thiserror = "2"
 # TLS (M13): rustls with the `ring` provider, NOT the default `aws-lc-rs` —
 # ring builds with `cc` alone (no cmake, no system OpenSSL), keeping the
 # build portable (docs/CONVENTIONS.md §Dependencies).

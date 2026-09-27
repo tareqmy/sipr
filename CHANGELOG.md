@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `sipr_engine::EngineError` is an enum — `Config`, `Scenario`, `Bind`
+  (with the OS error as its `source()`) and `Io` (with the path and the
+  OS error) — that implements `std::error::Error`, so `?` into `anyhow`
+  or `Box<dyn Error>` works. Every message reads exactly as before, and
+  the enum is `#[non_exhaustive]` (M49 D4). One wording changed: a
+  master that cannot dial its extended-3PCC peers now says "cannot
+  connect the extended 3PCC peers: <OS error>" instead of the bare OS
+  error.
 - The engine no longer prints. Everything it had to say on stderr — the
   bound address, the control-socket and HTTP banners, every `warning:`
   and `error:` line, the `-bg` statistics line — is a

@@ -979,14 +979,43 @@ struct CallState {
     secondary: bool,
 }
 
-/// Why the engine refused to run a scenario.
-#[derive(Debug)]
-pub struct EngineError(pub String);
-
-impl std::fmt::Display for EngineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
+/// Why the engine refused to run a scenario. Every message reads as it
+/// did when the error was a string — several are SIPp's own — so nothing
+/// that matches on the text changes; the variants say which side to look
+/// at. `#[non_exhaustive]`: match with a wildcard arm.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum EngineError {
+    /// The configuration is wrong or incomplete for this run: a flag
+    /// missing, malformed, or contradicting another or the scenario.
+    #[error("{0}")]
+    Config(String),
+    /// The scenario cannot run as given: a rule of its mode, or a keyword,
+    /// variable or file it names that the run does not provide.
+    #[error("{0}")]
+    Scenario(String),
+    /// A socket could not be bound or connected. `what` is the wording
+    /// before the OS error (`cannot bind UDP socket`, ...).
+    #[error("{what}: {source}")]
+    Bind {
+        /// What was being opened.
+        what: String,
+        /// The OS error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A file could not be read or created.
+    #[error("{what}: {source}")]
+    Io {
+        /// What was being done, path included (`cannot read injection
+        /// file users.csv`, ...).
+        what: String,
+        /// The file.
+        path: std::path::PathBuf,
+        /// The OS error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Channels wiring a live UI to the engine: snapshots flow out about once
@@ -1070,7 +1099,7 @@ pub fn run_scenarios(
 ) -> Result<(RunReport, EngineControl), EngineError> {
     if config.tdm_map.is_none() && uses_tdmmap(scenario) {
         // SIPp's wording, at start-up rather than at the first render.
-        return Err(EngineError(
+        return Err(EngineError::Scenario(
             "[tdmmap] keyword without -tdmmap parameter on command line".to_owned(),
         ));
     }
@@ -1078,7 +1107,7 @@ pub fn run_scenarios(
         validate_secondary(kind, scenario, second)?;
     }
     if scenario.role == Role::Uac && config.target.is_none() {
-        return Err(EngineError(
+        return Err(EngineError::Config(
             "this scenario places calls (UAC): a remote target is required".into(),
         ));
     }
@@ -1100,12 +1129,12 @@ fn validate_secondary(
     match kind {
         SecondaryKind::OutOfCall => {
             if main.role == Role::Uas {
-                return Err(EngineError(
+                return Err(EngineError::Scenario(
                     "SIPp cannot use out-of-call scenarios when running in server mode".into(),
                 ));
             }
             if second.uses_injection_fields() {
-                return Err(EngineError(
+                return Err(EngineError::Scenario(
                     "Automatic calls (created by -aa, -oocsn or -oocsf) cannot use input files!"
                         .into(),
                 ));
@@ -1113,14 +1142,14 @@ fn validate_secondary(
         }
         SecondaryKind::Receive => {
             if main.role == Role::Uas {
-                return Err(EngineError(format!(
+                return Err(EngineError::Scenario(format!(
                     "-rxsf/-rxsn: the main scenario must be a client-mode scenario \
                      (it originates the calls), but '{}' starts with a recv",
                     main.name
                 )));
             }
             if second.role == Role::Uac {
-                return Err(EngineError(format!(
+                return Err(EngineError::Scenario(format!(
                     "-rxsf/-rxsn: the receive scenario must be a server-mode scenario \
                      (its first message command a recv), but '{}' starts with a send",
                     second.name
@@ -1129,7 +1158,7 @@ fn validate_secondary(
         }
     }
     if twin_role(second).is_some() {
-        return Err(EngineError(format!(
+        return Err(EngineError::Scenario(format!(
             "the {} scenario cannot use <sendCmd>/<recvCmd> (3PCC)",
             kind.noun()
         )));
@@ -1249,7 +1278,7 @@ fn open_twin(
 ) -> Result<Option<TwinLink>, EngineError> {
     let role = twin_role(scenario);
     match (role, config.extended_3pcc.as_ref(), config.twin_addr) {
-        (None, Some(_), _) => Err(EngineError(
+        (None, Some(_), _) => Err(EngineError::Config(
             "-slave_cfg: extended 3PCC mode enabled but the scenario has no \
              <sendCmd>/<recvCmd> (SIPp: thirdPartyMode is different from MASTER and SLAVE)"
                 .into(),
@@ -1263,18 +1292,18 @@ fn open_twin(
                 .find(|(n, _)| *n == ext.name)
                 .map(|(_, a)| *a)
                 .ok_or_else(|| {
-                    EngineError(format!("get_peer_addr: Peer {} not found", ext.name))
+                    EngineError::Config(format!("get_peer_addr: Peer {} not found", ext.name))
                 })?;
-            let mut links = PeerLinks::listen(own, twin_bridge(tx)).map_err(|e| {
-                EngineError(format!(
-                    "Unable to bind twin sipp socket {own} for '{}': {e}",
-                    ext.name
-                ))
-            })?;
+            let mut links =
+                PeerLinks::listen(own, twin_bridge(tx)).map_err(|e| EngineError::Bind {
+                    what: format!("Unable to bind twin sipp socket {own} for '{}'", ext.name),
+                    source: e,
+                })?;
             if ext.master {
-                links
-                    .connect_all(&dests)
-                    .map_err(|e| EngineError(e.to_string()))?;
+                links.connect_all(&dests).map_err(|e| EngineError::Bind {
+                    what: "cannot connect the extended 3PCC peers".to_owned(),
+                    source: e,
+                })?;
             }
             Ok(Some(TwinLink::Extended { links, dests }))
         }
@@ -1285,7 +1314,7 @@ fn open_twin(
                 } => Some(dest),
                 _ => None,
             }) {
-                return Err(EngineError(format!(
+                return Err(EngineError::Scenario(format!(
                     "get_peer_addr: Peer {dest} not found — sendCmd dest= needs extended \
                      3PCC mode (-slave_cfg with -master or -slave), not -3pcc"
                 )));
@@ -1301,16 +1330,22 @@ fn open_twin(
                 );
             }
             let ch = match role {
-                TwinRole::Connect => TwinChannel::connect(addr, twin_bridge(tx)).map_err(|e| {
-                    EngineError(format!("cannot connect 3PCC twin socket {addr}: {e}"))
-                })?,
-                TwinRole::Listen => TwinChannel::listen(addr, twin_bridge(tx)).map_err(|e| {
-                    EngineError(format!("cannot bind 3PCC twin socket {addr}: {e}"))
-                })?,
+                TwinRole::Connect => {
+                    TwinChannel::connect(addr, twin_bridge(tx)).map_err(|e| EngineError::Bind {
+                        what: format!("cannot connect 3PCC twin socket {addr}"),
+                        source: e,
+                    })?
+                }
+                TwinRole::Listen => {
+                    TwinChannel::listen(addr, twin_bridge(tx)).map_err(|e| EngineError::Bind {
+                        what: format!("cannot bind 3PCC twin socket {addr}"),
+                        source: e,
+                    })?
+                }
             };
             Ok(Some(TwinLink::Classic(ch)))
         }
-        (Some(_), None, None) => Err(EngineError(
+        (Some(_), None, None) => Err(EngineError::Config(
             "scenario uses <sendCmd>/<recvCmd> (3PCC) but no twin address \
              was given — pass -3pcc HOST:PORT, or -slave_cfg with -master/-slave"
                 .into(),
@@ -1346,14 +1381,14 @@ fn check_extended_scenario(
 ) -> Result<Vec<(String, SocketAddr)>, EngineError> {
     match role {
         TwinRole::Connect if !ext.master => {
-            return Err(EngineError(
+            return Err(EngineError::Config(
                 "Inconsistency between command line and scenario: master scenario but \
                  -master option not set"
                     .into(),
             ));
         }
         TwinRole::Listen if ext.master => {
-            return Err(EngineError(
+            return Err(EngineError::Config(
                 "Inconsistency between command line and scenario: slave scenario but \
                  -slave option not set"
                     .into(),
@@ -1365,12 +1400,12 @@ fn check_extended_scenario(
     for step in &scenario.steps {
         match step {
             Step::SendCmd { dest: None, .. } => {
-                return Err(EngineError(
+                return Err(EngineError::Scenario(
                     "You must specify a 'dest' for sendCmd with extended 3pcc mode!".into(),
                 ));
             }
             Step::RecvCmd { src: None, .. } => {
-                return Err(EngineError(
+                return Err(EngineError::Scenario(
                     "You must specify a 'src' for recvCmd when using extended 3pcc mode!".into(),
                 ));
             }
@@ -1385,7 +1420,9 @@ fn check_extended_scenario(
                     .iter()
                     .find(|(n, _)| n == dest)
                     .map(|(_, a)| *a)
-                    .ok_or_else(|| EngineError(format!("get_peer_addr: Peer {dest} not found")))?;
+                    .ok_or_else(|| {
+                        EngineError::Config(format!("get_peer_addr: Peer {dest} not found"))
+                    })?;
                 dests.push((dest.clone(), addr));
             }
             _ => {}
@@ -1720,7 +1757,7 @@ impl<'s> Engine<'s> {
             |(_, sc)| vec![&scenario.vars, &sc.vars],
         ));
         if let [name, ..] = var_space.conflicts() {
-            return Err(EngineError(format!(
+            return Err(EngineError::Scenario(format!(
                 "variable '{name}' is <User> in one scenario and <Global> in the other: \
                  the two share one user and one global name space, as in SIPp"
             )));
@@ -1764,17 +1801,16 @@ impl<'s> Engine<'s> {
         let inf_default_files = config.inf_files.len();
         let mut inf_files = Vec::with_capacity(inf_default_files + config.rx_inf_files.len());
         for path in config.inf_files.iter().chain(&config.rx_inf_files) {
-            let text = std::fs::read_to_string(path).map_err(|e| {
-                EngineError(format!(
-                    "cannot read injection file {}: {e}",
-                    path.display()
-                ))
+            let text = std::fs::read_to_string(path).map_err(|e| EngineError::Io {
+                what: format!("cannot read injection file {}", path.display()),
+                path: path.clone(),
+                source: e,
             })?;
             let name = path.file_name().map_or_else(
                 || path.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             );
-            let file = InjectionFile::parse(&name, &text).map_err(EngineError)?;
+            let file = InjectionFile::parse(&name, &text).map_err(EngineError::Config)?;
             if file.mode == InjectMode::User && config.users.is_none() {
                 config.notices.warning(format!(
                     "injection file {name} uses USER mode but -users \
@@ -1789,7 +1825,7 @@ impl<'s> Engine<'s> {
                 .iter()
                 .find(|c| c.borrow().name == *file_name)
                 .ok_or_else(|| {
-                    EngineError(format!("-infindex: no injection file named '{file_name}'"))
+                    EngineError::Config(format!("-infindex: no injection file named '{file_name}'"))
                 })?;
             cell.borrow_mut().build_index(*field);
         }
@@ -1823,12 +1859,12 @@ impl<'s> Engine<'s> {
                 .first()
                 .and_then(|f| f.borrow().field(0, config.ip_field).map(|v| v.into_owned()))
                 .ok_or_else(|| {
-                    EngineError(
+                    EngineError::Config(
                         "-t ui needs an -inf file with an IP in the -ip_field column".into(),
                     )
                 })?;
             let ip: IpAddr = first.trim().parse().map_err(|_| {
-                EngineError(format!(
+                EngineError::Config(format!(
                     "-t ui: '{first}' (line 0, -ip_field) is not an IP address"
                 ))
             })?;
@@ -1837,8 +1873,10 @@ impl<'s> Engine<'s> {
         let rsa_server = config.remote_sending_addr.is_some() && scenario.role == Role::Uas;
         let (transport, transport_token, reliable) = match config.transport {
             TransportKind::UdpMono | TransportKind::UdpPerCall | TransportKind::UdpPerIp => {
-                let u = UdpTransport::bind(&tcfg, net_tx)
-                    .map_err(|e| EngineError(format!("cannot bind UDP socket: {e}")))?;
+                let u = UdpTransport::bind(&tcfg, net_tx).map_err(|e| EngineError::Bind {
+                    what: "cannot bind UDP socket".to_owned(),
+                    source: e,
+                })?;
                 (Transport::Udp(u), "UDP", false)
             }
             TransportKind::TcpMono | TransportKind::TcpPerCall => {
@@ -1847,17 +1885,24 @@ impl<'s> Engine<'s> {
                     Role::Uac if per_call => TcpTransport::client_pool(&tcfg, net_tx),
                     // Client: one mono-socket connection to the target, opened now.
                     Role::Uac => {
-                        let remote = config
-                            .target
-                            .ok_or_else(|| EngineError("TCP UAC needs a remote target".into()))?;
+                        let remote = config.target.ok_or_else(|| {
+                            EngineError::Config("TCP UAC needs a remote target".into())
+                        })?;
                         let remote = config.remote_sending_addr.unwrap_or(remote);
                         TcpTransport::connect(&tcfg, net_tx, remote).map_err(|e| {
-                            EngineError(format!("cannot connect TCP to {remote}: {e}"))
+                            EngineError::Bind {
+                                what: format!("cannot connect TCP to {remote}"),
+                                source: e,
+                            }
                         })?
                     }
                     // Server: listen and accept, framing each connection.
-                    Role::Uas => TcpTransport::listen(&tcfg, net_tx)
-                        .map_err(|e| EngineError(format!("cannot bind TCP listener: {e}")))?,
+                    Role::Uas => {
+                        TcpTransport::listen(&tcfg, net_tx).map_err(|e| EngineError::Bind {
+                            what: "cannot bind TCP listener".to_owned(),
+                            source: e,
+                        })?
+                    }
                 };
                 (Transport::Tcp(t), "TCP", true)
             }
@@ -1865,28 +1910,34 @@ impl<'s> Engine<'s> {
                 build_sctp_transport(config, &tcfg, net_tx, scenario.role, per_call)?
             }
             TransportKind::TlsMono | TransportKind::TlsPerCall => {
-                let tls_cfg = config
-                    .tls
-                    .as_ref()
-                    .ok_or_else(|| EngineError("TLS transport needs TLS configuration".into()))?;
+                let tls_cfg = config.tls.as_ref().ok_or_else(|| {
+                    EngineError::Config("TLS transport needs TLS configuration".into())
+                })?;
                 let t = match scenario.role {
                     // `ln` client: every call dials and handshakes its own.
                     Role::Uac if per_call => TlsTransport::client_pool(&tcfg, tls_cfg, net_tx)
-                        .map_err(|e| EngineError(format!("TLS configuration: {e}")))?,
+                        .map_err(|e| EngineError::Config(format!("TLS configuration: {e}")))?,
                     // Client: dial + handshake now; a failure is a startup error.
                     Role::Uac => {
-                        let remote = config
-                            .target
-                            .ok_or_else(|| EngineError("TLS UAC needs a remote target".into()))?;
+                        let remote = config.target.ok_or_else(|| {
+                            EngineError::Config("TLS UAC needs a remote target".into())
+                        })?;
                         let remote = config.remote_sending_addr.unwrap_or(remote);
                         TlsTransport::connect(&tcfg, tls_cfg, net_tx, remote).map_err(|e| {
-                            EngineError(format!("cannot connect TLS to {remote}: {e}"))
+                            EngineError::Bind {
+                                what: format!("cannot connect TLS to {remote}"),
+                                source: e,
+                            }
                         })?
                     }
                     // Server: listen; each accepted connection handshakes on
                     // its own thread and a bad client is dropped, not fatal.
-                    Role::Uas => TlsTransport::listen(&tcfg, tls_cfg, net_tx)
-                        .map_err(|e| EngineError(format!("cannot bind TLS listener: {e}")))?,
+                    Role::Uas => TlsTransport::listen(&tcfg, tls_cfg, net_tx).map_err(|e| {
+                        EngineError::Bind {
+                            what: "cannot bind TLS listener".to_owned(),
+                            source: e,
+                        }
+                    })?,
                 };
                 (Transport::Tls(t), "TLS", true)
             }
@@ -1912,7 +1963,7 @@ impl<'s> Engine<'s> {
                     .unwrap_or(config.rtp_payload.unwrap_or(DEFAULT_RTP_PAYLOAD)),
                 cmd.payload_name.as_deref(),
             )
-            .map_err(|e| EngineError(format!("exec rtp_echo=: {e}")))?;
+            .map_err(|e| EngineError::Scenario(format!("exec rtp_echo=: {e}")))?;
         }
         // -rtp_echo binds the media port (and +2) up front, probing upward
         // like SIPp; the port that bound is what [media_port] renders.
@@ -1925,8 +1976,13 @@ impl<'s> Engine<'s> {
             let bufsize = config
                 .media_bufsize
                 .unwrap_or(sipr_media::echo::DEFAULT_BUFSIZE);
-            let server = sipr_media::EchoServer::start(echo_ip, media_port, bufsize)
-                .map_err(|e| EngineError(format!("-rtp_echo: cannot bind media sockets: {e}")))?;
+            let server =
+                sipr_media::EchoServer::start(echo_ip, media_port, bufsize).map_err(|e| {
+                    EngineError::Bind {
+                        what: "-rtp_echo: cannot bind media sockets".to_owned(),
+                        source: e,
+                    }
+                })?;
             media_port = server.media_port;
             config.notices.info(format!(
                 "RTP echo on {echo_ip}:{media_port} and {echo_ip}:{}",
@@ -1985,13 +2041,19 @@ impl<'s> Engine<'s> {
                     sipr_control::udp::serve(sock, ctrl_tx.clone(), move |w| {
                         warnings.warning(w);
                     })
-                    .map_err(|e| EngineError(format!("cannot start the control socket: {e}")))?;
+                    .map_err(|e| EngineError::Bind {
+                        what: "cannot start the control socket".to_owned(),
+                        source: e,
+                    })?;
                 }
                 Err(e) if config.control_port.is_some() => {
-                    return Err(EngineError(format!(
-                        "cannot bind the control socket (-cp {}): {e}",
-                        config.control_port.unwrap_or_default()
-                    )));
+                    return Err(EngineError::Bind {
+                        what: format!(
+                            "cannot bind the control socket (-cp {})",
+                            config.control_port.unwrap_or_default()
+                        ),
+                        source: e,
+                    });
                 }
                 Err(e) => config.notices.warning(format!(
                     "no free control port in 8888..8947 ({e}); running without a \
@@ -2003,7 +2065,7 @@ impl<'s> Engine<'s> {
         let mut http = None;
         if let Some(addr) = config.http_addr {
             if !addr.ip().is_loopback() && config.http_token.is_none() {
-                return Err(EngineError(format!(
+                return Err(EngineError::Config(format!(
                     "--sipr-http {addr} is not a loopback address: the API can stop the run and \
                      change its load, so a --sipr-http-token is required there"
                 )));
@@ -2031,7 +2093,10 @@ impl<'s> Engine<'s> {
                 addr,
                 sipr_control::api::handler(link, config.http_token.clone()),
             )
-            .map_err(|e| EngineError(format!("cannot bind --sipr-http {addr}: {e}")))?;
+            .map_err(|e| EngineError::Bind {
+                what: format!("cannot bind --sipr-http {addr}"),
+                source: e,
+            })?;
             config.notices.info(format!(
                 "HTTP control API on http://{}/",
                 server.local_addr()
@@ -2044,12 +2109,15 @@ impl<'s> Engine<'s> {
         // condition to degrade through.
         let stats_json = match config.stats_json.as_deref() {
             None => None,
-            Some(path) => Some(sipr_stats::TraceFile::create(path).map_err(|e| {
-                EngineError(format!(
-                    "cannot create --sipr-stats-json {}: {e}",
-                    path.display()
-                ))
-            })?),
+            Some(path) => {
+                Some(
+                    sipr_stats::TraceFile::create(path).map_err(|e| EngineError::Io {
+                        what: format!("cannot create --sipr-stats-json {}", path.display()),
+                        path: path.to_path_buf(),
+                        source: e,
+                    })?,
+                )
+            }
         };
         if let Some(uri) = &config.auth_uri
             && (uri.starts_with("sip:") || uri.starts_with("sips:"))
@@ -2090,18 +2158,18 @@ impl<'s> Engine<'s> {
         let mut ip_sockets = HashMap::new();
         if per_ip && scenario.role == Role::Uas {
             let Transport::Udp(udp) = &transport else {
-                return Err(EngineError("-t ui is UDP only".into()));
+                return Err(EngineError::Config("-t ui is UDP only".into()));
             };
             let file = inf_files
                 .first()
-                .ok_or_else(|| EngineError("-t ui needs an -inf file".into()))?
+                .ok_or_else(|| EngineError::Config("-t ui needs an -inf file".into()))?
                 .borrow();
             for line in 0..file.len() {
                 let raw = file
                     .field(line, config.ip_field)
                     .map_or_else(String::new, |v| v.trim().to_owned());
                 let ip: IpAddr = raw.parse().map_err(|_| {
-                    EngineError(format!(
+                    EngineError::Config(format!(
                         "-t ui: '{raw}' (line {line}, -ip_field) is not an IP address"
                     ))
                 })?;
@@ -2110,11 +2178,9 @@ impl<'s> Engine<'s> {
                 }
                 let sock = udp
                     .open_call_socket_at(SocketAddr::new(ip, local_addr.port()))
-                    .map_err(|e| {
-                        EngineError(format!(
-                            "-t ui: cannot bind {ip}:{}: {e}",
-                            local_addr.port()
-                        ))
+                    .map_err(|e| EngineError::Bind {
+                        what: format!("-t ui: cannot bind {ip}:{}", local_addr.port()),
+                        source: e,
                     })?;
                 ip_sockets.insert(ip, Arc::new(sock));
             }
@@ -2140,8 +2206,10 @@ impl<'s> Engine<'s> {
          -> Result<Option<sipr_stats::TraceFile>, EngineError> {
             path.as_ref()
                 .map(|p| {
-                    sipr_stats::TraceFile::create(p).map_err(|e| {
-                        EngineError(format!("cannot create {what} file {}: {e}", p.display()))
+                    sipr_stats::TraceFile::create(p).map_err(|e| EngineError::Io {
+                        what: format!("cannot create {what} file {}", p.display()),
+                        path: p.clone(),
+                        source: e,
                     })
                 })
                 .transpose()
@@ -2158,8 +2226,10 @@ impl<'s> Engine<'s> {
             path.as_ref()
                 .map(|p| {
                     sipr_stats::TraceFile::open(p, &log_base, kind, overwrite, config.log_rotation)
-                        .map_err(|e| {
-                            EngineError(format!("cannot create {what} file {}: {e}", p.display()))
+                        .map_err(|e| EngineError::Io {
+                            what: format!("cannot create {what} file {}", p.display()),
+                            path: p.clone(),
+                            source: e,
                         })
                 })
                 .transpose()
@@ -6558,7 +6628,7 @@ fn build_sctp_transport(
     per_call: bool,
 ) -> Result<(Transport, &'static str, bool), EngineError> {
     if !sipr_net::sctp::available() {
-        return Err(EngineError(
+        return Err(EngineError::Config(
             "SCTP is not supported on this host (the kernel has no SCTP stack; Linux needs the \
              `sctp` module)"
                 .into(),
@@ -6569,13 +6639,17 @@ fn build_sctp_transport(
         Role::Uac => {
             let remote = config
                 .target
-                .ok_or_else(|| EngineError("SCTP UAC needs a remote target".into()))?;
+                .ok_or_else(|| EngineError::Config("SCTP UAC needs a remote target".into()))?;
             let remote = config.remote_sending_addr.unwrap_or(remote);
-            SctpTransport::connect(tcfg, net_tx, remote)
-                .map_err(|e| EngineError(format!("cannot connect SCTP to {remote}: {e}")))?
+            SctpTransport::connect(tcfg, net_tx, remote).map_err(|e| EngineError::Bind {
+                what: format!("cannot connect SCTP to {remote}"),
+                source: e,
+            })?
         }
-        Role::Uas => SctpTransport::listen(tcfg, net_tx)
-            .map_err(|e| EngineError(format!("cannot bind SCTP listener: {e}")))?,
+        Role::Uas => SctpTransport::listen(tcfg, net_tx).map_err(|e| EngineError::Bind {
+            what: "cannot bind SCTP listener".to_owned(),
+            source: e,
+        })?,
     };
     Ok((Transport::Sctp(t), "SCTP", true))
 }
@@ -6589,7 +6663,7 @@ fn build_sctp_transport(
     _role: Role,
     _per_call: bool,
 ) -> Result<(Transport, &'static str, bool), EngineError> {
-    Err(EngineError(
+    Err(EngineError::Config(
         "SCTP support is not enabled: rebuild sipr with `--features sctp` (Linux only at run time)"
             .into(),
     ))
@@ -6610,7 +6684,7 @@ fn seed_globals(
             } else {
                 space.global_names().join(", ")
             };
-            return Err(EngineError(format!(
+            return Err(EngineError::Config(format!(
                 "Can not set the global variable {name}, because it does not exist \
                  (declared <Global> variables: {declared})"
             )));
@@ -7172,7 +7246,7 @@ fn load_rtp_files(
             payload_type.unwrap_or(default_pt),
             payload_name.as_deref(),
         )
-        .map_err(|e| EngineError(format!("exec rtp_stream=: {e}")))?;
+        .map_err(|e| EngineError::Scenario(format!("exec rtp_stream=: {e}")))?;
         match source {
             RtpSource::Pattern { video, id } => {
                 if *video != params.video {
@@ -7189,11 +7263,13 @@ fn load_rtp_files(
                     continue;
                 }
                 let path = resolve_media_file(name, config);
-                let bytes = std::fs::read(&path).map_err(|e| {
-                    EngineError(format!(
-                        "exec rtp_stream=: cannot read '{name}' ({}): {e}",
+                let bytes = std::fs::read(&path).map_err(|e| EngineError::Io {
+                    what: format!(
+                        "exec rtp_stream=: cannot read '{name}' ({})",
                         path.display()
-                    ))
+                    ),
+                    path: path.clone(),
+                    source: e,
                 })?;
                 let data = sipr_media::rtp::stream_bytes(&bytes);
                 if data.len() < params.bytes_per_packet {
@@ -7223,15 +7299,17 @@ fn load_pcaps(
             continue;
         }
         let path = resolve_media_file(file, config);
-        let bytes = std::fs::read(&path).map_err(|e| {
-            EngineError(format!(
-                "play_pcap_{}: cannot read '{file}' ({}): {e}",
+        let bytes = std::fs::read(&path).map_err(|e| EngineError::Io {
+            what: format!(
+                "play_pcap_{}: cannot read '{file}' ({})",
                 kind.as_str(),
                 path.display()
-            ))
+            ),
+            path: path.clone(),
+            source: e,
         })?;
         let stream = sipr_media::pcap::parse(&bytes).map_err(|e| {
-            EngineError(format!(
+            EngineError::Scenario(format!(
                 "play_pcap_{}: cannot load '{file}' ({}): {e}",
                 kind.as_str(),
                 path.display()
@@ -7371,7 +7449,7 @@ fn validate_field_files(
             if let Keyword::Field { file, .. } = kw
                 && !resolves(file.as_deref())
             {
-                return Err(EngineError(match file {
+                return Err(EngineError::Scenario(match file {
                     Some(f) => format!(
                         "scenario uses [field... file={f}] but no injection file \
                          named '{f}' was given with -inf"

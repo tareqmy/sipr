@@ -18,6 +18,7 @@ sipr-auth = { workspace = true }
 sipr-stats = { workspace = true }
 sipr-media = { workspace = true }
 sipr-control = { workspace = true }
+thiserror = { workspace = true }
 
 [features]
 sctp = ["sipr-net/sctp"]

@@ -2044,10 +2044,12 @@ The steps are ordered as §6 of the design says; each is one commit.
       `Discard`); the stdin watcher moves into the binary and
       `EngineConfig::nostdin` goes; `#![deny(clippy::print_stderr,
       clippy::print_stdout)]` on the crate keeps it that way.
-- [ ] D4 `EngineError` is a `#[non_exhaustive]` `thiserror` enum
-      (`Config`, `Scenario`, `Bind`, `Io`, `Fatal`) implementing
+- [x] D4 `EngineError` is a `#[non_exhaustive]` `thiserror` enum
+      (`Config`, `Scenario`, `Bind`, `Io`; no `Fatal` — a run cut short
+      is `RunReport::fatal`, never an `Err`) implementing
       `std::error::Error`; every `Display` wording unchanged (the interop
-      tests match SIPp's).
+      tests match SIPp's) but one, the extended-3PCC dial failure, which
+      gained a prefix.
 - [ ] D2 `Run::start(scenario, config)` spawns the engine thread and
       returns a handle: `control()` (`set_rate`, `pause`, `resume`,
       `stop`, `abort`), `snapshots()` (the engine's 1 s tick),
