@@ -8896,8 +8896,9 @@ fn branching_recv_tail(recvs: &str) -> String {
 /// The branching cases (mirrored in `tests/interop.rs`): a name, the recvs,
 /// the `X-Branch` of the BYE the UAS sends once the INFO (sent 1 s after
 /// the ACK) matched, and when, in ms after the ACK — a fall-through shows
-/// 500 ms after the INFO, once the UPDATE recv has timed out. `flag` is
-/// set only when the `<ereg>` matches the INFO.
+/// 500 ms after the INFO, once the UPDATE recv has timed out, and a stay
+/// when the 2 s timeout armed at the ACK fires (3 s would mean the INFO
+/// restarted it). `flag` is set only when the `<ereg>` matches the INFO.
 const RECV_BRANCH_CASES: [(&str, &str, &str, u64); 7] = [
     (
         "a mandatory recv follows next=",
@@ -8983,17 +8984,22 @@ fn a_matched_recv_follows_next_test_and_chance() {
             .map(|h| h.join().expect("run"))
             .collect::<Vec<_>>()
     });
-    // Which BYE came back, and when, to the nearest 500 ms.
-    let outcome = |run: &RecvTimeoutRun| {
+    // Which BYE came back, and when: the case's expected delay when the
+    // BYE came within the window a correct run can produce (timers never
+    // fire early; seven UASes on a loaded runner slip by a few hundred
+    // ms), else the raw delay, so the mismatch shows it. Rounding to 500
+    // ms buckets used to flip a 1780 ms fall-through into the next bucket.
+    let outcome = |run: &RecvTimeoutRun, at_ms: u64| {
         run.request.as_ref().map(|(branch, after)| {
-            let rounded = (after.as_millis() + 250) / 500 * 500;
-            (branch.clone(), u64::try_from(rounded).expect("ms"))
+            let after = u64::try_from(after.as_millis()).expect("ms");
+            let on_time = (at_ms.saturating_sub(200)..at_ms + 700).contains(&after);
+            (branch.clone(), if on_time { at_ms } else { after })
         })
     };
     let got: Vec<_> = RECV_BRANCH_CASES
         .iter()
         .zip(&runs)
-        .map(|(&(name, ..), run)| (name, outcome(run)))
+        .map(|(&(name, _, _, at_ms), run)| (name, outcome(run, at_ms)))
         .collect();
     let expected: Vec<_> = RECV_BRANCH_CASES
         .iter()

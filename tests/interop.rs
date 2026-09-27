@@ -6899,7 +6899,7 @@ fn branch_bye(branch: &str, attrs: &str) -> String {
 
 /// One call against a recv-timeout UAS: its exit code (`None`: still
 /// running, reaped), the first request it sent back (`X-Branch`, delay
-/// after the ACK to the nearest 500 ms) and its `-trace_err` log.
+/// after the ACK in ms) and its `-trace_err` log.
 #[derive(Debug)]
 struct RecvTimeoutOutcome {
     code: Option<i32>,
@@ -6909,6 +6909,19 @@ struct RecvTimeoutOutcome {
 
 /// Where `run_recv_timeout_uas` keeps the UAS's stderr, in its tempdir.
 const UAS_STDERR: &str = "uas.stderr";
+
+/// A request's delay after the ACK, as `expected_ms` when it lies in the
+/// window a correct run can produce (timers never fire early; on a loaded
+/// runner fourteen UASes slip by a few hundred ms), else the raw delay, so
+/// a mismatch shows it. Rounding to 500 ms buckets used to flip a late
+/// wake-up into the next bucket.
+fn snap_delay(after_ms: u128, expected_ms: u128) -> u128 {
+    if (expected_ms.saturating_sub(200)..expected_ms + 700).contains(&after_ms) {
+        expected_ms
+    } else {
+        after_ms
+    }
+}
 
 /// What a UAS that never answered left behind: whether it is still running
 /// or how it exited, its stderr and its `-trace_err` log.
@@ -7026,7 +7039,7 @@ fn run_recv_timeout_uas(
         let text = String::from_utf8_lossy(&buf[..n]).into_owned();
         if !text.starts_with("SIP/2.0") {
             let branch = header(&text, "X-Branch:").unwrap_or_default();
-            back = Some((branch, (ack_at.elapsed().as_millis() + 250) / 500));
+            back = Some((branch, ack_at.elapsed().as_millis()));
             break;
         }
     }
@@ -7121,7 +7134,6 @@ fn recv_timeouts_arm_like_real_sipp() {
             ours.code, theirs.code,
             "{name}: exit code\n{theirs:?}\n{ours:?}"
         );
-        assert_eq!(ours.request, theirs.request, "{name}: timeout jump");
         assert_eq!(
             jump(&ours.error_log),
             jump(&theirs.error_log),
@@ -7148,20 +7160,31 @@ fn recv_timeouts_arm_like_real_sipp() {
             ),
             "window, INFO at 1 s" => (
                 Some(0),
-                Some(("late", 7)),
+                Some(("late", 3500)),
                 Some("recv-timeout-uas:4, jumping to label 6"),
             ),
             _ => (
                 Some(0),
-                Some(("early", 3)),
+                Some(("early", 1500)),
                 Some("recv-timeout-uas:3, jumping to label 5"),
             ),
         };
         assert_eq!(theirs.code, code, "{name}: real sipp's exit code");
+        let snapped = |r: &Option<(String, u128)>| {
+            r.as_ref().map(|(b, t)| {
+                let at = request.map_or(*t, |(_, at)| snap_delay(*t, at));
+                (b.clone(), at)
+            })
+        };
         assert_eq!(
-            theirs.request.as_ref().map(|(b, t)| (b.as_str(), *t)),
-            request,
+            snapped(&theirs.request),
+            request.map(|(b, at)| (b.to_owned(), at)),
             "{name}: real sipp's timeout jump"
+        );
+        assert_eq!(
+            snapped(&ours.request),
+            snapped(&theirs.request),
+            "{name}: timeout jump"
         );
         assert_eq!(jump(&theirs.error_log).as_deref(), warning, "{name}");
     }
@@ -7217,55 +7240,55 @@ fn a_matched_recv_branches_like_real_sipp() {
   <recv request="INFO" optional="true" next="jumped" test="flag">{unset}</recv>"#
     );
     // Name, recvs, and what real sipp does: the BYE's `X-Branch`, when it
-    // came (in 500 ms units after the ACK), and the timeout warning.
+    // came (in ms after the ACK), and the timeout warning.
     let cases: [(&str, String, &str, u128, Option<&str>); 7] = [
         (
             "a mandatory recv follows next=",
             info(r#" next="jumped" counter="infos""#, ""),
             "jumped",
-            2,
+            1000,
             None,
         ),
         (
             "a mandatory recv moves on when test= is unset",
             info(r#" next="jumped" test="flag""#, unset),
             "fell-through",
-            3,
+            1500,
             Some("recv-timeout-uas:4, jumping to label 5"),
         ),
         (
             "an optional recv follows next= when test= is set",
             info(r#" optional="true" next="jumped" test="flag""#, set),
             "jumped",
-            2,
+            1000,
             None,
         ),
         (
             "an optional recv stays when test= is unset",
             info(r#" optional="true" next="jumped" test="flag""#, unset),
             "timedout",
-            4,
+            2000,
             Some("recv-timeout-uas:3, jumping to label 7"),
         ),
         (
             "the stay keeps the call at the recv it waited at",
             behind,
             "timedout",
-            4,
+            2000,
             Some("recv-timeout-uas:3, jumping to label 8"),
         ),
         (
             "an optional recv without test= follows next=",
             info(r#" optional="true" next="jumped" chance="1""#, ""),
             "jumped",
-            2,
+            1000,
             None,
         ),
         (
             "chance=0 never jumps",
             info(r#" optional="true" next="jumped" chance="0""#, ""),
             "fell-through",
-            3,
+            1500,
             Some("recv-timeout-uas:4, jumping to label 5"),
         ),
     ];
@@ -7305,9 +7328,11 @@ fn a_matched_recv_branches_like_real_sipp() {
     for ((name, _, branch, at, warning), (theirs, ours)) in cases.iter().zip(outcomes) {
         // Pin what real sipp does, so the comparison cannot pass vacuously.
         assert_eq!(theirs.code, Some(0), "{name}: real sipp's exit code");
+        let snapped =
+            |r: &Option<(String, u128)>| r.as_ref().map(|(b, t)| (b.clone(), snap_delay(*t, *at)));
         assert_eq!(
-            theirs.request.as_ref().map(|(b, t)| (b.as_str(), *t)),
-            Some((*branch, *at)),
+            snapped(&theirs.request),
+            Some(((*branch).to_owned(), *at)),
             "{name}: real sipp's BYE"
         );
         assert_eq!(
@@ -7319,7 +7344,11 @@ fn a_matched_recv_branches_like_real_sipp() {
             ours.code, theirs.code,
             "{name}: exit code\n{theirs:?}\n{ours:?}"
         );
-        assert_eq!(ours.request, theirs.request, "{name}: the BYE sent");
+        assert_eq!(
+            snapped(&ours.request),
+            snapped(&theirs.request),
+            "{name}: the BYE sent"
+        );
         assert_eq!(
             jump(&ours.error_log),
             jump(&theirs.error_log),
