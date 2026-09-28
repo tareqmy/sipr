@@ -142,6 +142,10 @@ pub struct Cli {
     pub control_ip: Option<IpAddr>,
     /// `--sipr-http`: HTTP control API bind, `PORT` or `HOST:PORT`.
     pub http: Option<String>,
+    /// `--sipr-ws-path`: the resource the WebSocket upgrade asks for (default `/`).
+    pub ws_path: Option<String>,
+    /// `--sipr-ws-origin`: an `Origin` header on the WebSocket upgrade.
+    pub ws_origin: Option<String>,
     /// `--sipr-stats-json`: JSON-lines snapshot stream.
     pub stats_json: Option<PathBuf>,
     /// `--sipr-http-token`: bearer token for the HTTP API.
@@ -358,6 +362,8 @@ impl Default for Cli {
             control_port: None,
             control_ip: None,
             http: None,
+            ws_path: None,
+            ws_origin: None,
             http_token: None,
             stats_json: None,
             transport: Transport::UdpMono,
@@ -669,6 +675,18 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         true,
         "[HOST:]PORT",
         "HTTP/JSON control API (sipr addition; docs/CONTROL_API.md) [default: off]",
+    ),
+    (
+        "sipr-ws-path",
+        true,
+        "PATH",
+        "Resource the WebSocket upgrade requests with -t ws1|wsn|wss1|wssn (sipr addition) [default: /]",
+    ),
+    (
+        "sipr-ws-origin",
+        true,
+        "ORIGIN",
+        "Origin header on the WebSocket upgrade, e.g. https://example.org (sipr addition) [default: none]",
     ),
     (
         "sipr-http-token",
@@ -1409,6 +1427,8 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
         "cp" => cli.control_port = Some(parse_num(flag, &val(value))?),
         "ci" => cli.control_ip = Some(parse_num(flag, &val(value))?),
         "sipr-http" => cli.http = Some(val(value)),
+        "sipr-ws-path" => cli.ws_path = Some(val(value)),
+        "sipr-ws-origin" => cli.ws_origin = Some(val(value)),
         "sipr-stats-json" => cli.stats_json = Some(PathBuf::from(val(value))),
         "sipr-http-token" => cli.http_token = Some(val(value)),
         "t" => cli.transport = parse_transport(&val(value))?,
@@ -1935,6 +1955,22 @@ mod tests {
         assert!(run(&["-audiotolerance", "1.5", "x"]).is_err());
         let c = cli(&["-rtpcheck_debug", "-srtpcheck_debug", "x"]);
         assert!(c.rtpcheck_debug);
+    }
+
+    #[test]
+    fn websocket_request_flags_parse() {
+        let c = cli(&["-t", "ws1", "x"]);
+        assert_eq!(c.ws_path, None);
+        assert_eq!(c.ws_origin, None);
+        let c = cli(&[
+            "--sipr-ws-path",
+            "/sip/ws",
+            "--sipr-ws-origin",
+            "https://example.org",
+            "x",
+        ]);
+        assert_eq!(c.ws_path.as_deref(), Some("/sip/ws"));
+        assert_eq!(c.ws_origin.as_deref(), Some("https://example.org"));
     }
 
     #[test]

@@ -36,7 +36,7 @@ use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore, ServerCo
 use crate::rng::Rng;
 use crate::sockopt::SocketOpts;
 use crate::transport::{NetEvent, TransportConfig, framed_event};
-use crate::ws::{self, Framing, Next, Opcode, StreamFramer, Wire};
+use crate::ws::{self, Framing, Next, Opcode, StreamFramer, Wire, WsRequest};
 
 /// One read from the socket (ciphertext); the framer copes with any split.
 const READ_CHUNK: usize = 64 * 1024;
@@ -107,6 +107,8 @@ pub struct TlsTransport {
     send_loss_pct: f64,
     /// SIP or WebSocket framing on every connection (M51).
     framing: Framing,
+    /// The upgrade request dialed WebSocket connections send (M53).
+    ws_request: WsRequest,
     /// Masking keys for the frames of dialed WebSocket connections.
     mask_rng: Arc<Mutex<Rng>>,
     sink: Sender<NetEvent>,
@@ -189,7 +191,14 @@ impl TlsTransport {
         complete_handshake(&mut tls, &mut sock)
             .map_err(|e| std::io::Error::other(format!("TLS handshake with {remote}: {e}")))?;
         let mask_rng = Arc::new(Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0024)));
-        let upgraded = upgrade_dialed(&mut tls, &sock, config.framing, remote, &mask_rng)?;
+        let upgraded = upgrade_dialed(
+            &mut tls,
+            &sock,
+            config.framing,
+            &config.ws_request,
+            remote,
+            &mask_rng,
+        )?;
         let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
         register(&conns, peer, sock, tls, upgraded, &sink, &mask_rng)?;
         Ok(Self {
@@ -199,6 +208,7 @@ impl TlsTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0021)),
             send_loss_pct: config.send_loss_pct,
             framing: config.framing,
+            ws_request: config.ws_request.clone(),
             mask_rng,
             sink,
             client: Some(client_config),
@@ -226,6 +236,7 @@ impl TlsTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0023)),
             send_loss_pct: config.send_loss_pct,
             framing: config.framing,
+            ws_request: config.ws_request.clone(),
             mask_rng: Arc::new(Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0025))),
             sink,
             client: Some(client_config(tls_config)?),
@@ -262,7 +273,14 @@ impl TlsTransport {
         );
         complete_handshake(&mut tls, &mut sock)
             .map_err(|e| std::io::Error::other(format!("TLS handshake with {remote}: {e}")))?;
-        let upgraded = upgrade_dialed(&mut tls, &sock, self.framing, remote, &self.mask_rng)?;
+        let upgraded = upgrade_dialed(
+            &mut tls,
+            &sock,
+            self.framing,
+            &self.ws_request,
+            remote,
+            &self.mask_rng,
+        )?;
         register(
             &self.conns,
             peer,
@@ -294,8 +312,14 @@ impl TlsTransport {
         );
         complete_handshake(&mut tls, &mut sock)
             .map_err(|e| std::io::Error::other(format!("TLS handshake with {remote}: {e}")))?;
-        let Upgraded { wire, initial } =
-            upgrade_dialed(&mut tls, &sock, self.framing, remote, &self.mask_rng)?;
+        let Upgraded { wire, initial } = upgrade_dialed(
+            &mut tls,
+            &sock,
+            self.framing,
+            &self.ws_request,
+            remote,
+            &self.mask_rng,
+        )?;
         let read_sock = sock.try_clone()?;
         let tls = Arc::new(Mutex::new(tls));
         let reader_tls = Arc::clone(&tls);
@@ -424,6 +448,7 @@ impl TlsTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0022)),
             send_loss_pct: config.send_loss_pct,
             framing,
+            ws_request: config.ws_request.clone(),
             mask_rng,
             sink,
             // A server still dials out under `-rsa`; the same identity serves.
@@ -531,6 +556,7 @@ fn upgrade_dialed(
     tls: &mut Connection,
     sock: &TcpStream,
     framing: Framing,
+    request: &WsRequest,
     remote: SocketAddr,
     mask_rng: &Mutex<Rng>,
 ) -> std::io::Result<Upgraded> {
@@ -538,9 +564,13 @@ fn upgrade_dialed(
         Framing::Sip => Vec::new(),
         Framing::WebSocket => {
             let mut plain = PlainIo { tls, sock };
-            ws::client_handshake(&mut plain, &remote.to_string(), &mut ws::lock(mask_rng)).map_err(
-                |e| std::io::Error::other(format!("WebSocket upgrade with {remote}: {e}")),
-            )?
+            ws::client_handshake(
+                &mut plain,
+                &remote.to_string(),
+                request,
+                &mut ws::lock(mask_rng),
+            )
+            .map_err(|e| std::io::Error::other(format!("WebSocket upgrade with {remote}: {e}")))?
         }
     };
     Ok(Upgraded {
@@ -557,7 +587,7 @@ fn upgrade_accepted(
 ) -> std::io::Result<Upgraded> {
     let initial = match framing {
         Framing::Sip => Vec::new(),
-        Framing::WebSocket => ws::server_handshake(&mut PlainIo { tls, sock })?,
+        Framing::WebSocket => ws::server_handshake(&mut PlainIo { tls, sock })?.rest,
     };
     Ok(Upgraded {
         wire: Wire::accepted(framing),

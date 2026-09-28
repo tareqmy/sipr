@@ -85,7 +85,7 @@ pub use engine::{
     Behaviors, EngineConfig, EngineControl, EngineError, Extended3pcc, InjectionSource,
     LogOverwrite, Run, RunReport, SecondaryKind, TransportKind, run,
 };
-pub use sipr_net::{PeerTable, SocketOpts, TlsConfig, TlsVersion};
+pub use sipr_net::{PeerTable, SocketOpts, TlsConfig, TlsVersion, WsRequest};
 
 // The blocking entry points `Run` superseded, kept for one minor release.
 #[doc(hidden)]

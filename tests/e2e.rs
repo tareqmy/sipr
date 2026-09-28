@@ -9522,6 +9522,10 @@ struct WsUasStats {
     invites: u64,
     byes: u64,
     saw_ws_via: bool,
+    /// The resource the client's upgrade asked for.
+    path: String,
+    /// The client's `Origin` header, if any.
+    origin: Option<String>,
 }
 
 /// A scripted UAS speaking SIP over WebSocket (RFC 7118) by hand: accept one
@@ -9538,11 +9542,13 @@ fn spawn_ws_uas(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<WsUasSta
             return stats;
         };
         stream.set_read_timeout(Some(idle)).ok();
-        let Ok(initial) = server_handshake(&mut stream) else {
+        let Ok(upgrade) = server_handshake(&mut stream) else {
             return stats;
         };
+        stats.path = upgrade.path;
+        stats.origin = upgrade.origin;
         let mut framer = sipr_net::WsFramer::new();
-        framer.push(&initial);
+        framer.push(&upgrade.rest);
         let mut buf = [0u8; 16_384];
         loop {
             loop {
@@ -9587,8 +9593,9 @@ fn spawn_ws_uas(idle: Duration) -> (SocketAddr, std::thread::JoinHandle<WsUasSta
     (addr, handle)
 }
 
-/// sipr as a WebSocket UAC (`-t ws1`): it upgrades the connection, sends
-/// masked text frames, reads the UAS's unmasked ones, and the Via says WS.
+/// sipr as a WebSocket UAC (`-t ws1`): it upgrades the connection with the
+/// path and `Origin` it was given (M53), sends masked text frames, reads
+/// the UAS's unmasked ones, and the Via says WS.
 #[test]
 fn ws_uac_places_call_over_websocket() {
     let (addr, uas) = spawn_ws_uas(Duration::from_secs(3));
@@ -9597,6 +9604,10 @@ fn ws_uac_places_call_over_websocket() {
         "uac",
         "-t",
         "ws1",
+        "--sipr-ws-path",
+        "/sip/ws",
+        "--sipr-ws-origin",
+        "https://example.org",
         "-m",
         "1",
         "-d",
@@ -9614,6 +9625,58 @@ fn ws_uac_places_call_over_websocket() {
     assert_eq!(stats.invites, 1, "one INVITE framed off the WebSocket");
     assert_eq!(stats.byes, 1, "call torn down with BYE");
     assert!(stats.saw_ws_via, "[transport] rendered WS in the Via");
+    assert_eq!(stats.path, "/sip/ws", "--sipr-ws-path on the request line");
+    assert_eq!(
+        stats.origin.as_deref(),
+        Some("https://example.org"),
+        "--sipr-ws-origin as the Origin header"
+    );
+}
+
+/// The upgrade request flags are checked at start-up, and warned about
+/// when the transport is not WebSocket.
+#[test]
+fn ws_request_flags_are_validated_and_need_a_ws_transport() {
+    let out = run_sipr(&[
+        "-sn",
+        "uac",
+        "-t",
+        "ws1",
+        "--sipr-ws-path",
+        "sip",
+        "-m",
+        "1",
+        "-timeout",
+        "1",
+        "-bg",
+        "127.0.0.1:1",
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("--sipr-ws-path / --sipr-ws-origin"), "{err}");
+    assert!(err.contains("must start with '/'"), "{err}");
+    let out = run_sipr(&[
+        "-sn",
+        "uas",
+        "-t",
+        "t1",
+        "-p",
+        &free_port().to_string(),
+        "--sipr-ws-origin",
+        "https://example.org",
+        "-m",
+        "1",
+        "-timeout",
+        "1",
+        "-bg",
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(
+            "--sipr-ws-path / --sipr-ws-origin have no effect without -t ws1|wsn|wss1|wssn"
+        ),
+        "{err}"
+    );
 }
 
 /// sipr as a WebSocket UAS (`-t ws1`): a raw RFC 6455 client upgrades with
@@ -9650,8 +9713,13 @@ fn ws_uas_answers_a_raw_websocket_client() {
     sock.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
     let mut rng = sipr_net::rng::Rng::new(42);
-    let initial =
-        client_handshake(&mut sock, &format!("127.0.0.1:{port}"), &mut rng).expect("upgrade");
+    let initial = client_handshake(
+        &mut sock,
+        &format!("127.0.0.1:{port}"),
+        &sipr_net::WsRequest::default(),
+        &mut rng,
+    )
+    .expect("upgrade");
     let mut framer = sipr_net::WsFramer::new();
     framer.push(&initial);
 

@@ -134,7 +134,9 @@ Auth: `-au`/`-ap` (username/password defaults for `[authentication]`)
 `remote_ip:remote_port`, M21).
 Control (M17): `-cp <port>` `-ci <ip>` (SIPp's UDP control socket; `-cp 0`
 disables — sipr addition) and sipr's `--sipr-http [HOST:]PORT` /
-`--sipr-http-token` (docs/CONTROL_API.md). Statistics out (M46, sipr
+`--sipr-http-token` (docs/CONTROL_API.md). WebSocket upgrade (M53, sipr
+additions): `--sipr-ws-path <path>` `--sipr-ws-origin <origin>`.
+Statistics out (M46, sipr
 additions): `--sipr-stats-json <file>` (a JSON object per snapshot tick) and
 the `/metrics` endpoint on that API (Prometheus text). SIPp has neither.
 Tracing/output: `-trace_msg` `-trace_err` `-trace_stat` `-stf <file>`
@@ -475,9 +477,12 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   orderly disconnect, a message over 16 MiB or a reserved opcode drops
   the peer. `[transport]` renders `WS`/`WSS` (Via `SIP/2.0/WS`); a
   Contact that needs `;transport=ws` writes it as SIPp scenarios do,
-  `transport=[transport]`. Not offered: a request path other than `/`,
-  an `Origin` header, and extensions (none is negotiated, whatever the
-  peer offers).
+  `transport=[transport]`. `--sipr-ws-path` (default `/`) and
+  `--sipr-ws-origin` set the resource on the upgrade's request line and
+  an `Origin` header, for gateways that route or gate on them (M53; both
+  are checked at start-up, and warned about under any other `-t`); as
+  the server sipr accepts any path and any `Origin`. Not offered:
+  extensions (none is negotiated, whatever the peer offers).
 - Classic 3PCC `-3pcc HOST:PORT` (M10, verified in `scenario.cpp` role
   detection, `call.cpp` `sendCmdMessage`/`sendCmdBuffer`, `sipp.cpp`
   `SIPP_OPTION_3PCC`): two instances coordinate over a separate TCP "twin"

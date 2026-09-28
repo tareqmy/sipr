@@ -29,6 +29,94 @@ pub enum Framing {
     WebSocket,
 }
 
+/// What sipr puts in the upgrade request it sends as the WebSocket client
+/// (RFC 6455 §4.1): the resource name on the request line and an optional
+/// `Origin` header, for servers that route or gate on them
+/// (`--sipr-ws-path`, `--sipr-ws-origin`; M53). The default asks for `/`
+/// and sends no `Origin`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsRequest {
+    path: String,
+    origin: Option<String>,
+}
+
+impl Default for WsRequest {
+    fn default() -> Self {
+        Self {
+            path: "/".to_owned(),
+            origin: None,
+        }
+    }
+}
+
+impl WsRequest {
+    /// A request for `path` (which must start with `/`), with an `Origin`
+    /// header when `origin` is given.
+    ///
+    /// # Errors
+    ///
+    /// A path that does not start with `/`, an empty origin, or either
+    /// holding whitespace or a control character (which would break the
+    /// request head).
+    pub fn new(path: &str, origin: Option<&str>) -> Result<Self, String> {
+        if !path.starts_with('/') {
+            return Err(format!("WebSocket path '{path}' must start with '/'"));
+        }
+        check_head_token("path", path)?;
+        if let Some(o) = origin {
+            if o.is_empty() {
+                return Err("WebSocket origin must not be empty".to_owned());
+            }
+            check_head_token("origin", o)?;
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            origin: origin.map(str::to_owned),
+        })
+    }
+
+    /// The resource name on the request line.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The `Origin` header's value, if one is sent.
+    #[must_use]
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+
+    /// Whether this is the default request (`/`, no `Origin`).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.path == "/" && self.origin.is_none()
+    }
+}
+
+/// A value that goes on a request line or header must not carry what
+/// ends or splits one.
+fn check_head_token(what: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "WebSocket {what} '{value}' must not contain whitespace or control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// What the server side of the upgrade learned from the request, with the
+/// bytes that arrived after its head (the start of the first frames).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerUpgrade {
+    /// The resource name the client asked for (`/` when absent).
+    pub path: String,
+    /// The client's `Origin` header, if any.
+    pub origin: Option<String>,
+    /// Bytes read past the request head.
+    pub rest: Vec<u8>,
+}
+
 /// The constant every accept key is derived with (RFC 6455 §1.3).
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -49,8 +137,9 @@ pub fn accept_key(key: &str) -> String {
 }
 
 /// Upgrade a freshly connected stream as the client (RFC 6455 §4.1, with
-/// RFC 7118 §4's `Sec-WebSocket-Protocol: sip`). Returns the bytes that
-/// arrived after the response head: the start of the first frames.
+/// RFC 7118 §4's `Sec-WebSocket-Protocol: sip`), asking for `request`'s
+/// path and `Origin`. Returns the bytes that arrived after the response
+/// head: the start of the first frames.
 ///
 /// # Errors
 ///
@@ -58,20 +147,27 @@ pub fn accept_key(key: &str) -> String {
 pub fn client_handshake<S: Read + Write>(
     io: &mut S,
     host: &str,
+    request: &WsRequest,
     rng: &mut Rng,
 ) -> io::Result<Vec<u8>> {
     let mut nonce = [0u8; 16];
     rng.fill(&mut nonce);
     let key = sipr_auth::base64::encode(&nonce);
+    let origin = request
+        .origin()
+        .map(|o| format!("Origin: {o}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "GET / HTTP/1.1\r\n\
+        "GET {} HTTP/1.1\r\n\
          Host: {host}\r\n\
+         {origin}\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {key}\r\n\
          Sec-WebSocket-Version: 13\r\n\
          Sec-WebSocket-Protocol: sip\r\n\
-         \r\n"
+         \r\n",
+        request.path()
     );
     io.write_all(request.as_bytes())?;
     io.flush()?;
@@ -96,14 +192,14 @@ pub fn client_handshake<S: Read + Write>(
 
 /// Upgrade an accepted stream as the server (RFC 6455 §4.2): read the
 /// request, answer `101` with the accept key, and echo the `sip`
-/// subprotocol when the client offered it. Returns the bytes that arrived
-/// after the request head.
+/// subprotocol when the client offered it. Any path and any `Origin` are
+/// accepted and reported; a test tool gates on neither.
 ///
 /// # Errors
 ///
 /// I/O failures, or a request that is not a version-13 WebSocket upgrade
 /// (answered with `400` or `426` before the error).
-pub fn server_handshake<S: Read + Write>(io: &mut S) -> io::Result<Vec<u8>> {
+pub fn server_handshake<S: Read + Write>(io: &mut S) -> io::Result<ServerUpgrade> {
     let (head, rest) = read_head(io)?;
     let head = String::from_utf8_lossy(&head);
     let request_line = head.lines().next().unwrap_or_default();
@@ -141,7 +237,15 @@ pub fn server_handshake<S: Read + Write>(io: &mut S) -> io::Result<Vec<u8>> {
     );
     io.write_all(response.as_bytes())?;
     io.flush()?;
-    Ok(rest)
+    Ok(ServerUpgrade {
+        path: request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("/")
+            .to_owned(),
+        origin: header(&head, "Origin"),
+        rest,
+    })
 }
 
 /// Answer a bad upgrade request and let the caller drop the peer.
@@ -690,7 +794,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let server = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().expect("accept");
-            let rest = server_handshake(&mut sock).expect("server handshake");
+            let rest = server_handshake(&mut sock).expect("server handshake").rest;
             // The client's first frame may ride in with the request.
             let mut framer = WsFramer::new();
             framer.push(&rest);
@@ -707,7 +811,13 @@ mod tests {
         });
         let mut sock = TcpStream::connect(addr).expect("connect");
         let mut rng = Rng::new(7);
-        let rest = client_handshake(&mut sock, &addr.to_string(), &mut rng).expect("client");
+        let rest = client_handshake(
+            &mut sock,
+            &addr.to_string(),
+            &WsRequest::default(),
+            &mut rng,
+        )
+        .expect("client");
         assert!(rest.is_empty());
         let key = mask_key(&mut rng);
         sock.write_all(&frame(Opcode::Text, b"OPTIONS", Some(key)))
@@ -716,6 +826,46 @@ mod tests {
             server.join().expect("server"),
             Ok(Some(WsEvent::Message(b"OPTIONS".to_vec())))
         );
+    }
+
+    /// `--sipr-ws-path` / `--sipr-ws-origin`: the request line carries the
+    /// path and the head an `Origin`, and the server side reports both.
+    #[test]
+    fn client_request_carries_path_and_origin_and_the_server_reports_them() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            server_handshake(&mut sock).expect("server handshake")
+        });
+        let mut sock = TcpStream::connect(addr).expect("connect");
+        let request = WsRequest::new("/sip/ws", Some("https://example.org")).expect("request");
+        client_handshake(&mut sock, &addr.to_string(), &request, &mut Rng::new(5)).expect("client");
+        let seen = server.join().expect("server");
+        assert_eq!(seen.path, "/sip/ws");
+        assert_eq!(seen.origin.as_deref(), Some("https://example.org"));
+        assert!(seen.rest.is_empty());
+    }
+
+    #[test]
+    fn a_ws_request_is_validated() {
+        assert!(WsRequest::default().is_default());
+        assert_eq!(WsRequest::default().path(), "/");
+        assert_eq!(WsRequest::default().origin(), None);
+        let ok = WsRequest::new("/", Some("http://h:80")).expect("ok");
+        assert!(!ok.is_default());
+        assert_eq!(ok.origin(), Some("http://h:80"));
+        for (path, origin) in [
+            ("sip", None),
+            ("", None),
+            ("/a b", None),
+            ("/x\r\nEvil: 1", None),
+            ("/", Some("")),
+            ("/", Some("https://h\r\nEvil: 1")),
+            ("/", Some("a b")),
+        ] {
+            assert!(WsRequest::new(path, origin).is_err(), "{path:?} {origin:?}");
+        }
     }
 
     #[test]
@@ -756,7 +906,8 @@ mod tests {
             );
         });
         let mut sock = TcpStream::connect(addr).expect("connect");
-        let err = client_handshake(&mut sock, "x", &mut Rng::new(1)).expect_err("refused");
+        let err = client_handshake(&mut sock, "x", &WsRequest::default(), &mut Rng::new(1))
+            .expect_err("refused");
         assert!(err.to_string().contains("Sec-WebSocket-Accept"), "{err}");
     }
 

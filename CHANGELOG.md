@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `--sipr-ws-path` and `--sipr-ws-origin` (M53): the resource on the
+  WebSocket upgrade's request line (default `/`) and an `Origin` header,
+  for gateways that route or gate on them. Both are validated at
+  start-up and warned about under a transport other than
+  `-t ws1|wsn|wss1|wssn`. In the library, `EngineConfig::ws_request`
+  holds a `WsRequest`, and `server_handshake` now returns a
+  `ServerUpgrade` naming the path and `Origin` a client asked for.
+
 ## [0.31.0] — 2026-09-28
 
 ### Changed

@@ -83,6 +83,10 @@ pub struct TransportConfig {
     /// SIP's `Content-Length`, or WebSocket frames (`-t ws*`, M51). UDP
     /// and SCTP ignore it.
     pub framing: crate::ws::Framing,
+    /// The upgrade request a WebSocket client connection sends: its path
+    /// and `Origin` (`--sipr-ws-path`, `--sipr-ws-origin`; M53). Only read
+    /// under [`crate::ws::Framing::WebSocket`].
+    pub ws_request: crate::ws::WsRequest,
 }
 
 /// The event for a whole message `raw` that a stream connection framed:

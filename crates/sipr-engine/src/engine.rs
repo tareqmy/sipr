@@ -220,6 +220,10 @@ pub struct EngineConfig {
     /// transports ([`TransportKind::TlsMono`] and its per-call and `wss`
     /// siblings).
     pub tls: Option<sipr_net::TlsConfig>,
+    /// `--sipr-ws-path` / `--sipr-ws-origin`: the upgrade request a
+    /// WebSocket client connection sends (`-t ws*`/`wss*`; M53). The default
+    /// asks for `/` with no `Origin`.
+    pub ws_request: sipr_net::WsRequest,
     /// `-mi`: media address for `[media_ip]` and the RTP sockets (default:
     /// the local signaling IP).
     pub media_ip: Option<IpAddr>,
@@ -357,6 +361,7 @@ impl Default for EngineConfig {
             callid_slash_ign: false,
             notices: crate::NoticeSink::Stderr,
             tls: None,
+            ws_request: sipr_net::WsRequest::default(),
             media_ip: None,
             media_port: None,
             max_rtp_port: None,
@@ -2179,6 +2184,7 @@ impl<'s> Engine<'s> {
             loss_seed: config.seed,
             sockopts: config.sockopts.clone(),
             framing: sipr_net::Framing::Sip,
+            ws_request: config.ws_request.clone(),
         };
         let per_call = config.transport.per_call() && scenario.role == Role::Uac;
         // `-t ui`: the main socket binds the first injected IP (SIPp: "on some
@@ -2215,6 +2221,11 @@ impl<'s> Engine<'s> {
         } else {
             sipr_net::Framing::Sip
         };
+        if !websocket && !config.ws_request.is_default() {
+            config.notices.warning(
+                "--sipr-ws-path / --sipr-ws-origin have no effect without -t ws1|wsn|wss1|wssn",
+            );
+        }
         let (transport, transport_token, reliable) = match config.transport {
             TransportKind::UdpMono | TransportKind::UdpPerCall | TransportKind::UdpPerIp => {
                 let u = UdpTransport::bind(&tcfg, net_tx).map_err(|e| EngineError::Bind {

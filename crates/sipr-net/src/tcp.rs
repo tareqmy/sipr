@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use crate::rng::Rng;
 use crate::sockopt::SocketOpts;
 use crate::transport::{NetEvent, TransportConfig, framed_event};
-use crate::ws::{self, Framing, Next, Opcode, StreamFramer, Wire};
+use crate::ws::{self, Framing, Next, Opcode, StreamFramer, Wire, WsRequest};
 
 /// One read from the socket; big enough to hold most whole messages, but the
 /// framer copes with any split.
@@ -142,6 +142,8 @@ pub struct TcpTransport {
     send_loss_pct: f64,
     /// SIP or WebSocket framing on every connection (M51).
     framing: Framing,
+    /// The upgrade request dialed WebSocket connections send (M53).
+    ws_request: WsRequest,
     /// Masking keys for the frames of dialed WebSocket connections.
     mask_rng: Arc<Mutex<Rng>>,
     sink: Sender<NetEvent>,
@@ -205,7 +207,13 @@ impl TcpTransport {
         config.sockopts.apply(&stream)?;
         let local_addr = stream.local_addr()?;
         let peer = stream.peer_addr()?;
-        let (wire, initial) = upgrade_dialed(&mut stream, config.framing, remote, &mask_rng)?;
+        let (wire, initial) = upgrade_dialed(
+            &mut stream,
+            config.framing,
+            &config.ws_request,
+            remote,
+            &mask_rng,
+        )?;
         let conns: Conns = Arc::new(Mutex::new(HashMap::new()));
         register(&conns, peer, stream, wire, initial, &sink, &mask_rng)?;
         Ok(Self {
@@ -215,6 +223,7 @@ impl TcpTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0011)),
             send_loss_pct: config.send_loss_pct,
             framing: config.framing,
+            ws_request: config.ws_request.clone(),
             mask_rng,
             sink,
             stop: Arc::new(AtomicBool::new(false)),
@@ -234,6 +243,7 @@ impl TcpTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0013)),
             send_loss_pct: config.send_loss_pct,
             framing: config.framing,
+            ws_request: config.ws_request.clone(),
             mask_rng: Arc::new(Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0015))),
             sink,
             stop: Arc::new(AtomicBool::new(false)),
@@ -260,7 +270,13 @@ impl TcpTransport {
         let mut stream = TcpStream::connect(remote)?;
         self.sockopts.apply(&stream)?;
         let peer = stream.peer_addr()?;
-        let (wire, initial) = upgrade_dialed(&mut stream, self.framing, remote, &self.mask_rng)?;
+        let (wire, initial) = upgrade_dialed(
+            &mut stream,
+            self.framing,
+            &self.ws_request,
+            remote,
+            &self.mask_rng,
+        )?;
         register(
             &self.conns,
             peer,
@@ -283,7 +299,13 @@ impl TcpTransport {
         self.sockopts.apply(&stream)?;
         let local_addr = stream.local_addr()?;
         let peer = stream.peer_addr()?;
-        let (wire, initial) = upgrade_dialed(&mut stream, self.framing, remote, &self.mask_rng)?;
+        let (wire, initial) = upgrade_dialed(
+            &mut stream,
+            self.framing,
+            &self.ws_request,
+            remote,
+            &self.mask_rng,
+        )?;
         let read_half = stream.try_clone()?;
         let write_half = stream.try_clone()?;
         let write_lock = Arc::new(Mutex::new(()));
@@ -390,6 +412,7 @@ impl TcpTransport {
             send_rng: Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0012)),
             send_loss_pct: config.send_loss_pct,
             framing,
+            ws_request: config.ws_request.clone(),
             mask_rng,
             sink,
             stop,
@@ -441,16 +464,19 @@ impl TcpTransport {
 fn upgrade_dialed(
     stream: &mut TcpStream,
     framing: Framing,
+    request: &WsRequest,
     remote: SocketAddr,
     mask_rng: &Mutex<Rng>,
 ) -> std::io::Result<(Wire, Vec<u8>)> {
     let initial = match framing {
         Framing::Sip => Vec::new(),
-        Framing::WebSocket => {
-            ws::client_handshake(stream, &remote.to_string(), &mut ws::lock(mask_rng)).map_err(
-                |e| std::io::Error::other(format!("WebSocket upgrade with {remote}: {e}")),
-            )?
-        }
+        Framing::WebSocket => ws::client_handshake(
+            stream,
+            &remote.to_string(),
+            request,
+            &mut ws::lock(mask_rng),
+        )
+        .map_err(|e| std::io::Error::other(format!("WebSocket upgrade with {remote}: {e}")))?,
     };
     Ok((Wire::dialed(framing), initial))
 }
@@ -478,14 +504,16 @@ fn accept_connection(
             let mask_rng = Arc::clone(mask_rng);
             let _ = std::thread::Builder::new()
                 .name("sipr-ws-handshake".into())
-                .spawn(move || match ws::server_handshake(&mut stream) {
-                    Ok(initial) => {
-                        let _ = register(&conns, peer, stream, wire, initial, &sink, &mask_rng);
-                    }
-                    Err(e) => {
-                        eprintln!("sipr: warning: WebSocket upgrade from {peer} failed: {e}");
-                    }
-                });
+                .spawn(
+                    move || match ws::server_handshake(&mut stream).map(|u| u.rest) {
+                        Ok(initial) => {
+                            let _ = register(&conns, peer, stream, wire, initial, &sink, &mask_rng);
+                        }
+                        Err(e) => {
+                            eprintln!("sipr: warning: WebSocket upgrade from {peer} failed: {e}");
+                        }
+                    },
+                );
         }
     }
 }
@@ -848,7 +876,13 @@ mod tests {
         // A raw peer speaking RFC 6455 by hand.
         let mut raw = TcpStream::connect(srv_addr).expect("raw connect");
         let mut rng = Rng::new(3);
-        ws::client_handshake(&mut raw, &srv_addr.to_string(), &mut rng).expect("upgrade");
+        ws::client_handshake(
+            &mut raw,
+            &srv_addr.to_string(),
+            &WsRequest::default(),
+            &mut rng,
+        )
+        .expect("upgrade");
         raw.write_all(&ws::frame(Opcode::Text, MSG, Some(ws::mask_key(&mut rng))))
             .expect("frame");
         raw.write_all(&ws::frame(

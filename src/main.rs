@@ -401,6 +401,11 @@ fn engine_config(
         config.video_tolerance = t;
     }
     config.rtpcheck_debug = cli.rtpcheck_debug;
+    config.ws_request = sipr_engine::WsRequest::new(
+        cli.ws_path.as_deref().unwrap_or("/"),
+        cli.ws_origin.as_deref(),
+    )
+    .map_err(|e| format!("--sipr-ws-path / --sipr-ws-origin: {e}"))?;
     config.control_port = cli.control_port;
     config.control_ip = cli.control_ip;
     config.http_addr = match cli.http.as_deref() {

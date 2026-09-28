@@ -231,12 +231,13 @@ snapshots, never on the hot path.
 
 ## 7. Next steps
 
-M0–M52 are done: SIPp parity is complete (v0.28.0), the hot path is
+M0–M53 are done: SIPp parity is complete (v0.28.0), the hot path is
 measured against real sipp (M45), `--check` lints scenarios (M47),
 `sipr-engine` is a library any Rust harness can embed (M49,
 `docs/LIBRARY_API.md`), every parser of untrusted bytes has a fuzz
 target (M50, `make fuzz`), SIP over WebSocket is a transport (M51,
-`-t ws1|wsn|wss1|wssn`), and the RTP check is judged at SIPp's defaults
-with `-rtpcheck_debug` writing its files (M52). What comes next is the
-M53+ list at the bottom of `docs/MILESTONES.md`, empty until the users of
-the HTTP API and the library ask for something.
+`-t ws1|wsn|wss1|wssn`), the RTP check is judged at SIPp's defaults
+with `-rtpcheck_debug` writing its files (M52), and the WebSocket upgrade
+takes a path and an `Origin` (M53, `--sipr-ws-path`, `--sipr-ws-origin`).
+What comes next is the M54+ list at the bottom of `docs/MILESTONES.md`,
+empty until the users of the HTTP API and the library ask for something.

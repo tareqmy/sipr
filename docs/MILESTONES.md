@@ -2206,8 +2206,31 @@ now writes SIPp's `debugafile` / `debugvfile` in the working directory.
 - [x] Docs: `docs/SIPP_COMPAT.md` (M18 note, the rtp_stream note, §3
       flag list), CHANGELOG (a `Changed` entry: the exit code moves).
 
-### M53+ — further additions (after M52)
+### M53 — WebSocket upgrade path and `Origin` ✅
+
+The two things M51 left out of the upgrade request, for the gateways
+that route on them: `--sipr-ws-path` (default `/`) sets the resource on
+the request line and `--sipr-ws-origin` adds an `Origin` header. Both are
+sipr additions (SIPp has no WebSocket), validated at start-up — a path
+must start with `/`, and neither may carry whitespace or a control
+character, which would break the head — and warned about under any
+transport that is not `ws*`/`wss*`. As the server sipr keeps accepting
+any path and any `Origin`, and now reports both.
+
+- [x] `sipr_net::WsRequest` (validated constructor, `Default` = `/` and
+      no `Origin`) on `TransportConfig`; `client_handshake` takes it;
+      `server_handshake` returns a `ServerUpgrade` with the path, the
+      `Origin` and the bytes after the head.
+- [x] `EngineConfig::ws_request`; the CLI flags; the no-effect warning.
+- [x] Tests: the request line and `Origin` as the server sees them and
+      the validation table (ws.rs), the CLI parse, e2e
+      `ws_uac_places_call_over_websocket` asserts both on the scripted
+      UAS, and `ws_request_flags_are_validated_and_need_a_ws_transport`.
+- [x] Docs: `docs/SIPP_COMPAT.md` (§3 flags, §6 bullet),
+      `docs/LIBRARY_API.md`, CHANGELOG.
+
+### M54+ — further additions (after M53)
 
 Candidates, to be promoted into numbered milestones in the order the
 users of the HTTP API and the library ask for them. None listed yet:
-the parity backlog is closed; M49, M50 and M51 are sipr's own.
+the parity backlog is closed; M49, M50, M51 and M53 are sipr's own.

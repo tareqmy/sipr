@@ -41,4 +41,4 @@ pub use timer::{TimerQueue, TimerService};
 pub use tls::{TlsCallConn, TlsConfig, TlsTransport, TlsVersion};
 pub use transport::{InboundPacket, NetEvent, TransportConfig, UdpCallSocket, UdpTransport};
 pub use twin::{EscFramer, PeerLinks, PeerTable, TwinChannel, TwinEvent};
-pub use ws::{Framing, WsFramer};
+pub use ws::{Framing, ServerUpgrade, WsFramer, WsRequest};
