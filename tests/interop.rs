@@ -2041,18 +2041,57 @@ fn rsa_both_ways_against_real_sipp() {
     );
 }
 
+/// What times the kill of the first UAS in [`tcp_reconnect_pair`]: the
+/// UAC's own evidence that call one is over, so the kill lands between
+/// call one and call two however slowly a loaded host runs the pair. A
+/// fixed delay used to do it and flaked: sipp reaching its connect after
+/// the kill meant the dead socket was never used and all three calls
+/// passed (exit 0 instead of 1).
+enum KillWhen<'a> {
+    /// A substring of the UAC's stderr (sipr's live line after call one).
+    UacStderr(&'a str),
+    /// The `count`-th occurrence of `needle` across the UAC's `-trace_msg`
+    /// logs in `cwd` (sipp: the second `SIP/2.0 200` is the BYE's).
+    UacMessages { needle: &'a str, count: usize },
+}
+
+/// Poll `dir`'s `*_messages.log` files until `needle` occurs `count` times
+/// in total, or `timeout` passes (then `false`).
+fn wait_for_messages(dir: &std::path::Path, needle: &str, count: usize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let seen: usize = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with("_messages.log"))
+            .map(|e| {
+                std::fs::read_to_string(e.path())
+                    .unwrap_or_default()
+                    .matches(needle)
+                    .count()
+            })
+            .sum();
+        if seen >= count {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
 /// Run a UAS binary on `port` for the first call, kill it (its connection
 /// goes with it) between call one and call two, and start a second one
 /// while `uac_bin` places three calls over TCP a second apart with a
 /// reconnection budget; return the UAC's exit code and stderr. `cwd`
-/// receives sipp's trace files. `kill_when` is a UAC stderr substring that
-/// times the kill (sipr's live line after call one); `None` = fixed delay.
+/// receives sipp's trace files. `kill_when` times the kill on the UAC's
+/// evidence that call one completed.
 fn tcp_reconnect_pair(
     uas_bin: &std::path::Path,
     uas_extra: &[&str],
     uac_bin: &std::path::Path,
     uac_extra: &[&str],
-    kill_when: Option<&str>,
+    kill_when: KillWhen<'_>,
     cwd: &std::path::Path,
 ) -> (Option<i32>, String) {
     let port = free_port();
@@ -2121,7 +2160,10 @@ fn tcp_reconnect_pair(
     );
     let stderr_pipe = uac.0.stderr.take().expect("stderr");
     let (seen_tx, seen_rx) = std::sync::mpsc::channel::<()>();
-    let marker = kill_when.map(str::to_owned);
+    let marker = match kill_when {
+        KillWhen::UacStderr(m) => Some(m.to_owned()),
+        KillWhen::UacMessages { .. } => None,
+    };
     let reader = std::thread::spawn(move || {
         use std::io::BufRead;
         let mut all = String::new();
@@ -2137,14 +2179,16 @@ fn tcp_reconnect_pair(
         }
         all
     });
-    // Kill the first UAS between call one and call two: when the UAC's
-    // stderr shows `kill_when` (sipr's live line after call one), else after
-    // a fixed delay (sipp, whose first call is at t=0 and the next at 1 s).
-    match kill_when {
-        Some(_) => {
-            let _ = seen_rx.recv_timeout(Duration::from_secs(8));
+    // Kill the first UAS between call one and call two, once the UAC has
+    // seen call one through (its next call is a second after its first).
+    let seen = match kill_when {
+        KillWhen::UacStderr(_) => seen_rx.recv_timeout(Duration::from_secs(8)).is_ok(),
+        KillWhen::UacMessages { needle, count } => {
+            wait_for_messages(cwd, needle, count, Duration::from_secs(8))
         }
-        None => std::thread::sleep(Duration::from_millis(600)),
+    };
+    if !seen {
+        eprintln!("tcp_reconnect_pair: call one not seen within 8 s; killing the UAS anyway");
     }
     let _ = first.0.kill();
     let _ = first.0.wait();
@@ -2172,7 +2216,7 @@ fn sipr_tcp_uac_reconnects_to_real_sipp() {
         &[],
         &sipr,
         &["-bg", "-rp", "2000"],
-        Some(" ok 1 failed 0"),
+        KillWhen::UacStderr(" ok 1 failed 0"),
         dir.path(),
     );
     assert_eq!(
@@ -2199,8 +2243,19 @@ fn real_sipp_tcp_uac_reconnects_to_sipr() {
     };
     let sipr = PathBuf::from(env!("CARGO_BIN_EXE_sipr"));
     let dir = tempfile::tempdir().expect("tempdir");
-    let (code, stderr) =
-        tcp_reconnect_pair(&sipr, &["-bg"], &sipp, &["-trace_err"], None, dir.path());
+    // sipp's -trace_msg log shows call one's 200s: the INVITE's, then the
+    // BYE's, which is when call one is over on sipp's side.
+    let (code, stderr) = tcp_reconnect_pair(
+        &sipr,
+        &["-bg"],
+        &sipp,
+        &["-trace_err", "-trace_msg"],
+        KillWhen::UacMessages {
+            needle: "SIP/2.0 200",
+            count: 2,
+        },
+        dir.path(),
+    );
     if code != Some(0) && sipp_stream_client_cannot_bind(dir.path()) {
         eprintln!("SKIPPED interop::real_sipp_tcp_uac_reconnects_to_sipr — sipp bind limitation.");
         return;
