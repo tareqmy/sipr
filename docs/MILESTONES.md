@@ -496,9 +496,10 @@ Behavioral oracle: `sipp.cpp` `rtp_echo_thread` / `setup_media_sockets` /
       (SIPp's `EXIT_RTPCHECK_FAILED` = -3 as the shell sees it) and the
       summary says `rtpcheck N/M failed`. Tallies of streams ending with
       their calls are collected at shutdown before the report.
-- [x] Deliberate divergence: sipr judges a stream **only when a tolerance
-      flag was given**. SIPp judges always with a default of 1.0, so any
-      `rtp_stream` run against a peer that does not echo exits -3.
+- [x] Deliberate divergence (withdrawn in M52): sipr judged a stream
+      **only when a tolerance flag was given**. SIPp judges always with a
+      default of 1.0, so any `rtp_stream` run against a peer that does
+      not echo exits -3 — and since M52 so does sipr.
 - [x] Tests: echo unit tests (both sockets, counters, the toggle, probing
       past a taken port), a scheduler test proving the check passes against
       an echo peer, e2e sipr-vs-sipr `rtp_echo_uas_makes_the_uac_rtpcheck_pass`,
@@ -506,7 +507,8 @@ Behavioral oracle: `sipp.cpp` `rtp_echo_thread` / `setup_media_sockets` /
       `-rtp_echo` warning, interop `rtpcheck_against_real_sipp_echo`
       (`sipp -rtp_echo` echoes, sipr passes 1/1).
 - [x] Deferred: `exec rtp_echo=startaudio|…` (SIPp's per-call SRTP echo
-      threads — SRTP is out of scope), `-rtpcheck_debug` hex dumps.
+      threads — SRTP is out of scope; M25), `-rtpcheck_debug` hex dumps
+      (M52).
 
 ## M19 — AKA resynchronisation (AUTS) ✅
 
@@ -639,7 +641,8 @@ per-call echo), SIPp's `pfca_*crypto*` scenarios. Divergences in SIPP_COMPAT §6
 - [x] Media thread: generated streams are protected on send and the echo
       check unprotects with the peer's key before comparing plaintext (an
       auth failure counts as a miss). pcap replays stay as captured.
-- [x] `-srtpcheck_debug` / `-rtpcheck_debug` accepted as no-ops.
+- [x] `-srtpcheck_debug` / `-rtpcheck_debug` accepted as no-ops
+      (`-rtpcheck_debug` writes its files since M52).
 - [x] Tests: KDF/keystream/HMAC vectors, transform round trips for every
       suite incl. rollover and tampering, SDP crypto parsing, keyword
       tokenizing, corpus `positive/srtp_sdes.xml` (two suites, pattern
@@ -2174,7 +2177,36 @@ and base64 for `Sec-WebSocket-Accept` (the first internal dependency of
       out of "Not yet"), ARCHITECTURE §1, CHANGELOG, AGENTS/PLAN state
       lines.
 
-### M52+ — further additions (after M51)
+### M52 — RTP check at SIPp's defaults, `-rtpcheck_debug` ✅
+
+The last recorded divergence in the media path, withdrawn: every
+`rtp_stream` that sent a packet is judged against `-audiotolerance` /
+`-videotolerance` at SIPp's default of 1.0, so a run against a peer that
+does not echo exits 253 as SIPp's does. Confirmed against real sipp
+before changing anything: a pattern at a silent UAS exits 253, at an
+echoing one 0, and a file stream at an echoing one 0 too (its debug
+file shows some echoes arriving before the next check, so the ratio
+stays under 1.0). `-rtpcheck_debug`, accepted and ignored since M25,
+now writes SIPp's `debugafile` / `debugvfile` in the working directory.
+
+- [x] `EngineConfig::audio_tolerance` / `video_tolerance` are `f64`
+      (default `DEFAULT_RTP_TOLERANCE` = 1.0); the engine judges every
+      stream with `sent > 0`. A `-audiotolerance` on the command line
+      overrides, as before.
+- [x] `sipr_media::CheckDebug`: the two files, one line per send (hex,
+      header included), per datagram drained, per verdict (`COMPARISON
+      OK` / `COMPARISON FAILED` / `NODATA` with the running tally) and
+      the stream's tally when it ends; `MediaPlayer::start_with` takes
+      it. A file that cannot be created is a start-up error.
+- [x] Tests: the line format (unit), a silent peer's trace (media unit
+      and e2e, which also pins the default verdict: exit 253), the
+      file-stream e2e exits 253 at its non-echoing sink, and interop
+      `uac_rtp_stream_against_real_sipp_uas` asserts the check passed
+      against sipp's echo at the default tolerance.
+- [x] Docs: `docs/SIPP_COMPAT.md` (M18 note, the rtp_stream note, §3
+      flag list), CHANGELOG (a `Changed` entry: the exit code moves).
+
+### M53+ — further additions (after M52)
 
 Candidates, to be promoted into numbered milestones in the order the
 users of the HTTP API and the library ask for them. None listed yet:

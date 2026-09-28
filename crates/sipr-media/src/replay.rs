@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
+use crate::check_debug::{CheckDebug, StreamId};
 use crate::pcap::PcapStream;
 use crate::rtp::{RtpSource, RtpStep};
 
@@ -159,6 +160,38 @@ impl Active {
             bytes_in: self.bytes_in,
         })
     }
+
+    /// The stream's identity for a `-rtpcheck_debug` line, for generated
+    /// streams.
+    fn debug_id(&self) -> Option<StreamId<'_>> {
+        let Source::Rtp(rtp) = &self.spec.source else {
+            return None;
+        };
+        Some(StreamId {
+            call_id: &self.spec.call_id,
+            tag: &self.spec.tag,
+            video: rtp.is_video(),
+        })
+    }
+}
+
+/// A stream is over (finished, failed, stopped, replaced, or shut down):
+/// close its `-rtpcheck_debug` trace and report its check tally.
+fn end_stream(a: &Active, events: &Sender<MediaEvent>, debug: &mut Option<CheckDebug>) {
+    if let (Some(d), Some(id)) = (debug.as_mut(), a.debug_id()) {
+        d.event(
+            &id,
+            &format!(
+                "RTPCHECKS {} PACKET COUNTS {} BYTES IN {}",
+                a.check_failed, a.check_sent, a.bytes_in
+            ),
+            None,
+        );
+        d.flush();
+    }
+    if let Some(check) = a.check_result() {
+        let _ = events.send(check);
+    }
 }
 
 /// Handle to the media thread. Dropping it shuts the thread down.
@@ -174,13 +207,21 @@ impl MediaPlayer {
     /// Start the media thread; events flow to `events`.
     #[must_use]
     pub fn start(events: Sender<MediaEvent>) -> Self {
+        Self::start_with(events, None)
+    }
+
+    /// Start the media thread with a `-rtpcheck_debug` trace: every
+    /// generated stream's sends, echoes and verdicts go to `debug`'s files
+    /// (see [`CheckDebug`]).
+    #[must_use]
+    pub fn start_with(events: Sender<MediaEvent>, debug: Option<CheckDebug>) -> Self {
         let (tx, rx) = channel::<Cmd>();
         let packets = Arc::new(AtomicU64::new(0));
         let bytes = Arc::new(AtomicU64::new(0));
         let counters = (Arc::clone(&packets), Arc::clone(&bytes));
         let thread = std::thread::Builder::new()
             .name("sipr-media".into())
-            .spawn(move || run(&rx, &events, &counters.0, &counters.1))
+            .spawn(move || run(&rx, &events, &counters.0, &counters.1, debug))
             .ok();
         Self {
             tx,
@@ -282,7 +323,13 @@ impl Drop for MediaPlayer {
 /// Idle wait when nothing is scheduled; commands wake the loop earlier.
 const IDLE_WAIT: Duration = Duration::from_millis(500);
 
-fn run(rx: &Receiver<Cmd>, events: &Sender<MediaEvent>, packets: &AtomicU64, bytes: &AtomicU64) {
+fn run(
+    rx: &Receiver<Cmd>,
+    events: &Sender<MediaEvent>,
+    packets: &AtomicU64,
+    bytes: &AtomicU64,
+    mut debug: Option<CheckDebug>,
+) {
     let mut streams: HashMap<u64, Active> = HashMap::new();
     let mut due: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
     loop {
@@ -291,12 +338,12 @@ fn run(rx: &Receiver<Cmd>, events: &Sender<MediaEvent>, packets: &AtomicU64, byt
         });
         match rx.recv_timeout(wait) {
             Ok(cmd) => {
-                if !apply(cmd, &mut streams, &mut due, events) {
+                if !apply(cmd, &mut streams, &mut due, events, &mut debug) {
                     return;
                 }
                 // Coalesce a burst of commands before sending anything.
                 while let Ok(cmd) = rx.try_recv() {
-                    if !apply(cmd, &mut streams, &mut due, events) {
+                    if !apply(cmd, &mut streams, &mut due, events, &mut debug) {
                         return;
                     }
                 }
@@ -313,13 +360,11 @@ fn run(rx: &Receiver<Cmd>, events: &Sender<MediaEvent>, packets: &AtomicU64, byt
             let Some(active) = streams.get_mut(&id) else {
                 continue; // stopped or replaced: stale heap entry
             };
-            match pump(active, now, packets, bytes) {
+            match pump(active, now, packets, bytes, &mut debug) {
                 Pump::Next(at) => due.push(Reverse((at, id))),
                 Pump::Finished => {
                     if let Some(a) = streams.remove(&id) {
-                        if let Some(check) = a.check_result() {
-                            let _ = events.send(check);
-                        }
+                        end_stream(&a, events, &mut debug);
                         let _ = events.send(MediaEvent::Finished {
                             call_id: a.spec.call_id,
                             tag: a.spec.tag,
@@ -328,9 +373,7 @@ fn run(rx: &Receiver<Cmd>, events: &Sender<MediaEvent>, packets: &AtomicU64, byt
                 }
                 Pump::Failed(error) => {
                     if let Some(a) = streams.remove(&id) {
-                        if let Some(check) = a.check_result() {
-                            let _ = events.send(check);
-                        }
+                        end_stream(&a, events, &mut debug);
                         let _ = events.send(MediaEvent::SendError {
                             call_id: a.spec.call_id,
                             tag: a.spec.tag,
@@ -350,12 +393,14 @@ fn apply(
     streams: &mut HashMap<u64, Active>,
     due: &mut BinaryHeap<Reverse<(Instant, u64)>>,
     events: &Sender<MediaEvent>,
+    debug: &mut Option<CheckDebug>,
 ) -> bool {
-    let retain_reporting = |streams: &mut HashMap<u64, Active>, keep: &dyn Fn(&Active) -> bool| {
+    let mut retain_reporting = |streams: &mut HashMap<u64, Active>,
+                                keep: &dyn Fn(&Active) -> bool| {
         streams.retain(|_, a| {
             let k = keep(a);
-            if !k && let Some(check) = a.check_result() {
-                let _ = events.send(check);
+            if !k {
+                end_stream(a, events, debug);
             }
             k
         });
@@ -388,9 +433,7 @@ fn apply(
         }
         Cmd::Shutdown => {
             for a in streams.values() {
-                if let Some(check) = a.check_result() {
-                    let _ = events.send(check);
-                }
+                end_stream(a, events, debug);
             }
             return false;
         }
@@ -405,19 +448,31 @@ enum Pump {
 }
 
 /// Send everything that is due, then report when the next packet is.
-fn pump(active: &mut Active, now: Instant, packets: &AtomicU64, bytes: &AtomicU64) -> Pump {
+fn pump(
+    active: &mut Active,
+    now: Instant,
+    packets: &AtomicU64,
+    bytes: &AtomicU64,
+    debug: &mut Option<CheckDebug>,
+) -> Pump {
     match &active.spec.source {
         Source::Pcap(stream) => {
             let stream = Arc::clone(stream);
             pump_pcap(active, &stream, now, packets, bytes)
         }
-        Source::Rtp(_) => pump_rtp(active, now, packets, bytes),
+        Source::Rtp(_) => pump_rtp(active, now, packets, bytes, debug),
     }
 }
 
 /// Generated RTP: packet `n` is due at `start + n * interval`, so a stall
 /// catches up in a burst and cadence never drifts.
-fn pump_rtp(active: &mut Active, now: Instant, packets: &AtomicU64, bytes: &AtomicU64) -> Pump {
+fn pump_rtp(
+    active: &mut Active,
+    now: Instant,
+    packets: &AtomicU64,
+    bytes: &AtomicU64,
+    debug: &mut Option<CheckDebug>,
+) -> Pump {
     let Some((_, sock, remote)) = active.sockets.first() else {
         return Pump::Failed("no media socket".into());
     };
@@ -426,6 +481,17 @@ fn pump_rtp(active: &mut Active, now: Instant, packets: &AtomicU64, bytes: &Atom
     let Source::Rtp(rtp) = &mut active.spec.source else {
         return Pump::Failed("not an RTP source".into());
     };
+    let id = StreamId {
+        call_id: &active.spec.call_id,
+        tag: &active.spec.tag,
+        video: rtp.is_video(),
+    };
+    if let (Some(d), 0) = (debug.as_mut(), active.check_sent) {
+        let local = sock
+            .local_addr()
+            .map_or_else(|_| "?".to_owned(), |a| a.to_string());
+        d.event(&id, &format!("STREAM {local} -> {remote}"), None);
+    }
     let mut recv_buf = [0u8; 2048];
     loop {
         let at = started + rtp.interval() * u32::try_from(rtp.ticks()).unwrap_or(u32::MAX);
@@ -435,42 +501,61 @@ fn pump_rtp(active: &mut Active, now: Instant, packets: &AtomicU64, bytes: &Atom
         match rtp.next_packet() {
             RtpStep::Done => return Pump::Finished,
             RtpStep::Silent => {}
-            RtpStep::Packet(p) => match sock.send_to(
-                srtp.as_mut()
-                    .map_or_else(|| p.to_vec(), |(tx, _)| tx.protect(p))
-                    .as_slice(),
-                remote,
-            ) {
-                Ok(_) => {
-                    packets.fetch_add(1, Ordering::Relaxed);
-                    bytes.fetch_add(p.len() as u64, Ordering::Relaxed);
-                    // The RTP check: drain what the peer echoed and compare
-                    // the last datagram's payload to the one just sent. An
-                    // echo lags a packet, so this only passes for streams
-                    // whose payload is constant (SIPp's patterns).
-                    active.check_sent += 1;
-                    let mut echoed: Option<usize> = None;
-                    while let Ok((n, _)) = sock.recv_from(&mut recv_buf) {
-                        active.bytes_in += n as u64;
-                        echoed = Some(n);
+            RtpStep::Packet(p) => {
+                let wire = srtp
+                    .as_mut()
+                    .map_or_else(|| p.to_vec(), |(tx, _)| tx.protect(p));
+                match sock.send_to(&wire, remote) {
+                    Ok(_) => {
+                        packets.fetch_add(1, Ordering::Relaxed);
+                        bytes.fetch_add(p.len() as u64, Ordering::Relaxed);
+                        // The RTP check: drain what the peer echoed and
+                        // compare the last datagram's payload to the one
+                        // just sent. An echo lags a packet, so this only
+                        // passes for streams whose payload is constant
+                        // (SIPp's patterns).
+                        active.check_sent += 1;
+                        if let Some(d) = debug.as_mut() {
+                            let what = format!("SEND LOG {} {}", active.check_sent, wire.len());
+                            d.event(&id, &what, Some(&wire));
+                        }
+                        let mut echoed: Option<usize> = None;
+                        while let Ok((n, _)) = sock.recv_from(&mut recv_buf) {
+                            active.bytes_in += n as u64;
+                            if let Some(d) = debug.as_mut() {
+                                d.event(&id, &format!("RECV LOG {n}"), Some(&recv_buf[..n]));
+                            }
+                            echoed = Some(n);
+                        }
+                        // SRTP: unprotect the echo (peer's key) before
+                        // comparing plaintext payloads; an auth failure
+                        // counts as a miss.
+                        let matches = echoed.is_some_and(|n| match srtp.as_mut() {
+                            Some((_, rx)) => rx.unprotect(&recv_buf[..n]).is_ok_and(|clear| {
+                                clear.len() > 12 && p.len() > 12 && clear[12..] == p[12..]
+                            }),
+                            None => n > 12 && p.len() > 12 && recv_buf[12..n] == p[12..],
+                        });
+                        if !matches {
+                            active.check_failed += 1;
+                        }
+                        if let Some(d) = debug.as_mut() {
+                            let verdict = match (echoed, matches) {
+                                (None, _) => "NODATA",
+                                (Some(_), true) => "COMPARISON OK",
+                                (Some(_), false) => "COMPARISON FAILED",
+                            };
+                            let what =
+                                format!("{verdict} {}/{}", active.check_failed, active.check_sent);
+                            d.event(&id, &what, None);
+                        }
                     }
-                    // SRTP: unprotect the echo (peer's key) before comparing
-                    // plaintext payloads; an auth failure counts as a miss.
-                    let matches = echoed.is_some_and(|n| match srtp.as_mut() {
-                        Some((_, rx)) => rx.unprotect(&recv_buf[..n]).is_ok_and(|clear| {
-                            clear.len() > 12 && p.len() > 12 && clear[12..] == p[12..]
-                        }),
-                        None => n > 12 && p.len() > 12 && recv_buf[12..n] == p[12..],
-                    });
-                    if !matches {
-                        active.check_failed += 1;
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        return Pump::Next(now + Duration::from_millis(2));
                     }
+                    Err(e) => return Pump::Failed(e.to_string()),
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Pump::Next(now + Duration::from_millis(2));
-                }
-                Err(e) => return Pump::Failed(e.to_string()),
-            },
+            }
         }
     }
 }
@@ -870,6 +955,74 @@ mod tests {
         // some checks pass and its packets come back.
         assert!(failed < sent, "failed {failed} of {sent}");
         assert!(bytes_in >= 16 * 2, "bytes_in {bytes_in}");
+    }
+
+    /// `-rtpcheck_debug` against a silent peer: one `SEND LOG` and one
+    /// `NODATA` per packet, the tally last, nothing in the video file.
+    #[test]
+    fn rtp_check_debug_traces_every_send_and_miss() {
+        use crate::check_debug::{AUDIO_FILE, VIDEO_FILE};
+        use crate::rtp::{RtpParams, RtpSource};
+        let (_rx_sock, remote) = listener();
+        let dir =
+            std::env::temp_dir().join(format!("sipr-replay-check-debug-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let params = RtpParams {
+            payload_type: 8,
+            bytes_per_packet: 2,
+            ms_per_packet: 10,
+            ticks_per_packet: 80,
+            video: false,
+        };
+        let src = RtpSource::new(Arc::from(&[0x55u8; 2][..]), params, 3, 9, 0);
+        let (ev_tx, ev_rx) = channel();
+        let player = MediaPlayer::start_with(ev_tx, Some(CheckDebug::open(&dir).unwrap()));
+        player
+            .play(StreamSpec {
+                call_id: "dbg".into(),
+                tag: "rtp-audio".into(),
+                source: Source::Rtp(src),
+                local_ip: "127.0.0.1".parse().unwrap(),
+                local_port: 0,
+                remote,
+                srtp: None,
+            })
+            .unwrap();
+        let check = ev_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            matches!(
+                check,
+                MediaEvent::CheckResult {
+                    sent: 3,
+                    failed: 3,
+                    ..
+                }
+            ),
+            "{check:?}"
+        );
+        drop(player);
+        let audio = std::fs::read_to_string(dir.join(AUDIO_FILE)).unwrap();
+        let video = std::fs::read_to_string(dir.join(VIDEO_FILE)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let lines: Vec<&str> = audio.lines().collect();
+        assert_eq!(lines.len(), 8, "{audio}");
+        assert!(
+            lines[0].starts_with("call dbg rtp-audio: STREAM 127.0.0.1:"),
+            "{audio}"
+        );
+        assert!(lines[0].ends_with(&format!(" -> {remote}")), "{audio}");
+        // 12-byte header + 2 bytes of payload, sequence 0, SSRC 9.
+        assert_eq!(
+            lines[1],
+            "call dbg rtp-audio: SEND LOG 1 14 [8008000000000000000000095555]"
+        );
+        assert_eq!(lines[2], "call dbg rtp-audio: NODATA 1/1");
+        assert_eq!(lines[6], "call dbg rtp-audio: NODATA 3/3");
+        assert_eq!(
+            lines[7],
+            "call dbg rtp-audio: RTPCHECKS 3 PACKET COUNTS 3 BYTES IN 0"
+        );
+        assert!(video.is_empty(), "{video}");
     }
 
     #[test]

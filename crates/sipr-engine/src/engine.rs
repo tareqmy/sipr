@@ -245,11 +245,16 @@ pub struct EngineConfig {
     pub rtp_echo: bool,
     /// `-mb`: echo receive buffer size (default 2048).
     pub media_bufsize: Option<usize>,
-    /// `-audiotolerance`: judge audio `rtp_stream` echo checks against this
-    /// failure ratio; `None` = do not judge (SIPp judges always, default 1.0).
-    pub audio_tolerance: Option<f64>,
+    /// `-audiotolerance`: an audio `rtp_stream`'s echo check fails when
+    /// `failed / sent >= this` (0.0..=1.0). SIPp's default is 1.0, so a
+    /// stream whose every check missed fails and one echo suffices to pass.
+    pub audio_tolerance: f64,
     /// `-videotolerance`: same for video streams.
-    pub video_tolerance: Option<f64>,
+    pub video_tolerance: f64,
+    /// `-rtpcheck_debug`: trace every generated stream's sends, echoes and
+    /// verdicts to `debugafile` / `debugvfile` in the working directory
+    /// ([`sipr_media::CheckDebug`]).
+    pub rtpcheck_debug: bool,
     /// Directory of the `-sf` file: pcap paths resolve there first, then in
     /// the working directory (SIPp `find_file`).
     pub scenario_dir: Option<std::path::PathBuf>,
@@ -364,8 +369,9 @@ impl Default for EngineConfig {
             rate_scale: None,
             rtp_echo: false,
             media_bufsize: None,
-            audio_tolerance: None,
-            video_tolerance: None,
+            audio_tolerance: DEFAULT_RTP_TOLERANCE,
+            video_tolerance: DEFAULT_RTP_TOLERANCE,
+            rtpcheck_debug: false,
             scenario_dir: None,
             control_port: None,
             control_ip: None,
@@ -418,6 +424,9 @@ fn next_call_number() -> u64 {
 
 /// SIPp's `DEFAULT_MEDIA_PORT`.
 const DEFAULT_MEDIA_PORT: u16 = 6000;
+/// SIPp's default `-audiotolerance` / `-videotolerance`: a stream fails its
+/// echo check only when every packet did (`failed / sent >= 1.0`).
+pub const DEFAULT_RTP_TOLERANCE: f64 = 1.0;
 /// SIPp's `rtp_default_payload` (PCMA).
 const DEFAULT_RTP_PAYLOAD: u8 = 8;
 /// SIPp's initial `play_args_a.last_seq_no` for `play_dtmf`.
@@ -2356,7 +2365,19 @@ impl<'s> Engine<'s> {
                     }
                 })
                 .ok();
-            Some(MediaPlayer::start(media_tx))
+            let debug = if config.rtpcheck_debug {
+                let dir = std::path::Path::new(".");
+                Some(
+                    sipr_media::CheckDebug::open(dir).map_err(|e| EngineError::Io {
+                        what: "-rtpcheck_debug: cannot create the debug files".to_owned(),
+                        path: dir.join(sipr_media::check_debug::AUDIO_FILE),
+                        source: e,
+                    })?,
+                )
+            } else {
+                None
+            };
+            Some(MediaPlayer::start_with(media_tx, debug))
         };
         // Runtime control: SIPp's UDP control socket and the HTTP API both
         // feed Event::Control through one bridge.
@@ -5478,17 +5499,16 @@ impl<'s> Engine<'s> {
                 bytes_in,
             } => {
                 self.stats.rtp_bytes_received += bytes_in;
-                // SIPp judges every stream against its tolerance (default
-                // 1.0, so a peer that never echoes fails the run); sipr only
-                // judges when a tolerance was asked for.
-                let tolerance = if video {
+                // Every stream that sent something is judged against its
+                // tolerance, as in SIPp (`rtpstream.cpp`, at thread exit):
+                // with the default 1.0 a peer that never echoes fails the
+                // run.
+                let tol = if video {
                     self.config.video_tolerance
                 } else {
                     self.config.audio_tolerance
                 };
-                if let Some(tol) = tolerance
-                    && sent > 0
-                {
+                if sent > 0 {
                     #[allow(clippy::cast_precision_loss)]
                     let ratio = failed as f64 / sent as f64;
                     if ratio >= tol {

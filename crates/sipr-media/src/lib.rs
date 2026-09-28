@@ -19,6 +19,7 @@
 //! `docs/SIPP_COMPAT.md` §6 — chiefly that sipr sends through ordinary UDP
 //! sockets bound to the media port (no raw socket, so no root needed).
 
+pub mod check_debug;
 pub mod dtmf;
 pub mod echo;
 pub mod pcap;
@@ -29,6 +30,7 @@ pub mod sdp;
 pub mod srtp;
 pub mod srtp_echo;
 
+pub use check_debug::CheckDebug;
 pub use echo::EchoServer;
 pub use pcap::{Frame, PcapError, PcapStream};
 pub use replay::{MediaEvent, MediaPlayer, Source, StreamSpec};

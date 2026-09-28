@@ -2324,8 +2324,12 @@ fn rtp_stream_and_play_dtmf_send_generated_rtp() {
     let _ = std::fs::remove_file(&audio_path);
     let _ = std::fs::remove_file(&scenario_path);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "stderr:\n{err}");
+    // The sink never echoes, so the file stream fails its check at the
+    // default tolerance and the run exits 253 as SIPp's would; the DTMF
+    // burst is a capture replay and is not judged.
+    assert_eq!(out.status.code(), Some(253), "stderr:\n{err}");
     assert!(err.contains("successful 1 failed 0"), "{err}");
+    assert!(err.contains("rtpcheck 1/1 failed"), "{err}");
     // 4 stream packets + a 1-digit DTMF burst of 20 noop + 3 start + 3 end.
     assert!(err.contains("rtp-sent 30"), "{err}");
     assert_eq!(uas.join().expect("uas").byes, 1);
@@ -3053,10 +3057,11 @@ fn rtp_echo_uas_makes_the_uac_rtpcheck_pass() {
     assert!(uerr.contains(" echo "), "echo counters:\n{uerr}");
 }
 
-/// Without an echoing peer and with a tolerance given, the check fails
-/// and the run exits with SIPp's -3 (253) even though the calls succeeded.
+/// Without an echoing peer the check fails by default (SIPp judges every
+/// stream at a tolerance of 1.0) and the run exits with SIPp's -3 (253)
+/// even though the calls succeeded; `-rtpcheck_debug` shows why.
 #[test]
-fn rtpcheck_against_a_silent_peer_exits_253_when_a_tolerance_is_set() {
+fn rtpcheck_against_a_silent_peer_exits_253_by_default() {
     let (addr, _uas, _media, _sink) = {
         let (a, m, u, s) = spawn_media_uas(Duration::from_secs(2));
         (a, u, m, s)
@@ -3089,23 +3094,42 @@ fn rtpcheck_against_a_silent_peer_exits_253_when_a_tolerance_is_set() {
         "15",
         "-bg",
     ];
-    // No tolerance: the sink swallows the RTP, nothing is judged, exit 0.
+    // No flags: the sink swallows the RTP, every check misses, and the
+    // default tolerance of 1.0 fails the stream → 253.
     let mut args: Vec<&str> = base.to_vec();
     let target = addr.to_string();
     args.push(&target);
     let out = run_sipr(&args);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "{err}");
-    assert!(!err.contains("rtpcheck"), "{err}");
-    // With a tolerance: judged and failed → 253.
-    let mut args: Vec<&str> = base.to_vec();
-    args.extend(["-audiotolerance", "1.0", &target]);
-    let out = run_sipr(&args);
-    let _ = std::fs::remove_file(&scenario_path);
-    let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(253), "{err}");
     assert!(err.contains("successful 1 failed 0"), "{err}");
     assert!(err.contains("rtpcheck 1/1 failed"), "{err}");
+    // -rtpcheck_debug: the trace in the working directory names every
+    // missed echo, and its tally is the one the verdict was built on.
+    let debug_dir = dir.join(format!("sipr-e2e-rtpcheck-debug-{pid}"));
+    let _ = std::fs::remove_dir_all(&debug_dir);
+    std::fs::create_dir_all(&debug_dir).expect("debug dir");
+    let mut args: Vec<&str> = base.to_vec();
+    args.extend(["-rtpcheck_debug", &target]);
+    let (out, _) = run_sipr_in(&debug_dir, &args);
+    let _ = std::fs::remove_file(&scenario_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let trace = std::fs::read_to_string(debug_dir.join("debugafile")).unwrap_or_default();
+    let video = std::fs::read_to_string(debug_dir.join("debugvfile")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&debug_dir);
+    assert_eq!(out.status.code(), Some(253), "{err}");
+    assert!(trace.contains("rtp-audio: STREAM 127.0.0.1:"), "{trace}");
+    assert!(trace.contains("rtp-audio: SEND LOG 1 "), "{trace}");
+    assert!(trace.contains("rtp-audio: NODATA 1/1"), "{trace}");
+    let sent = trace.lines().filter(|l| l.contains(": SEND LOG ")).count();
+    let missed = trace.lines().filter(|l| l.contains(": NODATA ")).count();
+    assert!(
+        sent > 0 && missed == sent,
+        "sent {sent} missed {missed}:\n{trace}"
+    );
+    let tally = format!("RTPCHECKS {sent} PACKET COUNTS {sent} BYTES IN 0");
+    assert!(trace.trim_end().ends_with(&tally), "{trace}");
+    assert!(video.is_empty(), "{video}");
 }
 
 /// `<rtp_echo variable="v"/>` reads the variable at run time, where

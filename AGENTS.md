@@ -4,7 +4,7 @@ sipr is a SIPp-like SIP testing tool and traffic generator written in Rust. It p
 call flows described in SIPp's XML scenario format, as UAC or UAS, at a controlled
 rate, and reports live (TUI) and aggregate statistics.
 
-**Current state: v1 shipped, M0–M51 complete** (UDP/TCP/TLS transports incl. per-call and per-IP sockets, SIP over WebSocket (M51), SCTP behind the `sctp` feature, `-rsa`, reconnection, UAC/UAS, out-of-call scenarios (`-oocsf`/`-oocsn`), mixed mode (`-rxsf`/`-rxsn`, `-rxinf`),
+**Current state: v1 shipped, M0–M52 complete** (UDP/TCP/TLS transports incl. per-call and per-IP sockets, SIP over WebSocket (M51), SCTP behind the `sctp` feature, `-rsa`, reconnection, UAC/UAS, out-of-call scenarios (`-oocsf`/`-oocsn`), mixed mode (`-rxsf`/`-rxsn`, `-rxinf`),
 stats + TUI, the full SIPp action set incl. `_unexp.main`, `exec command=` and `<setdest>`, manual transactions (`start_txn`/`ack_txn`/`response_txn`), `<User>`/`<Global>` variable scopes, auth incl. IMS AKA + AUTS resync + `verifyauth`, `-inf` injection, 3PCC, `-users`, IPv6,
 pcap replay, RTP streaming + DTMF, RTP echo + rtpcheck, SRTP + SRTP echo server, SIPp
 control socket + HTTP API; and post-v1, statistical pauses, the tracing and
@@ -15,8 +15,9 @@ master plan (its dependency choices were superseded by in-tree implementations �
 `docs/MILESTONES.md` notes record each swap); M49 made `sipr-engine` a library
 (`docs/LIBRARY_API.md`); M50 added the fuzz targets (`make fuzz`,
 `docs/TESTING.md` §6); M51 the WebSocket transport (`-t ws1|wsn|wss1|wssn`,
-`docs/SIPP_COMPAT.md` §6); the M52+ list at the bottom of `docs/MILESTONES.md`
-is what comes next; M47 added the `--check` lints (`docs/LINTS.md`). M45 measured the hot path against real sipp —
+`docs/SIPP_COMPAT.md` §6); M52 the RTP check at SIPp's defaults and
+`-rtpcheck_debug`; the M53+ list at the bottom of `docs/MILESTONES.md` is what
+comes next; M47 added the `--check` lints (`docs/LINTS.md`). M45 measured the hot path against real sipp —
 `docs/PERFORMANCE.md` and `benches/BASELINES.md` hold the numbers, and
 `make bench-vs-sipp` reruns them.
 

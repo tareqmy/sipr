@@ -129,10 +129,13 @@ pub struct Cli {
     pub rtp_echo: bool,
     /// `-mb`: RTP echo buffer size (default 2048).
     pub media_bufsize: Option<usize>,
-    /// `-audiotolerance`: RTP-check failure ratio that fails the run (audio).
+    /// `-audiotolerance`: RTP-check failure ratio that fails the run (audio;
+    /// `None` = SIPp's default 1.0).
     pub audio_tolerance: Option<f64>,
     /// `-videotolerance`: same for video streams.
     pub video_tolerance: Option<f64>,
+    /// `-rtpcheck_debug`: trace the RTP check to `debugafile` / `debugvfile`.
+    pub rtpcheck_debug: bool,
     /// `-cp`: control socket port (`0` disables; default probes 8888..8947).
     pub control_port: Option<u16>,
     /// `-ci`: control socket bind address (default loopback).
@@ -351,6 +354,7 @@ impl Default for Cli {
             media_bufsize: None,
             audio_tolerance: None,
             video_tolerance: None,
+            rtpcheck_debug: false,
             control_port: None,
             control_ip: None,
             http: None,
@@ -628,7 +632,7 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "audiotolerance",
         true,
         "RATIO",
-        "Fail the run (exit 253, SIPp's -3) when this share of an audio rtp_stream's packets fail the echo check (0.0-1.0)",
+        "Fail the run (exit 253, SIPp's -3) when this share of an audio rtp_stream's packets fail the echo check (0.0-1.0) [default: 1.0]",
     ),
     (
         "videotolerance",
@@ -640,7 +644,7 @@ const FLAGS: &[(&str, bool, &str, &str)] = &[
         "rtpcheck_debug",
         false,
         "",
-        "Accepted for SIPp compatibility (sipr writes no RTP-check debug files)",
+        "Write the RTP check's sends, echoes and verdicts to debugafile (audio) and debugvfile (video) in the working directory",
     ),
     (
         "srtpcheck_debug",
@@ -1400,7 +1404,8 @@ fn apply(cli: &mut Cli, flag: &str, value: Option<String>) -> Result<(), String>
                 cli.video_tolerance = Some(ratio);
             }
         }
-        "srtpcheck_debug" | "rtpcheck_debug" => {}
+        "rtpcheck_debug" => cli.rtpcheck_debug = true,
+        "srtpcheck_debug" => {}
         "cp" => cli.control_port = Some(parse_num(flag, &val(value))?),
         "ci" => cli.control_ip = Some(parse_num(flag, &val(value))?),
         "sipr-http" => cli.http = Some(val(value)),
@@ -1926,7 +1931,10 @@ mod tests {
         assert_eq!(c.media_bufsize, Some(4096));
         assert_eq!(c.audio_tolerance, Some(0.5));
         assert_eq!(c.video_tolerance, Some(1.0));
+        assert!(!c.rtpcheck_debug);
         assert!(run(&["-audiotolerance", "1.5", "x"]).is_err());
+        let c = cli(&["-rtpcheck_debug", "-srtpcheck_debug", "x"]);
+        assert!(c.rtpcheck_debug);
     }
 
     #[test]

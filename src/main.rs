@@ -394,8 +394,13 @@ fn engine_config(
     config.rate_scale = cli.rate_scale;
     config.rtp_echo = cli.rtp_echo;
     config.media_bufsize = cli.media_bufsize;
-    config.audio_tolerance = cli.audio_tolerance;
-    config.video_tolerance = cli.video_tolerance;
+    if let Some(t) = cli.audio_tolerance {
+        config.audio_tolerance = t;
+    }
+    if let Some(t) = cli.video_tolerance {
+        config.video_tolerance = t;
+    }
+    config.rtpcheck_debug = cli.rtpcheck_debug;
     config.control_port = cli.control_port;
     config.control_ip = cli.control_ip;
     config.http_addr = match cli.http.as_deref() {

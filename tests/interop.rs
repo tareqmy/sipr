@@ -655,7 +655,9 @@ fn uac_pcap_against_real_sipp_uas() {
 
 /// sipr streams an endless `rtp_stream` file at real sipp (`-rtp_echo` UAS so
 /// the port is live), proving the generated RTP runs alongside signaling
-/// and stops with the call.
+/// and stops with the call. The file is one constant payload, so sipp's
+/// echo of the previous packet matches the next one and the check passes
+/// at the default tolerance.
 #[test]
 fn uac_rtp_stream_against_real_sipp_uas() {
     let Some(sipp) = sipp_bin() else {
@@ -800,6 +802,10 @@ fn uac_rtp_stream_against_real_sipp_uas() {
         stderr.contains("successful 2 failed 0"),
         "sipr summary:\n{stderr}"
     );
+    assert!(
+        stderr.contains("rtpcheck 0/2 failed"),
+        "sipr summary:\n{stderr}"
+    );
     // Two calls × ~400 ms at 20 ms per packet ≈ 40; allow for scheduling.
     let sent: u64 = stderr
         .split("rtp-sent ")
@@ -812,8 +818,8 @@ fn uac_rtp_stream_against_real_sipp_uas() {
 }
 
 /// The RTP check against real sipp: `sipp -sn uas -rtp_echo` echoes sipr's
-/// pattern stream back, and with a tolerance sipr judges it — exit 0 with
-/// every check passed.
+/// pattern stream back and sipr judges it (here at an explicit tolerance)
+/// — exit 0 with every check passed.
 #[test]
 fn rtpcheck_against_real_sipp_echo() {
     let Some(sipp) = sipp_bin() else {
@@ -961,8 +967,10 @@ fn rtpcheck_against_real_sipp_echo() {
 /// and decrypt there (`processIncomingPacket() rc == 0`). The echo itself
 /// cannot leave a macOS sipp — its `sendto` on a connected UDP socket fails
 /// with EISCONN (errno 56), a sipp-on-macOS limitation like the stream
-/// client bind — so the round-trip check is asserted only where the log
-/// shows the echo was sent. Needs the SIPp source tree for the scenario
+/// client bind — so the round trip (exit 0, every check passed at the
+/// default tolerance) is asserted only where the log shows the echo was
+/// sent; where it was not, sipr's check must fail like a sipp UAC's would
+/// (exit 253). Needs the SIPp source tree for the scenario
 /// (`$SIPP_SRC`, else the sibling checkout) and a sipp built with OpenSSL.
 #[test]
 fn srtp_against_real_sipp_echo() {
@@ -1126,7 +1134,6 @@ fn srtp_against_real_sipp_echo() {
             buf
         })
         .unwrap_or_default();
-    assert_eq!(sipr_code, Some(0), "sipr must exit 0; stderr:\n{stderr}");
     assert!(stderr.contains("successful 1 failed 0"), "{stderr}");
     assert!(stderr.contains("rtp-sent "), "{stderr}");
     // SIPp's view of our packets.
@@ -1152,6 +1159,21 @@ fn srtp_against_real_sipp_echo() {
              its echo sendto failed with EISCONN (sipp-on-macOS limitation); the round trip \
              is covered by the e2e SRTP echo peer instead."
         );
+        // Nothing came back, so at SIPp's default tolerance the stream
+        // fails and the run exits 253 — exactly what a sipp UAC does here.
+        assert_eq!(
+            sipr_code,
+            Some(253),
+            "no echo reached sipr, so its check must fail; stderr:\n{stderr}"
+        );
+        assert!(stderr.contains("rtpcheck 1/1 failed"), "{stderr}");
+    } else {
+        assert_eq!(
+            sipr_code,
+            Some(0),
+            "sipp echoed, so sipr's check must pass; stderr:\n{stderr}\nsipp echo log:\n{echo_log}"
+        );
+        assert!(stderr.contains("rtpcheck 0/1 failed"), "{stderr}");
     }
 }
 

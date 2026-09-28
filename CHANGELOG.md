@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The RTP echo check is judged at SIPp's defaults (M52): every
+  `rtp_stream` that sent a packet is held to `-audiotolerance` /
+  `-videotolerance`, default 1.0, so a stream whose every check missed
+  fails the run with exit 253 as it does under SIPp. **A run against a
+  peer that does not echo now exits 253 where it used to exit 0.** sipr
+  judged only when a tolerance flag was given (the M18 divergence,
+  withdrawn). `EngineConfig::audio_tolerance` / `video_tolerance` are
+  `f64` now, defaulting to `DEFAULT_RTP_TOLERANCE`.
+
+### Added
+
+- `-rtpcheck_debug` (M52) writes the RTP check's trace to SIPp's
+  `debugafile` (audio) and `debugvfile` (video) in the working
+  directory: one line per send (hex, header included), per datagram read
+  back, and per verdict with the running `failed/sent` tally, plus the
+  stream's tally when it ends. The flag was accepted and ignored before;
+  `-srtpcheck_debug` still is.
+
 ## [0.30.0] — 2026-09-28
 
 ### Added

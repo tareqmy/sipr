@@ -128,7 +128,7 @@ Media: `-mi <ip>` (media address; default local IP) `-mp <port>` (base media
 port, default 6000; `-min_rtp_port` is SIPp's alias — note SIPp's `-mp` is
 *that* alias too, not a fixed port) `-max_rtp_port` `-rtp_payload <pt>`
 (default 8) `-random_base_ssrc` `-rtp_echo` `-mb <bytes>` `-audiotolerance`
-`-videotolerance` (M18).
+`-videotolerance` (M18) `-rtpcheck_debug` (M52).
 Auth: `-au`/`-ap` (username/password defaults for `[authentication]`)
 `-auth_uri` (digest `uri=` after SIPp's `sip:` prefix; default
 `remote_ip:remote_port`, M21).
@@ -694,8 +694,8 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   `[media_port]` form on that `m=` line; (2) DTMF sequence numbers are
   consecutive (SIPp's warm-up increments two counters and skips every
   other number); (3) the sender's post-send RTP check and the
-  `-audiotolerance` verdict are M18's (the RTP echo note below): sipr
-  judges a stream only when a tolerance flag was given; (4) the
+  `-audiotolerance` verdict are M18's (the RTP echo note below), at
+  SIPp's defaults since M52; (4) the
   packet grid is per stream (`start + n*interval`), not SIPp's global
   wall-clock grid that fires every stream in the same millisecond; (5)
   `-rtp_threadtasks` is not needed (one scheduler thread) and not accepted.
@@ -781,15 +781,24 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   does not echo exits -3. `exec rtp_echo=startaudio|…` is a different
   feature (per-call SRTP echo threads with process-global state). sipr
   matches the echo sockets, probing, counters, toggle action, compare
-  semantics, and exit code, with these divergences: (1) a stream is
-  judged **only when `-audiotolerance`/`-videotolerance` was given**;
-  (2) `<rtp_echo variable="v"/>` (M44) reads `v`, where SIPp parses the
+  semantics, the default tolerance (1.0: every stream that sent a packet
+  is judged, so a silent peer exits 253 — until M52 sipr judged only
+  under an explicit tolerance flag), and exit code, with one divergence:
+  `<rtp_echo variable="v"/>` (M44) reads `v`, where SIPp parses the
   attribute through `handle_rhs` and then calls `getDoubleValue()` rather
   than `get_rhs()` — its literal slot, which `variable=` never fills — so
   in SIPp that form always switches echoing **off**. Every other rhs
   action (`jump`, `pauserestore`, `add`, …) reads the variable; sipr makes
   this one consistent instead of copying the slip. `exec rtp_echo=`
-  (the per-call SRTP echo) is M25 below.
+  (the per-call SRTP echo) is M25 below. `-rtpcheck_debug` (M52) writes
+  SIPp's `debugafile` (audio) and `debugvfile` (video) in the working
+  directory — one line per send (hex, header included), per datagram
+  read back, per verdict (`COMPARISON OK` / `COMPARISON FAILED` /
+  `NODATA`, with the running `failed/sent`), and the stream's tally when
+  it ends — in sipr's own line format (`sipr-media/src/check_debug.rs`),
+  not SIPp's per-thread `TID:` dumps; both files are created when the
+  media thread starts, where SIPp creates each on its first stream.
+  `-srtpcheck_debug` stays accepted and ignored.
 - Socket options and the local address (M44; verified in `socket.cpp`
   `open_connections` ~l.2372-2560 — `bind_specific`, the connect-probe,
   the `bind_local || peripsocket` re-resolve — `sipp_customize_socket`
