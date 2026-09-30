@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.32.0] — 2026-09-30
+
 ### Added
 
 - `--sipr-ws-path` and `--sipr-ws-origin` (M53): the resource on the
@@ -1003,7 +1005,8 @@ library — no external crates.
   leftmost-longest — identical on the patterns real scenarios use; see
   `docs/SIPP_COMPAT.md` §6.
 
-[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/tareqmy/sipr/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/tareqmy/sipr/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/tareqmy/sipr/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/tareqmy/sipr/compare/v0.28.0...v0.29.0

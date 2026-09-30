@@ -5,7 +5,7 @@
 class Sipr < Formula
   desc "SIP testing tool and traffic generator in Rust, compatible with SIPp scenarios"
   homepage "https://github.com/tareqmy/sipr"
-  version "0.31.0"
+  version "0.32.0"
   license "MIT"
 
   if OS.mac?
