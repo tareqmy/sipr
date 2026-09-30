@@ -2512,17 +2512,17 @@ impl<'s> Engine<'s> {
         };
         control.set_rate(config.rate);
         // Pacer: tick faster than the rate period and start fractional
-        // batches, so a `-r 500 -rp 1000` run smooths into ~20ms bursts of
-        // ~10 instead of one burst of 500 (SIPp smooths within the period).
-        let tick = config.rate_period.min(Duration::from_millis(20));
-        let pacer_tx = tx.clone();
-        let pacer_stop = Arc::clone(&control.stop_pacer);
+        // batches of a few calls, so a `-r 500 -rp 1000` run smooths into
+        // 10 ms bursts of ~5 instead of one burst of 500 (SIPp smooths
+        // within the period). The tick follows the rate as it changes.
+        let rate_period = config.rate_period;
+        let pacer = control.clone();
         let _pacer = std::thread::Builder::new()
             .name("sipr-pacer".into())
             .spawn(move || {
-                while !pacer_stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(tick);
-                    if pacer_tx.send(Event::PacerTick).is_err() {
+                while !pacer.stop_pacer.load(Ordering::Relaxed) {
+                    std::thread::sleep(pacer_tick(pacer.rate(), rate_period));
+                    if pacer.events.send(Event::PacerTick).is_err() {
                         return;
                     }
                 }
@@ -7612,6 +7612,23 @@ fn pacer_credit(rate: f64, elapsed: Duration, rate_period: Duration) -> f64 {
     rate * elapsed.as_secs_f64() / period
 }
 
+/// How long the pacer sleeps between ticks: about [`CALLS_PER_TICK`]
+/// calls' worth at `rate`, within 1–20 ms and never past the rate period.
+/// A fixed 20 ms tick started 100 calls back to back at 5000 cps, a burst
+/// that overflowed the peer's socket receive buffer once each call got
+/// cheap to start (docs/PERFORMANCE.md); SIPp's own loop creates calls
+/// about every millisecond.
+fn pacer_tick(rate: f64, rate_period: Duration) -> Duration {
+    const CALLS_PER_TICK: f64 = 5.0;
+    let longest = rate_period.min(Duration::from_millis(20));
+    let shortest = longest.min(Duration::from_millis(1));
+    if rate <= 0.0 {
+        return longest;
+    }
+    Duration::try_from_secs_f64(rate_period.as_secs_f64() * CALLS_PER_TICK / rate)
+        .map_or(longest, |tick| tick.clamp(shortest, longest))
+}
+
 /// One ramp tick (SIPp `ratetask::run`): the new rate, and whether the
 /// cap was exceeded and `rate_quit` asks to stop. Reaching the cap exactly
 /// does not quit; only the tick that would go past it does.
@@ -8304,6 +8321,25 @@ mod tests {
             pacer_credit(10.0, Duration::from_millis(10), Duration::ZERO),
             0.0
         );
+    }
+
+    #[test]
+    fn pacer_tick_starts_a_few_calls_at_a_time() {
+        let ms = Duration::from_millis;
+        let second = ms(1000);
+        // About five calls per tick ...
+        assert_eq!(pacer_tick(5000.0, second), ms(1));
+        assert_eq!(pacer_tick(1000.0, second), ms(5));
+        assert_eq!(pacer_tick(500.0, second), ms(10));
+        assert_eq!(pacer_tick(5000.0, ms(2000)), ms(2));
+        // ... never shorter than 1 ms, never longer than 20 ms ...
+        assert_eq!(pacer_tick(100_000.0, second), ms(1));
+        assert_eq!(pacer_tick(10.0, second), ms(20));
+        assert_eq!(pacer_tick(0.0, second), ms(20));
+        // ... nor than the rate period, and degenerate input cannot panic.
+        assert_eq!(pacer_tick(1.0, ms(5)), ms(5));
+        assert_eq!(pacer_tick(10.0, Duration::ZERO), Duration::ZERO);
+        assert_eq!(pacer_tick(1e-300, Duration::MAX), ms(20));
     }
 
     #[test]

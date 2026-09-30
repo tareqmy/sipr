@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The pacer ticks about five calls' worth of time (1–20 ms, sized to the
+  rate) instead of every 20 ms, so `-r 5000` no longer starts 100 calls
+  back to back. Those bursts overflowed the peer's socket receive buffer
+  into failed calls, the more so the faster sipr starts calls. SIPp's
+  generator opens about as many per millisecond.
+
 ## [0.32.0] — 2026-09-30
 
 ### Added

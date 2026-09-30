@@ -314,8 +314,13 @@ call-failure code, as in `sipp_exit`). sipr adds 2 = usage error.
   the behavior faithfully; scenarios can mitigate with `timeout`/`ontimeout`
   on the mandatory recv.
 - Pacing: SIPp smooths call starts within the rate period rather than
-  bursting `-r` calls at once; sipr ticks every ≤20 ms and accumulates
-  fractional starts.
+  bursting `-r` calls at once. Its generator (`call_generation_task.cpp`
+  `wake` ~l.60-80, `run` ~l.170) is woken when the next call is due and
+  stops after 1 ms of work, so at 5000 cps it opens about five calls a
+  millisecond. sipr ticks about five calls' worth of time, within 1–20 ms
+  and never past the rate period, and accumulates fractional starts. A
+  fixed 20 ms tick started 100 calls at once at 5000 cps, bursts that
+  overflowed the peer's socket receive buffer into failed calls.
 - UAS behaviors (M4): an inbound retransmission of the last received
   message (same top Via branch, CSeq and method or status) is handled as
   the "Received retransmissions" note below describes; during `timewait`
