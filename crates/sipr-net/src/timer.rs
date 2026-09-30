@@ -137,6 +137,11 @@ struct Shared<E> {
 struct QueueState<E> {
     queue: TimerQueue<E>,
     shutdown: bool,
+    /// When the driver thread next looks at the queue on its own: the
+    /// deadline it sleeps toward, or `None` while it sleeps until notified.
+    /// Arming only wakes it for a timer due before this, so a busy engine
+    /// does not pay a futex wake and a context switch per armed timer.
+    wakes_at: Option<Instant>,
 }
 
 /// Threaded driver delivering fired timer events into an mpsc channel.
@@ -153,6 +158,8 @@ impl<E: Send + 'static> TimerService<E> {
             queue: Mutex::new(QueueState {
                 queue: TimerQueue::new(),
                 shutdown: false,
+                // Not started yet: its first look at the queue is immediate.
+                wakes_at: Some(Instant::now()),
             }),
             wake: Condvar::new(),
         });
@@ -173,15 +180,22 @@ impl<E: Send + 'static> TimerService<E> {
     pub fn arm_at(&self, deadline: Instant, event: E) -> TimerId {
         let mut state = lock(&self.shared.queue);
         let id = state.queue.arm(deadline, event);
+        let sooner = state.wakes_at.is_none_or(|at| deadline < at);
+        if sooner {
+            state.wakes_at = Some(deadline);
+        }
         drop(state);
-        self.shared.wake.notify_one();
+        if sooner {
+            self.shared.wake.notify_one();
+        }
         id
     }
 
-    /// Cancel an armed timer (no-op if already fired).
+    /// Cancel an armed timer (no-op if already fired). The driver is not
+    /// woken: if this was the timer it sleeps toward, it finds the
+    /// tombstone when it wakes and sleeps on until the next live one.
     pub fn cancel(&self, id: TimerId) {
         lock(&self.shared.queue).queue.cancel(id);
-        self.shared.wake.notify_one();
     }
 }
 
@@ -216,7 +230,9 @@ fn run<E: Send>(shared: &Shared<E>, sink: &Sender<E>) {
                 return; // receiver gone: engine shut down
             }
         }
-        state = match state.queue.next_deadline() {
+        let next = state.queue.next_deadline();
+        state.wakes_at = next;
+        state = match next {
             Some(deadline) => {
                 let timeout = deadline.saturating_duration_since(now);
                 match shared.wake.wait_timeout(state, timeout) {
@@ -305,5 +321,41 @@ mod tests {
             "cancelled timer must not fire"
         );
         drop(svc);
+    }
+
+    #[test]
+    fn sooner_timer_wakes_a_driver_sleeping_toward_a_later_one() {
+        let (tx, rx) = mpsc::channel();
+        let svc = TimerService::start(tx);
+        svc.arm(Duration::from_secs(60), "late");
+        std::thread::sleep(Duration::from_millis(50)); // let the driver park
+        let armed = Instant::now();
+        svc.arm(Duration::from_millis(20), "soon");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).ok(), Some("soon"));
+        assert!(armed.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn later_timers_fire_without_waking_the_driver_early() {
+        let (tx, rx) = mpsc::channel();
+        let svc = TimerService::start(tx);
+        svc.arm(Duration::from_millis(20), "first");
+        svc.arm(Duration::from_millis(40), "second");
+        svc.arm(Duration::from_millis(60), "third");
+        let fired: Vec<_> = (0..3)
+            .filter_map(|_| rx.recv_timeout(Duration::from_secs(2)).ok())
+            .collect();
+        assert_eq!(fired, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn cancelling_the_awaited_timer_leaves_later_ones_live() {
+        let (tx, rx) = mpsc::channel();
+        let svc = TimerService::start(tx);
+        let head = svc.arm(Duration::from_millis(20), "cancelled");
+        svc.arm(Duration::from_millis(60), "live");
+        std::thread::sleep(Duration::from_millis(5)); // driver sleeps toward `head`
+        svc.cancel(head);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).ok(), Some("live"));
     }
 }
