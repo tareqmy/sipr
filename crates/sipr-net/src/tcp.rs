@@ -15,12 +15,11 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use crate::rng::Rng;
 use crate::sockopt::SocketOpts;
-use crate::transport::{NetEvent, TransportConfig, framed_event};
+use crate::transport::{NetEvent, NetSink, TransportConfig, framed_event};
 use crate::ws::{self, Framing, Next, Opcode, StreamFramer, Wire, WsRequest};
 
 /// One read from the socket; big enough to hold most whole messages, but the
@@ -146,7 +145,7 @@ pub struct TcpTransport {
     ws_request: WsRequest,
     /// Masking keys for the frames of dialed WebSocket connections.
     mask_rng: Arc<Mutex<Rng>>,
-    sink: Sender<NetEvent>,
+    sink: NetSink,
     /// Raised when the transport is dropped, so the accept loop ends.
     stop: Arc<AtomicBool>,
     /// The accept loop (server only), joined on drop.
@@ -199,9 +198,10 @@ impl TcpTransport {
     /// Connection failures (e.g. the peer is not listening yet).
     pub fn connect(
         config: &TransportConfig,
-        sink: Sender<NetEvent>,
+        sink: impl Into<NetSink>,
         remote: SocketAddr,
     ) -> std::io::Result<Self> {
+        let sink = sink.into();
         let mask_rng = Arc::new(Mutex::new(Rng::new(config.loss_seed ^ 0x5EED_0014)));
         let mut stream = TcpStream::connect(remote)?;
         config.sockopts.apply(&stream)?;
@@ -234,7 +234,8 @@ impl TcpTransport {
     /// Client in `tn` mode: no connection yet — each call dials its own
     /// with [`Self::connect_call`]. `local_addr` is the local IP, port 0.
     #[must_use]
-    pub fn client_pool(config: &TransportConfig, sink: Sender<NetEvent>) -> Self {
+    pub fn client_pool(config: &TransportConfig, sink: impl Into<NetSink>) -> Self {
+        let sink = sink.into();
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         Self {
             local_addr: SocketAddr::new(ip, 0),
@@ -367,7 +368,8 @@ impl TcpTransport {
     /// # Errors
     ///
     /// Bind failures.
-    pub fn listen(config: &TransportConfig, sink: Sender<NetEvent>) -> std::io::Result<Self> {
+    pub fn listen(config: &TransportConfig, sink: impl Into<NetSink>) -> std::io::Result<Self> {
+        let sink = sink.into();
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let listener = TcpListener::bind(SocketAddr::new(ip, config.port.unwrap_or(0)))?;
         config.sockopts.apply(&listener)?;
@@ -490,7 +492,7 @@ fn accept_connection(
     peer: SocketAddr,
     framing: Framing,
     conns: &Conns,
-    sink: &Sender<NetEvent>,
+    sink: &NetSink,
     mask_rng: &Arc<Mutex<Rng>>,
 ) {
     let wire = Wire::accepted(framing);
@@ -528,7 +530,7 @@ fn register(
     stream: TcpStream,
     wire: Wire,
     initial: Vec<u8>,
-    sink: &Sender<NetEvent>,
+    sink: &NetSink,
     mask_rng: &Arc<Mutex<Rng>>,
 ) -> std::io::Result<()> {
     let read_half = stream.try_clone()?;
@@ -566,7 +568,7 @@ fn register(
 fn read_loop(
     mut stream: TcpStream,
     peer: SocketAddr,
-    sink: &Sender<NetEvent>,
+    sink: &NetSink,
     wire: Wire,
     initial: Vec<u8>,
     mut reply: impl FnMut(Opcode, &[u8]) -> std::io::Result<()>,

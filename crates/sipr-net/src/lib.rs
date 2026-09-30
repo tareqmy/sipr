@@ -39,6 +39,8 @@ pub use table::CallTable;
 pub use tcp::{TcpCallConn, TcpFramer, TcpTransport};
 pub use timer::{TimerQueue, TimerService};
 pub use tls::{TlsCallConn, TlsConfig, TlsTransport, TlsVersion};
-pub use transport::{InboundPacket, NetEvent, TransportConfig, UdpCallSocket, UdpTransport};
+pub use transport::{
+    InboundPacket, NetEvent, NetSink, SinkClosed, TransportConfig, UdpCallSocket, UdpTransport,
+};
 pub use twin::{EscFramer, PeerLinks, PeerTable, TwinChannel, TwinEvent};
 pub use ws::{Framing, ServerUpgrade, WsFramer, WsRequest};

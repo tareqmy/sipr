@@ -90,13 +90,14 @@ sipr is genuinely idle where sipp is not, which is the difference between a
 generator you can leave running next to the thing you are testing and one you
 cannot.
 
-**Answering load: sipp is slightly cheaper.** On Linux sipp's UAS spends about
-20% less CPU per call than sipr's (0.065 ms against 0.084 ms at 5000 cps).
-sipr is not faster at everything, and this is the half where SIPp's C receive
-path with `epoll` still has the edge. sipr also carries more calls
-concurrently at the same rate (101 against 70 at 5000 cps), i.e. its calls
-live a little longer, which is consistent with spending a little more per
-call on the answering side.
+**Answering load: sipp was slightly cheaper, up to 0.32.** In the table above
+sipp's UAS spends about 20% less CPU per call than sipr's (0.065 ms against
+0.084 ms at 5000 cps). That was not sipr's code but its threads waking one
+another, and it is fixed — see
+[Where the answering side's time went](#where-the-answering-sides-time-went).
+sipr also carries more calls concurrently at the same rate (101 against 70 at
+5000 cps), i.e. its calls live a little longer, which is consistent with
+spending a little more per call on the answering side.
 
 **Beware the macOS UAS column.** There sipp's UAS looks catastrophic — a flat
 ~13.9 s — and that is an artifact, not a property of sipp. A macOS build of
@@ -135,6 +136,58 @@ is already cheap, and the remaining cost is in the machinery around it. The
 one primitive with obvious headroom is message routing, where the accessors
 (`call_id`, `cseq`, `top_via_branch`) re-scan headers the parse already
 walked, costing about as much again as the parse itself.
+
+## Where the answering side's time went
+
+Profiling the one column sipr lost — the UAS on Linux — showed its own code
+was not the cost. On a 6-core Linux VM (OrbStack, aarch64; 5000 cps × 10 s,
+median of three), sipr's UAS spent *less* user time than sipp's (2.86 s
+against 3.54 s) and five times the kernel time (1.83 s against 0.36 s), with
+180k voluntary context switches against sipp's 9k. `strace -f -c` put **13.8
+futex calls on every call**; sipp makes none — it waits in `epoll_pwait`.
+Attributed per thread, two of sipr's threads existed mostly to be woken:
+
+- **The timer thread** was notified on every arm and every cancel. It only
+  needs waking for a timer due *before* the one it already sleeps toward,
+  and never for a cancel: a cancelled timer is a tombstone it skips when it
+  wakes anyway. `TimerService` now records when its driver next looks at the
+  queue and notifies only for a sooner deadline. This alone took the UAS
+  from 4.68 s to 3.23 s, and the UAC from 4.25 s to 2.55 s — the UAC arms
+  more timers per call.
+- **A relay thread** (`sipr-net-bridge`) re-sent every inbound message from
+  the transport's channel into the engine's: a second hop, one more wake
+  and switch per message. Transports now deliver straight into the engine's
+  channel through `sipr_net::NetSink`. It halved the remaining context
+  switches (104k to 58k) and took the UAS to 3.08 s.
+
+Cheaper call starts then exposed a pacing flaw. The pacer ticked every 20 ms,
+so at 5000 cps it started 100 calls back to back; the faster those went out,
+the more of the burst — and of the 180/200 and BYE bursts that follow it —
+overflowed a socket receive buffer. The kernel counted it (`RcvbufErrors` in
+`/proc/net/snmp`): 240–760 drops a run and 50–80 failed calls, against none
+with `-buff_size 1048576`. The old build overflowed too, just less (16–69
+drops). The tick now spans about five calls, within 1–20 ms, which is what
+SIPp's generator does — it wakes when the next call is due and runs at most
+1 ms at a time, opening about five a millisecond at 5000 cps. Arrivals that
+no longer come in bursts cost the receiver a little: each message now tends
+to wake its thread instead of sharing a wake with its neighbours.
+
+`make bench-vs-sipp` on the same VM, one run each, CPU of UAS / UAC:
+
+| Rate | sipr 0.32 | sipr after | sipp 3.7.7 |
+|---|---|---|---|
+| 500 cps | 0.80 / 0.71 s | 0.71 / 0.63 s | 1.15 / 1.12 s |
+| 2000 cps | 2.47 / 2.23 s | 1.95 / 1.65 s | 2.59 / 2.16 s |
+| 5000 cps | 5.06 / 4.61 s | 3.91 / 3.34 s | 4.05 / 3.52 s |
+
+sipr failed no call at any rate; sipp failed 40 and retransmitted 859 times
+at 5000 cps. Repeat runs move these figures by about 10%, so the columns
+compare within a row, not across sessions.
+
+What remains is one hop: the socket's reader thread hands each message to
+the engine's loop, where sipp reads it on its loop thread. Closing that
+means the loop waiting on sockets itself (`epoll`/`kqueue`, i.e. a new
+dependency or `unsafe`), which these numbers do not call for.
 
 ## Caveats, and what these numbers are not
 

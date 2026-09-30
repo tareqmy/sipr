@@ -63,6 +63,49 @@ pub enum NetEvent {
     },
 }
 
+/// Where a transport delivers what it receives: a `NetSink`, or,
+/// through [`NetSink::wrapping`], a channel of the caller's own events. The
+/// engine uses the latter so a datagram reaches its event loop directly; a
+/// relay thread re-sending into the engine's channel cost a futex wake and
+/// a context switch per message (docs/PERFORMANCE.md).
+#[derive(Clone)]
+pub struct NetSink(Arc<dyn Fn(NetEvent) -> Result<(), SinkClosed> + Send + Sync>);
+
+/// The receiving end of a [`NetSink`] is gone: the engine shut down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SinkClosed;
+
+impl NetSink {
+    /// Deliver into `tx`, each event wrapped by `wrap` (e.g. an enum
+    /// variant constructor such as `Event::Net`).
+    pub fn wrapping<E: Send + 'static>(tx: Sender<E>, wrap: fn(NetEvent) -> E) -> Self {
+        Self(Arc::new(move |event| {
+            tx.send(wrap(event)).map_err(|_| SinkClosed)
+        }))
+    }
+
+    /// Deliver one event.
+    ///
+    /// # Errors
+    ///
+    /// [`SinkClosed`] when the receiver is gone.
+    pub fn send(&self, event: NetEvent) -> Result<(), SinkClosed> {
+        (self.0)(event)
+    }
+}
+
+impl From<Sender<NetEvent>> for NetSink {
+    fn from(tx: Sender<NetEvent>) -> Self {
+        Self::wrapping(tx, std::convert::identity)
+    }
+}
+
+impl std::fmt::Debug for NetSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NetSink")
+    }
+}
+
 /// Configuration for binding the transport.
 #[derive(Debug, Clone, Default)]
 pub struct TransportConfig {
@@ -113,7 +156,7 @@ pub struct UdpTransport {
     send_loss_pct: f64,
     recv_loss_pct: f64,
     loss_seed: u64,
-    sink: Sender<NetEvent>,
+    sink: NetSink,
     stop: Arc<AtomicBool>,
     recv_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -150,7 +193,7 @@ impl Drop for UdpCallSocket {
 /// `report_errors` (the main socket); a per-call socket's is its own.
 fn recv_loop(
     socket: &UdpSocket,
-    sink: &Sender<NetEvent>,
+    sink: &NetSink,
     recv_loss_pct: f64,
     mut recv_rng: Rng,
     stop: &AtomicBool,
@@ -218,7 +261,8 @@ impl UdpTransport {
     /// # Errors
     ///
     /// I/O errors from binding or inspecting the socket.
-    pub fn bind(config: &TransportConfig, sink: Sender<NetEvent>) -> std::io::Result<Self> {
+    pub fn bind(config: &TransportConfig, sink: impl Into<NetSink>) -> std::io::Result<Self> {
+        let sink = sink.into();
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let socket = UdpSocket::bind(SocketAddr::new(ip, config.port.unwrap_or(0)))?;
         config.sockopts.apply(&socket)?;

@@ -26,7 +26,6 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use rustls::pki_types::pem::{self, PemObject};
@@ -35,7 +34,7 @@ use rustls::{ClientConfig, ClientConnection, Connection, RootCertStore, ServerCo
 
 use crate::rng::Rng;
 use crate::sockopt::SocketOpts;
-use crate::transport::{NetEvent, TransportConfig, framed_event};
+use crate::transport::{NetEvent, NetSink, TransportConfig, framed_event};
 use crate::ws::{self, Framing, Next, Opcode, StreamFramer, Wire, WsRequest};
 
 /// One read from the socket (ciphertext); the framer copes with any split.
@@ -111,7 +110,7 @@ pub struct TlsTransport {
     ws_request: WsRequest,
     /// Masking keys for the frames of dialed WebSocket connections.
     mask_rng: Arc<Mutex<Rng>>,
-    sink: Sender<NetEvent>,
+    sink: NetSink,
     /// Client configuration, kept for per-call connections (`ln`).
     client: Option<Arc<ClientConfig>>,
     /// Raised when the transport is dropped, so the accept loop ends.
@@ -173,9 +172,10 @@ impl TlsTransport {
     pub fn connect(
         config: &TransportConfig,
         tls_config: &TlsConfig,
-        sink: Sender<NetEvent>,
+        sink: impl Into<NetSink>,
         remote: SocketAddr,
     ) -> std::io::Result<Self> {
+        let sink = sink.into();
         let client_config = client_config(tls_config)?;
         let mut sock = TcpStream::connect(remote)?;
         config.sockopts.apply(&sock)?;
@@ -226,8 +226,9 @@ impl TlsTransport {
     pub fn client_pool(
         config: &TransportConfig,
         tls_config: &TlsConfig,
-        sink: Sender<NetEvent>,
+        sink: impl Into<NetSink>,
     ) -> std::io::Result<Self> {
+        let sink = sink.into();
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         Ok(Self {
             local_addr: SocketAddr::new(ip, 0),
@@ -384,8 +385,9 @@ impl TlsTransport {
     pub fn listen(
         config: &TransportConfig,
         tls_config: &TlsConfig,
-        sink: Sender<NetEvent>,
+        sink: impl Into<NetSink>,
     ) -> std::io::Result<Self> {
+        let sink = sink.into();
         let server_config = server_config(tls_config)?;
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let listener = TcpListener::bind(SocketAddr::new(ip, config.port.unwrap_or(0)))?;
@@ -644,7 +646,7 @@ fn register(
     sock: TcpStream,
     tls: Connection,
     upgraded: Upgraded,
-    sink: &Sender<NetEvent>,
+    sink: &NetSink,
     mask_rng: &Arc<Mutex<Rng>>,
 ) -> std::io::Result<()> {
     let Upgraded { wire, initial } = upgraded;
@@ -673,7 +675,7 @@ fn read_loop(
     mut sock: TcpStream,
     tls: &Arc<Mutex<Connection>>,
     peer: SocketAddr,
-    sink: &Sender<NetEvent>,
+    sink: &NetSink,
     wire: Wire,
     initial: Vec<u8>,
     mut reply: impl FnMut(Opcode, &[u8]) -> std::io::Result<()>,

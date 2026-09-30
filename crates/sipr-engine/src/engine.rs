@@ -23,7 +23,7 @@ use sipr_media::sdp::CryptoAttr;
 use sipr_media::{MediaEvent, MediaPlayer, PcapStream, Source, StreamSpec};
 use sipr_net::timer::TimerId;
 use sipr_net::{
-    Inbound, NetEvent, PeerLinks, RetransCaps, RetransSchedule, SocketOpts, TcpCallConn,
+    Inbound, NetEvent, NetSink, PeerLinks, RetransCaps, RetransSchedule, SocketOpts, TcpCallConn,
     TcpTransport, TimerService, TlsCallConn, TlsTransport, TransportConfig, TwinChannel, TwinEvent,
     UdpCallSocket, UdpTransport,
 };
@@ -2125,18 +2125,8 @@ impl<'s> Engine<'s> {
             }
             ui.snapshots
         });
-        // Bridge net events into the engine channel.
-        let (net_tx, net_rx) = channel::<NetEvent>();
-        let bridge_tx = tx.clone();
-        let _bridge = std::thread::Builder::new()
-            .name("sipr-net-bridge".into())
-            .spawn(move || {
-                while let Ok(ev) = net_rx.recv() {
-                    if bridge_tx.send(Event::Net(ev)).is_err() {
-                        return;
-                    }
-                }
-            });
+        // Transports deliver straight into the engine channel.
+        let net_tx = NetSink::wrapping(tx.clone(), Event::Net);
         // Injection files first: `-t ui` binds sockets from their IP column.
         // `-inf` files lead, `-rxinf` ones follow in the same table (SIPp's
         // one `inFiles` map): the first `-inf` stays the default file.
@@ -7034,7 +7024,7 @@ fn pause_length(spec: &PauseSpec) -> String {
 fn build_sctp_transport(
     config: &EngineConfig,
     tcfg: &TransportConfig,
-    net_tx: std::sync::mpsc::Sender<NetEvent>,
+    net_tx: NetSink,
     role: Role,
     per_call: bool,
 ) -> Result<(Transport, &'static str, bool), EngineError> {
@@ -7070,7 +7060,7 @@ fn build_sctp_transport(
 fn build_sctp_transport(
     _config: &EngineConfig,
     _tcfg: &TransportConfig,
-    _net_tx: std::sync::mpsc::Sender<NetEvent>,
+    _net_tx: NetSink,
     _role: Role,
     _per_call: bool,
 ) -> Result<(Transport, &'static str, bool), EngineError> {

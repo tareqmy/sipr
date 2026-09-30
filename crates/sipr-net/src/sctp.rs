@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -30,7 +29,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use crate::message::Inbound;
 use crate::rng::Rng;
 use crate::sockopt::SocketOpts;
-use crate::transport::{InboundPacket, NetEvent, TransportConfig};
+use crate::transport::{InboundPacket, NetEvent, NetSink, TransportConfig};
 
 /// `IPPROTO_SCTP` (the same number on Linux, the BSDs, and macOS).
 const IPPROTO_SCTP: i32 = 132;
@@ -85,7 +84,7 @@ pub struct SctpTransport {
     sockopts: SocketOpts,
     send_rng: Mutex<Rng>,
     send_loss_pct: f64,
-    sink: Sender<NetEvent>,
+    sink: NetSink,
     /// Raised when the transport is dropped, so the accept loop ends.
     stop: Arc<AtomicBool>,
     /// The accept loop (server only), joined on drop.
@@ -135,9 +134,10 @@ impl SctpTransport {
     /// No SCTP stack, or connection failures.
     pub fn connect(
         config: &TransportConfig,
-        sink: Sender<NetEvent>,
+        sink: impl Into<NetSink>,
         remote: SocketAddr,
     ) -> std::io::Result<Self> {
+        let sink = sink.into();
         let local = config.port.map(|p| {
             SocketAddr::new(
                 config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
@@ -166,7 +166,8 @@ impl SctpTransport {
     /// # Errors
     ///
     /// No SCTP stack, or bind failures.
-    pub fn listen(config: &TransportConfig, sink: Sender<NetEvent>) -> std::io::Result<Self> {
+    pub fn listen(config: &TransportConfig, sink: impl Into<NetSink>) -> std::io::Result<Self> {
+        let sink = sink.into();
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let bind_at = SocketAddr::new(ip, config.port.unwrap_or(0));
         let listener = sctp_socket(domain_of(bind_at))?;
@@ -216,7 +217,8 @@ impl SctpTransport {
 
     /// Client in `sn` mode: no association yet — each call dials its own.
     #[must_use]
-    pub fn client_pool(config: &TransportConfig, sink: Sender<NetEvent>) -> Self {
+    pub fn client_pool(config: &TransportConfig, sink: impl Into<NetSink>) -> Self {
+        let sink = sink.into();
         let ip = config.local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         Self {
             local_addr: SocketAddr::new(ip, 0),
@@ -336,7 +338,7 @@ fn register(
     conns: &Conns,
     peer: SocketAddr,
     stream: TcpStream,
-    sink: &Sender<NetEvent>,
+    sink: &NetSink,
 ) -> std::io::Result<()> {
     let read_half = stream.try_clone()?;
     if let Ok(mut map) = conns.lock() {
@@ -353,7 +355,7 @@ fn register(
 /// One SCTP message per read, each a whole SIP message (SIPp's
 /// `sctp_recvmsg` model); the end of the association is reported as with
 /// TCP and the engine `forget`s it.
-fn read_loop(mut stream: TcpStream, peer: SocketAddr, sink: &Sender<NetEvent>) {
+fn read_loop(mut stream: TcpStream, peer: SocketAddr, sink: &NetSink) {
     let local = stream
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));

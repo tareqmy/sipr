@@ -8,15 +8,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Less CPU on both sides of a call: the timer thread is woken only for a
-  timer due before the one it sleeps toward, not on every timer armed or
-  cancelled — each of those cost a futex wake and a context switch.
-  `TimerService::cancel` no longer wakes it at all.
+- Less CPU on both sides of a call, about a quarter less on Linux at
+  2000–5000 cps (`docs/PERFORMANCE.md`), and sipr's UAS is now cheaper
+  than sipp's at every measured rate, where it cost about 20% more. The
+  gap was kernel time, not sipr's code: the timer thread was woken on
+  every timer armed or cancelled, and a relay thread re-sent every
+  inbound message into the engine's channel. The timer thread is now
+  woken only for a timer due before the one it sleeps toward, and
+  messages reach the engine's loop directly.
 - The pacer ticks about five calls' worth of time (1–20 ms, sized to the
   rate) instead of every 20 ms, so `-r 5000` no longer starts 100 calls
   back to back. Those bursts overflowed the peer's socket receive buffer
   into failed calls, the more so the faster sipr starts calls. SIPp's
   generator opens about as many per millisecond.
+- `sipr-net`: transports deliver into a `NetSink`. A `Sender<NetEvent>`
+  converts into one, so existing callers compile unchanged;
+  `NetSink::wrapping` delivers into a channel of the caller's own events.
+  `TimerService::cancel` no longer wakes the timer thread.
 
 ## [0.32.0] — 2026-09-30
 
