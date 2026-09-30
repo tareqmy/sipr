@@ -492,7 +492,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sipr"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "criterion",
  "rcgen",
@@ -510,18 +510,18 @@ dependencies = [
 
 [[package]]
 name = "sipr-auth"
-version = "0.32.0"
+version = "0.33.0"
 
 [[package]]
 name = "sipr-control"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "sipr-stats",
 ]
 
 [[package]]
 name = "sipr-engine"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "sipr-auth",
  "sipr-control",
@@ -535,14 +535,14 @@ dependencies = [
 
 [[package]]
 name = "sipr-media"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "sipr-auth",
 ]
 
 [[package]]
 name = "sipr-net"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "rcgen",
  "rustls",
@@ -554,15 +554,15 @@ dependencies = [
 
 [[package]]
 name = "sipr-scenario"
-version = "0.32.0"
+version = "0.33.0"
 
 [[package]]
 name = "sipr-stats"
-version = "0.32.0"
+version = "0.33.0"
 
 [[package]]
 name = "sipr-tui"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "sipr-stats",
 ]

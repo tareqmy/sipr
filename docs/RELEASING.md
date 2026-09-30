@@ -48,8 +48,8 @@ The version lives in four places; they must agree:
 Then:
 
 ```sh
-git commit -am "release: v0.32.0"
-git tag -a v0.32.0 -m "sipr v0.32.0"
+git commit -am "release: v0.33.0"
+git tag -a v0.33.0 -m "sipr v0.33.0"
 git push origin master --tags
 ```
 
@@ -94,7 +94,7 @@ crates** workflow from `master` with the tag name; it checks out the tag's
 sources and publishes only the crates still missing:
 
 ```sh
-gh workflow run publish-crates.yml -f tag=v0.32.0
+gh workflow run publish-crates.yml -f tag=v0.33.0
 ```
 
 The same script works locally after `cargo login`: `make publish` from a
