@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- The library crates on crates.io (`sipr-auth`, `sipr-control`, `sipr-engine`,
+  `sipr-media`, `sipr-net`, `sipr-scenario`, `sipr-stats`, `sipr-tui`) now
+  carry a README; their crates.io pages were blank.
+
 ## [0.33.0] — 2026-09-30
 
 ### Changed
