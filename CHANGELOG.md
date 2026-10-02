@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.33.1] — 2026-10-02
+
 ### Fixed
 
 - The library crates on crates.io (`sipr-auth`, `sipr-control`, `sipr-engine`,
@@ -1033,7 +1035,8 @@ library — no external crates.
   leftmost-longest — identical on the patterns real scenarios use; see
   `docs/SIPP_COMPAT.md` §6.
 
-[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.33.0...HEAD
+[Unreleased]: https://github.com/tareqmy/sipr/compare/v0.33.1...HEAD
+[0.33.1]: https://github.com/tareqmy/sipr/compare/v0.33.0...v0.33.1
 [0.33.0]: https://github.com/tareqmy/sipr/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/tareqmy/sipr/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/tareqmy/sipr/compare/v0.30.0...v0.31.0
